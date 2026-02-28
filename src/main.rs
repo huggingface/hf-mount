@@ -1,10 +1,3 @@
-mod auth;
-mod cache;
-mod error;
-mod fs;
-mod hub_api;
-mod inode;
-
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -13,10 +6,10 @@ use data::data_client::default_config;
 use data::FileDownloadSession;
 use tracing::{error, info};
 
-use crate::auth::{HubTokenRefresher, HubWriteTokenRefresher};
-use crate::cache::FileCache;
-use crate::fs::HfFs;
-use crate::hub_api::HubApiClient;
+use hf_mount::auth::{HubTokenRefresher, HubWriteTokenRefresher};
+use hf_mount::cache::FileCache;
+use hf_mount::fs::HfFs;
+use hf_mount::hub_api::HubApiClient;
 
 #[derive(Parser)]
 #[command(name = "hf-mount", about = "Mount a HuggingFace bucket as a FUSE filesystem")]
@@ -44,6 +37,10 @@ struct Args {
 
     #[arg(long, default_value_t = false)]
     read_only: bool,
+
+    /// Interval in seconds for polling remote changes (0 to disable)
+    #[arg(long, default_value_t = 30)]
+    poll_interval_secs: u64,
 }
 
 fn main() {
@@ -137,6 +134,7 @@ fn main() {
         args.read_only,
         uid,
         gid,
+        args.poll_interval_secs,
     );
 
     // Ensure mount point exists

@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use utils::auth::{AuthConfig, TokenInfo, TokenRefresher};
+use utils::auth::{TokenInfo, TokenRefresher};
 use utils::errors::AuthError;
 
 use crate::hub_api::HubApiClient;
@@ -55,13 +55,4 @@ impl TokenRefresher for HubWriteTokenRefresher {
             .map_err(|e| AuthError::TokenRefreshFailure(e.to_string()))?;
         Ok((jwt.access_token, jwt.exp))
     }
-}
-
-/// Build an AuthConfig from a CAS token + refresher.
-pub fn build_auth_config(
-    token: String,
-    exp: u64,
-    refresher: Arc<dyn TokenRefresher>,
-) -> Option<AuthConfig> {
-    AuthConfig::maybe_new(Some(token), Some(exp), Some(refresher))
 }

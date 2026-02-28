@@ -31,6 +31,12 @@ pub struct InodeTable {
     next_inode: AtomicU64,
 }
 
+impl Default for InodeTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl InodeTable {
     pub fn new() -> Self {
         let mut table = Self {
@@ -77,16 +83,17 @@ impl InodeTable {
     pub fn lookup_child(&self, parent: u64, name: &str) -> Option<&InodeEntry> {
         let parent_entry = self.inodes.get(&parent)?;
         for &child_ino in &parent_entry.children {
-            if let Some(child) = self.inodes.get(&child_ino) {
-                if child.name == name {
-                    return Some(child);
-                }
+            if let Some(child) = self.inodes.get(&child_ino)
+                && child.name == name
+            {
+                return Some(child);
             }
         }
         None
     }
 
     /// Insert a new inode, returning its inode number.
+    #[allow(clippy::too_many_arguments)]
     pub fn insert(
         &mut self,
         parent: u64,
@@ -136,6 +143,61 @@ impl InodeTable {
     /// Insert a path → inode mapping.
     pub fn insert_path(&mut self, path: String, inode: u64) {
         self.path_to_inode.insert(path, inode);
+    }
+
+    /// Snapshot of all file entries: (ino, full_path, xet_hash, size, dirty)
+    pub fn file_snapshot(&self) -> Vec<(u64, String, Option<String>, u64, bool)> {
+        self.inodes
+            .values()
+            .filter(|e| e.kind == InodeKind::File)
+            .map(|e| {
+                (
+                    e.inode,
+                    e.full_path.clone(),
+                    e.xet_hash.clone(),
+                    e.size,
+                    e.dirty,
+                )
+            })
+            .collect()
+    }
+
+    /// Update remote file metadata (only if not dirty). Returns true if updated.
+    pub fn update_remote_file(
+        &mut self,
+        ino: u64,
+        new_hash: Option<String>,
+        new_size: u64,
+        new_mtime: SystemTime,
+    ) -> bool {
+        if let Some(entry) = self.inodes.get_mut(&ino) {
+            if entry.dirty {
+                return false;
+            }
+            entry.xet_hash = new_hash;
+            entry.size = new_size;
+            entry.mtime = new_mtime;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Reset children_loaded to false so the next readdir/lookup re-fetches.
+    pub fn invalidate_children(&mut self, ino: u64) {
+        if let Some(entry) = self.inodes.get_mut(&ino) {
+            entry.children_loaded = false;
+        }
+    }
+
+    /// Get directory inode by path.
+    pub fn get_dir_ino(&self, path: &str) -> Option<u64> {
+        self.path_to_inode.get(path).copied().and_then(|ino| {
+            self.inodes
+                .get(&ino)
+                .filter(|e| e.kind == InodeKind::Directory)
+                .map(|e| e.inode)
+        })
     }
 
     /// Remove an inode from the table (also removes from parent's children list).

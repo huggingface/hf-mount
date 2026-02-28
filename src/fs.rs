@@ -1,18 +1,20 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs::{File, OpenOptions};
+use std::io::Write;
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use data::XetFileInfo;
 use fuser::{
     Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo,
     OpenFlags, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen,
     ReplyStatfs, ReplyWrite, Request, TimeOrNow,
 };
 use tokio::sync::mpsc;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::cache::FileCache;
 use crate::hub_api::{BatchOp, HubApiClient};
@@ -22,6 +24,35 @@ const TTL: Duration = Duration::from_secs(60);
 const BLOCK_SIZE: u32 = 512;
 const DEBOUNCE_DURATION: Duration = Duration::from_secs(2);
 const MAX_BATCH_WINDOW: Duration = Duration::from_secs(30);
+
+/// An open file handle — either a local fd or a lazy remote reference.
+enum OpenFile {
+    /// Local file (staging for writes, or fully cached reads).
+    Local { file: File, writable: bool },
+    /// Lazy remote — data fetched on-demand per read() via range requests.
+    Lazy { xet_hash: String, file_size: u64 },
+}
+
+/// What to do in read() after releasing the open_files lock.
+enum ReadTarget {
+    LocalFd(i32),
+    Remote { xet_hash: String, file_size: u64 },
+}
+
+/// Wraps `Arc<Mutex<Vec<u8>>>` to implement `Write + Send + 'static`
+/// for use with `FileDownloadSession::download_to_writer`.
+struct SharedBufWriter(Arc<Mutex<Vec<u8>>>);
+
+impl Write for SharedBufWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().expect("SharedBufWriter lock poisoned").extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
 
 /// A request to flush a dirty file to CAS + bucket.
 /// Only carries the inode number; full_path and staging_path are resolved
@@ -37,8 +68,8 @@ pub struct HfFs {
     cache: Arc<FileCache>,
     read_only: bool,
     inodes: Arc<Mutex<InodeTable>>,
-    /// Maps fh → (inode, open File handle, writable)
-    open_files: Mutex<HashMap<u64, (u64, File, bool)>>,
+    /// Maps fh → OpenFile (local fd or lazy remote reference).
+    open_files: Mutex<HashMap<u64, OpenFile>>,
     next_fh: Mutex<u64>,
     uid: u32,
     gid: u32,
@@ -46,9 +77,12 @@ pub struct HfFs {
     flush_tx: Option<mpsc::UnboundedSender<FlushRequest>>,
     /// Handle to the background flush task, used for graceful shutdown.
     flush_handle: Option<tokio::task::JoinHandle<()>>,
+    /// Handle to the background polling task, used for graceful shutdown.
+    poll_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl HfFs {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         rt: tokio::runtime::Handle,
         hub_client: Arc<HubApiClient>,
@@ -57,6 +91,7 @@ impl HfFs {
         read_only: bool,
         uid: u32,
         gid: u32,
+        poll_interval_secs: u64,
     ) -> Self {
         let inodes = Arc::new(Mutex::new(InodeTable::new()));
 
@@ -74,6 +109,19 @@ impl HfFs {
             (None, None)
         };
 
+        // Spawn remote change polling task (if interval > 0)
+        let poll_handle = if poll_interval_secs > 0 {
+            let bg_hub = hub_client.clone();
+            let bg_bucket = bucket_id.clone();
+            let bg_inodes = inodes.clone();
+            let bg_cache = cache.clone();
+            let interval = Duration::from_secs(poll_interval_secs);
+
+            Some(rt.spawn(Self::poll_remote_changes(bg_hub, bg_bucket, bg_inodes, bg_cache, interval)))
+        } else {
+            None
+        };
+
         Self {
             rt,
             hub_client,
@@ -87,6 +135,7 @@ impl HfFs {
             gid,
             flush_tx,
             flush_handle,
+            poll_handle,
         }
     }
 
@@ -259,7 +308,7 @@ impl HfFs {
         FileAttr {
             ino: INodeNo(entry.inode),
             size: entry.size,
-            blocks: (entry.size + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64,
+            blocks: entry.size.div_ceil(BLOCK_SIZE as u64),
             atime: entry.mtime,
             mtime: entry.mtime,
             ctime: entry.mtime,
@@ -277,23 +326,13 @@ impl HfFs {
 
     /// Ensure children of a directory inode are loaded from the Hub API.
     fn ensure_children_loaded(&self, parent_ino: u64) {
-        let needs_load = {
-            let inodes = self.inodes.lock().unwrap();
-            inodes
-                .get(parent_ino)
-                .map(|e| !e.children_loaded && e.kind == InodeKind::Directory)
-                .unwrap_or(false)
-        };
-
-        if !needs_load {
-            return;
-        }
-
         let prefix = {
             let inodes = self.inodes.lock().unwrap();
             match inodes.get(parent_ino) {
-                Some(e) => e.full_path.clone(),
-                None => return,
+                Some(e) if !e.children_loaded && e.kind == InodeKind::Directory => {
+                    e.full_path.clone()
+                }
+                _ => return,
             }
         };
 
@@ -378,12 +417,121 @@ impl HfFs {
         FileHandle(val)
     }
 
+    /// Background task: polls Hub API tree listing to detect remote changes.
+    async fn poll_remote_changes(
+        hub_client: Arc<HubApiClient>,
+        bucket_id: String,
+        inodes: Arc<Mutex<InodeTable>>,
+        cache: Arc<FileCache>,
+        interval: Duration,
+    ) {
+        loop {
+            tokio::time::sleep(interval).await;
+
+            let remote_entries = match hub_client.list_tree(&bucket_id, "").await {
+                Ok(entries) => entries,
+                Err(e) => {
+                    warn!("Remote poll failed: {}", e);
+                    continue;
+                }
+            };
+
+            let remote_map: HashMap<String, _> = remote_entries
+                .iter()
+                .filter(|e| e.entry_type == "file")
+                .map(|e| (e.path.clone(), e))
+                .collect();
+
+            // Take snapshot under lock, then release to avoid blocking FUSE ops
+            let snapshot = inodes.lock().unwrap().file_snapshot();
+
+            // Phase 1: Compute diff (no lock held)
+            struct Update {
+                ino: u64,
+                hash: Option<String>,
+                size: u64,
+                mtime: SystemTime,
+            }
+            let mut updates = Vec::new();
+            let mut deletions = Vec::new();
+
+            for (ino, path, local_hash, local_size, is_dirty) in &snapshot {
+                if *is_dirty {
+                    continue;
+                }
+                match remote_map.get(path.as_str()) {
+                    Some(remote) => {
+                        let remote_hash = remote.xet_hash.as_deref();
+                        let remote_size = remote.size.unwrap_or(0);
+                        let hash_changed = remote_hash != local_hash.as_deref();
+                        let size_changed = remote_size != *local_size;
+
+                        if hash_changed || size_changed {
+                            let mtime = remote
+                                .mtime
+                                .as_deref()
+                                .map(HubApiClient::mtime_from_str)
+                                .unwrap_or(SystemTime::now());
+                            updates.push(Update {
+                                ino: *ino,
+                                hash: remote_hash.map(|s| s.to_string()),
+                                size: remote_size,
+                                mtime,
+                            });
+                            info!("Remote update detected: {}", path);
+                        }
+                    }
+                    None => {
+                        info!("Remote deletion detected: {}", path);
+                        deletions.push(*ino);
+                    }
+                }
+            }
+
+            // Phase 2: Apply mutations under lock
+            {
+                let mut inode_table = inodes.lock().unwrap();
+
+                for upd in updates {
+                    inode_table.update_remote_file(upd.ino, upd.hash, upd.size, upd.mtime);
+                }
+
+                for ino in &deletions {
+                    inode_table.remove(*ino);
+                }
+
+                // Phase 3: New remote files → invalidate parent dir
+                let mut dirs_to_invalidate = HashSet::new();
+                for path in remote_map.keys() {
+                    if inode_table.get_by_path(path).is_none() {
+                        let parent = path.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
+                        if let Some(dir_ino) = inode_table.get_dir_ino(parent) {
+                            dirs_to_invalidate.insert(dir_ino);
+                        }
+                    }
+                }
+
+                for dir_ino in dirs_to_invalidate {
+                    inode_table.invalidate_children(dir_ino);
+                }
+            }
+
+            // Clean up staging files for deleted inodes (outside lock scope)
+            for ino in deletions {
+                let staging_path = cache.staging_path(ino);
+                if staging_path.exists() {
+                    std::fs::remove_file(&staging_path).ok();
+                }
+            }
+        }
+    }
+
     /// Enqueue a dirty file for debounced batch flush.
     fn enqueue_flush(&self, ino: u64) {
-        if let Some(tx) = &self.flush_tx {
-            if tx.send(FlushRequest { ino }).is_err() {
-                error!("Flush channel closed, cannot enqueue ino={}", ino);
-            }
+        if let Some(tx) = &self.flush_tx
+            && tx.send(FlushRequest { ino }).is_err()
+        {
+            error!("Flush channel closed, cannot enqueue ino={}", ino);
         }
     }
 }
@@ -508,8 +656,20 @@ impl Filesystem for HfFs {
 
         if writable {
             let staging_path = self.cache.staging_path(ino);
+            let is_dirty = {
+                let inodes = self.inodes.lock().unwrap();
+                inodes.get(ino).map(|e| e.dirty).unwrap_or(false)
+            };
 
-            if !truncate && !xet_hash.is_empty() && size > 0 {
+            if is_dirty && staging_path.exists() {
+                // Reuse existing staging file (preserves pending local edits)
+            } else if truncate {
+                if let Err(e) = File::create(&staging_path) {
+                    error!("Failed to create staging file: {}", e);
+                    reply.error(Errno::EIO);
+                    return;
+                }
+            } else if !xet_hash.is_empty() && size > 0 {
                 let cache = self.cache.clone();
                 match self.rt.block_on(cache.ensure_cached(&xet_hash, size)) {
                     Ok(cached_path) => {
@@ -525,12 +685,10 @@ impl Filesystem for HfFs {
                         return;
                     }
                 }
-            } else {
-                if let Err(e) = File::create(&staging_path) {
-                    error!("Failed to create staging file: {}", e);
-                    reply.error(Errno::EIO);
-                    return;
-                }
+            } else if let Err(e) = File::create(&staging_path) {
+                error!("Failed to create staging file: {}", e);
+                reply.error(Errno::EIO);
+                return;
             }
 
             match OpenOptions::new()
@@ -552,7 +710,7 @@ impl Filesystem for HfFs {
                     self.open_files
                         .lock()
                         .unwrap()
-                        .insert(fh.0, (ino, file, true));
+                        .insert(fh.0, OpenFile::Local { file, writable: true });
                     reply.opened(fh, FopenFlags::empty());
                 }
                 Err(e) => {
@@ -561,16 +719,29 @@ impl Filesystem for HfFs {
                 }
             }
         } else {
-            // Read-only open: check dirty staging first, then fall back to CAS cache
+            // Read-only open: check dirty staging first, then use lazy range reads
             let staging_path = self.cache.staging_path(ino);
             let is_dirty = {
                 let inodes = self.inodes.lock().unwrap();
                 inodes.get(ino).map(|e| e.dirty).unwrap_or(false)
             };
 
-            let file_to_open = if is_dirty && staging_path.exists() {
+            if is_dirty && staging_path.exists() {
                 // Dirty file: read from staging area (handles files not yet flushed)
-                staging_path
+                match File::open(&staging_path) {
+                    Ok(file) => {
+                        let fh = self.alloc_fh();
+                        self.open_files
+                            .lock()
+                            .unwrap()
+                            .insert(fh.0, OpenFile::Local { file, writable: false });
+                        reply.opened(fh, FopenFlags::empty());
+                    }
+                    Err(e) => {
+                        error!("Failed to open staging file {:?}: {}", staging_path, e);
+                        reply.error(Errno::EIO);
+                    }
+                }
             } else if xet_hash.is_empty() {
                 if size == 0 {
                     // Empty file with no hash: create a temp empty file to open
@@ -578,37 +749,32 @@ impl Filesystem for HfFs {
                     if !empty_path.exists() {
                         File::create(&empty_path).ok();
                     }
-                    empty_path
+                    match File::open(&empty_path) {
+                        Ok(file) => {
+                            let fh = self.alloc_fh();
+                            self.open_files
+                                .lock()
+                                .unwrap()
+                                .insert(fh.0, OpenFile::Local { file, writable: false });
+                            reply.opened(fh, FopenFlags::empty());
+                        }
+                        Err(e) => {
+                            error!("Failed to open empty file {:?}: {}", empty_path, e);
+                            reply.error(Errno::EIO);
+                        }
+                    }
                 } else {
                     error!("No xet hash for non-empty, non-dirty file {}", full_path);
                     reply.error(Errno::EIO);
-                    return;
                 }
             } else {
-                let cache = self.cache.clone();
-                match self.rt.block_on(cache.ensure_cached(&xet_hash, size)) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        error!("Failed to cache file {}: {}", full_path, e);
-                        reply.error(Errno::EIO);
-                        return;
-                    }
-                }
-            };
-
-            match File::open(&file_to_open) {
-                Ok(file) => {
-                    let fh = self.alloc_fh();
-                    self.open_files
-                        .lock()
-                        .unwrap()
-                        .insert(fh.0, (ino, file, false));
-                    reply.opened(fh, FopenFlags::empty());
-                }
-                Err(e) => {
-                    error!("Failed to open cached file {:?}: {}", file_to_open, e);
-                    reply.error(Errno::EIO);
-                }
+                // Lazy remote: don't download anything, fetch on read()
+                let fh = self.alloc_fh();
+                self.open_files
+                    .lock()
+                    .unwrap()
+                    .insert(fh.0, OpenFile::Lazy { xet_hash, file_size: size });
+                reply.opened(fh, FopenFlags::empty());
             }
         }
     }
@@ -626,12 +792,25 @@ impl Filesystem for HfFs {
     ) {
         debug!("read: fh={}, offset={}, size={}", fh.0, offset, size);
 
-        let files = self.open_files.lock().unwrap();
-        match files.get(&fh.0) {
-            Some((_ino, file, _writable)) => {
-                let fd = file.as_raw_fd();
-                let mut buf = vec![0u8; size as usize];
+        // Extract what we need under the lock, then release it
+        let read_target = {
+            let files = self.open_files.lock().unwrap();
+            match files.get(&fh.0) {
+                Some(OpenFile::Local { file, .. }) => ReadTarget::LocalFd(file.as_raw_fd()),
+                Some(OpenFile::Lazy { xet_hash, file_size }) => ReadTarget::Remote {
+                    xet_hash: xet_hash.clone(),
+                    file_size: *file_size,
+                },
+                None => {
+                    reply.error(Errno::EBADF);
+                    return;
+                }
+            }
+        };
 
+        match read_target {
+            ReadTarget::LocalFd(fd) => {
+                let mut buf = vec![0u8; size as usize];
                 let n = unsafe {
                     libc::pread(
                         fd,
@@ -640,7 +819,6 @@ impl Filesystem for HfFs {
                         offset as i64,
                     )
                 };
-
                 if n < 0 {
                     reply.error(Errno::EIO);
                 } else {
@@ -648,8 +826,27 @@ impl Filesystem for HfFs {
                     reply.data(&buf);
                 }
             }
-            None => {
-                reply.data(&[]);
+            ReadTarget::Remote { xet_hash, file_size } => {
+                if offset >= file_size {
+                    reply.data(&[]);
+                    return;
+                }
+                let end = (offset + size as u64).min(file_size);
+                let file_info = XetFileInfo::new(xet_hash, file_size);
+                let buf = Arc::new(Mutex::new(Vec::with_capacity((end - offset) as usize)));
+                let writer = SharedBufWriter(buf.clone());
+
+                match self.rt.block_on(
+                    self.cache
+                        .download_session()
+                        .download_to_writer(&file_info, offset..end, writer, None),
+                ) {
+                    Ok(_) => reply.data(&buf.lock().expect("SharedBufWriter lock poisoned")),
+                    Err(e) => {
+                        error!("Range read failed: {}", e);
+                        reply.error(Errno::EIO);
+                    }
+                }
             }
         }
     }
@@ -684,8 +881,8 @@ impl Filesystem for HfFs {
         let fd = {
             let files = self.open_files.lock().unwrap();
             match files.get(&fh.0) {
-                Some((_, file, true)) => file.as_raw_fd(),
-                Some((_, _, false)) => {
+                Some(OpenFile::Local { file, writable: true }) => file.as_raw_fd(),
+                Some(OpenFile::Local { writable: false, .. }) | Some(OpenFile::Lazy { .. }) => {
                     reply.error(Errno::EBADF);
                     return;
                 }
@@ -711,10 +908,10 @@ impl Filesystem for HfFs {
             let written = n as u32;
             let new_end = offset + written as u64;
             let mut inodes = self.inodes.lock().unwrap();
-            if let Some(entry) = inodes.get_mut(ino.0) {
-                if new_end > entry.size {
-                    entry.size = new_end;
-                }
+            if let Some(entry) = inodes.get_mut(ino.0)
+                && new_end > entry.size
+            {
+                entry.size = new_end;
             }
             reply.written(written);
         }
@@ -747,7 +944,7 @@ impl Filesystem for HfFs {
 
         let was_writable = {
             let files = self.open_files.lock().unwrap();
-            files.get(&fh.0).map(|(_, _, w)| *w).unwrap_or(false)
+            matches!(files.get(&fh.0), Some(OpenFile::Local { writable: true, .. }))
         };
 
         if was_writable && !self.read_only {
@@ -831,7 +1028,7 @@ impl Filesystem for HfFs {
                 self.open_files
                     .lock()
                     .unwrap()
-                    .insert(fh.0, (ino, file, true));
+                    .insert(fh.0, OpenFile::Local { file, writable: true });
 
                 let inodes = self.inodes.lock().unwrap();
                 let attr = self.inode_to_attr(inodes.get(ino).unwrap());
@@ -1023,11 +1220,11 @@ impl Filesystem for HfFs {
 
         {
             let inodes = self.inodes.lock().unwrap();
-            if let Some(entry) = inodes.get(ino) {
-                if !entry.children.is_empty() {
-                    reply.error(Errno::ENOTEMPTY);
-                    return;
-                }
+            if let Some(entry) = inodes.get(ino)
+                && !entry.children.is_empty()
+            {
+                reply.error(Errno::ENOTEMPTY);
+                return;
             }
         }
 
@@ -1109,10 +1306,9 @@ impl Filesystem for HfFs {
             format!("{}/{}", new_parent_path, newname)
         };
 
-        if kind == InodeKind::File && xet_hash.is_some() && !is_dirty {
+        if let Some(hash) = xet_hash.filter(|_| kind == InodeKind::File && !is_dirty) {
             let hub = self.hub_client.clone();
             let bucket_id = self.bucket_id.clone();
-            let hash = xet_hash.unwrap();
 
             let mtime_ms = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -1141,13 +1337,19 @@ impl Filesystem for HfFs {
         {
             let mut inodes = self.inodes.lock().unwrap();
 
+            // Remove existing destination inode if it exists (POSIX rename replaces target)
+            if let Some(existing) = inodes.lookup_child(newparent.0, newname) {
+                let existing_ino = existing.inode;
+                inodes.remove(existing_ino);
+            }
+
             if let Some(old_parent) = inodes.get_mut(parent.0) {
                 old_parent.children.retain(|&c| c != ino);
             }
 
-            inodes.get(ino).map(|e| e.full_path.clone()).map(|old| {
+            if let Some(old) = inodes.get(ino).map(|e| e.full_path.clone()) {
                 inodes.remove_path(&old);
-            });
+            }
 
             if let Some(entry) = inodes.get_mut(ino) {
                 entry.name = newname.to_string();
@@ -1199,16 +1401,15 @@ impl Filesystem for HfFs {
                     reply.error(Errno::EIO);
                     return;
                 }
-            } else if staging_path.exists() {
-                if let Err(e) = OpenOptions::new()
+            } else if staging_path.exists()
+                && let Err(e) = OpenOptions::new()
                     .write(true)
                     .open(&staging_path)
                     .and_then(|f| f.set_len(new_size))
-                {
-                    error!("Failed to set staging file length: {}", e);
-                    reply.error(Errno::EIO);
-                    return;
-                }
+            {
+                error!("Failed to set staging file length: {}", e);
+                reply.error(Errno::EIO);
+                return;
             }
 
             let mut inodes = self.inodes.lock().unwrap();
@@ -1216,6 +1417,10 @@ impl Filesystem for HfFs {
                 entry.size = new_size;
                 entry.dirty = true;
             }
+
+            // Schedule flush so the truncation is committed to CAS/bucket
+            drop(inodes);
+            self.enqueue_flush(ino.0);
         }
 
         let inodes = self.inodes.lock().unwrap();
@@ -1259,13 +1464,17 @@ impl Filesystem for HfFs {
 
     fn destroy(&mut self) {
         info!("Destroying filesystem, flushing pending writes...");
+        // Abort the polling task.
+        if let Some(handle) = self.poll_handle.take() {
+            handle.abort();
+        }
         // Drop the sender to signal the flush loop to drain and exit.
         self.flush_tx.take();
         // Wait for the flush task to complete (processes remaining items).
-        if let Some(handle) = self.flush_handle.take() {
-            if let Err(e) = self.rt.block_on(handle) {
-                error!("Flush task panicked: {}", e);
-            }
+        if let Some(handle) = self.flush_handle.take()
+            && let Err(e) = self.rt.block_on(handle)
+        {
+            error!("Flush task panicked: {}", e);
         }
         info!("Flush loop finished, filesystem destroyed.");
     }
