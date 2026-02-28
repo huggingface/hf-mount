@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::sync::Arc;
 
 use data::{FileUploadSession, XetFileInfo};
 use reqwest::Client;
@@ -67,6 +68,33 @@ pub async fn whoami(endpoint: &str, token: &str) -> String {
         .as_str()
         .expect("whoami: missing 'name' field")
         .to_string()
+}
+
+/// Build an Arc<TranslatorConfig> for CAS writes.
+pub async fn build_write_config(
+    hub: &Arc<hf_mount::hub_api::HubApiClient>,
+    bucket_id: &str,
+) -> Arc<data::configurations::TranslatorConfig> {
+    let write_jwt = hub
+        .get_cas_write_token(bucket_id)
+        .await
+        .expect("get_cas_write_token failed");
+
+    let write_refresher = Arc::new(hf_mount::auth::HubWriteTokenRefresher::new(
+        hub.clone(),
+        bucket_id.to_string(),
+    ));
+
+    Arc::new(
+        data::data_client::default_config(
+            write_jwt.cas_url,
+            None,
+            Some((write_jwt.access_token, write_jwt.exp)),
+            Some(write_refresher),
+            None,
+        )
+        .expect("write default_config failed"),
+    )
 }
 
 /// Upload a single file to CAS via an upload session.

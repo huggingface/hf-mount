@@ -33,26 +33,7 @@ async fn setup_bucket_with_file() -> Option<(
     let hub = Arc::new(hf_mount::hub_api::HubApiClient::new(ENDPOINT, &token));
 
     // Upload a test file via CAS
-    let write_jwt = hub
-        .get_cas_write_token(&bucket_id)
-        .await
-        .expect("get_cas_write_token failed");
-
-    let write_refresher = Arc::new(hf_mount::auth::HubWriteTokenRefresher::new(
-        hub.clone(),
-        bucket_id.clone(),
-    ));
-
-    let write_config = Arc::new(
-        data::data_client::default_config(
-            write_jwt.cas_url,
-            None,
-            Some((write_jwt.access_token, write_jwt.exp)),
-            Some(write_refresher),
-            None,
-        )
-        .expect("default_config failed"),
-    );
+    let write_config = common::build_write_config(&hub, &bucket_id).await;
 
     // Create a file with recognizable content for range read testing
     let test_content = "AAAA_HEADER_AAAA|BBBB_MIDDLE_BBBB|CCCC_FOOTER_CCCC".to_string();

@@ -74,20 +74,7 @@ async fn test_batch_add_and_delete_inner(
     hub: &Arc<hf_mount::hub_api::HubApiClient>,
     bucket_id: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let write_jwt = hub.get_cas_write_token(bucket_id).await?;
-
-    let write_refresher = Arc::new(hf_mount::auth::HubWriteTokenRefresher::new(
-        hub.clone(),
-        bucket_id.to_string(),
-    ));
-
-    let write_config = Arc::new(data::data_client::default_config(
-        write_jwt.cas_url,
-        None,
-        Some((write_jwt.access_token, write_jwt.exp)),
-        Some(write_refresher),
-        None,
-    )?);
+    let write_config = common::build_write_config(hub, bucket_id).await;
 
     let test_filename = format!("_test_write_{}.txt", std::process::id());
     let cache_dir = std::env::temp_dir().join("hf-mount-write-test");
@@ -173,20 +160,7 @@ async fn test_write_then_read_back_inner(
     hub: &Arc<hf_mount::hub_api::HubApiClient>,
     bucket_id: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let write_jwt = hub.get_cas_write_token(bucket_id).await?;
-
-    let write_refresher = Arc::new(hf_mount::auth::HubWriteTokenRefresher::new(
-        hub.clone(),
-        bucket_id.to_string(),
-    ));
-
-    let write_config = Arc::new(data::data_client::default_config(
-        write_jwt.cas_url,
-        None,
-        Some((write_jwt.access_token, write_jwt.exp)),
-        Some(write_refresher),
-        None,
-    )?);
+    let write_config = common::build_write_config(hub, bucket_id).await;
 
     let read_jwt = hub.get_cas_token(bucket_id).await?;
 

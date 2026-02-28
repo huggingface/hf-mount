@@ -417,6 +417,24 @@ impl HfFs {
         FileHandle(val)
     }
 
+    /// Open a local file as read-only and reply with the file handle.
+    fn open_local_readonly(&self, path: &PathBuf, reply: ReplyOpen) {
+        match File::open(path) {
+            Ok(file) => {
+                let fh = self.alloc_fh();
+                self.open_files
+                    .lock()
+                    .unwrap()
+                    .insert(fh.0, OpenFile::Local { file, writable: false });
+                reply.opened(fh, FopenFlags::empty());
+            }
+            Err(e) => {
+                error!("Failed to open file {:?}: {}", path, e);
+                reply.error(Errno::EIO);
+            }
+        }
+    }
+
     /// Background task: polls Hub API tree listing to detect remote changes.
     async fn poll_remote_changes(
         hub_client: Arc<HubApiClient>,
@@ -637,7 +655,7 @@ impl Filesystem for HfFs {
             return;
         }
 
-        let (full_path, xet_hash, size) = {
+        let (full_path, xet_hash, size, is_dirty) = {
             let inodes = self.inodes.lock().unwrap();
             let entry = match inodes.get(ino) {
                 Some(e) if e.kind == InodeKind::File => e,
@@ -651,15 +669,12 @@ impl Filesystem for HfFs {
                 entry.full_path.clone(),
                 entry.xet_hash.clone().unwrap_or_default(),
                 entry.size,
+                entry.dirty,
             )
         };
 
         if writable {
             let staging_path = self.cache.staging_path(ino);
-            let is_dirty = {
-                let inodes = self.inodes.lock().unwrap();
-                inodes.get(ino).map(|e| e.dirty).unwrap_or(false)
-            };
 
             if is_dirty && staging_path.exists() {
                 // Reuse existing staging file (preserves pending local edits)
@@ -721,27 +736,10 @@ impl Filesystem for HfFs {
         } else {
             // Read-only open: check dirty staging first, then use lazy range reads
             let staging_path = self.cache.staging_path(ino);
-            let is_dirty = {
-                let inodes = self.inodes.lock().unwrap();
-                inodes.get(ino).map(|e| e.dirty).unwrap_or(false)
-            };
 
             if is_dirty && staging_path.exists() {
                 // Dirty file: read from staging area (handles files not yet flushed)
-                match File::open(&staging_path) {
-                    Ok(file) => {
-                        let fh = self.alloc_fh();
-                        self.open_files
-                            .lock()
-                            .unwrap()
-                            .insert(fh.0, OpenFile::Local { file, writable: false });
-                        reply.opened(fh, FopenFlags::empty());
-                    }
-                    Err(e) => {
-                        error!("Failed to open staging file {:?}: {}", staging_path, e);
-                        reply.error(Errno::EIO);
-                    }
-                }
+                self.open_local_readonly(&staging_path, reply);
             } else if xet_hash.is_empty() {
                 if size == 0 {
                     // Empty file with no hash: create a temp empty file to open
@@ -749,20 +747,7 @@ impl Filesystem for HfFs {
                     if !empty_path.exists() {
                         File::create(&empty_path).ok();
                     }
-                    match File::open(&empty_path) {
-                        Ok(file) => {
-                            let fh = self.alloc_fh();
-                            self.open_files
-                                .lock()
-                                .unwrap()
-                                .insert(fh.0, OpenFile::Local { file, writable: false });
-                            reply.opened(fh, FopenFlags::empty());
-                        }
-                        Err(e) => {
-                            error!("Failed to open empty file {:?}: {}", empty_path, e);
-                            reply.error(Errno::EIO);
-                        }
-                    }
+                    self.open_local_readonly(&empty_path, reply);
                 } else {
                     error!("No xet hash for non-empty, non-dirty file {}", full_path);
                     reply.error(Errno::EIO);
