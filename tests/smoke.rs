@@ -1,28 +1,38 @@
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+mod common;
 
-/// Smoke test: writes a file to the bucket, then reads it back and verifies content.
-/// Self-contained: does not depend on pre-existing bucket state.
-/// Requires HF_TOKEN env var. Uses TEST_WRITE_BUCKET_ID or defaults to XciD/hf-mount-test-bucket.
-#[tokio::test]
-async fn test_write_then_download() {
+use std::io::{Read, Seek, SeekFrom};
+use std::process::{Child, Command};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+const ENDPOINT: &str = "https://huggingface.co";
+
+/// Setup: create a bucket, upload a test file to it via CAS.
+/// Returns (token, bucket_id, hub, test_filename, test_content).
+async fn setup_bucket_with_file() -> Option<(
+    String,
+    String,
+    Arc<hf_mount::hub_api::HubApiClient>,
+    String,
+    String,
+)> {
     let token = match std::env::var("HF_TOKEN") {
         Ok(t) => t,
         Err(_) => {
             eprintln!("Skipping: HF_TOKEN not set");
-            return;
+            return None;
         }
     };
-    let bucket_id = std::env::var("TEST_WRITE_BUCKET_ID")
-        .unwrap_or_else(|_| "XciD/hf-mount-test-bucket".to_string());
 
-    let hub = Arc::new(hf_mount::hub_api::HubApiClient::new(
-        "https://huggingface.co",
-        &token,
-    ));
+    let username = common::whoami(ENDPOINT, &token).await;
+    let bucket_id = format!("{}/hf-mount-fuse-{}", username, std::process::id());
 
-    // --- Write phase: upload a file to CAS then commit to bucket ---
+    common::create_bucket(ENDPOINT, &token, &bucket_id).await;
+    eprintln!("Created bucket: {}", bucket_id);
 
+    let hub = Arc::new(hf_mount::hub_api::HubApiClient::new(ENDPOINT, &token));
+
+    // Upload a test file via CAS
     let write_jwt = hub
         .get_cas_write_token(&bucket_id)
         .await
@@ -33,39 +43,27 @@ async fn test_write_then_download() {
         bucket_id.clone(),
     ));
 
-    let write_config = data::data_client::default_config(
-        write_jwt.cas_url,
-        None,
-        Some((write_jwt.access_token, write_jwt.exp)),
-        Some(write_refresher),
-        None,
-    )
-    .expect("write default_config failed");
+    let write_config = Arc::new(
+        data::data_client::default_config(
+            write_jwt.cas_url,
+            None,
+            Some((write_jwt.access_token, write_jwt.exp)),
+            Some(write_refresher),
+            None,
+        )
+        .expect("default_config failed"),
+    );
 
-    let cache_dir = std::env::temp_dir().join("hf-mount-smoke-test");
-    std::fs::create_dir_all(&cache_dir).ok();
+    // Create a file with recognizable content for range read testing
+    let test_content = "AAAA_HEADER_AAAA|BBBB_MIDDLE_BBBB|CCCC_FOOTER_CCCC".to_string();
+    let test_filename = format!("range_test_{}.txt", std::process::id());
 
-    let test_content = "smoke test content\n";
-    let test_filename = format!("_smoke_test_{}.txt", std::process::id());
-    let staging_path = cache_dir.join(&test_filename);
-    std::fs::write(&staging_path, test_content).expect("write staging file");
+    let tmp_dir = std::env::temp_dir().join("hf-mount-fuse-setup");
+    std::fs::create_dir_all(&tmp_dir).ok();
+    let staging_path = tmp_dir.join(&test_filename);
+    std::fs::write(&staging_path, &test_content).expect("write staging file");
 
-    let upload_session =
-        data::FileUploadSession::new(Arc::new(write_config), None)
-            .await
-            .expect("FileUploadSession::new failed");
-
-    let mut results = upload_session
-        .upload_files(vec![(staging_path.clone(), None::<mdb_shard::Sha256>)])
-        .await
-        .expect("upload_files failed");
-
-    let file_info = results.pop().expect("upload returned no file info");
-
-    upload_session
-        .finalize()
-        .await
-        .expect("finalize failed");
+    let file_info = common::upload_file(write_config, &staging_path).await;
 
     let xet_hash = file_info.hash().to_string();
     let file_size = file_info.file_size();
@@ -80,7 +78,7 @@ async fn test_write_then_download() {
         &bucket_id,
         &[hf_mount::hub_api::BatchOp::AddFile {
             path: test_filename.clone(),
-            xet_hash: xet_hash.clone(),
+            xet_hash,
             mtime: mtime_ms,
             content_type: None,
         }],
@@ -88,69 +86,189 @@ async fn test_write_then_download() {
     .await
     .expect("batch add failed");
 
-    eprintln!("Committed to bucket: {}", test_filename);
+    eprintln!("Committed {} to bucket", test_filename);
 
-    // --- Verify in tree listing ---
+    std::fs::remove_dir_all(&tmp_dir).ok();
 
-    let entries = hub
-        .list_tree(&bucket_id, "")
-        .await
-        .expect("list_tree failed");
+    Some((token, bucket_id, hub, test_filename, test_content))
+}
 
-    let found = entries.iter().find(|e| e.path == test_filename);
-    assert!(found.is_some(), "file should appear in tree listing");
-    let found = found.unwrap();
-    assert_eq!(found.size, Some(file_size));
-    assert!(found.xet_hash.is_some());
-    eprintln!("Tree listing OK: found {} with size={}", test_filename, file_size);
+/// Spawn hf-mount as a child process, wait until the mountpoint is live.
+fn mount_bucket(bucket_id: &str, mount_point: &str, cache_dir: &str) -> Child {
+    let token = std::env::var("HF_TOKEN").unwrap();
 
-    // --- Read phase: download via CAS and verify content ---
+    // Find the binary — it's in target/debug/hf-mount
+    let binary = std::env::current_exe()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("hf-mount");
 
-    let cas_info = hub
-        .get_cas_token(&bucket_id)
-        .await
-        .expect("get_cas_token failed");
+    eprintln!("Mounting with binary: {:?}", binary);
 
-    let read_refresher = Arc::new(hf_mount::auth::HubTokenRefresher::new(
-        hub.clone(),
-        bucket_id.clone(),
-    ));
+    std::fs::create_dir_all(mount_point).ok();
+    std::fs::create_dir_all(cache_dir).ok();
 
-    let read_config = data::data_client::default_config(
-        cas_info.cas_url,
-        None,
-        Some((cas_info.access_token, cas_info.exp)),
-        Some(read_refresher),
-        None,
-    )
-    .expect("read default_config failed");
+    let child = Command::new(binary)
+        .args([
+            "--bucket-id",
+            bucket_id,
+            "--mount-point",
+            mount_point,
+            "--hf-token",
+            &token,
+            "--cache-dir",
+            cache_dir,
+            "--poll-interval-secs",
+            "0",
+        ])
+        .spawn()
+        .expect("Failed to spawn hf-mount");
 
-    let session = data::FileDownloadSession::new(Arc::new(read_config), None)
-        .await
-        .expect("FileDownloadSession::new failed");
+    // Wait for mount to be ready by checking /proc/mounts for the FUSE mount
+    for i in 0..30 {
+        std::thread::sleep(Duration::from_millis(500));
+        if let Ok(mounts) = std::fs::read_to_string("/proc/mounts")
+            && mounts.lines().any(|line| line.contains(mount_point))
+        {
+            eprintln!("Mount ready after {}ms", (i + 1) * 500);
+            return child;
+        }
+    }
 
-    let download_path = cache_dir.join(format!("downloaded_{}", test_filename));
-    let dl_file_info = data::XetFileInfo::new(xet_hash.clone(), file_size);
-    session
-        .download_file(&dl_file_info, &download_path, None)
-        .await
-        .expect("download_file failed");
+    eprintln!("Warning: mount may not be ready after 15s");
+    child
+}
 
-    let content = std::fs::read_to_string(&download_path).expect("read downloaded file");
-    assert_eq!(content, test_content, "downloaded content should match");
-    eprintln!("Download OK: content matches");
+fn unmount(mount_point: &str, mut child: Child) {
+    // Try fusermount first (Linux), then umount
+    let _ = Command::new("fusermount")
+        .args(["-u", mount_point])
+        .status();
 
-    // --- Cleanup: delete from bucket + local files ---
+    // Give it a moment to exit gracefully, then force kill
+    std::thread::sleep(Duration::from_secs(2));
+    child.kill().ok();
+    match child.wait() {
+        Ok(status) => eprintln!("hf-mount exited: {}", status),
+        Err(e) => eprintln!("wait error: {}", e),
+    }
+}
 
-    hub.batch_operations(
-        &bucket_id,
-        &[hf_mount::hub_api::BatchOp::DeleteFile {
-            path: test_filename.clone(),
-        }],
-    )
-    .await
-    .expect("batch delete cleanup failed");
+/// FUSE smoke test: mounts a bucket, reads files through the filesystem (range reads),
+/// writes a new file, reads it back, then cleans up.
+#[tokio::test]
+async fn test_fuse_range_read_and_write() {
+    let (token, bucket_id, _hub, test_filename, test_content) =
+        match setup_bucket_with_file().await {
+            Some(cfg) => cfg,
+            None => return,
+        };
 
-    eprintln!("Cleaned up: deleted {} from bucket", test_filename);
+    let mount_point = format!("/tmp/hf-mount-test-{}", std::process::id());
+    let cache_dir = format!("/tmp/hf-mount-cache-{}", std::process::id());
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // This runs in a blocking context since FUSE I/O is sync
+        let child = mount_bucket(&bucket_id, &mount_point, &cache_dir);
+
+        let test_result = run_fuse_tests(&mount_point, &test_filename, &test_content);
+
+        unmount(&mount_point, child);
+        test_result
+    }));
+
+    // Always clean up bucket
+    common::delete_bucket(ENDPOINT, &token, &bucket_id).await;
+    std::fs::remove_dir_all(&mount_point).ok();
     std::fs::remove_dir_all(&cache_dir).ok();
+
+    match result {
+        Ok(Ok(())) => eprintln!("All FUSE tests passed!"),
+        Ok(Err(e)) => panic!("FUSE test failed: {}", e),
+        Err(e) => std::panic::resume_unwind(e),
+    }
+}
+
+fn run_fuse_tests(
+    mount_point: &str,
+    test_filename: &str,
+    test_content: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let file_path = format!("{}/{}", mount_point, test_filename);
+
+    // --- Test 1: readdir lists the file ---
+    eprintln!("=== Test 1: readdir ===");
+    let entries: Vec<String> = std::fs::read_dir(mount_point)?
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect();
+    eprintln!("  Directory entries: {:?}", entries);
+    assert!(
+        entries.contains(&test_filename.to_string()),
+        "file should appear in readdir"
+    );
+
+    // --- Test 2: full read matches expected content ---
+    eprintln!("=== Test 2: full read ===");
+    let content = std::fs::read_to_string(&file_path)?;
+    assert_eq!(content, test_content, "full read content should match");
+    eprintln!("  Full read OK: {} bytes", content.len());
+
+    // --- Test 3: range read (seek + read a portion) ---
+    eprintln!("=== Test 3: range read ===");
+    {
+        let mut f = std::fs::File::open(&file_path)?;
+
+        // Read just the "BBBB_MIDDLE_BBBB" part (offset 17, len 16)
+        // "AAAA_HEADER_AAAA|BBBB_MIDDLE_BBBB|CCCC_FOOTER_CCCC"
+        //  0123456789012345678901234567890123
+        f.seek(SeekFrom::Start(17))?;
+        let mut buf = vec![0u8; 16];
+        f.read_exact(&mut buf)?;
+        let middle = String::from_utf8(buf)?;
+        eprintln!("  Range read at offset 17, len 16: {:?}", middle);
+        assert_eq!(middle, "BBBB_MIDDLE_BBBB", "range read should return middle portion");
+    }
+
+    // --- Test 4: read just the last part ---
+    eprintln!("=== Test 4: tail range read ===");
+    {
+        let mut f = std::fs::File::open(&file_path)?;
+        f.seek(SeekFrom::Start(34))?;
+        let mut buf = String::new();
+        f.read_to_string(&mut buf)?;
+        eprintln!("  Tail read from offset 34: {:?}", buf);
+        assert_eq!(buf, "CCCC_FOOTER_CCCC", "tail range should return footer");
+    }
+
+    // --- Test 5: write a new file and read it back ---
+    eprintln!("=== Test 5: write + read back ===");
+    {
+        let new_file = format!("{}/written_by_test.txt", mount_point);
+        let write_content = "hello from FUSE test!\n";
+        std::fs::write(&new_file, write_content)?;
+
+        // Read it back through the mount
+        let read_back = std::fs::read_to_string(&new_file)?;
+        assert_eq!(read_back, write_content, "written content should match when read back");
+        eprintln!("  Write + read back OK");
+    }
+
+    // --- Test 6: stat reports correct size ---
+    eprintln!("=== Test 6: stat size ===");
+    {
+        let meta = std::fs::metadata(&file_path)?;
+        assert_eq!(
+            meta.len(),
+            test_content.len() as u64,
+            "stat should report correct file size"
+        );
+        eprintln!("  Stat OK: size={}", meta.len());
+    }
+
+    eprintln!("=== All FUSE tests passed ===");
+    Ok(())
 }

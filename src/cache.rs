@@ -39,10 +39,10 @@ impl FileCache {
         // Check if already cached
         {
             let cached = self.cached.read().await;
-            if let Some(path) = cached.get(xet_hash) {
-                if path.exists() {
-                    return Ok(path.clone());
-                }
+            if let Some(path) = cached.get(xet_hash)
+                && path.exists()
+            {
+                return Ok(path.clone());
             }
         }
 
@@ -64,38 +64,6 @@ impl FileCache {
     /// Get the staging path for a given inode (for files being written).
     pub fn staging_path(&self, inode: u64) -> PathBuf {
         self.staging_dir.join(format!("inode_{}", inode))
-    }
-
-    /// Upload a staged file to CAS and return its xet hash and size.
-    /// Creates a fresh upload session per call and finalizes it to ensure
-    /// all data (xorbs + shards) are fully committed to CAS.
-    pub async fn upload_file(&self, staged_path: &Path) -> Result<XetFileInfo> {
-        let config = self
-            .upload_config
-            .as_ref()
-            .ok_or_else(|| Error::Hub("no upload config (read-only mode)".into()))?;
-
-        let upload_session = FileUploadSession::new(config.clone(), None)
-            .await
-            .map_err(|e| Error::Xet(e.to_string()))?;
-
-        let files = vec![(staged_path.to_path_buf(), None::<mdb_shard::Sha256>)];
-        let mut results = upload_session
-            .upload_files(files)
-            .await
-            .map_err(|e| Error::Xet(e.to_string()))?;
-
-        let file_info = results
-            .pop()
-            .ok_or_else(|| Error::Xet("upload returned no file info".into()))?;
-
-        // Finalize the session to ensure xorbs + shards are fully uploaded
-        upload_session
-            .finalize()
-            .await
-            .map_err(|e| Error::Xet(e.to_string()))?;
-
-        Ok(file_info)
     }
 
     /// Upload multiple staged files in a single session.
@@ -128,7 +96,7 @@ impl FileCache {
         Ok(results)
     }
 
-    pub fn cache_dir(&self) -> &Path {
-        &self.cache_dir
+    pub fn download_session(&self) -> &Arc<FileDownloadSession> {
+        &self.session
     }
 }

@@ -200,12 +200,11 @@ impl HubApiClient {
 fn parse_link_next(header: &str) -> Option<String> {
     for part in header.split(',') {
         let part = part.trim();
-        if part.contains("rel=\"next\"") {
-            if let Some(start) = part.find('<') {
-                if let Some(end) = part.find('>') {
-                    return Some(part[start + 1..end].to_string());
-                }
-            }
+        if part.contains("rel=\"next\"")
+            && let Some(start) = part.find('<')
+            && let Some(end) = part.find('>')
+        {
+            return Some(part[start + 1..end].to_string());
         }
     }
     None
