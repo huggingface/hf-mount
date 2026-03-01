@@ -125,7 +125,7 @@ fn main() {
 
     // Create CAS client with reconstruction cache wrapper
     let raw_client = rt
-        .block_on(data::create_client(&read_config))
+        .block_on(data::create_remote_client(&read_config, "hf-mount", false))
         .expect("Failed to create CAS client");
     let caching_client = Arc::new(CachingClient::new(raw_client));
 
