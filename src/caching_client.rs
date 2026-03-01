@@ -64,10 +64,7 @@ impl Client for CachingClient {
             }
             // If still at capacity after eviction, drop oldest entry
             if cache.len() >= MAX_CACHE_ENTRIES
-                && let Some(oldest_key) = cache
-                    .iter()
-                    .min_by_key(|(_, (ts, _))| *ts)
-                    .map(|(k, _)| *k)
+                && let Some(oldest_key) = cache.iter().min_by_key(|(_, (ts, _))| *ts).map(|(k, _)| *k)
             {
                 cache.remove(&oldest_key);
             }
@@ -84,10 +81,7 @@ impl Client for CachingClient {
         self.inner.get_file_reconstruction_info(file_hash).await
     }
 
-    async fn batch_get_reconstruction(
-        &self,
-        file_ids: &[MerkleHash],
-    ) -> Result<BatchQueryReconstructionResponse> {
+    async fn batch_get_reconstruction(&self, file_ids: &[MerkleHash]) -> Result<BatchQueryReconstructionResponse> {
         self.inner.batch_get_reconstruction(file_ids).await
     }
 
@@ -107,11 +101,7 @@ impl Client for CachingClient {
             .await
     }
 
-    async fn query_for_global_dedup_shard(
-        &self,
-        prefix: &str,
-        chunk_hash: &MerkleHash,
-    ) -> Result<Option<Bytes>> {
+    async fn query_for_global_dedup_shard(&self, prefix: &str, chunk_hash: &MerkleHash) -> Result<Option<Bytes>> {
         self.inner.query_for_global_dedup_shard(prefix, chunk_hash).await
     }
 
@@ -119,11 +109,7 @@ impl Client for CachingClient {
         self.inner.acquire_upload_permit().await
     }
 
-    async fn upload_shard(
-        &self,
-        shard_data: Bytes,
-        upload_permit: ConnectionPermit,
-    ) -> Result<bool> {
+    async fn upload_shard(&self, shard_data: Bytes, upload_permit: ConnectionPermit) -> Result<bool> {
         self.inner.upload_shard(shard_data, upload_permit).await
     }
 

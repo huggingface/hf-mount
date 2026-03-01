@@ -40,12 +40,7 @@ impl FileCache {
     }
 
     /// Download a file directly to a destination path (for writable opens).
-    pub async fn download_to_file(
-        &self,
-        xet_hash: &str,
-        file_size: u64,
-        dest: &Path,
-    ) -> Result<()> {
+    pub async fn download_to_file(&self, xet_hash: &str, file_size: u64, dest: &Path) -> Result<()> {
         let file_info = XetFileInfo::new(xet_hash.to_string(), file_size);
         self.session
             .download_file(&file_info, dest, None)
@@ -83,10 +78,7 @@ impl FileCache {
             .await
             .map_err(|e| Error::Xet(e.to_string()))?;
 
-        upload_session
-            .finalize()
-            .await
-            .map_err(|e| Error::Xet(e.to_string()))?;
+        upload_session.finalize().await.map_err(|e| Error::Xet(e.to_string()))?;
 
         Ok(results)
     }

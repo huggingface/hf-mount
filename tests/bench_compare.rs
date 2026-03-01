@@ -9,12 +9,7 @@ const FILE_SIZE: usize = 50 * 1024 * 1024; // 50 MB
 
 /// Mount with --backend=nfs --read-only.
 fn mount_nfs_bucket(bucket_id: &str, mount_point: &str, cache_dir: &str) -> Child {
-    common::mount_bucket(
-        bucket_id,
-        mount_point,
-        cache_dir,
-        &["--backend=nfs", "--read-only"],
-    )
+    common::mount_bucket(bucket_id, mount_point, cache_dir, &["--backend=nfs", "--read-only"])
 }
 
 /// Unmount NFS (uses umount instead of fusermount).
@@ -84,10 +79,7 @@ fn run_read_benchmarks(
         let mut buf = vec![0u8; read_size];
         f.read_exact(&mut buf)?;
         range_read_ms = t.elapsed().as_secs_f64() * 1000.0;
-        assert!(
-            common::verify_pattern(&buf, offset),
-            "range read content mismatch"
-        );
+        assert!(common::verify_pattern(&buf, offset), "range read content mismatch");
     }
 
     // 4. Random reads: 100x 4KB
@@ -98,9 +90,7 @@ fn run_read_benchmarks(
         let mut rng_state: u64 = 42;
         let mut total = Duration::ZERO;
         for _ in 0..100 {
-            rng_state = rng_state
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1);
+            rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
             let offset = (rng_state % max_offset as u64) as usize;
 
             let mut f = std::fs::File::open(&file_path)?;
@@ -181,11 +171,7 @@ async fn test_bench_compare() {
     let write_config = common::build_write_config(&hub, &bucket_id).await;
     let file_info = common::upload_file(write_config, &staging_path).await;
     let xet_hash = file_info.hash().to_string();
-    eprintln!(
-        "Uploaded: xet_hash={}, size={}",
-        xet_hash,
-        file_info.file_size()
-    );
+    eprintln!("Uploaded: xet_hash={}, size={}", xet_hash, file_info.file_size());
 
     let mtime_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -211,8 +197,7 @@ async fn test_bench_compare() {
     let fuse_cache = format!("/tmp/hf-bench-cmp-fuse-cache-{}", std::process::id());
 
     let fuse_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let child =
-            common::mount_bucket(&bucket_id, &fuse_mount, &fuse_cache, &["--read-only"]);
+        let child = common::mount_bucket(&bucket_id, &fuse_mount, &fuse_cache, &["--read-only"]);
         let r = run_read_benchmarks(&fuse_mount, &test_filename, &expected);
         common::unmount(&fuse_mount, child, 5);
         r
@@ -266,10 +251,7 @@ async fn test_bench_compare() {
     eprintln!("\n============================================================");
     eprintln!("  FUSE vs NFS Benchmark — 50 MB file");
     eprintln!("============================================================");
-    eprintln!(
-        "  {:30} {:>12} {:>12}",
-        "Metric", "FUSE", "NFS"
-    );
+    eprintln!("  {:30} {:>12} {:>12}", "Metric", "FUSE", "NFS");
     eprintln!("  {:-<30} {:-<12} {:-<12}", "", "", "");
 
     if let (Some(f), Some(n)) = (&fuse, &nfs) {

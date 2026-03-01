@@ -4,9 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use nfsserve::nfs::{
-    fattr3, fileid3, filename3, ftype3, nfspath3, nfsstat3, nfstime3, sattr3, specdata3,
-};
+use nfsserve::nfs::{fattr3, fileid3, filename3, ftype3, nfspath3, nfsstat3, nfstime3, sattr3, specdata3};
 use nfsserve::tcp::{NFSTcp, NFSTcpListener};
 use nfsserve::vfs::{DirEntry, NFSFileSystem, ReadDirResult, VFSCapabilities};
 use tracing::info;
@@ -110,11 +108,7 @@ fn vfs_attr_to_nfs(attr: &VfsAttr) -> fattr3 {
 }
 
 /// Get or open a file handle from the pool. Called from blocking context.
-fn get_or_open_handle(
-    vfs: &HfVfsCore,
-    handle_pool: &Mutex<HandlePool>,
-    ino: u64,
-) -> Result<u64, nfsstat3> {
+fn get_or_open_handle(vfs: &HfVfsCore, handle_pool: &Mutex<HandlePool>, ino: u64) -> Result<u64, nfsstat3> {
     // Check pool first (quick lock)
     if let Some(fh) = handle_pool.lock().unwrap().get(ino) {
         return Ok(fh);
@@ -165,32 +159,19 @@ impl NFSFileSystem for NfsAdapter {
             .map_err(|_| nfsstat3::NFS3ERR_NOENT)?
             .to_string();
         let vfs = self.vfs.clone();
-        tokio::task::spawn_blocking(move || {
-            vfs.lookup(dirid, &name)
-                .map(|a| a.ino)
-                .map_err(errno_to_nfs)
-        })
-        .await
-        .map_err(|_| nfsstat3::NFS3ERR_SERVERFAULT)?
+        tokio::task::spawn_blocking(move || vfs.lookup(dirid, &name).map(|a| a.ino).map_err(errno_to_nfs))
+            .await
+            .map_err(|_| nfsstat3::NFS3ERR_SERVERFAULT)?
     }
 
     async fn getattr(&self, id: fileid3) -> Result<fattr3, nfsstat3> {
         let vfs = self.vfs.clone();
-        tokio::task::spawn_blocking(move || {
-            vfs.getattr(id)
-                .map(|a| vfs_attr_to_nfs(&a))
-                .map_err(errno_to_nfs)
-        })
-        .await
-        .map_err(|_| nfsstat3::NFS3ERR_SERVERFAULT)?
+        tokio::task::spawn_blocking(move || vfs.getattr(id).map(|a| vfs_attr_to_nfs(&a)).map_err(errno_to_nfs))
+            .await
+            .map_err(|_| nfsstat3::NFS3ERR_SERVERFAULT)?
     }
 
-    async fn read(
-        &self,
-        id: fileid3,
-        offset: u64,
-        count: u32,
-    ) -> Result<(Vec<u8>, bool), nfsstat3> {
+    async fn read(&self, id: fileid3, offset: u64, count: u32) -> Result<(Vec<u8>, bool), nfsstat3> {
         let vfs = self.vfs.clone();
         let pool = self.handle_pool.clone();
         tokio::task::spawn_blocking(move || {
@@ -226,10 +207,7 @@ impl NFSFileSystem for NfsAdapter {
                 .iter()
                 .take(max_entries)
                 .map(|e| {
-                    let attr = vfs
-                        .getattr(e.ino)
-                        .map(|a| vfs_attr_to_nfs(&a))
-                        .unwrap_or_default();
+                    let attr = vfs.getattr(e.ino).map(|a| vfs_attr_to_nfs(&a)).unwrap_or_default();
                     DirEntry {
                         fileid: e.ino,
                         name: e.name.clone().into_bytes().into(),
@@ -263,19 +241,11 @@ impl NFSFileSystem for NfsAdapter {
         Err(nfsstat3::NFS3ERR_ROFS)
     }
 
-    async fn create_exclusive(
-        &self,
-        _dirid: fileid3,
-        _filename: &filename3,
-    ) -> Result<fileid3, nfsstat3> {
+    async fn create_exclusive(&self, _dirid: fileid3, _filename: &filename3) -> Result<fileid3, nfsstat3> {
         Err(nfsstat3::NFS3ERR_ROFS)
     }
 
-    async fn mkdir(
-        &self,
-        _dirid: fileid3,
-        _dirname: &filename3,
-    ) -> Result<(fileid3, fattr3), nfsstat3> {
+    async fn mkdir(&self, _dirid: fileid3, _dirname: &filename3) -> Result<(fileid3, fattr3), nfsstat3> {
         Err(nfsstat3::NFS3ERR_ROFS)
     }
 
@@ -336,17 +306,13 @@ pub async fn mount_nfs(vfs: Arc<HfVfsCore>, mount_point: &Path) -> std::io::Resu
                 "-t",
                 "nfs",
                 "-o",
-                &format!(
-                    "rdonly,nolocks,vers=3,tcp,rsize=1048576,actimeo=60,port={port},mountport={port}"
-                ),
+                &format!("rdonly,nolocks,vers=3,tcp,rsize=1048576,actimeo=60,port={port},mountport={port}"),
                 "127.0.0.1:/",
                 mount_point_str,
             ])
             .status()?;
         if !status.success() {
-            return Err(std::io::Error::other(
-                format!("mount command failed with {status}"),
-            ));
+            return Err(std::io::Error::other(format!("mount command failed with {status}")));
         }
     }
 
@@ -355,9 +321,7 @@ pub async fn mount_nfs(vfs: Arc<HfVfsCore>, mount_point: &Path) -> std::io::Resu
         let output = std::process::Command::new("mount.nfs")
             .args([
                 "-o",
-                &format!(
-                    "nolock,vers=3,tcp,rsize=1048576,actimeo=60,port={port},mountport={port}"
-                ),
+                &format!("nolock,vers=3,tcp,rsize=1048576,actimeo=60,port={port},mountport={port}"),
                 "127.0.0.1:/",
                 mount_point_str,
             ])
@@ -365,9 +329,10 @@ pub async fn mount_nfs(vfs: Arc<HfVfsCore>, mount_point: &Path) -> std::io::Resu
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             let stdout = String::from_utf8_lossy(&output.stdout);
-            return Err(std::io::Error::other(
-                format!("mount.nfs failed with {}: stdout={stdout} stderr={stderr}", output.status),
-            ));
+            return Err(std::io::Error::other(format!(
+                "mount.nfs failed with {}: stdout={stdout} stderr={stderr}",
+                output.status
+            )));
         }
     }
 

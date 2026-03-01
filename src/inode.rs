@@ -77,9 +77,7 @@ impl InodeTable {
     }
 
     pub fn get_by_path(&self, path: &str) -> Option<&InodeEntry> {
-        self.path_to_inode
-            .get(path)
-            .and_then(|ino| self.inodes.get(ino))
+        self.path_to_inode.get(path).and_then(|ino| self.inodes.get(ino))
     }
 
     /// Find a child of `parent` by name.
@@ -154,15 +152,7 @@ impl InodeTable {
         self.inodes
             .values()
             .filter(|e| e.kind == InodeKind::File)
-            .map(|e| {
-                (
-                    e.inode,
-                    e.full_path.clone(),
-                    e.xet_hash.clone(),
-                    e.size,
-                    e.dirty,
-                )
-            })
+            .map(|e| (e.inode, e.full_path.clone(), e.xet_hash.clone(), e.size, e.dirty))
             .collect()
     }
 
@@ -477,10 +467,7 @@ mod tests {
         assert_eq!(table.get(dir_ino).unwrap().full_path, "new_dir");
         assert_eq!(table.get(child_ino).unwrap().full_path, "new_dir/child.txt");
         assert_eq!(table.get(subdir_ino).unwrap().full_path, "new_dir/subdir");
-        assert_eq!(
-            table.get(deep_ino).unwrap().full_path,
-            "new_dir/subdir/deep.txt"
-        );
+        assert_eq!(table.get(deep_ino).unwrap().full_path, "new_dir/subdir/deep.txt");
 
         // Verify path_to_inode updated (old paths gone, new paths work)
         assert!(table.get_by_path("old_dir").is_none());
@@ -488,14 +475,8 @@ mod tests {
         assert!(table.get_by_path("old_dir/subdir/deep.txt").is_none());
 
         assert_eq!(table.get_by_path("new_dir").unwrap().inode, dir_ino);
-        assert_eq!(
-            table.get_by_path("new_dir/child.txt").unwrap().inode,
-            child_ino
-        );
-        assert_eq!(
-            table.get_by_path("new_dir/subdir/deep.txt").unwrap().inode,
-            deep_ino
-        );
+        assert_eq!(table.get_by_path("new_dir/child.txt").unwrap().inode, child_ino);
+        assert_eq!(table.get_by_path("new_dir/subdir/deep.txt").unwrap().inode, deep_ino);
     }
 
     #[test]

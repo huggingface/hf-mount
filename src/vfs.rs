@@ -65,7 +65,9 @@ enum OpenFile {
 enum ReadTarget {
     /// Hold an Arc<File> so the FD stays alive even if release() runs concurrently.
     LocalFd(Arc<File>),
-    Remote { prefetch: Arc<Mutex<PrefetchState>> },
+    Remote {
+        prefetch: Arc<Mutex<PrefetchState>>,
+    },
 }
 
 /// Wraps `Arc<Mutex<Vec<u8>>>` to implement `Write + Send + 'static`
@@ -74,10 +76,7 @@ struct SharedBufWriter(Arc<Mutex<Vec<u8>>>);
 
 impl Write for SharedBufWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .extend_from_slice(buf);
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).extend_from_slice(buf);
         Ok(buf.len())
     }
 
@@ -250,7 +249,14 @@ impl HfVfsCore {
             let bg_inodes = inodes.clone();
             let bg_flush_errors = flush_errors.clone();
 
-            let handle = rt.spawn(Self::flush_loop(rx, bg_cache, bg_hub, bg_bucket, bg_inodes, bg_flush_errors));
+            let handle = rt.spawn(Self::flush_loop(
+                rx,
+                bg_cache,
+                bg_hub,
+                bg_bucket,
+                bg_inodes,
+                bg_flush_errors,
+            ));
 
             (Some(tx), Some(handle))
         } else {
@@ -266,7 +272,14 @@ impl HfVfsCore {
             let bg_neg_cache = neg_cache.clone();
             let interval = Duration::from_secs(poll_interval_secs);
 
-            Some(rt.spawn(Self::poll_remote_changes(bg_hub, bg_bucket, bg_inodes, bg_cache, bg_neg_cache, interval)))
+            Some(rt.spawn(Self::poll_remote_changes(
+                bg_hub,
+                bg_bucket,
+                bg_inodes,
+                bg_cache,
+                bg_neg_cache,
+                interval,
+            )))
         } else {
             None
         };
@@ -388,7 +401,12 @@ impl HfVfsCore {
                         error!("Staging file missing for ino={}, skipping", ino);
                         return None;
                     }
-                    Some((ino, entry.full_path.clone(), staging_path, entry.pending_deletes.clone()))
+                    Some((
+                        ino,
+                        entry.full_path.clone(),
+                        staging_path,
+                        entry.pending_deletes.clone(),
+                    ))
                 })
                 .collect()
         };
@@ -398,8 +416,7 @@ impl HfVfsCore {
         }
 
         // Upload all files through a single upload session
-        let staging_paths: Vec<&std::path::Path> =
-            to_flush.iter().map(|(_, _, p, _)| p.as_path()).collect();
+        let staging_paths: Vec<&std::path::Path> = to_flush.iter().map(|(_, _, p, _)| p.as_path()).collect();
         let upload_results = match cache.upload_files(&staging_paths).await {
             Ok(results) => results,
             Err(e) => {
@@ -662,9 +679,7 @@ impl HfVfsCore {
         let prefix = {
             let inodes = self.inodes.lock().unwrap();
             match inodes.get(parent_ino) {
-                Some(e) if !e.children_loaded && e.kind == InodeKind::Directory => {
-                    e.full_path.clone()
-                }
+                Some(e) if !e.children_loaded && e.kind == InodeKind::Directory => e.full_path.clone(),
                 _ => return,
             }
         };
@@ -755,10 +770,13 @@ impl HfVfsCore {
         match File::open(path) {
             Ok(file) => {
                 let fh = self.alloc_fh();
-                self.open_files
-                    .lock()
-                    .unwrap()
-                    .insert(fh, OpenFile::Local { file: Arc::new(file), writable: false });
+                self.open_files.lock().unwrap().insert(
+                    fh,
+                    OpenFile::Local {
+                        file: Arc::new(file),
+                        writable: false,
+                    },
+                );
                 Ok(fh)
             }
             Err(e) => {
@@ -783,10 +801,7 @@ impl HfVfsCore {
             cache.retain(|_, ts| ts.elapsed() < NEG_CACHE_TTL);
             // If still full, evict the oldest entry
             if cache.len() >= NEG_CACHE_CAPACITY
-                && let Some(oldest_key) = cache
-                    .iter()
-                    .min_by_key(|(_, ts)| **ts)
-                    .map(|(k, _)| k.clone())
+                && let Some(oldest_key) = cache.iter().min_by_key(|(_, ts)| **ts).map(|(k, _)| k.clone())
             {
                 cache.remove(&oldest_key);
             }
@@ -820,8 +835,7 @@ impl HfVfsCore {
             } else {
                 format!("{}/{}", parent_entry.full_path, name)
             };
-            let needs_load =
-                !parent_entry.children_loaded && parent_entry.kind == InodeKind::Directory;
+            let needs_load = !parent_entry.children_loaded && parent_entry.kind == InodeKind::Directory;
             (fp, needs_load)
         };
 
@@ -868,8 +882,16 @@ impl HfVfsCore {
         };
 
         let mut entries = Vec::new();
-        entries.push(VfsDirEntry { ino, kind: InodeKind::Directory, name: ".".to_string() });
-        entries.push(VfsDirEntry { ino: entry.parent, kind: InodeKind::Directory, name: "..".to_string() });
+        entries.push(VfsDirEntry {
+            ino,
+            kind: InodeKind::Directory,
+            name: ".".to_string(),
+        });
+        entries.push(VfsDirEntry {
+            ino: entry.parent,
+            kind: InodeKind::Directory,
+            name: "..".to_string(),
+        });
 
         for &child_ino in &entry.children {
             if let Some(child) = inodes.get(child_ino) {
@@ -918,10 +940,7 @@ impl HfVfsCore {
                 }
             } else if !xet_hash.is_empty() && size > 0 {
                 let cache = self.cache.clone();
-                if let Err(e) =
-                    self.rt
-                        .block_on(cache.download_to_file(&xet_hash, size, &staging_path))
-                {
+                if let Err(e) = self.rt.block_on(cache.download_to_file(&xet_hash, size, &staging_path)) {
                     error!("Failed to download file for write: {}", e);
                     return Err(libc::EIO);
                 }
@@ -930,11 +949,7 @@ impl HfVfsCore {
                 return Err(libc::EIO);
             }
 
-            match OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&staging_path)
-            {
+            match OpenOptions::new().read(true).write(true).open(&staging_path) {
                 Ok(file) => {
                     let fh = self.alloc_fh();
                     {
@@ -946,10 +961,13 @@ impl HfVfsCore {
                             }
                         }
                     }
-                    self.open_files
-                        .lock()
-                        .unwrap()
-                        .insert(fh, OpenFile::Local { file: Arc::new(file), writable: true });
+                    self.open_files.lock().unwrap().insert(
+                        fh,
+                        OpenFile::Local {
+                            file: Arc::new(file),
+                            writable: true,
+                        },
+                    );
                     Ok((fh, false))
                 }
                 Err(e) => {
@@ -982,10 +1000,7 @@ impl HfVfsCore {
                 // Lazy remote: create prefetch buffer, fetch on read()
                 let prefetch = Arc::new(Mutex::new(PrefetchState::new(xet_hash, size)));
                 let fh = self.alloc_fh();
-                self.open_files
-                    .lock()
-                    .unwrap()
-                    .insert(fh, OpenFile::Lazy { prefetch });
+                self.open_files.lock().unwrap().insert(fh, OpenFile::Lazy { prefetch });
                 // Bypass kernel page cache so all reads hit our prefetch buffer
                 Ok((fh, true))
             }
@@ -1012,14 +1027,7 @@ impl HfVfsCore {
             ReadTarget::LocalFd(file) => {
                 let fd = file.as_raw_fd();
                 let mut buf = vec![0u8; size as usize];
-                let n = unsafe {
-                    libc::pread(
-                        fd,
-                        buf.as_mut_ptr() as *mut libc::c_void,
-                        size as usize,
-                        offset as i64,
-                    )
-                };
+                let n = unsafe { libc::pread(fd, buf.as_mut_ptr() as *mut libc::c_void, size as usize, offset as i64) };
                 if n < 0 {
                     Err(libc::EIO)
                 } else {
@@ -1053,11 +1061,7 @@ impl HfVfsCore {
 
                 // Drain consumed forward bytes to seek window
                 if !ps.data.is_empty() {
-                    let consumed = if offset >= ps.buf_start {
-                        ps.data.len()
-                    } else {
-                        0
-                    };
+                    let consumed = if offset >= ps.buf_start { ps.data.len() } else { 0 };
                     ps.drain_to_seek(consumed);
                 }
 
@@ -1158,16 +1162,12 @@ impl HfVfsCore {
                         offset, fetch_size, ps.window_size
                     );
 
-                    match self.rt.block_on(
-                        self.cache
-                            .download_session()
-                            .download_to_writer(
-                                &file_info,
-                                offset..fetch_end,
-                                writer,
-                                None,
-                            ),
-                    ) {
+                    match self.rt.block_on(self.cache.download_session().download_to_writer(
+                        &file_info,
+                        offset..fetch_end,
+                        writer,
+                        None,
+                    )) {
                         Ok(_) => match Arc::try_unwrap(buf) {
                             Ok(mutex) => mutex.into_inner().unwrap_or_default(),
                             Err(arc) => arc.lock().unwrap_or_else(|e| e.into_inner()).clone(),
@@ -1197,13 +1197,7 @@ impl HfVfsCore {
     }
 
     pub fn write(&self, ino: u64, fh: u64, offset: u64, data: &[u8]) -> VfsResult<u32> {
-        debug!(
-            "write: ino={}, fh={}, offset={}, len={}",
-            ino,
-            fh,
-            offset,
-            data.len()
-        );
+        debug!("write: ino={}, fh={}, offset={}, len={}", ino, fh, offset, data.len());
 
         if self.read_only {
             return Err(libc::EROFS);
@@ -1222,14 +1216,7 @@ impl HfVfsCore {
         };
         let fd = file.as_raw_fd();
 
-        let n = unsafe {
-            libc::pwrite(
-                fd,
-                data.as_ptr() as *const libc::c_void,
-                data.len(),
-                offset as i64,
-            )
-        };
+        let n = unsafe { libc::pwrite(fd, data.as_ptr() as *const libc::c_void, data.len(), offset as i64) };
 
         if n < 0 {
             Err(libc::EIO)
@@ -1298,15 +1285,7 @@ impl HfVfsCore {
         let now = SystemTime::now();
         let ino = {
             let mut inodes = self.inodes.lock().unwrap();
-            let ino = inodes.insert(
-                parent,
-                name.to_string(),
-                full_path,
-                InodeKind::File,
-                0,
-                now,
-                None,
-            );
+            let ino = inodes.insert(parent, name.to_string(), full_path, InodeKind::File, 0, now, None);
             if let Some(entry) = inodes.get_mut(ino) {
                 entry.dirty = true;
             }
@@ -1323,10 +1302,13 @@ impl HfVfsCore {
         {
             Ok(file) => {
                 let fh = self.alloc_fh();
-                self.open_files
-                    .lock()
-                    .unwrap()
-                    .insert(fh, OpenFile::Local { file: Arc::new(file), writable: true });
+                self.open_files.lock().unwrap().insert(
+                    fh,
+                    OpenFile::Local {
+                        file: Arc::new(file),
+                        writable: true,
+                    },
+                );
 
                 let inodes = self.inodes.lock().unwrap();
                 let attr = self.make_vfs_attr(inodes.get(ino).unwrap());
@@ -1374,15 +1356,7 @@ impl HfVfsCore {
         }
 
         let now = SystemTime::now();
-        let ino = inodes.insert(
-            parent,
-            name.to_string(),
-            full_path,
-            InodeKind::Directory,
-            0,
-            now,
-            None,
-        );
+        let ino = inodes.insert(parent, name.to_string(), full_path, InodeKind::Directory, 0, now, None);
 
         if let Some(entry) = inodes.get_mut(ino) {
             entry.children_loaded = true;
@@ -1403,9 +1377,7 @@ impl HfVfsCore {
         let (ino, full_path, was_dirty) = {
             let inodes = self.inodes.lock().unwrap();
             match inodes.lookup_child(parent, name) {
-                Some(entry) if entry.kind == InodeKind::File => {
-                    (entry.inode, entry.full_path.clone(), entry.dirty)
-                }
+                Some(entry) if entry.kind == InodeKind::File => (entry.inode, entry.full_path.clone(), entry.dirty),
                 Some(_) => return Err(libc::EISDIR),
                 None => return Err(libc::ENOENT),
             }
@@ -1413,10 +1385,7 @@ impl HfVfsCore {
 
         let needs_remote_delete = !was_dirty || {
             let inodes = self.inodes.lock().unwrap();
-            inodes
-                .get(ino)
-                .and_then(|e| e.xet_hash.as_ref())
-                .is_some()
+            inodes.get(ino).and_then(|e| e.xet_hash.as_ref()).is_some()
         };
 
         if needs_remote_delete {
@@ -1424,10 +1393,10 @@ impl HfVfsCore {
             let bucket_id = self.bucket_id.clone();
             let path = full_path.clone();
 
-            if let Err(e) = self.rt.block_on(async {
-                hub.batch_operations(&bucket_id, &[BatchOp::DeleteFile { path }])
-                    .await
-            }) {
+            if let Err(e) = self
+                .rt
+                .block_on(async { hub.batch_operations(&bucket_id, &[BatchOp::DeleteFile { path }]).await })
+            {
                 error!("Failed to delete file {}: {}", full_path, e);
                 return Err(libc::EIO);
             }
@@ -1540,9 +1509,7 @@ impl HfVfsCore {
                         mtime: mtime_ms,
                         content_type: None,
                     },
-                    BatchOp::DeleteFile {
-                        path: old_path.clone(),
-                    },
+                    BatchOp::DeleteFile { path: old_path.clone() },
                 ];
 
                 if let Err(e) = self.rt.block_on(hub.batch_operations(&bucket_id, &ops)) {
@@ -1570,9 +1537,7 @@ impl HfVfsCore {
                 let existing_ino = existing.inode;
                 let existing_kind = existing.kind;
                 // Don't allow replacing a non-empty directory
-                if existing_kind == InodeKind::Directory
-                    && !existing.children.is_empty()
-                {
+                if existing_kind == InodeKind::Directory && !existing.children.is_empty() {
                     return Err(libc::ENOTEMPTY);
                 }
                 inodes.remove(existing_ino);
@@ -1624,7 +1589,10 @@ impl HfVfsCore {
                     };
                     if !xet_hash.is_empty() && file_size > 0 {
                         let cache = self.cache.clone();
-                        if let Err(e) = self.rt.block_on(cache.download_to_file(&xet_hash, file_size, &staging_path)) {
+                        if let Err(e) = self
+                            .rt
+                            .block_on(cache.download_to_file(&xet_hash, file_size, &staging_path))
+                        {
                             error!("Failed to download file for truncate: {}", e);
                             return Err(libc::EIO);
                         }

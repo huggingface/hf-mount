@@ -9,8 +9,10 @@ fn run_fio(mount_point: &str, job_name: &str, extra_args: &[&str]) {
     eprintln!("\n--- fio: {} ---", job_name);
     let output = Command::new("fio")
         .args([
-            "--name", job_name,
-            "--directory", mount_point,
+            "--name",
+            job_name,
+            "--directory",
+            mount_point,
             "--readonly",
             "--minimal",
         ])
@@ -75,7 +77,12 @@ async fn test_fio_bench() {
 
         let file_info = common::upload_file(write_config.clone(), &staging_path).await;
         let xet_hash = file_info.hash().to_string();
-        eprintln!("  Uploaded {} ({} MB) hash={}", filename, size / (1024 * 1024), &xet_hash[..16]);
+        eprintln!(
+            "  Uploaded {} ({} MB) hash={}",
+            filename,
+            size / (1024 * 1024),
+            &xet_hash[..16]
+        );
 
         batch_ops.push(hf_mount::hub_api::BatchOp::AddFile {
             path: filename.clone(),
@@ -99,53 +106,100 @@ async fn test_fio_bench() {
         let child = common::mount_bucket(&bucket_id, &mount_point, &cache_dir, &["--read-only"]);
 
         // 1. Sequential read of the large file
-        run_fio(&mount_point, "seq-read-large", &[
-            "--filename", "large_0.bin",
-            "--rw", "read",
-            "--bs", "128k",
-            "--ioengine", "sync",
-            "--output-format", "normal",
-        ]);
+        run_fio(
+            &mount_point,
+            "seq-read-large",
+            &[
+                "--filename",
+                "large_0.bin",
+                "--rw",
+                "read",
+                "--bs",
+                "128k",
+                "--ioengine",
+                "sync",
+                "--output-format",
+                "normal",
+            ],
+        );
 
         // 2. Sequential re-read (xorb cache hot)
-        run_fio(&mount_point, "seq-reread-large", &[
-            "--filename", "large_0.bin",
-            "--rw", "read",
-            "--bs", "128k",
-            "--ioengine", "sync",
-            "--output-format", "normal",
-        ]);
+        run_fio(
+            &mount_point,
+            "seq-reread-large",
+            &[
+                "--filename",
+                "large_0.bin",
+                "--rw",
+                "read",
+                "--bs",
+                "128k",
+                "--ioengine",
+                "sync",
+                "--output-format",
+                "normal",
+            ],
+        );
 
         // 3. Random read 4K on large file
-        run_fio(&mount_point, "rand-read-4k", &[
-            "--filename", "large_0.bin",
-            "--rw", "randread",
-            "--bs", "4k",
-            "--ioengine", "sync",
-            "--runtime", "10",
-            "--time_based",
-            "--output-format", "normal",
-        ]);
+        run_fio(
+            &mount_point,
+            "rand-read-4k",
+            &[
+                "--filename",
+                "large_0.bin",
+                "--rw",
+                "randread",
+                "--bs",
+                "4k",
+                "--ioengine",
+                "sync",
+                "--runtime",
+                "10",
+                "--time_based",
+                "--output-format",
+                "normal",
+            ],
+        );
 
         // 4. Sequential read of multiple medium files
-        run_fio(&mount_point, "seq-read-medium", &[
-            "--filename", "medium_0.bin:medium_1.bin:medium_2.bin:medium_3.bin:medium_4.bin",
-            "--rw", "read",
-            "--bs", "128k",
-            "--ioengine", "sync",
-            "--output-format", "normal",
-        ]);
+        run_fio(
+            &mount_point,
+            "seq-read-medium",
+            &[
+                "--filename",
+                "medium_0.bin:medium_1.bin:medium_2.bin:medium_3.bin:medium_4.bin",
+                "--rw",
+                "read",
+                "--bs",
+                "128k",
+                "--ioengine",
+                "sync",
+                "--output-format",
+                "normal",
+            ],
+        );
 
         // 5. Random read across small files
-        run_fio(&mount_point, "rand-read-small", &[
-            "--filename", "small_0.bin:small_1.bin:small_2.bin:small_3.bin:small_4.bin:small_5.bin:small_6.bin:small_7.bin:small_8.bin:small_9.bin",
-            "--rw", "randread",
-            "--bs", "4k",
-            "--ioengine", "sync",
-            "--runtime", "10",
-            "--time_based",
-            "--output-format", "normal",
-        ]);
+        run_fio(
+            &mount_point,
+            "rand-read-small",
+            &[
+                "--filename",
+                "small_0.bin:small_1.bin:small_2.bin:small_3.bin:small_4.bin:small_5.bin:small_6.bin:small_7.bin:small_8.bin:small_9.bin",
+                "--rw",
+                "randread",
+                "--bs",
+                "4k",
+                "--ioengine",
+                "sync",
+                "--runtime",
+                "10",
+                "--time_based",
+                "--output-format",
+                "normal",
+            ],
+        );
 
         common::unmount(&mount_point, child, 5);
     }));

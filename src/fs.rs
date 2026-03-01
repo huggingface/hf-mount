@@ -3,9 +3,9 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use fuser::{
-    Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo,
-    KernelConfig, OpenFlags, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry,
-    ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow,
+    Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo, KernelConfig, OpenFlags,
+    ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request,
+    TimeOrNow,
 };
 
 use crate::cache::FileCache;
@@ -100,14 +100,7 @@ impl Filesystem for HfFs {
         }
     }
 
-    fn readdir(
-        &self,
-        _req: &Request,
-        ino: INodeNo,
-        _fh: FileHandle,
-        offset: u64,
-        mut reply: ReplyDirectory,
-    ) {
+    fn readdir(&self, _req: &Request, ino: INodeNo, _fh: FileHandle, offset: u64, mut reply: ReplyDirectory) {
         match self.vfs.readdir(ino.0) {
             Ok(entries) => {
                 for (i, entry) in entries.into_iter().enumerate().skip(offset as usize) {
@@ -132,7 +125,11 @@ impl Filesystem for HfFs {
 
         match self.vfs.open(ino.0, writable, truncate) {
             Ok((fh, direct_io)) => {
-                let fopen_flags = if direct_io { FopenFlags::FOPEN_DIRECT_IO } else { FopenFlags::empty() };
+                let fopen_flags = if direct_io {
+                    FopenFlags::FOPEN_DIRECT_IO
+                } else {
+                    FopenFlags::empty()
+                };
                 reply.opened(FileHandle(fh), fopen_flags);
             }
             Err(e) => reply.error(Errno::from_i32(e)),
@@ -174,14 +171,7 @@ impl Filesystem for HfFs {
         }
     }
 
-    fn flush(
-        &self,
-        _req: &Request,
-        ino: INodeNo,
-        _fh: FileHandle,
-        _lock_owner: fuser::LockOwner,
-        reply: ReplyEmpty,
-    ) {
+    fn flush(&self, _req: &Request, ino: INodeNo, _fh: FileHandle, _lock_owner: fuser::LockOwner, reply: ReplyEmpty) {
         match self.vfs.flush(ino.0) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(Errno::from_i32(e)),
@@ -221,21 +211,19 @@ impl Filesystem for HfFs {
         };
         match self.vfs.create(parent.0, name) {
             Ok((attr, fh)) => {
-                reply.created(&TTL, &vfs_attr_to_fuse(&attr), Generation(0), FileHandle(fh), FopenFlags::empty());
+                reply.created(
+                    &TTL,
+                    &vfs_attr_to_fuse(&attr),
+                    Generation(0),
+                    FileHandle(fh),
+                    FopenFlags::empty(),
+                );
             }
             Err(e) => reply.error(Errno::from_i32(e)),
         }
     }
 
-    fn mkdir(
-        &self,
-        _req: &Request,
-        parent: INodeNo,
-        name: &OsStr,
-        _mode: u32,
-        _umask: u32,
-        reply: ReplyEntry,
-    ) {
+    fn mkdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, _mode: u32, _umask: u32, reply: ReplyEntry) {
         let name = match name.to_str() {
             Some(n) => n,
             None => {
@@ -291,9 +279,7 @@ impl Filesystem for HfFs {
 
         // Reject unsupported flags
         #[cfg(target_os = "linux")]
-        if flags.intersects(
-            fuser::RenameFlags::RENAME_EXCHANGE | fuser::RenameFlags::RENAME_WHITEOUT,
-        ) {
+        if flags.intersects(fuser::RenameFlags::RENAME_EXCHANGE | fuser::RenameFlags::RENAME_WHITEOUT) {
             reply.error(Errno::EINVAL);
             return;
         }
@@ -357,14 +343,7 @@ impl Filesystem for HfFs {
         }
     }
 
-    fn releasedir(
-        &self,
-        _req: &Request,
-        _ino: INodeNo,
-        _fh: FileHandle,
-        _flags: OpenFlags,
-        reply: ReplyEmpty,
-    ) {
+    fn releasedir(&self, _req: &Request, _ino: INodeNo, _fh: FileHandle, _flags: OpenFlags, reply: ReplyEmpty) {
         reply.ok();
     }
 

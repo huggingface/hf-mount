@@ -8,13 +8,7 @@ const ENDPOINT: &str = "https://huggingface.co";
 
 /// Setup: create a bucket, upload a remote test file.
 /// Returns (token, bucket_id, hub, remote_filename, remote_content).
-async fn setup_bucket_with_file() -> Option<(
-    String,
-    String,
-    Arc<hf_mount::hub_api::HubApiClient>,
-    String,
-    String,
-)> {
+async fn setup_bucket_with_file() -> Option<(String, String, Arc<hf_mount::hub_api::HubApiClient>, String, String)> {
     let token = match std::env::var("HF_TOKEN") {
         Ok(t) => t,
         Err(_) => {
@@ -69,11 +63,10 @@ async fn setup_bucket_with_file() -> Option<(
 
 #[tokio::test]
 async fn test_fuse_file_operations() {
-    let (token, bucket_id, hub, remote_file, remote_content) =
-        match setup_bucket_with_file().await {
-            Some(cfg) => cfg,
-            None => return,
-        };
+    let (token, bucket_id, hub, remote_file, remote_content) = match setup_bucket_with_file().await {
+        Some(cfg) => cfg,
+        None => return,
+    };
 
     let mount_point = format!("/tmp/hf-mount-ops-{}", std::process::id());
     let cache_dir = format!("/tmp/hf-mount-ops-cache-{}", std::process::id());
@@ -233,12 +226,8 @@ fn run_op_tests(
     {
         std::fs::rename(format!("{}/mydir", mp), format!("{}/renamed_dir", mp))?;
 
-        let content =
-            std::fs::read_to_string(format!("{}/renamed_dir/child.txt", mp))?;
-        assert_eq!(
-            content, "nested content",
-            "child should be readable at new parent path"
-        );
+        let content = std::fs::read_to_string(format!("{}/renamed_dir/child.txt", mp))?;
+        assert_eq!(content, "nested content", "child should be readable at new parent path");
 
         assert!(
             std::fs::metadata(format!("{}/mydir", mp)).is_err(),
@@ -256,16 +245,10 @@ fn run_op_tests(
         std::fs::write(&file, "delete me")?;
 
         std::fs::remove_file(&file)?;
-        assert!(
-            std::fs::metadata(&file).is_err(),
-            "unlinked file should not exist"
-        );
+        assert!(std::fs::metadata(&file).is_err(), "unlinked file should not exist");
 
         std::fs::remove_dir(&dir)?;
-        assert!(
-            std::fs::metadata(&dir).is_err(),
-            "removed dir should not exist"
-        );
+        assert!(std::fs::metadata(&dir).is_err(), "removed dir should not exist");
         eprintln!("  OK");
     }
 

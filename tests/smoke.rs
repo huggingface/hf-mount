@@ -8,13 +8,7 @@ const ENDPOINT: &str = "https://huggingface.co";
 
 /// Setup: create a bucket, upload a test file to it via CAS.
 /// Returns (token, bucket_id, hub, test_filename, test_content).
-async fn setup_bucket_with_file() -> Option<(
-    String,
-    String,
-    Arc<hf_mount::hub_api::HubApiClient>,
-    String,
-    String,
-)> {
+async fn setup_bucket_with_file() -> Option<(String, String, Arc<hf_mount::hub_api::HubApiClient>, String, String)> {
     let token = match std::env::var("HF_TOKEN") {
         Ok(t) => t,
         Err(_) => {
@@ -77,11 +71,10 @@ async fn setup_bucket_with_file() -> Option<(
 /// writes a new file, reads it back, then cleans up.
 #[tokio::test]
 async fn test_fuse_range_read_and_write() {
-    let (token, bucket_id, _hub, test_filename, test_content) =
-        match setup_bucket_with_file().await {
-            Some(cfg) => cfg,
-            None => return,
-        };
+    let (token, bucket_id, _hub, test_filename, test_content) = match setup_bucket_with_file().await {
+        Some(cfg) => cfg,
+        None => return,
+    };
 
     let mount_point = format!("/tmp/hf-mount-test-{}", std::process::id());
     let cache_dir = format!("/tmp/hf-mount-cache-{}", std::process::id());

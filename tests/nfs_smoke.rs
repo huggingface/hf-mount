@@ -7,13 +7,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const ENDPOINT: &str = "https://huggingface.co";
 
-async fn setup_bucket_with_file() -> Option<(
-    String,
-    String,
-    Arc<hf_mount::hub_api::HubApiClient>,
-    String,
-    String,
-)> {
+async fn setup_bucket_with_file() -> Option<(String, String, Arc<hf_mount::hub_api::HubApiClient>, String, String)> {
     let token = match std::env::var("HF_TOKEN") {
         Ok(t) => t,
         Err(_) => {
@@ -94,11 +88,10 @@ fn unmount_nfs(mount_point: &str, mut child: Child, graceful_secs: u64) {
 
 #[tokio::test]
 async fn test_nfs_read_only() {
-    let (token, bucket_id, _hub, test_filename, test_content) =
-        match setup_bucket_with_file().await {
-            Some(cfg) => cfg,
-            None => return,
-        };
+    let (token, bucket_id, _hub, test_filename, test_content) = match setup_bucket_with_file().await {
+        Some(cfg) => cfg,
+        None => return,
+    };
 
     let mount_point = format!("/tmp/hf-mount-nfs-test-{}", std::process::id());
     let cache_dir = format!("/tmp/hf-mount-nfs-cache-{}", std::process::id());
@@ -134,7 +127,10 @@ fn run_nfs_tests(
         .map(|e| e.file_name().to_string_lossy().to_string())
         .collect();
     eprintln!("  Directory entries: {:?}", entries);
-    assert!(entries.contains(&test_filename.to_string()), "file should appear in readdir");
+    assert!(
+        entries.contains(&test_filename.to_string()),
+        "file should appear in readdir"
+    );
 
     eprintln!("=== Test 2: full read ===");
     let content = std::fs::read_to_string(&file_path)?;

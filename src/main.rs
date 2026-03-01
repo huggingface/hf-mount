@@ -2,8 +2,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::Parser;
-use data::data_client::default_config;
 use data::FileDownloadSession;
+use data::data_client::default_config;
 use tracing::{error, info};
 
 use hf_mount::auth::{HubTokenRefresher, HubWriteTokenRefresher};
@@ -13,7 +13,7 @@ use hf_mount::fs::HfFs;
 use hf_mount::hub_api::HubApiClient;
 
 #[derive(Parser)]
-#[command(name = "hf-mount", about = "Mount a HuggingFace bucket as a FUSE filesystem")]
+#[command(name = "hf-mount", about = "Mount a HuggingFace bucket as a filesystem")]
 struct Args {
     #[arg(long)]
     bucket_id: String,
@@ -51,8 +51,7 @@ struct Args {
 fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("hf_mount=info".parse().unwrap()),
+            tracing_subscriber::EnvFilter::from_default_env().add_directive("hf_mount=info".parse().unwrap()),
         )
         .init();
 
@@ -97,10 +96,7 @@ fn main() {
     info!("Got CAS token for endpoint: {}", cas_jwt.cas_url);
 
     // Build read token refresher
-    let refresher = Arc::new(HubTokenRefresher::new(
-        hub_client.clone(),
-        args.bucket_id.clone(),
-    ));
+    let refresher = Arc::new(HubTokenRefresher::new(hub_client.clone(), args.bucket_id.clone()));
 
     // Build read TranslatorConfig
     let read_config = default_config(
@@ -139,10 +135,7 @@ fn main() {
 
         info!("Got CAS write token for endpoint: {}", write_jwt.cas_url);
 
-        let write_refresher = Arc::new(HubWriteTokenRefresher::new(
-            hub_client.clone(),
-            args.bucket_id.clone(),
-        ));
+        let write_refresher = Arc::new(HubWriteTokenRefresher::new(hub_client.clone(), args.bucket_id.clone()));
 
         let write_config = default_config(
             write_jwt.cas_url,
@@ -169,7 +162,10 @@ fn main() {
     std::fs::create_dir_all(&args.mount_point).ok();
 
     let mode = if args.read_only { "read-only" } else { "read-write" };
-    info!("Mounting bucket {} at {:?} ({}, backend={})", args.bucket_id, args.mount_point, mode, args.backend);
+    info!(
+        "Mounting bucket {} at {:?} ({}, backend={})",
+        args.bucket_id, args.mount_point, mode, args.backend
+    );
 
     match args.backend.as_str() {
         "fuse" => {
@@ -194,7 +190,12 @@ fn main() {
             }
             fuse_config.acl = fuser::SessionACL::All;
             fuse_config.clone_fd = true;
-            fuse_config.n_threads = Some(std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).max(4));
+            fuse_config.n_threads = Some(
+                std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(4)
+                    .max(4),
+            );
 
             if let Err(e) = fuser::mount2(hf_fs, &args.mount_point, &fuse_config) {
                 error!("FUSE mount failed: {}", e);

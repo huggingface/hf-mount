@@ -17,9 +17,7 @@ pub enum BatchOp {
         content_type: Option<String>,
     },
     #[serde(rename_all = "camelCase")]
-    DeleteFile {
-        path: String,
-    },
+    DeleteFile { path: String },
 }
 
 #[derive(Debug, Deserialize)]
@@ -62,19 +60,11 @@ impl HubApiClient {
         let mut url = if prefix.is_empty() {
             format!("{}/api/buckets/{}/tree", self.endpoint, bucket_id)
         } else {
-            format!(
-                "{}/api/buckets/{}/tree/{}",
-                self.endpoint, bucket_id, prefix
-            )
+            format!("{}/api/buckets/{}/tree/{}", self.endpoint, bucket_id, prefix)
         };
 
         loop {
-            let resp = self
-                .client
-                .get(&url)
-                .bearer_auth(&self.token)
-                .send()
-                .await?;
+            let resp = self.client.get(&url).bearer_auth(&self.token).send().await?;
 
             if !resp.status().is_success() {
                 return Err(Error::Hub(format!(
@@ -105,17 +95,9 @@ impl HubApiClient {
 
     /// Get a CAS read token for the bucket.
     pub async fn get_cas_token(&self, bucket_id: &str) -> Result<CasTokenInfo> {
-        let url = format!(
-            "{}/api/buckets/{}/xet-read-token",
-            self.endpoint, bucket_id
-        );
+        let url = format!("{}/api/buckets/{}/xet-read-token", self.endpoint, bucket_id);
 
-        let resp = self
-            .client
-            .get(&url)
-            .bearer_auth(&self.token)
-            .send()
-            .await?;
+        let resp = self.client.get(&url).bearer_auth(&self.token).send().await?;
 
         if !resp.status().is_success() {
             return Err(Error::Hub(format!(
@@ -131,17 +113,9 @@ impl HubApiClient {
 
     /// Get a CAS write token for the bucket.
     pub async fn get_cas_write_token(&self, bucket_id: &str) -> Result<CasTokenInfo> {
-        let url = format!(
-            "{}/api/buckets/{}/xet-write-token",
-            self.endpoint, bucket_id
-        );
+        let url = format!("{}/api/buckets/{}/xet-write-token", self.endpoint, bucket_id);
 
-        let resp = self
-            .client
-            .get(&url)
-            .bearer_auth(&self.token)
-            .send()
-            .await?;
+        let resp = self.client.get(&url).bearer_auth(&self.token).send().await?;
 
         if !resp.status().is_success() {
             return Err(Error::Hub(format!(

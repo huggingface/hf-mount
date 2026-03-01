@@ -7,9 +7,7 @@ const ENDPOINT: &str = "https://huggingface.co";
 
 /// Create a fresh bucket and return (token, hub, bucket_id).
 /// Skips the test (returns None) if HF_TOKEN is not set.
-async fn setup_bucket(
-    suffix: &str,
-) -> Option<(String, Arc<hf_mount::hub_api::HubApiClient>, String)> {
+async fn setup_bucket(suffix: &str) -> Option<(String, Arc<hf_mount::hub_api::HubApiClient>, String)> {
     let token = match std::env::var("HF_TOKEN") {
         Ok(t) => t,
         Err(_) => {
@@ -40,10 +38,7 @@ async fn test_write_token() {
         let write_token = hub.get_cas_write_token(&bucket_id).await?;
 
         assert!(!write_token.cas_url.is_empty(), "cas_url should not be empty");
-        assert!(
-            !write_token.access_token.is_empty(),
-            "access_token should not be empty"
-        );
+        assert!(!write_token.access_token.is_empty(), "access_token should not be empty");
         assert!(write_token.exp > 0, "exp should be a positive timestamp");
 
         eprintln!(
@@ -217,9 +212,7 @@ async fn test_write_then_read_back_inner(
     eprintln!("Committed to bucket: {}", test_filename);
 
     let downloaded_path = std::env::temp_dir().join(format!("hf_mount_test_{}", xet_hash));
-    cache
-        .download_to_file(&xet_hash, file_size, &downloaded_path)
-        .await?;
+    cache.download_to_file(&xet_hash, file_size, &downloaded_path).await?;
 
     let downloaded_content = std::fs::read_to_string(&downloaded_path)?;
 

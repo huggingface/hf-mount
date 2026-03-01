@@ -61,17 +61,10 @@ pub async fn whoami(endpoint: &str, token: &str) -> String {
         .await
         .expect("whoami request failed");
 
-    assert!(
-        resp.status().is_success(),
-        "whoami failed: {}",
-        resp.status()
-    );
+    assert!(resp.status().is_success(), "whoami failed: {}", resp.status());
 
     let body: serde_json::Value = resp.json().await.expect("whoami json parse failed");
-    body["name"]
-        .as_str()
-        .expect("whoami: missing 'name' field")
-        .to_string()
+    body["name"].as_str().expect("whoami: missing 'name' field").to_string()
 }
 
 /// Build an Arc<TranslatorConfig> for CAS writes.
@@ -111,17 +104,11 @@ pub async fn upload_file(
         .expect("FileUploadSession::new failed");
 
     let files = vec![(staged_path.to_path_buf(), None::<mdb_shard::Sha256>)];
-    let mut results = upload_session
-        .upload_files(files)
-        .await
-        .expect("upload_files failed");
+    let mut results = upload_session.upload_files(files).await.expect("upload_files failed");
 
     let file_info = results.pop().expect("upload returned no file info");
 
-    upload_session
-        .finalize()
-        .await
-        .expect("finalize failed");
+    upload_session.finalize().await.expect("finalize failed");
 
     file_info
 }
@@ -146,11 +133,16 @@ pub fn mount_bucket(bucket_id: &str, mount_point: &str, cache_dir: &str, extra_a
 
     let child = Command::new(binary)
         .args([
-            "--bucket-id", bucket_id,
-            "--mount-point", mount_point,
-            "--hf-token", &token,
-            "--cache-dir", cache_dir,
-            "--poll-interval-secs", "0",
+            "--bucket-id",
+            bucket_id,
+            "--mount-point",
+            mount_point,
+            "--hf-token",
+            &token,
+            "--cache-dir",
+            cache_dir,
+            "--poll-interval-secs",
+            "0",
         ])
         .args(extra_args)
         .spawn()
@@ -173,9 +165,7 @@ pub fn mount_bucket(bucket_id: &str, mount_point: &str, cache_dir: &str, extra_a
 /// Unmount and wait for hf-mount to exit. Waits up to `graceful_secs` for
 /// a clean exit (destroy() may flush + upload) before force-killing.
 pub fn unmount(mount_point: &str, mut child: Child, graceful_secs: u64) {
-    let _ = Command::new("fusermount")
-        .args(["-u", mount_point])
-        .status();
+    let _ = Command::new("fusermount").args(["-u", mount_point]).status();
 
     for _ in 0..graceful_secs {
         if let Ok(Some(status)) = child.try_wait() {
@@ -198,7 +188,5 @@ pub fn generate_pattern(size: usize) -> Vec<u8> {
 
 /// Verify content matches the deterministic pattern at a given offset.
 pub fn verify_pattern(data: &[u8], offset: usize) -> bool {
-    data.iter()
-        .enumerate()
-        .all(|(i, &b)| b == ((offset + i) % 251) as u8)
+    data.iter().enumerate().all(|(i, &b)| b == ((offset + i) % 251) as u8)
 }

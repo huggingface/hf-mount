@@ -12,10 +12,7 @@ pub struct HubTokenRefresher {
 
 impl HubTokenRefresher {
     pub fn new(hub_client: Arc<HubApiClient>, bucket_id: String) -> Self {
-        Self {
-            hub_client,
-            bucket_id,
-        }
+        Self { hub_client, bucket_id }
     }
 }
 
@@ -38,10 +35,7 @@ pub struct HubWriteTokenRefresher {
 
 impl HubWriteTokenRefresher {
     pub fn new(hub_client: Arc<HubApiClient>, bucket_id: String) -> Self {
-        Self {
-            hub_client,
-            bucket_id,
-        }
+        Self { hub_client, bucket_id }
     }
 }
 

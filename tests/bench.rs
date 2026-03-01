@@ -37,11 +37,7 @@ async fn test_bench() {
     let write_config = common::build_write_config(&hub, &bucket_id).await;
     let file_info = common::upload_file(write_config, &staging_path).await;
     let xet_hash = file_info.hash().to_string();
-    eprintln!(
-        "Uploaded: xet_hash={}, size={}",
-        xet_hash,
-        file_info.file_size()
-    );
+    eprintln!("Uploaded: xet_hash={}, size={}", xet_hash, file_info.file_size());
 
     let mtime_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)

@@ -25,53 +25,100 @@ fn run_fio(mount_point: &str, job_name: &str, extra_args: &[&str]) {
 
 fn run_fio_suite(mount_point: &str) {
     // 1. Sequential read of the large file (cold)
-    run_fio(mount_point, "seq-read-100M", &[
-        "--filename", "large_0.bin",
-        "--rw", "read",
-        "--bs", "128k",
-        "--ioengine", "sync",
-        "--output-format", "normal",
-    ]);
+    run_fio(
+        mount_point,
+        "seq-read-100M",
+        &[
+            "--filename",
+            "large_0.bin",
+            "--rw",
+            "read",
+            "--bs",
+            "128k",
+            "--ioengine",
+            "sync",
+            "--output-format",
+            "normal",
+        ],
+    );
 
     // 2. Sequential re-read (cache hot)
-    run_fio(mount_point, "seq-reread-100M", &[
-        "--filename", "large_0.bin",
-        "--rw", "read",
-        "--bs", "128k",
-        "--ioengine", "sync",
-        "--output-format", "normal",
-    ]);
+    run_fio(
+        mount_point,
+        "seq-reread-100M",
+        &[
+            "--filename",
+            "large_0.bin",
+            "--rw",
+            "read",
+            "--bs",
+            "128k",
+            "--ioengine",
+            "sync",
+            "--output-format",
+            "normal",
+        ],
+    );
 
     // 3. Random read 4K on large file (10s)
-    run_fio(mount_point, "rand-read-4k", &[
-        "--filename", "large_0.bin",
-        "--rw", "randread",
-        "--bs", "4k",
-        "--ioengine", "sync",
-        "--runtime", "10",
-        "--time_based",
-        "--output-format", "normal",
-    ]);
+    run_fio(
+        mount_point,
+        "rand-read-4k",
+        &[
+            "--filename",
+            "large_0.bin",
+            "--rw",
+            "randread",
+            "--bs",
+            "4k",
+            "--ioengine",
+            "sync",
+            "--runtime",
+            "10",
+            "--time_based",
+            "--output-format",
+            "normal",
+        ],
+    );
 
     // 4. Sequential read of multiple medium files
-    run_fio(mount_point, "seq-read-5x10M", &[
-        "--filename", "medium_0.bin:medium_1.bin:medium_2.bin:medium_3.bin:medium_4.bin",
-        "--rw", "read",
-        "--bs", "128k",
-        "--ioengine", "sync",
-        "--output-format", "normal",
-    ]);
+    run_fio(
+        mount_point,
+        "seq-read-5x10M",
+        &[
+            "--filename",
+            "medium_0.bin:medium_1.bin:medium_2.bin:medium_3.bin:medium_4.bin",
+            "--rw",
+            "read",
+            "--bs",
+            "128k",
+            "--ioengine",
+            "sync",
+            "--output-format",
+            "normal",
+        ],
+    );
 
     // 5. Random read across small files (10s)
-    run_fio(mount_point, "rand-read-small", &[
-        "--filename", "small_0.bin:small_1.bin:small_2.bin:small_3.bin:small_4.bin:small_5.bin:small_6.bin:small_7.bin:small_8.bin:small_9.bin",
-        "--rw", "randread",
-        "--bs", "4k",
-        "--ioengine", "sync",
-        "--runtime", "10",
-        "--time_based",
-        "--output-format", "normal",
-    ]);
+    run_fio(
+        mount_point,
+        "rand-read-small",
+        &[
+            "--filename",
+            "small_0.bin:small_1.bin:small_2.bin:small_3.bin:small_4.bin:small_5.bin:small_6.bin:small_7.bin:small_8.bin:small_9.bin",
+            "--rw",
+            "randread",
+            "--bs",
+            "4k",
+            "--ioengine",
+            "sync",
+            "--runtime",
+            "10",
+            "--time_based",
+            "--output-format",
+            "normal",
+        ],
+    );
 }
 
 fn unmount_nfs(mount_point: &str, mut child: Child, graceful_secs: u64) {
@@ -133,11 +180,7 @@ async fn test_fio_compare() {
         .collect();
 
     let total_mb: usize = file_specs.iter().map(|(_, s)| s).sum::<usize>() / (1024 * 1024);
-    eprintln!(
-        "Uploading {} files ({} MB total)...",
-        file_specs.len(),
-        total_mb
-    );
+    eprintln!("Uploading {} files ({} MB total)...", file_specs.len(), total_mb);
 
     for (filename, size) in &file_specs {
         let data = common::generate_pattern(*size);
@@ -177,8 +220,7 @@ async fn test_fio_compare() {
     eprintln!("============================================================");
 
     let fuse_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let child =
-            common::mount_bucket(&bucket_id, &fuse_mount, &fuse_cache, &["--read-only"]);
+        let child = common::mount_bucket(&bucket_id, &fuse_mount, &fuse_cache, &["--read-only"]);
         run_fio_suite(&fuse_mount);
         common::unmount(&fuse_mount, child, 5);
     }));
@@ -195,12 +237,7 @@ async fn test_fio_compare() {
     eprintln!("============================================================");
 
     let nfs_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let child = common::mount_bucket(
-            &bucket_id,
-            &nfs_mount,
-            &nfs_cache,
-            &["--backend=nfs", "--read-only"],
-        );
+        let child = common::mount_bucket(&bucket_id, &nfs_mount, &nfs_cache, &["--backend=nfs", "--read-only"]);
         run_fio_suite(&nfs_mount);
         unmount_nfs(&nfs_mount, child, 5);
     }));
