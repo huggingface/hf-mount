@@ -8,6 +8,7 @@ use tracing::{error, info};
 
 use hf_mount::auth::{HubTokenRefresher, HubWriteTokenRefresher};
 use hf_mount::cache::FileCache;
+use hf_mount::caching_client::CachingClient;
 use hf_mount::fs::HfFs;
 use hf_mount::hub_api::HubApiClient;
 
@@ -53,6 +54,29 @@ fn main() {
 
     let args = Args::parse();
 
+    // Tune xet-core for interactive FUSE reads (not batch downloads).
+    // Only set if not already overridden by the user.
+    for (k, v) in [
+        // Start with 16 concurrent connections instead of ramping from 1
+        ("HF_XET_CLIENT_AC_INITIAL_DOWNLOAD_CONCURRENCY", "16"),
+        // Allow concurrency adjustments after 4 MB (vs 20 MB default) for faster ramp-up
+        ("HF_XET_CLIENT_AC_MIN_BYTES_REQUIRED_FOR_ADJUSTMENT", "4194304"),
+        // Smaller fetch blocks (4 MB vs 256 MB default) for lower latency
+        ("HF_XET_RECONSTRUCTION_MIN_RECONSTRUCTION_FETCH_SIZE", "4194304"),
+        // Smaller prefetch buffer (8 MB vs 1 GB default)
+        ("HF_XET_RECONSTRUCTION_MIN_PREFETCH_BUFFER", "8388608"),
+        // Target 30s block completion (vs 15 min default) for better prefetch sizing
+        ("HF_XET_RECONSTRUCTION_TARGET_BLOCK_COMPLETION_TIME", "30"),
+        // Cap download buffer for lower memory usage (64 MB vs 2 GB default)
+        ("HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_SIZE", "67108864"),
+        ("HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT", "134217728"),
+    ] {
+        if std::env::var(k).is_err() {
+            // SAFETY: called before any threads are spawned.
+            unsafe { std::env::set_var(k, v) };
+        }
+    }
+
     // Build tokio runtime
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -86,10 +110,22 @@ fn main() {
 
     let read_config = Arc::new(read_config);
 
-    // Create FileDownloadSession
-    let download_session = rt
-        .block_on(FileDownloadSession::new(read_config, None))
-        .expect("Failed to create download session");
+    // Create on-disk xorb chunk cache for cross-file deduplication.
+    let xorb_cache = {
+        let config = data::CacheConfig {
+            cache_directory: args.cache_dir.join("xorbs"),
+            cache_size: 10_000_000_000,
+        };
+        data::get_cache(&config).expect("Failed to create xorb cache")
+    };
+
+    // Create CAS client with reconstruction cache wrapper
+    let raw_client = rt
+        .block_on(data::create_client(&read_config))
+        .expect("Failed to create CAS client");
+    let caching_client = Arc::new(CachingClient::new(raw_client));
+
+    let download_session = FileDownloadSession::from_client(caching_client, None, Some(xorb_cache));
 
     // Create upload config if not read-only
     let upload_config = if !args.read_only {
@@ -153,6 +189,8 @@ fn main() {
         fuse_config.mount_options.push(fuser::MountOption::RO);
     }
     fuse_config.acl = fuser::SessionACL::All;
+    fuse_config.clone_fd = true;
+    fuse_config.n_threads = Some(std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).max(4));
 
     // Mount (this blocks until unmount)
     if let Err(e) = fuser::mount2(hf_fs, &args.mount_point, &fuse_config) {

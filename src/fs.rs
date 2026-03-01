@@ -1,17 +1,17 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsStr;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use data::XetFileInfo;
+use data::{DownloadStream, XetFileInfo};
 use fuser::{
     Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo,
-    OpenFlags, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen,
-    ReplyStatfs, ReplyWrite, Request, TimeOrNow,
+    KernelConfig, OpenFlags, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry,
+    ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow,
 };
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
@@ -24,19 +24,28 @@ const TTL: Duration = Duration::from_secs(60);
 const BLOCK_SIZE: u32 = 512;
 const DEBOUNCE_DURATION: Duration = Duration::from_secs(2);
 const MAX_BATCH_WINDOW: Duration = Duration::from_secs(30);
+const NEG_CACHE_CAPACITY: usize = 10_000;
+const NEG_CACHE_TTL: Duration = Duration::from_secs(30);
+
+// Prefetch buffer constants
+const INITIAL_WINDOW: u64 = 1_048_576 + 131_072; // 1 MiB + 128 KiB
+const MAX_WINDOW: u64 = 128 * 1_048_576; // 128 MiB
+const SEEK_WINDOW: usize = 1_048_576; // 1 MiB backward seek buffer
+const FORWARD_SKIP: u64 = 16 * 1_048_576; // 16 MiB skip without reset
 
 /// An open file handle — either a local fd or a lazy remote reference.
 enum OpenFile {
-    /// Local file (staging for writes, or fully cached reads).
-    Local { file: File, writable: bool },
-    /// Lazy remote — data fetched on-demand per read() via range requests.
-    Lazy { xet_hash: String, file_size: u64 },
+    /// Local file (staging for writes, or dirty reads).
+    Local { file: Arc<File>, writable: bool },
+    /// Lazy remote — data fetched on-demand with adaptive prefetch buffer.
+    Lazy { prefetch: Arc<Mutex<PrefetchState>> },
 }
 
 /// What to do in read() after releasing the open_files lock.
 enum ReadTarget {
-    LocalFd(i32),
-    Remote { xet_hash: String, file_size: u64 },
+    /// Hold an Arc<File> so the FD stays alive even if release() runs concurrently.
+    LocalFd(Arc<File>),
+    Remote { prefetch: Arc<Mutex<PrefetchState>> },
 }
 
 /// Wraps `Arc<Mutex<Vec<u8>>>` to implement `Write + Send + 'static`
@@ -45,12 +54,120 @@ struct SharedBufWriter(Arc<Mutex<Vec<u8>>>);
 
 impl Write for SharedBufWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().expect("SharedBufWriter lock poisoned").extend_from_slice(buf);
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .extend_from_slice(buf);
         Ok(buf.len())
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
+    }
+}
+
+/// Per-file-handle prefetch state with adaptive window sizing.
+struct PrefetchState {
+    xet_hash: String,
+    file_size: u64,
+    // Forward buffer: bytes [buf_start .. buf_start + data.len())
+    data: Vec<u8>,
+    buf_start: u64,
+    // Backward seek window: bytes [seek_start .. seek_start + seek_data.len())
+    seek_data: VecDeque<u8>,
+    seek_start: u64,
+    // Adaptive window size
+    window_size: u64,
+    // Full-file stream for sequential reads (reuses one FileReconstructor)
+    stream: Option<DownloadStream>,
+}
+
+impl PrefetchState {
+    fn new(xet_hash: String, file_size: u64) -> Self {
+        Self {
+            xet_hash,
+            file_size,
+            data: Vec::new(),
+            buf_start: 0,
+            seek_data: VecDeque::new(),
+            seek_start: 0,
+            window_size: INITIAL_WINDOW,
+            stream: None,
+        }
+    }
+
+    /// Try to serve a read from the forward buffer.
+    /// Returns the slice if the requested range is fully contained.
+    fn try_serve_forward(&self, offset: u64, size: u32) -> Option<&[u8]> {
+        if self.data.is_empty() {
+            return None;
+        }
+        let buf_end = self.buf_start + self.data.len() as u64;
+        if offset >= self.buf_start && offset < buf_end {
+            let local_off = (offset - self.buf_start) as usize;
+            let avail = self.data.len() - local_off;
+            let to_read = (size as usize).min(avail);
+            Some(&self.data[local_off..local_off + to_read])
+        } else {
+            None
+        }
+    }
+
+    /// Try to serve a read from the backward seek window.
+    fn try_serve_seek(&mut self, offset: u64, size: u32) -> Option<&[u8]> {
+        if self.seek_data.is_empty() {
+            return None;
+        }
+        let seek_end = self.seek_start + self.seek_data.len() as u64;
+        if offset >= self.seek_start && offset < seek_end {
+            let local_off = (offset - self.seek_start) as usize;
+            let avail = self.seek_data.len() - local_off;
+            let to_read = (size as usize).min(avail);
+            let slice = self.seek_data.make_contiguous();
+            Some(&slice[local_off..local_off + to_read])
+        } else {
+            None
+        }
+    }
+
+    /// Move consumed bytes from the front of the forward buffer into the seek window.
+    fn drain_to_seek(&mut self, consumed: usize) {
+        if consumed == 0 {
+            return;
+        }
+        let to_move = consumed.min(self.data.len());
+        // Only append to seek window if contiguous with forward buffer
+        let seek_end = self.seek_start + self.seek_data.len() as u64;
+        if self.seek_data.is_empty() || seek_end == self.buf_start {
+            if to_move > SEEK_WINDOW {
+                // Fast path: only copy the last SEEK_WINDOW bytes instead of all
+                // to_move bytes (which can be up to 128 MiB).
+                let copy_start = to_move - SEEK_WINDOW;
+                self.seek_data.clear();
+                self.seek_start = self.buf_start + copy_start as u64;
+                self.seek_data.extend(&self.data[copy_start..to_move]);
+            } else {
+                self.seek_data.extend(&self.data[..to_move]);
+                if self.seek_data.len() > SEEK_WINDOW {
+                    let excess = self.seek_data.len() - SEEK_WINDOW;
+                    drop(self.seek_data.drain(..excess));
+                    self.seek_start += excess as u64;
+                }
+            }
+        } else {
+            // Gap between seek window and forward buffer — reset seek window
+            let keep = to_move.min(SEEK_WINDOW);
+            self.seek_data.clear();
+            self.seek_data.extend(&self.data[to_move - keep..to_move]);
+            self.seek_start = self.buf_start + (to_move - keep) as u64;
+        }
+        // Remove consumed bytes from forward buffer
+        if to_move == self.data.len() {
+            self.data.clear();
+        } else {
+            self.data.drain(..to_move);
+        }
+        self.buf_start += to_move as u64;
     }
 }
 
@@ -73,12 +190,17 @@ pub struct HfFs {
     next_fh: Mutex<u64>,
     uid: u32,
     gid: u32,
+    /// Negative lookup cache: paths known to not exist (TTL-based).
+    neg_cache: Arc<Mutex<HashMap<String, Instant>>>,
     /// Channel to send dirty files for debounced batch flush.
     flush_tx: Option<mpsc::UnboundedSender<FlushRequest>>,
     /// Handle to the background flush task, used for graceful shutdown.
     flush_handle: Option<tokio::task::JoinHandle<()>>,
     /// Handle to the background polling task, used for graceful shutdown.
     poll_handle: Option<tokio::task::JoinHandle<()>>,
+    /// Per-inode flush errors reported by the background flush loop.
+    /// Checked and cleared by fsync to propagate errors to the application.
+    flush_errors: Arc<Mutex<HashMap<u64, String>>>,
 }
 
 impl HfFs {
@@ -94,6 +216,9 @@ impl HfFs {
         poll_interval_secs: u64,
     ) -> Self {
         let inodes = Arc::new(Mutex::new(InodeTable::new()));
+        let neg_cache = Arc::new(Mutex::new(HashMap::new()));
+
+        let flush_errors = Arc::new(Mutex::new(HashMap::new()));
 
         let (flush_tx, flush_handle) = if !read_only {
             let (tx, rx) = mpsc::unbounded_channel::<FlushRequest>();
@@ -101,8 +226,9 @@ impl HfFs {
             let bg_hub = hub_client.clone();
             let bg_bucket = bucket_id.clone();
             let bg_inodes = inodes.clone();
+            let bg_flush_errors = flush_errors.clone();
 
-            let handle = rt.spawn(Self::flush_loop(rx, bg_cache, bg_hub, bg_bucket, bg_inodes));
+            let handle = rt.spawn(Self::flush_loop(rx, bg_cache, bg_hub, bg_bucket, bg_inodes, bg_flush_errors));
 
             (Some(tx), Some(handle))
         } else {
@@ -115,9 +241,10 @@ impl HfFs {
             let bg_bucket = bucket_id.clone();
             let bg_inodes = inodes.clone();
             let bg_cache = cache.clone();
+            let bg_neg_cache = neg_cache.clone();
             let interval = Duration::from_secs(poll_interval_secs);
 
-            Some(rt.spawn(Self::poll_remote_changes(bg_hub, bg_bucket, bg_inodes, bg_cache, interval)))
+            Some(rt.spawn(Self::poll_remote_changes(bg_hub, bg_bucket, bg_inodes, bg_cache, bg_neg_cache, interval)))
         } else {
             None
         };
@@ -133,9 +260,11 @@ impl HfFs {
             next_fh: Mutex::new(1),
             uid,
             gid,
+            neg_cache,
             flush_tx,
             flush_handle,
             poll_handle,
+            flush_errors,
         }
     }
 
@@ -147,6 +276,7 @@ impl HfFs {
         hub_client: Arc<HubApiClient>,
         bucket_id: String,
         inodes: Arc<Mutex<InodeTable>>,
+        flush_errors: Arc<Mutex<HashMap<u64, String>>>,
     ) {
         loop {
             // Wait for the first request
@@ -175,7 +305,7 @@ impl HfFs {
             let count = pending.len();
             info!("Flushing batch of {} dirty file(s)", count);
 
-            Self::flush_batch(pending, &cache, &hub_client, &bucket_id, &inodes).await;
+            Self::flush_batch(pending, &cache, &hub_client, &bucket_id, &inodes, &flush_errors).await;
         }
     }
 
@@ -187,6 +317,7 @@ impl HfFs {
         hub_client: &HubApiClient,
         bucket_id: &str,
         inodes: &Mutex<InodeTable>,
+        flush_errors: &Mutex<HashMap<u64, String>>,
     ) {
         // Dedup by inode (keep last request per ino)
         let mut seen = std::collections::HashSet::new();
@@ -201,7 +332,7 @@ impl HfFs {
             .collect();
 
         // Resolve paths from inode table, skip deleted/non-dirty inodes
-        let to_flush: Vec<(u64, String, PathBuf)> = {
+        let to_flush: Vec<(u64, String, PathBuf, Vec<String>)> = {
             let inode_table = inodes.lock().unwrap();
             deduped
                 .into_iter()
@@ -215,7 +346,7 @@ impl HfFs {
                         error!("Staging file missing for ino={}, skipping", ino);
                         return None;
                     }
-                    Some((ino, entry.full_path.clone(), staging_path))
+                    Some((ino, entry.full_path.clone(), staging_path, entry.pending_deletes.clone()))
                 })
                 .collect()
         };
@@ -226,11 +357,16 @@ impl HfFs {
 
         // Upload all files through a single upload session
         let staging_paths: Vec<&std::path::Path> =
-            to_flush.iter().map(|(_, _, p)| p.as_path()).collect();
+            to_flush.iter().map(|(_, _, p, _)| p.as_path()).collect();
         let upload_results = match cache.upload_files(&staging_paths).await {
             Ok(results) => results,
             Err(e) => {
                 error!("Batch upload failed: {}", e);
+                let msg = format!("upload failed: {e}");
+                let mut errs = flush_errors.lock().unwrap();
+                for (ino, _, _, _) in &to_flush {
+                    errs.insert(*ino, msg.clone());
+                }
                 return;
             }
         };
@@ -240,11 +376,12 @@ impl HfFs {
             .unwrap_or_default()
             .as_millis() as u64;
 
-        // Build batch operations
+        // Build batch operations — Hub API requires all adds before all deletes
         let mut ops = Vec::with_capacity(to_flush.len());
+        let mut delete_ops = Vec::new();
         let mut successes: Vec<(u64, String, u64)> = Vec::new();
 
-        for ((ino, full_path, _), file_info) in to_flush.iter().zip(upload_results.iter()) {
+        for ((ino, full_path, _, pending_deletes), file_info) in to_flush.iter().zip(upload_results.iter()) {
             info!(
                 "Uploaded file ino={} path={} xet_hash={} size={}",
                 ino,
@@ -260,12 +397,24 @@ impl HfFs {
                 content_type: None,
             });
 
+            // Delete old remote paths left behind by rename of dirty files
+            for old_path in pending_deletes {
+                delete_ops.push(BatchOp::DeleteFile { path: old_path.clone() });
+            }
+
             successes.push((*ino, file_info.hash().to_string(), file_info.file_size()));
         }
+
+        ops.append(&mut delete_ops);
 
         // Single batch commit
         if let Err(e) = hub_client.batch_operations(bucket_id, &ops).await {
             error!("Batch commit failed: {}", e);
+            let msg = format!("commit failed: {e}");
+            let mut errs = flush_errors.lock().unwrap();
+            for (ino, _, _, _) in &to_flush {
+                errs.insert(*ino, msg.clone());
+            }
             return;
         }
 
@@ -278,6 +427,7 @@ impl HfFs {
                 entry.size = size;
                 entry.dirty = false;
                 entry.mtime = now;
+                entry.pending_deletes.clear();
             }
         }
 
@@ -425,7 +575,7 @@ impl HfFs {
                 self.open_files
                     .lock()
                     .unwrap()
-                    .insert(fh.0, OpenFile::Local { file, writable: false });
+                    .insert(fh.0, OpenFile::Local { file: Arc::new(file), writable: false });
                 reply.opened(fh, FopenFlags::empty());
             }
             Err(e) => {
@@ -441,6 +591,7 @@ impl HfFs {
         bucket_id: String,
         inodes: Arc<Mutex<InodeTable>>,
         cache: Arc<FileCache>,
+        neg_cache: Arc<Mutex<HashMap<String, Instant>>>,
         interval: Duration,
     ) {
         loop {
@@ -518,19 +669,58 @@ impl HfFs {
                     inode_table.remove(*ino);
                 }
 
-                // Phase 3: New remote files → invalidate parent dir
+                // Phase 3: New remote files → invalidate parent dir + negative cache
+                // Walk up the path to find the nearest existing ancestor directory
+                // and invalidate it so the next readdir/lookup discovers the new entries.
                 let mut dirs_to_invalidate = HashSet::new();
+                let mut dir_paths_to_invalidate = Vec::new();
                 for path in remote_map.keys() {
                     if inode_table.get_by_path(path).is_none() {
-                        let parent = path.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
-                        if let Some(dir_ino) = inode_table.get_dir_ino(parent) {
-                            dirs_to_invalidate.insert(dir_ino);
+                        // Walk up to find the nearest existing ancestor directory
+                        let mut ancestor = path.as_str();
+                        loop {
+                            ancestor = match ancestor.rsplit_once('/') {
+                                Some((parent, _)) => parent,
+                                None => "",
+                            };
+                            if let Some(dir_ino) = inode_table.get_dir_ino(ancestor) {
+                                if dirs_to_invalidate.insert(dir_ino) {
+                                    dir_paths_to_invalidate.push(ancestor.to_string());
+                                }
+                                break;
+                            }
+                            if ancestor.is_empty() {
+                                // Root always exists; invalidate it
+                                if dirs_to_invalidate.insert(crate::inode::ROOT_INODE) {
+                                    dir_paths_to_invalidate.push(String::new());
+                                }
+                                break;
+                            }
                         }
                     }
                 }
 
                 for dir_ino in dirs_to_invalidate {
                     inode_table.invalidate_children(dir_ino);
+                }
+
+                // Invalidate negative cache entries under changed directories
+                if !dir_paths_to_invalidate.is_empty() {
+                    let mut nc = neg_cache.lock().unwrap();
+                    for dir_path in &dir_paths_to_invalidate {
+                        let prefix = if dir_path.is_empty() {
+                            String::new()
+                        } else {
+                            format!("{}/", dir_path)
+                        };
+                        nc.retain(|k, _| {
+                            if dir_path.is_empty() {
+                                false
+                            } else {
+                                !k.starts_with(&prefix) && k != dir_path
+                            }
+                        });
+                    }
                 }
             }
 
@@ -544,6 +734,32 @@ impl HfFs {
         }
     }
 
+    /// Check if a path is in the negative cache (and not expired).
+    fn neg_cache_check(&self, path: &str) -> bool {
+        let cache = self.neg_cache.lock().unwrap();
+        matches!(cache.get(path), Some(inserted) if inserted.elapsed() < NEG_CACHE_TTL)
+    }
+
+    /// Insert a path into the negative cache, evicting if at capacity.
+    fn neg_cache_insert(&self, path: String) {
+        let mut cache = self.neg_cache.lock().unwrap();
+        let now = Instant::now();
+        if cache.len() >= NEG_CACHE_CAPACITY {
+            // Evict expired entries first
+            cache.retain(|_, ts| ts.elapsed() < NEG_CACHE_TTL);
+            // If still full, evict the oldest entry
+            if cache.len() >= NEG_CACHE_CAPACITY
+                && let Some(oldest_key) = cache
+                    .iter()
+                    .min_by_key(|(_, ts)| **ts)
+                    .map(|(k, _)| k.clone())
+            {
+                cache.remove(&oldest_key);
+            }
+        }
+        cache.insert(path, now);
+    }
+
     /// Enqueue a dirty file for debounced batch flush.
     fn enqueue_flush(&self, ino: u64) {
         if let Some(tx) = &self.flush_tx
@@ -555,6 +771,14 @@ impl HfFs {
 }
 
 impl Filesystem for HfFs {
+    fn init(&mut self, _req: &Request, config: &mut KernelConfig) -> std::io::Result<()> {
+        let _ = config.set_max_background(64);
+        // Readahead benefits local/cached files; remote lazy files use DIRECT_IO
+        // and rely on our userspace PrefetchState instead.
+        let _ = config.set_max_readahead(1_048_576); // 1 MiB
+        Ok(())
+    }
+
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         let parent = parent.0;
         let name = match name.to_str() {
@@ -567,7 +791,36 @@ impl Filesystem for HfFs {
 
         debug!("lookup: parent={}, name={}", parent, name);
 
-        self.ensure_children_loaded(parent);
+        // Build full path and check negative cache under a single inode lock
+        let (full_path, needs_load) = {
+            let inodes = self.inodes.lock().unwrap();
+            let parent_entry = match inodes.get(parent) {
+                Some(e) => e,
+                None => {
+                    reply.error(Errno::ENOENT);
+                    return;
+                }
+            };
+            let fp = if parent_entry.full_path.is_empty() {
+                name.to_string()
+            } else {
+                format!("{}/{}", parent_entry.full_path, name)
+            };
+            let needs_load =
+                !parent_entry.children_loaded && parent_entry.kind == InodeKind::Directory;
+            (fp, needs_load)
+        };
+
+        // Check negative cache
+        if self.neg_cache_check(&full_path) {
+            debug!("negative cache hit: {}", full_path);
+            reply.error(Errno::ENOENT);
+            return;
+        }
+
+        if needs_load {
+            self.ensure_children_loaded(parent);
+        }
 
         let inodes = self.inodes.lock().unwrap();
         match inodes.lookup_child(parent, name) {
@@ -576,6 +829,8 @@ impl Filesystem for HfFs {
                 reply.entry(&TTL, &attr, Generation(0));
             }
             None => {
+                drop(inodes);
+                self.neg_cache_insert(full_path);
                 reply.error(Errno::ENOENT);
             }
         }
@@ -686,19 +941,13 @@ impl Filesystem for HfFs {
                 }
             } else if !xet_hash.is_empty() && size > 0 {
                 let cache = self.cache.clone();
-                match self.rt.block_on(cache.ensure_cached(&xet_hash, size)) {
-                    Ok(cached_path) => {
-                        if let Err(e) = std::fs::copy(&cached_path, &staging_path) {
-                            error!("Failed to copy to staging: {}", e);
-                            reply.error(Errno::EIO);
-                            return;
-                        }
-                    }
-                    Err(e) => {
-                        error!("Failed to cache file for write: {}", e);
-                        reply.error(Errno::EIO);
-                        return;
-                    }
+                if let Err(e) =
+                    self.rt
+                        .block_on(cache.download_to_file(&xet_hash, size, &staging_path))
+                {
+                    error!("Failed to download file for write: {}", e);
+                    reply.error(Errno::EIO);
+                    return;
                 }
             } else if let Err(e) = File::create(&staging_path) {
                 error!("Failed to create staging file: {}", e);
@@ -725,7 +974,7 @@ impl Filesystem for HfFs {
                     self.open_files
                         .lock()
                         .unwrap()
-                        .insert(fh.0, OpenFile::Local { file, writable: true });
+                        .insert(fh.0, OpenFile::Local { file: Arc::new(file), writable: true });
                     reply.opened(fh, FopenFlags::empty());
                 }
                 Err(e) => {
@@ -753,13 +1002,15 @@ impl Filesystem for HfFs {
                     reply.error(Errno::EIO);
                 }
             } else {
-                // Lazy remote: don't download anything, fetch on read()
+                // Lazy remote: create prefetch buffer, fetch on read()
+                let prefetch = Arc::new(Mutex::new(PrefetchState::new(xet_hash, size)));
                 let fh = self.alloc_fh();
                 self.open_files
                     .lock()
                     .unwrap()
-                    .insert(fh.0, OpenFile::Lazy { xet_hash, file_size: size });
-                reply.opened(fh, FopenFlags::empty());
+                    .insert(fh.0, OpenFile::Lazy { prefetch });
+                // Bypass kernel page cache so all reads hit our prefetch buffer
+                reply.opened(fh, FopenFlags::FOPEN_DIRECT_IO);
             }
         }
     }
@@ -777,14 +1028,14 @@ impl Filesystem for HfFs {
     ) {
         debug!("read: fh={}, offset={}, size={}", fh.0, offset, size);
 
-        // Extract what we need under the lock, then release it
+        // Extract what we need under the lock, then release it.
+        // Clone Arc<File> so the FD stays alive even if release() runs concurrently.
         let read_target = {
             let files = self.open_files.lock().unwrap();
             match files.get(&fh.0) {
-                Some(OpenFile::Local { file, .. }) => ReadTarget::LocalFd(file.as_raw_fd()),
-                Some(OpenFile::Lazy { xet_hash, file_size }) => ReadTarget::Remote {
-                    xet_hash: xet_hash.clone(),
-                    file_size: *file_size,
+                Some(OpenFile::Local { file, .. }) => ReadTarget::LocalFd(file.clone()),
+                Some(OpenFile::Lazy { prefetch }) => ReadTarget::Remote {
+                    prefetch: prefetch.clone(),
                 },
                 None => {
                     reply.error(Errno::EBADF);
@@ -794,7 +1045,8 @@ impl Filesystem for HfFs {
         };
 
         match read_target {
-            ReadTarget::LocalFd(fd) => {
+            ReadTarget::LocalFd(file) => {
+                let fd = file.as_raw_fd();
                 let mut buf = vec![0u8; size as usize];
                 let n = unsafe {
                     libc::pread(
@@ -811,27 +1063,166 @@ impl Filesystem for HfFs {
                     reply.data(&buf);
                 }
             }
-            ReadTarget::Remote { xet_hash, file_size } => {
-                if offset >= file_size {
+            ReadTarget::Remote { prefetch } => {
+                let mut ps = prefetch.lock().unwrap();
+
+                // Past EOF
+                if offset >= ps.file_size {
                     reply.data(&[]);
                     return;
                 }
-                let end = (offset + size as u64).min(file_size);
-                let file_info = XetFileInfo::new(xet_hash, file_size);
-                let buf = Arc::new(Mutex::new(Vec::with_capacity((end - offset) as usize)));
-                let writer = SharedBufWriter(buf.clone());
 
-                match self.rt.block_on(
-                    self.cache
-                        .download_session()
-                        .download_to_writer(&file_info, offset..end, writer, None),
-                ) {
-                    Ok(_) => reply.data(&buf.lock().expect("SharedBufWriter lock poisoned")),
-                    Err(e) => {
-                        error!("Range read failed: {}", e);
-                        reply.error(Errno::EIO);
+                // Try forward buffer
+                if let Some(data) = ps.try_serve_forward(offset, size) {
+                    debug!("prefetch hit (forward): offset={}, len={}", offset, data.len());
+                    reply.data(data);
+                    return;
+                }
+
+                // Try seek window
+                if let Some(data) = ps.try_serve_seek(offset, size) {
+                    debug!("prefetch hit (seek): offset={}, len={}", offset, data.len());
+                    reply.data(data);
+                    return;
+                }
+
+                // Cache miss — compute window adjustment before draining
+                let old_buf_end = ps.buf_start + ps.data.len() as u64;
+                let is_first_fetch = ps.data.is_empty() && ps.buf_start == 0;
+
+                // Drain consumed forward bytes to seek window
+                if !ps.data.is_empty() {
+                    let consumed = if offset >= ps.buf_start {
+                        ps.data.len()
+                    } else {
+                        0
+                    };
+                    ps.drain_to_seek(consumed);
+                }
+
+                // Classify the access pattern and adjust window
+                let is_sequential;
+                if is_first_fetch {
+                    // First fetch: use initial window as-is
+                    is_sequential = true;
+                } else if offset >= old_buf_end && offset <= old_buf_end + FORWARD_SKIP {
+                    // Sequential or small forward skip: double window (TCP slow-start)
+                    ps.window_size = (ps.window_size * 2).min(MAX_WINDOW);
+                    debug!("prefetch window doubled to {}", ps.window_size);
+                    is_sequential = true;
+                } else {
+                    // Far seek: reset to initial window, cancel stream
+                    ps.window_size = INITIAL_WINDOW;
+                    debug!("prefetch window reset to {}", ps.window_size);
+                    is_sequential = false;
+                    if let Some(s) = ps.stream.take() {
+                        debug!("prefetch: cancelling stream (far seek)");
+                        drop(s);
                     }
                 }
+
+                // Fetch: download max(needed, window_size) bytes
+                let needed = (size as u64).min(ps.file_size - offset);
+                let fetch_size = needed.max(ps.window_size).min(ps.file_size - offset);
+
+                // Try streaming for pure sequential reads (offset must match
+                // stream position exactly — no gaps or skips).
+                let streamed = if is_sequential && offset == ps.buf_start {
+                    if ps.stream.is_none() && is_first_fetch && offset == 0 {
+                        let fi = XetFileInfo::new(ps.xet_hash.clone(), ps.file_size);
+                        match self.cache.download_session().download_stream(&fi, None) {
+                            Ok(stream) => {
+                                debug!("prefetch: started full-file stream");
+                                ps.stream = Some(stream);
+                            }
+                            Err(e) => {
+                                warn!("prefetch: stream start failed: {}", e);
+                            }
+                        }
+                    }
+                    if let Some(mut stream) = ps.stream.take() {
+                        // Enter tokio runtime context so blocking_next() can
+                        // spawn tasks on FUSE threads (which lack a runtime).
+                        let _guard = self.rt.enter();
+                        let mut buf = Vec::with_capacity(fetch_size as usize);
+                        let mut stream_eof = false;
+                        while (buf.len() as u64) < fetch_size {
+                            match stream.blocking_next() {
+                                Ok(Some(chunk)) => {
+                                    buf.extend_from_slice(&chunk);
+                                }
+                                Ok(None) => {
+                                    stream_eof = true;
+                                    break;
+                                }
+                                Err(e) => {
+                                    error!("prefetch: stream error: {}", e);
+                                    break;
+                                }
+                            }
+                        }
+                        if !stream_eof {
+                            // Put stream back for next read
+                            ps.stream = Some(stream);
+                        }
+                        if !buf.is_empty() { Some(buf) } else { None }
+                    } else {
+                        None
+                    }
+                } else {
+                    // Non-sequential: cancel stale stream
+                    if let Some(s) = ps.stream.take() {
+                        drop(s);
+                    }
+                    None
+                };
+
+                // Fall back to range download if streaming wasn't used
+                let fetched = if let Some(buf) = streamed {
+                    debug!(
+                        "prefetch stream: offset={}, got={}, window={}",
+                        offset,
+                        buf.len(),
+                        ps.window_size
+                    );
+                    buf
+                } else {
+                    let fetch_end = offset + fetch_size;
+                    let file_info = XetFileInfo::new(ps.xet_hash.clone(), ps.file_size);
+                    let buf = Arc::new(Mutex::new(Vec::with_capacity(fetch_size as usize)));
+                    let writer = SharedBufWriter(buf.clone());
+
+                    debug!(
+                        "prefetch fetch: offset={}, size={}, window={}",
+                        offset, fetch_size, ps.window_size
+                    );
+
+                    match self.rt.block_on(
+                        self.cache
+                            .download_session()
+                            .download_to_writer(
+                                &file_info,
+                                offset..fetch_end,
+                                writer,
+                                None,
+                            ),
+                    ) {
+                        Ok(_) => match Arc::try_unwrap(buf) {
+                            Ok(mutex) => mutex.into_inner().unwrap_or_default(),
+                            Err(arc) => arc.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+                        },
+                        Err(e) => {
+                            error!("Prefetch range read failed: {}", e);
+                            reply.error(Errno::EIO);
+                            return;
+                        }
+                    }
+                };
+
+                let to_read = (size as usize).min(fetched.len());
+                reply.data(&fetched[..to_read]);
+                ps.data = fetched;
+                ps.buf_start = offset;
             }
         }
     }
@@ -861,12 +1252,11 @@ impl Filesystem for HfFs {
             return;
         }
 
-        // Extract fd from open_files, then release the lock before acquiring inodes
-        // to maintain consistent lock ordering (inodes before open_files elsewhere).
-        let fd = {
+        // Clone Arc<File> so the FD stays alive even if release() runs concurrently.
+        let file = {
             let files = self.open_files.lock().unwrap();
             match files.get(&fh.0) {
-                Some(OpenFile::Local { file, writable: true }) => file.as_raw_fd(),
+                Some(OpenFile::Local { file, writable: true }) => file.clone(),
                 Some(OpenFile::Local { writable: false, .. }) | Some(OpenFile::Lazy { .. }) => {
                     reply.error(Errno::EBADF);
                     return;
@@ -877,6 +1267,7 @@ impl Filesystem for HfFs {
                 }
             }
         };
+        let fd = file.as_raw_fd();
 
         let n = unsafe {
             libc::pwrite(
@@ -911,7 +1302,12 @@ impl Filesystem for HfFs {
         reply: ReplyEmpty,
     ) {
         debug!("flush: ino={}", ino.0);
-        // Actual upload happens via debounced batch in release()
+        // Check if a previous async flush failed for this inode
+        if let Some(err_msg) = self.flush_errors.lock().unwrap().remove(&ino.0) {
+            error!("Deferred flush error for ino={}: {}", ino.0, err_msg);
+            reply.error(Errno::EIO);
+            return;
+        }
         reply.ok();
     }
 
@@ -982,6 +1378,9 @@ impl Filesystem for HfFs {
             format!("{}/{}", parent_path, name)
         };
 
+        // Remove from negative cache since this path is being created
+        self.neg_cache.lock().unwrap().remove(&full_path);
+
         let now = SystemTime::now();
         let ino = {
             let mut inodes = self.inodes.lock().unwrap();
@@ -1013,7 +1412,7 @@ impl Filesystem for HfFs {
                 self.open_files
                     .lock()
                     .unwrap()
-                    .insert(fh.0, OpenFile::Local { file, writable: true });
+                    .insert(fh.0, OpenFile::Local { file: Arc::new(file), writable: true });
 
                 let inodes = self.inodes.lock().unwrap();
                 let attr = self.inode_to_attr(inodes.get(ino).unwrap());
@@ -1021,6 +1420,8 @@ impl Filesystem for HfFs {
             }
             Err(e) => {
                 error!("Failed to create staging file: {}", e);
+                // Rollback: remove the inode we just inserted
+                self.inodes.lock().unwrap().remove(ino);
                 reply.error(Errno::EIO);
             }
         }
@@ -1068,6 +1469,9 @@ impl Filesystem for HfFs {
         } else {
             format!("{}/{}", parent_path, name)
         };
+
+        // Remove from negative cache since this path is being created
+        self.neg_cache.lock().unwrap().remove(&full_path);
 
         let mut inodes = self.inodes.lock().unwrap();
 
@@ -1291,31 +1695,39 @@ impl Filesystem for HfFs {
             format!("{}/{}", new_parent_path, newname)
         };
 
-        if let Some(hash) = xet_hash.filter(|_| kind == InodeKind::File && !is_dirty) {
-            let hub = self.hub_client.clone();
-            let bucket_id = self.bucket_id.clone();
+        if kind == InodeKind::File && !is_dirty {
+            if let Some(hash) = xet_hash {
+                let hub = self.hub_client.clone();
+                let bucket_id = self.bucket_id.clone();
 
-            let mtime_ms = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64;
+                let mtime_ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
 
-            let ops = vec![
-                BatchOp::AddFile {
-                    path: new_full_path.clone(),
-                    xet_hash: hash,
-                    mtime: mtime_ms,
-                    content_type: None,
-                },
-                BatchOp::DeleteFile {
-                    path: old_path.clone(),
-                },
-            ];
+                let ops = vec![
+                    BatchOp::AddFile {
+                        path: new_full_path.clone(),
+                        xet_hash: hash,
+                        mtime: mtime_ms,
+                        content_type: None,
+                    },
+                    BatchOp::DeleteFile {
+                        path: old_path.clone(),
+                    },
+                ];
 
-            if let Err(e) = self.rt.block_on(hub.batch_operations(&bucket_id, &ops)) {
-                error!("Failed to rename {} -> {}: {}", old_path, new_full_path, e);
-                reply.error(Errno::EIO);
-                return;
+                if let Err(e) = self.rt.block_on(hub.batch_operations(&bucket_id, &ops)) {
+                    error!("Failed to rename {} -> {}: {}", old_path, new_full_path, e);
+                    reply.error(Errno::EIO);
+                    return;
+                }
+            }
+        } else if is_dirty && kind == InodeKind::File && xet_hash.is_some() {
+            // Dirty file with a remote presence: record old path for deletion at flush time
+            let mut inodes = self.inodes.lock().unwrap();
+            if let Some(entry) = inodes.get_mut(ino) {
+                entry.pending_deletes.push(old_path.clone());
             }
         }
 
@@ -1325,6 +1737,14 @@ impl Filesystem for HfFs {
             // Remove existing destination inode if it exists (POSIX rename replaces target)
             if let Some(existing) = inodes.lookup_child(newparent.0, newname) {
                 let existing_ino = existing.inode;
+                let existing_kind = existing.kind;
+                // Don't allow replacing a non-empty directory
+                if existing_kind == InodeKind::Directory
+                    && !existing.children.is_empty()
+                {
+                    reply.error(Errno::ENOTEMPTY);
+                    return;
+                }
                 inodes.remove(existing_ino);
             }
 
@@ -1332,17 +1752,12 @@ impl Filesystem for HfFs {
                 old_parent.children.retain(|&c| c != ino);
             }
 
-            if let Some(old) = inodes.get(ino).map(|e| e.full_path.clone()) {
-                inodes.remove_path(&old);
-            }
-
+            // Update this inode's name/parent, then recursively fix all descendant paths
             if let Some(entry) = inodes.get_mut(ino) {
                 entry.name = newname.to_string();
-                entry.full_path = new_full_path.clone();
                 entry.parent = newparent.0;
             }
-
-            inodes.insert_path(new_full_path, ino);
+            inodes.update_subtree_paths(ino, new_full_path.clone());
 
             if let Some(new_parent) = inodes.get_mut(newparent.0) {
                 new_parent.children.push(ino);
@@ -1386,15 +1801,41 @@ impl Filesystem for HfFs {
                     reply.error(Errno::EIO);
                     return;
                 }
-            } else if staging_path.exists()
-                && let Err(e) = OpenOptions::new()
+            } else {
+                // If staging file doesn't exist, download from remote first
+                if !staging_path.exists() {
+                    let (xet_hash, file_size) = {
+                        let inodes = self.inodes.lock().unwrap();
+                        match inodes.get(ino.0) {
+                            Some(e) => (e.xet_hash.clone().unwrap_or_default(), e.size),
+                            None => {
+                                reply.error(Errno::ENOENT);
+                                return;
+                            }
+                        }
+                    };
+                    if !xet_hash.is_empty() && file_size > 0 {
+                        let cache = self.cache.clone();
+                        if let Err(e) = self.rt.block_on(cache.download_to_file(&xet_hash, file_size, &staging_path)) {
+                            error!("Failed to download file for truncate: {}", e);
+                            reply.error(Errno::EIO);
+                            return;
+                        }
+                    } else if let Err(e) = File::create(&staging_path) {
+                        error!("Failed to create staging file for truncate: {}", e);
+                        reply.error(Errno::EIO);
+                        return;
+                    }
+                }
+                if let Err(e) = OpenOptions::new()
                     .write(true)
                     .open(&staging_path)
                     .and_then(|f| f.set_len(new_size))
-            {
-                error!("Failed to set staging file length: {}", e);
-                reply.error(Errno::EIO);
-                return;
+                {
+                    error!("Failed to set staging file length: {}", e);
+                    reply.error(Errno::EIO);
+                    return;
+                }
             }
 
             let mut inodes = self.inodes.lock().unwrap();

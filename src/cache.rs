@@ -1,19 +1,15 @@
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use data::configurations::TranslatorConfig;
 use data::{FileDownloadSession, FileUploadSession, XetFileInfo};
-use tokio::sync::RwLock;
 
 use crate::error::{Error, Result};
 
 pub struct FileCache {
-    cache_dir: PathBuf,
     staging_dir: PathBuf,
     session: Arc<FileDownloadSession>,
     upload_config: Option<Arc<TranslatorConfig>>,
-    cached: RwLock<HashMap<String, PathBuf>>,
 }
 
 impl FileCache {
@@ -26,39 +22,25 @@ impl FileCache {
         let staging_dir = cache_dir.join("staging");
         std::fs::create_dir_all(&staging_dir).ok();
         Self {
-            cache_dir,
             staging_dir,
             session,
             upload_config,
-            cached: RwLock::new(HashMap::new()),
         }
     }
 
-    /// Ensure a file is downloaded to the local cache. Returns path to cached file.
-    pub async fn ensure_cached(&self, xet_hash: &str, file_size: u64) -> Result<PathBuf> {
-        // Check if already cached
-        {
-            let cached = self.cached.read().await;
-            if let Some(path) = cached.get(xet_hash)
-                && path.exists()
-            {
-                return Ok(path.clone());
-            }
-        }
-
-        // Download to cache
+    /// Download a file directly to a destination path (for writable opens).
+    pub async fn download_to_file(
+        &self,
+        xet_hash: &str,
+        file_size: u64,
+        dest: &Path,
+    ) -> Result<()> {
         let file_info = XetFileInfo::new(xet_hash.to_string(), file_size);
-        let cache_path = self.cache_dir.join(xet_hash);
-
         self.session
-            .download_file(&file_info, &cache_path, None)
+            .download_file(&file_info, dest, None)
             .await
             .map_err(|e| Error::Xet(e.to_string()))?;
-
-        let mut cached = self.cached.write().await;
-        cached.insert(xet_hash.to_string(), cache_path.clone());
-
-        Ok(cache_path)
+        Ok(())
     }
 
     /// Get the staging path for a given inode (for files being written).

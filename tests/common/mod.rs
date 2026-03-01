@@ -1,5 +1,9 @@
+#![allow(dead_code)]
+
 use std::path::Path;
+use std::process::{Child, Command};
 use std::sync::Arc;
+use std::time::Duration;
 
 use data::{FileUploadSession, XetFileInfo};
 use reqwest::Client;
@@ -120,4 +124,81 @@ pub async fn upload_file(
         .expect("finalize failed");
 
     file_info
+}
+
+/// Spawn hf-mount as a child process, wait until the mountpoint is live.
+/// `extra_args` are appended to the command (e.g. `&["--read-only"]`).
+pub fn mount_bucket(bucket_id: &str, mount_point: &str, cache_dir: &str, extra_args: &[&str]) -> Child {
+    let token = std::env::var("HF_TOKEN").unwrap();
+
+    let binary = std::env::current_exe()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("hf-mount");
+
+    eprintln!("Mounting with binary: {:?}", binary);
+
+    std::fs::create_dir_all(mount_point).ok();
+    std::fs::create_dir_all(cache_dir).ok();
+
+    let child = Command::new(binary)
+        .args([
+            "--bucket-id", bucket_id,
+            "--mount-point", mount_point,
+            "--hf-token", &token,
+            "--cache-dir", cache_dir,
+            "--poll-interval-secs", "0",
+        ])
+        .args(extra_args)
+        .spawn()
+        .expect("Failed to spawn hf-mount");
+
+    for i in 0..30 {
+        std::thread::sleep(Duration::from_millis(500));
+        if let Ok(mounts) = std::fs::read_to_string("/proc/mounts")
+            && mounts.lines().any(|line| line.contains(mount_point))
+        {
+            eprintln!("Mount ready after {}ms", (i + 1) * 500);
+            return child;
+        }
+    }
+
+    eprintln!("Warning: mount may not be ready after 15s");
+    child
+}
+
+/// Unmount and wait for hf-mount to exit. Waits up to `graceful_secs` for
+/// a clean exit (destroy() may flush + upload) before force-killing.
+pub fn unmount(mount_point: &str, mut child: Child, graceful_secs: u64) {
+    let _ = Command::new("fusermount")
+        .args(["-u", mount_point])
+        .status();
+
+    for _ in 0..graceful_secs {
+        if let Ok(Some(status)) = child.try_wait() {
+            eprintln!("hf-mount exited: {}", status);
+            return;
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    child.kill().ok();
+    match child.wait() {
+        Ok(status) => eprintln!("hf-mount killed: {}", status),
+        Err(e) => eprintln!("wait error: {}", e),
+    }
+}
+
+/// Generate deterministic content: byte[i] = (i % 251) as u8
+pub fn generate_pattern(size: usize) -> Vec<u8> {
+    (0..size).map(|i| (i % 251) as u8).collect()
+}
+
+/// Verify content matches the deterministic pattern at a given offset.
+pub fn verify_pattern(data: &[u8], offset: usize) -> bool {
+    data.iter()
+        .enumerate()
+        .all(|(i, &b)| b == ((offset + i) % 251) as u8)
 }

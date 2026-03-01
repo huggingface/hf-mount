@@ -177,7 +177,7 @@ async fn test_write_then_read_back_inner(
         None,
     )?;
 
-    let download_session = data::FileDownloadSession::new(Arc::new(read_config), None).await?;
+    let download_session = data::FileDownloadSession::new(Arc::new(read_config), None, None).await?;
 
     let cache_dir = std::env::temp_dir().join("hf-mount-roundtrip-test");
     let cache = Arc::new(hf_mount::cache::FileCache::new(
@@ -216,7 +216,10 @@ async fn test_write_then_read_back_inner(
 
     eprintln!("Committed to bucket: {}", test_filename);
 
-    let downloaded_path = cache.ensure_cached(&xet_hash, file_size).await?;
+    let downloaded_path = std::env::temp_dir().join(format!("hf_mount_test_{}", xet_hash));
+    cache
+        .download_to_file(&xet_hash, file_size, &downloaded_path)
+        .await?;
 
     let downloaded_content = std::fs::read_to_string(&downloaded_path)?;
 

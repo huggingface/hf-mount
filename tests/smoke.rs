@@ -1,9 +1,8 @@
 mod common;
 
 use std::io::{Read, Seek, SeekFrom};
-use std::process::{Child, Command};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const ENDPOINT: &str = "https://huggingface.co";
 
@@ -74,70 +73,6 @@ async fn setup_bucket_with_file() -> Option<(
     Some((token, bucket_id, hub, test_filename, test_content))
 }
 
-/// Spawn hf-mount as a child process, wait until the mountpoint is live.
-fn mount_bucket(bucket_id: &str, mount_point: &str, cache_dir: &str) -> Child {
-    let token = std::env::var("HF_TOKEN").unwrap();
-
-    // Find the binary — it's in target/debug/hf-mount
-    let binary = std::env::current_exe()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("hf-mount");
-
-    eprintln!("Mounting with binary: {:?}", binary);
-
-    std::fs::create_dir_all(mount_point).ok();
-    std::fs::create_dir_all(cache_dir).ok();
-
-    let child = Command::new(binary)
-        .args([
-            "--bucket-id",
-            bucket_id,
-            "--mount-point",
-            mount_point,
-            "--hf-token",
-            &token,
-            "--cache-dir",
-            cache_dir,
-            "--poll-interval-secs",
-            "0",
-        ])
-        .spawn()
-        .expect("Failed to spawn hf-mount");
-
-    // Wait for mount to be ready by checking /proc/mounts for the FUSE mount
-    for i in 0..30 {
-        std::thread::sleep(Duration::from_millis(500));
-        if let Ok(mounts) = std::fs::read_to_string("/proc/mounts")
-            && mounts.lines().any(|line| line.contains(mount_point))
-        {
-            eprintln!("Mount ready after {}ms", (i + 1) * 500);
-            return child;
-        }
-    }
-
-    eprintln!("Warning: mount may not be ready after 15s");
-    child
-}
-
-fn unmount(mount_point: &str, mut child: Child) {
-    // Try fusermount first (Linux), then umount
-    let _ = Command::new("fusermount")
-        .args(["-u", mount_point])
-        .status();
-
-    // Give it a moment to exit gracefully, then force kill
-    std::thread::sleep(Duration::from_secs(2));
-    child.kill().ok();
-    match child.wait() {
-        Ok(status) => eprintln!("hf-mount exited: {}", status),
-        Err(e) => eprintln!("wait error: {}", e),
-    }
-}
-
 /// FUSE smoke test: mounts a bucket, reads files through the filesystem (range reads),
 /// writes a new file, reads it back, then cleans up.
 #[tokio::test]
@@ -152,12 +87,9 @@ async fn test_fuse_range_read_and_write() {
     let cache_dir = format!("/tmp/hf-mount-cache-{}", std::process::id());
 
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        // This runs in a blocking context since FUSE I/O is sync
-        let child = mount_bucket(&bucket_id, &mount_point, &cache_dir);
-
+        let child = common::mount_bucket(&bucket_id, &mount_point, &cache_dir, &[]);
         let test_result = run_fuse_tests(&mount_point, &test_filename, &test_content);
-
-        unmount(&mount_point, child);
+        common::unmount(&mount_point, child, 5);
         test_result
     }));
 
