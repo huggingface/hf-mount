@@ -1628,11 +1628,22 @@ impl Filesystem for HfFs {
         name: &OsStr,
         newparent: INodeNo,
         newname: &OsStr,
-        _flags: fuser::RenameFlags,
+        flags: fuser::RenameFlags,
         reply: ReplyEmpty,
     ) {
+        let _ = &flags; // used conditionally on linux
+
         if self.read_only {
             reply.error(Errno::EROFS);
+            return;
+        }
+
+        // Reject unsupported flags
+        #[cfg(target_os = "linux")]
+        if flags.intersects(
+            fuser::RenameFlags::RENAME_EXCHANGE | fuser::RenameFlags::RENAME_WHITEOUT,
+        ) {
+            reply.error(Errno::EINVAL);
             return;
         }
 
@@ -1736,6 +1747,12 @@ impl Filesystem for HfFs {
 
             // Remove existing destination inode if it exists (POSIX rename replaces target)
             if let Some(existing) = inodes.lookup_child(newparent.0, newname) {
+                // RENAME_NOREPLACE: refuse if the target already exists
+                #[cfg(target_os = "linux")]
+                if flags.contains(fuser::RenameFlags::RENAME_NOREPLACE) {
+                    reply.error(Errno::EEXIST);
+                    return;
+                }
                 let existing_ino = existing.inode;
                 let existing_kind = existing.kind;
                 // Don't allow replacing a non-empty directory

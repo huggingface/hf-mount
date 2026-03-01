@@ -16,9 +16,9 @@
 
 - [x] 7. **create leaves phantom dirty inode on staging open failure**: inode inserted+marked dirty before staging file open; on failure, inode not rolled back. Fix: rollback on error.
 - [x] 8. **CachingClient unbounded cache growth**: no size cap, no expired entry cleanup. Fix: add max entries + periodic eviction of expired entries.
-- [ ] 9. **Predictable staging paths + symlink following**: `inode_<n>` under `/tmp` + `File::create` follows symlinks. Fix: use `O_NOFOLLOW` or randomize staging names.
+- [x] 9. **Predictable staging paths + symlink following**: `inode_<n>` under `/tmp` + `File::create` follows symlinks. Fix: use `O_NOFOLLOW` or randomize staging names.
 - [x] 10. **Panic paths in non-test hot path**: `expect` on `Arc::try_unwrap` and poisoned mutex in read path. Fix: return EIO instead of panicking.
 
 ## LOW
 
-- [ ] 11. **rename ignores kernel RenameFlags**: `RENAME_NOREPLACE` etc. not enforced. Fix: check flags and return EEXIST/EINVAL as appropriate.
+- [x] 11. **rename ignores kernel RenameFlags**: `RENAME_NOREPLACE` etc. not enforced. Fix: check flags and return EEXIST/EINVAL as appropriate.

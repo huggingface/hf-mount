@@ -6,10 +6,20 @@ use data::{FileDownloadSession, FileUploadSession, XetFileInfo};
 
 use crate::error::{Error, Result};
 
+fn rand_u64() -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    std::time::Instant::now().hash(&mut hasher);
+    std::process::id().hash(&mut hasher);
+    hasher.finish()
+}
+
 pub struct FileCache {
     staging_dir: PathBuf,
     session: Arc<FileDownloadSession>,
     upload_config: Option<Arc<TranslatorConfig>>,
+    /// Per-session random key to make staging paths unpredictable.
+    session_key: u64,
 }
 
 impl FileCache {
@@ -25,6 +35,7 @@ impl FileCache {
             staging_dir,
             session,
             upload_config,
+            session_key: rand_u64(),
         }
     }
 
@@ -44,8 +55,10 @@ impl FileCache {
     }
 
     /// Get the staging path for a given inode (for files being written).
+    /// Deterministic within a session but unpredictable from outside.
     pub fn staging_path(&self, inode: u64) -> PathBuf {
-        self.staging_dir.join(format!("inode_{}", inode))
+        self.staging_dir
+            .join(format!("ino_{:x}_{:016x}", inode, self.session_key))
     }
 
     /// Upload multiple staged files in a single session.
