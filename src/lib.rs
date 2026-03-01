@@ -5,3 +5,6 @@ pub mod error;
 pub mod fs;
 pub mod hub_api;
 pub mod inode;
+#[cfg(feature = "nfs")]
+pub mod nfs;
+pub mod vfs;

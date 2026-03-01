@@ -29,3 +29,7 @@ libc = "0.2"
 async-trait = "0.1"
 bytes = "1"
 chrono = "0.4"
+nfsserve = { version = "0.10", optional = true }
+
+[features]
+nfs = ["dep:nfsserve"]
