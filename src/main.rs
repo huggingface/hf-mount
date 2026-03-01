@@ -42,6 +42,10 @@ struct Args {
     /// Interval in seconds for polling remote changes (0 to disable)
     #[arg(long, default_value_t = 30)]
     poll_interval_secs: u64,
+
+    /// Mount backend: "fuse" (default) or "nfs" (requires --features nfs)
+    #[arg(long, default_value = "fuse")]
+    backend: String,
 }
 
 fn main() {
@@ -61,15 +65,15 @@ fn main() {
         ("HF_XET_CLIENT_AC_INITIAL_DOWNLOAD_CONCURRENCY", "16"),
         // Allow concurrency adjustments after 4 MB (vs 20 MB default) for faster ramp-up
         ("HF_XET_CLIENT_AC_MIN_BYTES_REQUIRED_FOR_ADJUSTMENT", "4194304"),
-        // Smaller fetch blocks (4 MB vs 256 MB default) for lower latency
-        ("HF_XET_RECONSTRUCTION_MIN_RECONSTRUCTION_FETCH_SIZE", "4194304"),
-        // Smaller prefetch buffer (8 MB vs 1 GB default)
+        // Fetch blocks matching VFS initial window (8 MB vs 256 MB default)
+        ("HF_XET_RECONSTRUCTION_MIN_RECONSTRUCTION_FETCH_SIZE", "8388608"),
+        // Prefetch buffer (8 MB) — kept small to avoid buffering latency on first fetch
         ("HF_XET_RECONSTRUCTION_MIN_PREFETCH_BUFFER", "8388608"),
         // Target 30s block completion (vs 15 min default) for better prefetch sizing
         ("HF_XET_RECONSTRUCTION_TARGET_BLOCK_COMPLETION_TIME", "30"),
-        // Cap download buffer for lower memory usage (64 MB vs 2 GB default)
-        ("HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_SIZE", "67108864"),
-        ("HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT", "134217728"),
+        // Download buffer sized for large VFS windows (128 MB vs 2 GB default)
+        ("HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_SIZE", "134217728"),
+        ("HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT", "268435456"),
     ] {
         if std::env::var(k).is_err() {
             // SAFETY: called before any threads are spawned.
@@ -161,41 +165,71 @@ fn main() {
     let uid = args.uid.unwrap_or_else(|| unsafe { libc::getuid() });
     let gid = args.gid.unwrap_or_else(|| unsafe { libc::getgid() });
 
-    // Create FUSE filesystem
-    let hf_fs = HfFs::new(
-        rt.handle().clone(),
-        hub_client,
-        args.bucket_id.clone(),
-        cache,
-        args.read_only,
-        uid,
-        gid,
-        args.poll_interval_secs,
-    );
-
     // Ensure mount point exists
     std::fs::create_dir_all(&args.mount_point).ok();
 
     let mode = if args.read_only { "read-only" } else { "read-write" };
-    info!("Mounting bucket {} at {:?} ({})", args.bucket_id, args.mount_point, mode);
+    info!("Mounting bucket {} at {:?} ({}, backend={})", args.bucket_id, args.mount_point, mode, args.backend);
 
-    // Mount options
-    let mut fuse_config = fuser::Config::default();
-    fuse_config.mount_options = vec![
-        fuser::MountOption::FSName("hf-mount".to_string()),
-        fuser::MountOption::DefaultPermissions,
-    ];
-    if args.read_only {
-        fuse_config.mount_options.push(fuser::MountOption::RO);
-    }
-    fuse_config.acl = fuser::SessionACL::All;
-    fuse_config.clone_fd = true;
-    fuse_config.n_threads = Some(std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).max(4));
+    match args.backend.as_str() {
+        "fuse" => {
+            let hf_fs = HfFs::new(
+                rt.handle().clone(),
+                hub_client,
+                args.bucket_id.clone(),
+                cache,
+                args.read_only,
+                uid,
+                gid,
+                args.poll_interval_secs,
+            );
 
-    // Mount (this blocks until unmount)
-    if let Err(e) = fuser::mount2(hf_fs, &args.mount_point, &fuse_config) {
-        error!("FUSE mount failed: {}", e);
-        std::process::exit(1);
+            let mut fuse_config = fuser::Config::default();
+            fuse_config.mount_options = vec![
+                fuser::MountOption::FSName("hf-mount".to_string()),
+                fuser::MountOption::DefaultPermissions,
+            ];
+            if args.read_only {
+                fuse_config.mount_options.push(fuser::MountOption::RO);
+            }
+            fuse_config.acl = fuser::SessionACL::All;
+            fuse_config.clone_fd = true;
+            fuse_config.n_threads = Some(std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).max(4));
+
+            if let Err(e) = fuser::mount2(hf_fs, &args.mount_point, &fuse_config) {
+                error!("FUSE mount failed: {}", e);
+                std::process::exit(1);
+            }
+        }
+        #[cfg(feature = "nfs")]
+        "nfs" => {
+            use hf_mount::vfs::HfVfsCore;
+
+            let vfs = Arc::new(HfVfsCore::new(
+                rt.handle().clone(),
+                hub_client,
+                args.bucket_id.clone(),
+                cache,
+                args.read_only,
+                uid,
+                gid,
+                args.poll_interval_secs,
+            ));
+
+            if let Err(e) = rt.block_on(hf_mount::nfs::mount_nfs(vfs, &args.mount_point)) {
+                error!("NFS mount failed: {}", e);
+                std::process::exit(1);
+            }
+        }
+        #[cfg(not(feature = "nfs"))]
+        "nfs" => {
+            error!("NFS backend requires building with --features nfs");
+            std::process::exit(1);
+        }
+        other => {
+            error!("Unknown backend: {other}. Use \"fuse\" or \"nfs\".");
+            std::process::exit(1);
+        }
     }
 
     info!("Unmounted cleanly");
