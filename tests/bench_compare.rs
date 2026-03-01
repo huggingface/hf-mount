@@ -156,7 +156,7 @@ async fn test_bench_compare() {
     common::create_bucket(ENDPOINT, &token, &bucket_id).await;
     eprintln!("Created bucket: {}", bucket_id);
 
-    let hub = std::sync::Arc::new(hf_mount::hub_api::HubApiClient::new(ENDPOINT, &token));
+    let hub = hf_mount::hub_api::HubApiClient::new(ENDPOINT, &token);
 
     // Generate and upload 50 MB test file
     let test_filename = format!("bench_{}.bin", std::process::id());

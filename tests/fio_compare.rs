@@ -160,7 +160,7 @@ async fn test_fio_compare() {
     common::create_bucket(ENDPOINT, &token, &bucket_id).await;
     eprintln!("Created bucket: {}", bucket_id);
 
-    let hub = std::sync::Arc::new(hf_mount::hub_api::HubApiClient::new(ENDPOINT, &token));
+    let hub = hf_mount::hub_api::HubApiClient::new(ENDPOINT, &token);
     let write_config = common::build_write_config(&hub, &bucket_id).await;
 
     // Upload files: 10x 1MB, 5x 10MB, 1x 100MB

@@ -23,7 +23,7 @@ async fn setup_bucket_with_file() -> Option<(String, String, Arc<hf_mount::hub_a
     common::create_bucket(ENDPOINT, &token, &bucket_id).await;
     eprintln!("Created bucket: {}", bucket_id);
 
-    let hub = Arc::new(hf_mount::hub_api::HubApiClient::new(ENDPOINT, &token));
+    let hub = hf_mount::hub_api::HubApiClient::new(ENDPOINT, &token);
 
     // Upload a test file via CAS
     let write_config = common::build_write_config(&hub, &bucket_id).await;

@@ -77,7 +77,7 @@ pub async fn build_write_config(
         .await
         .expect("get_cas_write_token failed");
 
-    let write_refresher = Arc::new(hf_mount::auth::HubWriteTokenRefresher::new(
+    let write_refresher = Arc::new(hf_mount::auth::HubTokenRefresher::for_write(
         hub.clone(),
         bucket_id.to_string(),
     ));

@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use reqwest::Client;
@@ -46,12 +47,12 @@ pub struct HubApiClient {
 }
 
 impl HubApiClient {
-    pub fn new(endpoint: &str, token: &str) -> Self {
-        Self {
+    pub fn new(endpoint: &str, token: &str) -> Arc<Self> {
+        Arc::new(Self {
             client: Client::new(),
             endpoint: endpoint.trim_end_matches('/').to_string(),
             token: token.to_string(),
-        }
+        })
     }
 
     /// List tree entries at the given prefix (follows `Link` header pagination).

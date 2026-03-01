@@ -27,16 +27,16 @@ impl FileCache {
         cache_dir: PathBuf,
         session: Arc<FileDownloadSession>,
         upload_config: Option<Arc<TranslatorConfig>>,
-    ) -> Self {
+    ) -> Arc<Self> {
         std::fs::create_dir_all(&cache_dir).ok();
         let staging_dir = cache_dir.join("staging");
         std::fs::create_dir_all(&staging_dir).ok();
-        Self {
+        Arc::new(Self {
             staging_dir,
             session,
             upload_config,
             session_key: rand_u64(),
-        }
+        })
     }
 
     /// Download a file directly to a destination path (for writable opens).
