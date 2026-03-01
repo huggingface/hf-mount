@@ -235,7 +235,7 @@ impl HfVfsCore {
         uid: u32,
         gid: u32,
         poll_interval_secs: u64,
-    ) -> Self {
+    ) -> Arc<Self> {
         let inodes = Arc::new(Mutex::new(InodeTable::new()));
         let neg_cache = Arc::new(Mutex::new(HashMap::new()));
 
@@ -284,7 +284,7 @@ impl HfVfsCore {
             None
         };
 
-        Self {
+        Arc::new(Self {
             rt,
             hub_client,
             bucket_id,
@@ -300,7 +300,7 @@ impl HfVfsCore {
             flush_handle: Mutex::new(flush_handle),
             poll_handle: Mutex::new(poll_handle),
             flush_errors,
-        }
+        })
     }
 
     /// Graceful shutdown: abort polling, drain flush queue, wait for completion.

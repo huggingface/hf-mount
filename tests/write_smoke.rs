@@ -22,7 +22,7 @@ async fn setup_bucket(suffix: &str) -> Option<(String, Arc<hf_mount::hub_api::Hu
     common::create_bucket(ENDPOINT, &token, &bucket_id).await;
     eprintln!("Created bucket: {}", bucket_id);
 
-    let hub = Arc::new(hf_mount::hub_api::HubApiClient::new(ENDPOINT, &token));
+    let hub = hf_mount::hub_api::HubApiClient::new(ENDPOINT, &token);
 
     Some((token, hub, bucket_id))
 }
@@ -159,7 +159,7 @@ async fn test_write_then_read_back_inner(
 
     let read_jwt = hub.get_cas_token(bucket_id).await?;
 
-    let read_refresher = Arc::new(hf_mount::auth::HubTokenRefresher::new(
+    let read_refresher = Arc::new(hf_mount::auth::HubTokenRefresher::for_read(
         hub.clone(),
         bucket_id.to_string(),
     ));
@@ -175,11 +175,7 @@ async fn test_write_then_read_back_inner(
     let download_session = data::FileDownloadSession::new(Arc::new(read_config), None, None).await?;
 
     let cache_dir = std::env::temp_dir().join("hf-mount-roundtrip-test");
-    let cache = Arc::new(hf_mount::cache::FileCache::new(
-        cache_dir.clone(),
-        download_session,
-        None,
-    ));
+    let cache = hf_mount::cache::FileCache::new(cache_dir.clone(), download_session, None);
 
     let test_content = "round-trip test content 🚀\nline 2\nline 3\n";
     let test_filename = format!("_test_roundtrip_{}.txt", std::process::id());

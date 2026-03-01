@@ -6,7 +6,7 @@ use data::FileDownloadSession;
 use data::data_client::default_config;
 use tracing::{error, info};
 
-use hf_mount::auth::{HubTokenRefresher, HubWriteTokenRefresher};
+use hf_mount::auth::HubTokenRefresher;
 use hf_mount::cache::FileCache;
 use hf_mount::caching_client::CachingClient;
 use hf_mount::fs::HfFs;
@@ -86,29 +86,11 @@ fn main() {
         .build()
         .expect("Failed to create tokio runtime");
 
-    let hub_client = Arc::new(HubApiClient::new(&args.hub_endpoint, &args.hf_token));
+    let hub_client = HubApiClient::new(&args.hub_endpoint, &args.hf_token);
 
-    // Get initial CAS read JWT
-    let cas_jwt = rt
-        .block_on(hub_client.get_cas_token(&args.bucket_id))
-        .expect("Failed to get CAS token");
-
-    info!("Got CAS token for endpoint: {}", cas_jwt.cas_url);
-
-    // Build read token refresher
-    let refresher = Arc::new(HubTokenRefresher::new(hub_client.clone(), args.bucket_id.clone()));
-
-    // Build read TranslatorConfig
-    let read_config = default_config(
-        cas_jwt.cas_url.clone(),
-        None,
-        Some((cas_jwt.access_token, cas_jwt.exp)),
-        Some(refresher),
-        None,
-    )
-    .expect("Failed to build TranslatorConfig");
-
-    let read_config = Arc::new(read_config);
+    // Build read CAS config
+    let read_refresher = Arc::new(HubTokenRefresher::for_read(hub_client.clone(), args.bucket_id.clone()));
+    let read_config = Arc::new(build_cas_config(&rt, &read_refresher, "read"));
 
     // Create on-disk xorb chunk cache for cross-file deduplication.
     let xorb_cache = {
@@ -123,36 +105,20 @@ fn main() {
     let raw_client = rt
         .block_on(data::create_remote_client(&read_config, "hf-mount", false))
         .expect("Failed to create CAS client");
-    let caching_client = Arc::new(CachingClient::new(raw_client));
+    let caching_client = CachingClient::new(raw_client);
 
     let download_session = FileDownloadSession::from_client(caching_client, None, Some(xorb_cache));
 
-    // Create upload config if not read-only
+    // Build write CAS config (if not read-only)
     let upload_config = if !args.read_only {
-        let write_jwt = rt
-            .block_on(hub_client.get_cas_write_token(&args.bucket_id))
-            .expect("Failed to get CAS write token");
-
-        info!("Got CAS write token for endpoint: {}", write_jwt.cas_url);
-
-        let write_refresher = Arc::new(HubWriteTokenRefresher::new(hub_client.clone(), args.bucket_id.clone()));
-
-        let write_config = default_config(
-            write_jwt.cas_url,
-            None,
-            Some((write_jwt.access_token, write_jwt.exp)),
-            Some(write_refresher),
-            None,
-        )
-        .expect("Failed to build write TranslatorConfig");
-
-        Some(Arc::new(write_config))
+        let write_refresher = Arc::new(HubTokenRefresher::for_write(hub_client.clone(), args.bucket_id.clone()));
+        Some(Arc::new(build_cas_config(&rt, &write_refresher, "write")))
     } else {
         None
     };
 
     // Create file cache
-    let cache = Arc::new(FileCache::new(args.cache_dir, download_session, upload_config));
+    let cache = FileCache::new(args.cache_dir, download_session, upload_config);
 
     // Determine uid/gid
     let uid = args.uid.unwrap_or_else(|| unsafe { libc::getuid() });
@@ -206,7 +172,7 @@ fn main() {
         "nfs" => {
             use hf_mount::vfs::HfVfsCore;
 
-            let vfs = Arc::new(HfVfsCore::new(
+            let vfs = HfVfsCore::new(
                 rt.handle().clone(),
                 hub_client,
                 args.bucket_id.clone(),
@@ -215,7 +181,7 @@ fn main() {
                 uid,
                 gid,
                 args.poll_interval_secs,
-            ));
+            );
 
             if let Err(e) = rt.block_on(hf_mount::nfs::mount_nfs(vfs, &args.mount_point)) {
                 error!("NFS mount failed: {}", e);
@@ -234,4 +200,23 @@ fn main() {
     }
 
     info!("Unmounted cleanly");
+}
+
+fn build_cas_config(
+    rt: &tokio::runtime::Runtime,
+    refresher: &Arc<HubTokenRefresher>,
+    label: &str,
+) -> data::configurations::TranslatorConfig {
+    let jwt = rt.block_on(refresher.fetch_initial()).unwrap_or_else(|e| {
+        panic!("Failed to get CAS {label} token: {e}");
+    });
+    info!("Got CAS {label} token for endpoint: {}", jwt.cas_url);
+    default_config(
+        jwt.cas_url,
+        None,
+        Some((jwt.access_token, jwt.exp)),
+        Some(refresher.clone()),
+        None,
+    )
+    .unwrap_or_else(|e| panic!("Failed to build {label} TranslatorConfig: {e}"))
 }

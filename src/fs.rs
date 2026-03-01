@@ -32,7 +32,7 @@ impl HfFs {
         poll_interval_secs: u64,
     ) -> Self {
         Self {
-            vfs: Arc::new(HfVfsCore::new(
+            vfs: HfVfsCore::new(
                 rt,
                 hub_client,
                 bucket_id,
@@ -41,7 +41,7 @@ impl HfFs {
                 uid,
                 gid,
                 poll_interval_secs,
-            )),
+            ),
         }
     }
 }

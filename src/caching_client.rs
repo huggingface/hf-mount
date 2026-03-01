@@ -25,11 +25,11 @@ pub struct CachingClient {
 }
 
 impl CachingClient {
-    pub fn new(inner: Arc<dyn Client>) -> Self {
-        Self {
+    pub fn new(inner: Arc<dyn Client>) -> Arc<Self> {
+        Arc::new(Self {
             inner,
             cache: Mutex::new(HashMap::new()),
-        }
+        })
     }
 }
 
