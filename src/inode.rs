@@ -147,6 +147,15 @@ impl InodeTable {
         self.path_to_inode.insert(path, inode);
     }
 
+    /// Return inodes of all dirty files.
+    pub fn dirty_inos(&self) -> Vec<u64> {
+        self.inodes
+            .values()
+            .filter(|e| e.kind == InodeKind::File && e.dirty)
+            .map(|e| e.inode)
+            .collect()
+    }
+
     /// Snapshot of all file entries: (ino, full_path, xet_hash, size, dirty)
     pub fn file_snapshot(&self) -> Vec<(u64, String, Option<String>, u64, bool)> {
         self.inodes

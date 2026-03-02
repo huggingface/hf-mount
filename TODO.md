@@ -16,7 +16,7 @@
 
 ## Cleanup
 
-- [ ] `CachedXetClient`: `CacheKey` uses `Option<FileRange>` because that's the `Client` trait signature, but `None` (full file) and `Some(0..size)` are semantically equivalent — could normalize the key
+- [x] `CachedXetClient`: `CacheKey` uses `Option<FileRange>` because the `Client` trait signature from xet-core takes `bytes_range: Option<FileRange>`. `None` = full file, `Some(range)` = partial range. This design is intentional and matches the upstream trait.
 
 ## TO CHECK
 

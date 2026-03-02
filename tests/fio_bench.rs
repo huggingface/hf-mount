@@ -3,56 +3,117 @@ mod common;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const ENDPOINT: &str = "https://huggingface.co";
+fn run_fio_suite(mount_point: &str) {
+    run_fio(
+        mount_point,
+        "seq-read-100M",
+        &[
+            "--filename",
+            "large_0.bin",
+            "--rw",
+            "read",
+            "--bs",
+            "128k",
+            "--ioengine",
+            "sync",
+            "--output-format",
+            "normal",
+        ],
+    );
 
-fn run_fio(mount_point: &str, job_name: &str, extra_args: &[&str]) {
-    eprintln!("\n--- fio: {} ---", job_name);
-    let output = Command::new("fio")
-        .args([
-            "--name",
-            job_name,
-            "--directory",
-            mount_point,
-            "--readonly",
-            "--minimal",
-        ])
-        .args(extra_args)
-        .output()
-        .expect("Failed to run fio");
+    run_fio(
+        mount_point,
+        "seq-reread-100M",
+        &[
+            "--filename",
+            "large_0.bin",
+            "--rw",
+            "read",
+            "--bs",
+            "128k",
+            "--ioengine",
+            "sync",
+            "--output-format",
+            "normal",
+        ],
+    );
 
-    // Print human-readable output
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    if !stderr.is_empty() {
-        eprintln!("{}", stderr);
-    }
-    if !stdout.is_empty() {
-        eprintln!("{}", stdout);
-    }
+    run_fio(
+        mount_point,
+        "rand-read-4k",
+        &[
+            "--filename",
+            "large_0.bin",
+            "--rw",
+            "randread",
+            "--bs",
+            "4k",
+            "--ioengine",
+            "sync",
+            "--runtime",
+            "10",
+            "--time_based",
+            "--output-format",
+            "normal",
+        ],
+    );
+
+    run_fio(
+        mount_point,
+        "seq-read-5x10M",
+        &[
+            "--filename",
+            "medium_0.bin:medium_1.bin:medium_2.bin:medium_3.bin:medium_4.bin",
+            "--rw",
+            "read",
+            "--bs",
+            "128k",
+            "--ioengine",
+            "sync",
+            "--output-format",
+            "normal",
+        ],
+    );
+
+    run_fio(
+        mount_point,
+        "rand-read-small",
+        &[
+            "--filename",
+            "small_0.bin:small_1.bin:small_2.bin:small_3.bin:small_4.bin:small_5.bin:small_6.bin:small_7.bin:small_8.bin:small_9.bin",
+            "--rw",
+            "randread",
+            "--bs",
+            "4k",
+            "--ioengine",
+            "sync",
+            "--runtime",
+            "10",
+            "--time_based",
+            "--output-format",
+            "normal",
+        ],
+    );
 }
 
 #[tokio::test]
-async fn test_fio_bench() {
-    let token = match std::env::var("HF_TOKEN") {
-        Ok(t) => t,
-        Err(_) => {
-            eprintln!("Skipping: HF_TOKEN not set");
-            return;
-        }
+async fn test_fio_compare() {
+    // Check fio is installed
+    if Command::new("fio").arg("--version").output().is_err() {
+        eprintln!("Skipping: fio not installed");
+        return;
+    }
+
+    let (token, bucket_id, hub) = match common::setup_bucket("fio-cmp").await {
+        Some(cfg) => cfg,
+        None => return,
     };
 
+    let write_config = common::build_write_config(&hub).await;
+
+    // Upload files: 10x 1MB, 5x 10MB, 1x 100MB
     let pid = std::process::id();
-    let username = common::whoami(ENDPOINT, &token).await;
-    let bucket_id = format!("{}/hf-mount-fio-{}", username, pid);
-
-    common::create_bucket(ENDPOINT, &token, &bucket_id).await;
-    eprintln!("Created bucket: {}", bucket_id);
-
-    let hub = hf_mount::hub_api::HubApiClient::new(ENDPOINT, &token);
-    let write_config = common::build_write_config(&hub, &bucket_id).await;
-
-    // Upload files of various sizes: 10x 1MB, 5x 10MB, 1x 100MB
-    let tmp_dir = std::env::temp_dir().join(format!("hf-fio-setup-{}", pid));
+    let tmp_dir = std::env::temp_dir().join(format!("hf-fio-cmp-setup-{}", pid));
     std::fs::create_dir_all(&tmp_dir).ok();
 
     let mut batch_ops = Vec::new();
@@ -92,123 +153,74 @@ async fn test_fio_bench() {
         });
     }
 
-    hub.batch_operations(&bucket_id, &batch_ops)
-        .await
-        .expect("batch add failed");
+    hub.batch_operations(&batch_ops).await.expect("batch add failed");
     eprintln!("All files committed to bucket");
 
     std::fs::remove_dir_all(&tmp_dir).ok();
 
-    let mount_point = format!("/tmp/hf-fio-mount-{}", pid);
-    let cache_dir = format!("/tmp/hf-fio-cache-{}", pid);
+    // --- FUSE fio ---
+    let fuse_mount = format!("/tmp/hf-fio-cmp-fuse-{}", pid);
+    let fuse_cache = format!("/tmp/hf-fio-cmp-fuse-cache-{}", pid);
 
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let child = common::mount_bucket(&bucket_id, &mount_point, &cache_dir, &["--read-only"]);
+    eprintln!("\n============================================================");
+    eprintln!("  FUSE — fio benchmarks");
+    eprintln!("============================================================");
 
-        // 1. Sequential read of the large file
-        run_fio(
-            &mount_point,
-            "seq-read-large",
-            &[
-                "--filename",
-                "large_0.bin",
-                "--rw",
-                "read",
-                "--bs",
-                "128k",
-                "--ioengine",
-                "sync",
-                "--output-format",
-                "normal",
-            ],
-        );
-
-        // 2. Sequential re-read (xorb cache hot)
-        run_fio(
-            &mount_point,
-            "seq-reread-large",
-            &[
-                "--filename",
-                "large_0.bin",
-                "--rw",
-                "read",
-                "--bs",
-                "128k",
-                "--ioengine",
-                "sync",
-                "--output-format",
-                "normal",
-            ],
-        );
-
-        // 3. Random read 4K on large file
-        run_fio(
-            &mount_point,
-            "rand-read-4k",
-            &[
-                "--filename",
-                "large_0.bin",
-                "--rw",
-                "randread",
-                "--bs",
-                "4k",
-                "--ioengine",
-                "sync",
-                "--runtime",
-                "10",
-                "--time_based",
-                "--output-format",
-                "normal",
-            ],
-        );
-
-        // 4. Sequential read of multiple medium files
-        run_fio(
-            &mount_point,
-            "seq-read-medium",
-            &[
-                "--filename",
-                "medium_0.bin:medium_1.bin:medium_2.bin:medium_3.bin:medium_4.bin",
-                "--rw",
-                "read",
-                "--bs",
-                "128k",
-                "--ioengine",
-                "sync",
-                "--output-format",
-                "normal",
-            ],
-        );
-
-        // 5. Random read across small files
-        run_fio(
-            &mount_point,
-            "rand-read-small",
-            &[
-                "--filename",
-                "small_0.bin:small_1.bin:small_2.bin:small_3.bin:small_4.bin:small_5.bin:small_6.bin:small_7.bin:small_8.bin:small_9.bin",
-                "--rw",
-                "randread",
-                "--bs",
-                "4k",
-                "--ioengine",
-                "sync",
-                "--runtime",
-                "10",
-                "--time_based",
-                "--output-format",
-                "normal",
-            ],
-        );
-
-        common::unmount(&mount_point, child, 5);
+    let fuse_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let child = common::mount_bucket(&bucket_id, &fuse_mount, &fuse_cache, &["--read-only"]);
+        run_fio_suite(&fuse_mount);
+        common::unmount(&fuse_mount, child, 5);
     }));
 
-    common::delete_bucket(ENDPOINT, &token, &bucket_id).await;
-    std::fs::remove_dir_all(&mount_point).ok();
-    std::fs::remove_dir_all(&cache_dir).ok();
+    std::fs::remove_dir_all(&fuse_mount).ok();
+    std::fs::remove_dir_all(&fuse_cache).ok();
 
-    if let Err(e) = result {
+    // --- NFS fio ---
+    let nfs_mount = format!("/tmp/hf-fio-cmp-nfs-{}", pid);
+    let nfs_cache = format!("/tmp/hf-fio-cmp-nfs-cache-{}", pid);
+
+    eprintln!("\n============================================================");
+    eprintln!("  NFS — fio benchmarks");
+    eprintln!("============================================================");
+
+    let nfs_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let child = common::mount_bucket(&bucket_id, &nfs_mount, &nfs_cache, &["--backend=nfs", "--read-only"]);
+        run_fio_suite(&nfs_mount);
+        common::unmount_nfs(&nfs_mount, child, 5);
+    }));
+
+    std::fs::remove_dir_all(&nfs_mount).ok();
+    std::fs::remove_dir_all(&nfs_cache).ok();
+
+    // Cleanup
+    common::delete_bucket(common::ENDPOINT, &token, &bucket_id).await;
+
+    if let Err(e) = fuse_result {
         std::panic::resume_unwind(e);
+    }
+    if let Err(e) = nfs_result {
+        std::panic::resume_unwind(e);
+    }
+
+    eprintln!("\n============================================================");
+    eprintln!("  fio comparison complete");
+    eprintln!("============================================================");
+}
+
+fn run_fio(mount_point: &str, job_name: &str, extra_args: &[&str]) {
+    eprintln!("\n--- fio: {} ---", job_name);
+    let output = Command::new("fio")
+        .args(["--name", job_name, "--directory", mount_point, "--readonly"])
+        .args(extra_args)
+        .output()
+        .expect("Failed to run fio");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !stderr.is_empty() {
+        eprintln!("{}", stderr);
+    }
+    if !stdout.is_empty() {
+        eprintln!("{}", stdout);
     }
 }

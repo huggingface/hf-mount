@@ -3,6 +3,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use utils::auth::{TokenInfo, TokenRefresher};
+use utils::errors::AuthError;
 
 use crate::error::{Error, Result};
 
@@ -44,24 +46,30 @@ pub struct HubApiClient {
     client: Client,
     endpoint: String,
     token: String,
+    bucket_id: String,
 }
 
 impl HubApiClient {
-    pub fn new(endpoint: &str, token: &str) -> Arc<Self> {
+    pub fn new(endpoint: &str, token: &str, bucket_id: &str) -> Arc<Self> {
         Arc::new(Self {
             client: Client::new(),
             endpoint: endpoint.trim_end_matches('/').to_string(),
             token: token.to_string(),
+            bucket_id: bucket_id.to_string(),
         })
     }
 
+    pub fn bucket_id(&self) -> &str {
+        &self.bucket_id
+    }
+
     /// List tree entries at the given prefix (follows `Link` header pagination).
-    pub async fn list_tree(&self, bucket_id: &str, prefix: &str) -> Result<Vec<TreeEntry>> {
+    pub async fn list_tree(&self, prefix: &str) -> Result<Vec<TreeEntry>> {
         let mut all_entries = Vec::new();
         let mut url = if prefix.is_empty() {
-            format!("{}/api/buckets/{}/tree", self.endpoint, bucket_id)
+            format!("{}/api/buckets/{}/tree", self.endpoint, self.bucket_id)
         } else {
-            format!("{}/api/buckets/{}/tree/{}", self.endpoint, bucket_id, prefix)
+            format!("{}/api/buckets/{}/tree/{}", self.endpoint, self.bucket_id, prefix)
         };
 
         loop {
@@ -95,8 +103,8 @@ impl HubApiClient {
     }
 
     /// Get a CAS read token for the bucket.
-    pub async fn get_cas_token(&self, bucket_id: &str) -> Result<CasTokenInfo> {
-        let url = format!("{}/api/buckets/{}/xet-read-token", self.endpoint, bucket_id);
+    pub async fn get_cas_token(&self) -> Result<CasTokenInfo> {
+        let url = format!("{}/api/buckets/{}/xet-read-token", self.endpoint, self.bucket_id);
 
         let resp = self.client.get(&url).bearer_auth(&self.token).send().await?;
 
@@ -113,8 +121,8 @@ impl HubApiClient {
     }
 
     /// Get a CAS write token for the bucket.
-    pub async fn get_cas_write_token(&self, bucket_id: &str) -> Result<CasTokenInfo> {
-        let url = format!("{}/api/buckets/{}/xet-write-token", self.endpoint, bucket_id);
+    pub async fn get_cas_write_token(&self) -> Result<CasTokenInfo> {
+        let url = format!("{}/api/buckets/{}/xet-write-token", self.endpoint, self.bucket_id);
 
         let resp = self.client.get(&url).bearer_auth(&self.token).send().await?;
 
@@ -131,8 +139,8 @@ impl HubApiClient {
     }
 
     /// Execute batch operations (add/delete files) on the bucket.
-    pub async fn batch_operations(&self, bucket_id: &str, ops: &[BatchOp]) -> Result<()> {
-        let url = format!("{}/api/buckets/{}/batch", self.endpoint, bucket_id);
+    pub async fn batch_operations(&self, ops: &[BatchOp]) -> Result<()> {
+        let url = format!("{}/api/buckets/{}/batch", self.endpoint, self.bucket_id);
 
         // Build NDJSON body
         let mut body = String::new();
@@ -161,6 +169,16 @@ impl HubApiClient {
         Ok(())
     }
 
+    /// Create a token refresher for this bucket.
+    /// Uses a write token when `read_only` is false (write tokens can also read).
+    pub fn token_refresher(self: &Arc<Self>, read_only: bool) -> Arc<HubTokenRefresher> {
+        let kind = if read_only { TokenKind::Read } else { TokenKind::Write };
+        Arc::new(HubTokenRefresher {
+            hub_client: self.clone(),
+            kind,
+        })
+    }
+
     pub fn mtime_from_str(s: &str) -> SystemTime {
         chrono::DateTime::parse_from_rfc3339(s)
             .map(|dt: chrono::DateTime<chrono::FixedOffset>| {
@@ -183,6 +201,39 @@ fn parse_link_next(header: &str) -> Option<String> {
         }
     }
     None
+}
+
+// ── Token refresh ─────────────────────────────────────────────────────
+
+#[derive(Clone, Copy)]
+enum TokenKind {
+    Read,
+    Write,
+}
+
+pub struct HubTokenRefresher {
+    hub_client: Arc<HubApiClient>,
+    kind: TokenKind,
+}
+
+impl HubTokenRefresher {
+    pub async fn fetch_initial(&self) -> Result<CasTokenInfo> {
+        match self.kind {
+            TokenKind::Read => self.hub_client.get_cas_token().await,
+            TokenKind::Write => self.hub_client.get_cas_write_token().await,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl TokenRefresher for HubTokenRefresher {
+    async fn refresh(&self) -> std::result::Result<TokenInfo, AuthError> {
+        let jwt = self
+            .fetch_initial()
+            .await
+            .map_err(|e| AuthError::TokenRefreshFailure(e.to_string()))?;
+        Ok((jwt.access_token, jwt.exp))
+    }
 }
 
 #[cfg(test)]

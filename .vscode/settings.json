@@ -2,5 +2,6 @@
   "editor.formatOnSave": true,
   "[rust]": {
     "editor.defaultFormatter": "rust-lang.rust-analyzer"
-  }
+  },
+  "rust-analyzer.cargo.features": ["nfs"]
 }
