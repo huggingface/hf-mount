@@ -141,7 +141,10 @@ fn main() {
 
     match args.backend.as_str() {
         "fuse" => {
-            let fuse_adapter = FuseAdapter::new(
+            use hf_mount::virtual_fs::VirtualFs;
+            use std::time::Duration;
+
+            let virtual_fs = VirtualFs::new(
                 runtime.handle().clone(),
                 hub_client,
                 staging,
@@ -149,6 +152,12 @@ fn main() {
                 uid,
                 gid,
                 args.poll_interval_secs,
+            );
+
+            let fuse_adapter = FuseAdapter::new(
+                runtime.handle().clone(),
+                virtual_fs.clone(),
+                Duration::from_secs(args.poll_interval_secs),
             );
 
             let mut fuse_config = fuser::Config::default();
@@ -163,10 +172,27 @@ fn main() {
             fuse_config.clone_fd = true;
             fuse_config.n_threads = Some(args.max_threads);
 
-            if let Err(e) = fuser::mount2(fuse_adapter, &args.mount_point, &fuse_config) {
-                error!("FUSE mount failed: {}", e);
-                std::process::exit(1);
-            }
+            let session = match fuser::Session::new(fuse_adapter, &args.mount_point, &fuse_config) {
+                Ok(s) => s,
+                Err(e) => {
+                    error!("FUSE session failed: {}", e);
+                    std::process::exit(1);
+                }
+            };
+            let notifier = session.notifier();
+            virtual_fs.set_invalidator(Box::new(move |ino| {
+                if let Err(e) = notifier.inval_inode(fuser::INodeNo(ino), 0, -1) {
+                    tracing::debug!("inval_inode({}) failed: {}", ino, e);
+                }
+            }));
+            let bg = match session.spawn() {
+                Ok(bg) => bg,
+                Err(e) => {
+                    error!("FUSE spawn failed: {}", e);
+                    std::process::exit(1);
+                }
+            };
+            let _ = bg.join();
         }
         #[cfg(feature = "nfs")]
         "nfs" => {

@@ -181,9 +181,9 @@ impl HubApiClient {
 
     pub fn mtime_from_str(s: &str) -> SystemTime {
         chrono::DateTime::parse_from_rfc3339(s)
-            .map(|dt: chrono::DateTime<chrono::FixedOffset>| {
-                UNIX_EPOCH + std::time::Duration::from_secs(dt.timestamp() as u64)
-            })
+            .ok()
+            .and_then(|dt| u64::try_from(dt.timestamp()).ok())
+            .map(|secs| UNIX_EPOCH + std::time::Duration::from_secs(secs))
             .unwrap_or(UNIX_EPOCH)
     }
 }

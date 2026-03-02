@@ -27,28 +27,23 @@ impl NFSAdapter {
         }
     }
 
-    /// Get or open a file handle from the pool. Called from blocking context.
-    /// Takes Arcs so it can be called from inside `spawn_blocking`.
-    fn get_or_open_handle(
-        virtual_fs: &VirtualFs,
-        handle_pool: &Mutex<HandlePool>,
-        ino: u64,
-    ) -> Result<u64, nfsstat3> {
+    /// Get or open a file handle from the pool.
+    async fn get_or_open_handle(&self, ino: u64) -> Result<u64, nfsstat3> {
         // Check pool first (quick lock)
-        if let Some(file_handle) = handle_pool.lock().unwrap().get(ino) {
+        if let Some(file_handle) = self.handle_pool.lock().expect("handle_pool poisoned").get(ino) {
             return Ok(file_handle);
         }
-        // Pool miss: open file (may block on download)
-        let (file_handle, _direct_io) = virtual_fs.open(ino, false, false).map_err(errno_to_nfs)?;
+        // Pool miss: open file (may await download)
+        let (file_handle, _direct_io) = self.virtual_fs.open(ino, false, false).await.map_err(errno_to_nfs)?;
         // Insert into pool
-        let mut pool = handle_pool.lock().unwrap();
-        // Double-check: another thread may have opened it concurrently
+        let mut pool = self.handle_pool.lock().expect("handle_pool poisoned");
+        // Double-check: another task may have opened it concurrently
         if let Some(existing) = pool.get(ino) {
-            virtual_fs.release(ino, file_handle);
+            self.virtual_fs.release(file_handle);
             return Ok(existing);
         }
-        if let Some((evicted_ino, evicted_handle)) = pool.insert(ino, file_handle) {
-            virtual_fs.release(evicted_ino, evicted_handle);
+        if let Some((_evicted_ino, evicted_handle)) = pool.insert(ino, file_handle) {
+            self.virtual_fs.release(evicted_handle);
         }
         Ok(file_handle)
     }
@@ -65,37 +60,21 @@ impl NFSFileSystem for NFSAdapter {
     }
 
     async fn lookup(&self, dirid: fileid3, filename: &filename3) -> Result<fileid3, nfsstat3> {
-        let name = std::str::from_utf8(&filename.0)
-            .map_err(|_| nfsstat3::NFS3ERR_NOENT)?
-            .to_string();
-        let virtual_fs = self.virtual_fs.clone();
-        tokio::task::spawn_blocking(move || virtual_fs.lookup(dirid, &name).map(|a| a.ino).map_err(errno_to_nfs))
-            .await
-            .map_err(|_| nfsstat3::NFS3ERR_SERVERFAULT)?
+        let name = std::str::from_utf8(&filename.0).map_err(|_| nfsstat3::NFS3ERR_NOENT)?;
+        self.virtual_fs.lookup(dirid, name).await.map(|a| a.ino).map_err(errno_to_nfs)
     }
 
     async fn getattr(&self, id: fileid3) -> Result<fattr3, nfsstat3> {
-        let virtual_fs = self.virtual_fs.clone();
-        tokio::task::spawn_blocking(move || {
-            virtual_fs
-                .getattr(id)
-                .map(|a| vfs_attr_to_nfs(&a))
-                .map_err(errno_to_nfs)
-        })
-        .await
-        .map_err(|_| nfsstat3::NFS3ERR_SERVERFAULT)?
+        self.virtual_fs.getattr(id).map(|a| vfs_attr_to_nfs(&a)).map_err(errno_to_nfs)
     }
 
     async fn read(&self, id: fileid3, offset: u64, count: u32) -> Result<(Vec<u8>, bool), nfsstat3> {
-        let virtual_fs = self.virtual_fs.clone();
-        let pool = self.handle_pool.clone();
-        tokio::task::spawn_blocking(move || {
-            let file_handle = Self::get_or_open_handle(&virtual_fs, &pool, id)?;
-            let (data, eof) = virtual_fs.read(file_handle, offset, count).map_err(errno_to_nfs)?;
-            Ok((data, eof))
-        })
-        .await
-        .map_err(|_| nfsstat3::NFS3ERR_SERVERFAULT)?
+        let file_handle = self.get_or_open_handle(id).await?;
+        self.virtual_fs
+            .read(file_handle, offset, count)
+            .await
+            .map(|(b, eof)| (b.to_vec(), eof))
+            .map_err(errno_to_nfs)
     }
 
     async fn readdir(
@@ -104,38 +83,34 @@ impl NFSFileSystem for NFSAdapter {
         start_after: fileid3,
         max_entries: usize,
     ) -> Result<ReadDirResult, nfsstat3> {
-        let virtual_fs = self.virtual_fs.clone();
-        tokio::task::spawn_blocking(move || {
-            let entries = virtual_fs.readdir(dirid).map_err(errno_to_nfs)?;
-            let skip = if start_after > 0 {
-                entries
-                    .iter()
-                    .position(|e| e.ino == start_after)
-                    .map(|i| i + 1)
-                    .unwrap_or(0)
-            } else {
-                0
-            };
-            let page: Vec<DirEntry> = entries[skip..]
+        let entries = self.virtual_fs.readdir(dirid).await.map_err(errno_to_nfs)?;
+        let skip = if start_after > 0 {
+            entries
                 .iter()
-                .take(max_entries)
-                .map(|e| {
-                    let attr = virtual_fs
-                        .getattr(e.ino)
-                        .map(|a| vfs_attr_to_nfs(&a))
-                        .unwrap_or_default();
-                    DirEntry {
-                        fileid: e.ino,
-                        name: e.name.clone().into_bytes().into(),
-                        attr,
-                    }
-                })
-                .collect();
-            let end = skip + page.len() >= entries.len();
-            Ok(ReadDirResult { entries: page, end })
-        })
-        .await
-        .map_err(|_| nfsstat3::NFS3ERR_SERVERFAULT)?
+                .position(|e| e.ino == start_after)
+                .map(|i| i + 1)
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        let page: Vec<DirEntry> = entries[skip..]
+            .iter()
+            .take(max_entries)
+            .map(|e| {
+                let attr = self
+                    .virtual_fs
+                    .getattr(e.ino)
+                    .map(|a| vfs_attr_to_nfs(&a))
+                    .unwrap_or_default();
+                DirEntry {
+                    fileid: e.ino,
+                    name: e.name.clone().into_bytes().into(),
+                    attr,
+                }
+            })
+            .collect();
+        let end = skip + page.len() >= entries.len();
+        Ok(ReadDirResult { entries: page, end })
     }
 
     // ── Read-only stubs ────────────────────────────────────────────────

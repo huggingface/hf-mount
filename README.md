@@ -16,41 +16,34 @@ Mount [Hugging Face Buckets](https://huggingface.co/docs/hub/buckets) as a local
 
 ```mermaid
 graph TD
-    subgraph Clients
-        APP[Application]
-    end
+    APP["<b>Application</b><br/><i>read · write · ls</i>"]
 
-    subgraph "hf-mount"
-        FUSE["fs.rs<br/>FUSE Adapter"]
-        NFS["nfs.rs<br/>NFS Adapter"]
-        VFS["vfs.rs<br/>HfVfsCore"]
-        INODE["inode.rs<br/>Inode Table"]
-        CACHE["cache.rs<br/>File Cache & Staging"]
-        HUB["hub_api.rs<br/>Hub API Client"]
-        AUTH["auth.rs<br/>Token Refresh"]
-        CC["caching_client.rs<br/>CAS Client + Cache"]
-    end
+    APP --> FUSE & NFS
 
-    subgraph "Hugging Face"
-        HUB_API["Hub API"]
-        CAS["CAS Storage<br/>(xet-core)"]
-    end
+    FUSE["<b>fuse.rs</b><br/>FUSE Adapter"]
+    NFS["<b>nfs.rs</b><br/>NFS v3 Adapter"]
 
-    APP -->|"mount"| FUSE
-    APP -->|"mount"| NFS
-    FUSE --> VFS
-    NFS --> VFS
-    VFS --> INODE
-    VFS --> CACHE
-    VFS --> CC
-    VFS --> HUB
-    HUB --> HUB_API
-    CACHE --> CAS
-    CC --> CAS
-    AUTH --> HUB_API
-    VFS -->|"poll_remote_changes"| HUB
-    VFS -->|"flush_loop"| CACHE
-    VFS -->|"flush_loop"| HUB
+    FUSE & NFS --> VFS
+
+    VFS["<b>virtual_fs.rs</b><br/>VirtualFs"]
+
+    VFS --> INODE["<b>inode.rs</b><br/>InodeTable"]
+    VFS --> PREFETCH["<b>prefetch.rs</b><br/>PrefetchState"]
+    VFS --> FLUSH["<b>flush.rs</b><br/>FlushManager"]
+
+    PREFETCH --> STAGING
+    FLUSH --> STAGING
+    FLUSH --> HUB
+
+    STAGING["<b>staging.rs</b><br/>FileStaging"]
+    HUB["<b>hub_api.rs</b><br/>Hub API Client"]
+
+    STAGING --> CC["<b>cached_xet_client.rs</b><br/>CAS Client + Cache"]
+
+    HUB --> HUB_API["Hub API"]
+    CC --> CAS["CAS Storage<br/><i>xet-core</i>"]
+
+    VFS -.->|"poll loop"| HUB
 ```
 
 ### Data flow
@@ -58,31 +51,39 @@ graph TD
 ```mermaid
 sequenceDiagram
     participant App
-    participant VFS as HfVfsCore
-    participant Prefetch as PrefetchState
+    participant VFS as VirtualFs
+    participant PF as PrefetchState
+    participant Staging as FileStaging
     participant CAS as CAS Storage
     participant Hub as Hub API
 
-    Note over App,Hub: Read path
+    Note over App,Hub: Read path (lazy)
+    App->>VFS: open(ino)
+    VFS-->>App: file handle (no I/O yet)
     App->>VFS: read(fh, offset, size)
-    VFS->>Prefetch: check buffer
-    alt Cache hit
-        Prefetch-->>VFS: buffered data
-    else Cache miss
-        Prefetch->>CAS: download range
-        CAS-->>Prefetch: data
-        Prefetch-->>VFS: data
-    end
-    VFS-->>App: bytes
+    VFS->>PF: prepare_fetch(offset, size)
+    PF-->>VFS: FetchPlan{strategy, fetch_size}
 
-    Note over App,Hub: Write path
+    alt Buffer hit
+        VFS-->>App: buffered data
+    else Stream / Range download
+        VFS->>Staging: download range
+        Staging->>CAS: GET range
+        CAS-->>Staging: bytes
+        Staging-->>VFS: data
+        VFS->>PF: store_fetched(chunks)
+        VFS-->>App: bytes
+    end
+
+    Note over App,Hub: Write path (async flush)
     App->>VFS: write(ino, fh, offset, data)
-    VFS->>VFS: write to staging file
-    App->>VFS: flush(ino)
-    VFS->>VFS: mark dirty, enqueue flush
+    VFS->>Staging: pwrite to staging file
+    App->>VFS: close(fh)
+    VFS->>VFS: enqueue flush(ino)
     Note over VFS: debounce 2s / max 30s
-    VFS->>CAS: upload_files (batch)
-    VFS->>Hub: batch_operations (metadata)
+    VFS->>Staging: upload_files (batch)
+    Staging->>CAS: PUT files
+    VFS->>Hub: batch_operations (commit)
 ```
 
 ## Installation
@@ -123,9 +124,11 @@ hf-mount \
 | `--hf-token` | *required* | HF API token (or `HF_TOKEN` env var) |
 | `--hub-endpoint` | `https://huggingface.co` | Hub API endpoint |
 | `--cache-dir` | `/tmp/hf-mount-cache` | Local cache directory |
-| `--backend` | `fuse` | `fuse` or `nfs` |
+| `--cache-size` | `10000000000` | Max size in bytes for the on-disk xorb chunk cache |
+| `--backend` | `fuse` | `fuse` or `nfs` (NFS requires `--features nfs`) |
 | `--read-only` | `false` | Mount read-only |
 | `--poll-interval-secs` | `30` | Remote change polling interval (0 to disable) |
+| `--max-threads` | `16` | Maximum number of FUSE threads |
 | `--uid` | current user | UID for mounted files |
 | `--gid` | current group | GID for mounted files |
 
@@ -160,22 +163,14 @@ RUST_LOG=hf_mount=debug hf-mount ...
 
 ## Benchmarks
 
-Cold read performance on a 100 MB file (m5.xlarge, us-east-1):
+50 MB file, m5.xlarge, us-east-1:
 
-| Backend | Throughput | vs mountpoint-s3 |
-|---------|-----------|-------------------|
-| **hf-mount FUSE** | **333 MB/s** | 1.9x faster |
-| **hf-mount NFS** | **175 MB/s** | 1.0x |
-| mountpoint-s3 | 171 MB/s | baseline |
-
-Multi-file sequential reads (5 x 10 MB):
-
-| Backend | Throughput |
-|---------|-----------|
-| **hf-mount FUSE** | **243 MB/s** |
-| **hf-mount NFS** | **130 MB/s** |
-
-*Benchmarks averaged over 3 runs with cache cleared between each run.*
+| Metric | FUSE | NFS |
+|--------|------|-----|
+| Sequential read (cold) | 175 MB/s | 170 MB/s |
+| Sequential re-read (cached) | 1.6 GB/s | 1.5 GB/s |
+| Range read (1 MB @ 25 MB) | 0.7 ms | 0.4 ms |
+| Random reads (100 x 4 KB) | < 0.1 ms | 0.1 ms |
 
 ## Testing
 
@@ -184,10 +179,12 @@ Multi-file sequential reads (5 x 10 MB):
 cargo test
 
 # Integration tests (require HF_TOKEN and network)
-HF_TOKEN=... cargo test --test smoke
-HF_TOKEN=... cargo test --test fuse_ops
-HF_TOKEN=... cargo test --test write_smoke
-HF_TOKEN=... cargo test --test nfs_smoke --features nfs
+HF_TOKEN=... cargo test --release --test fuse_ops
+HF_TOKEN=... cargo test --release --test nfs_ops --features nfs
+
+# Benchmarks
+HF_TOKEN=... cargo test --release --test bench --features nfs
+HF_TOKEN=... cargo test --release --test fio_bench --features nfs
 ```
 
 ## License

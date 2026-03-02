@@ -41,7 +41,7 @@ impl Client for CachedXetClient {
         let key = (*file_id, bytes_range);
 
         {
-            let cache = self.cache.lock().unwrap();
+            let cache = self.cache.lock().expect("cache poisoned");
             if let Some(response) = cache.get(&key) {
                 debug!("reconstruction cache hit for {file_id}");
                 return Ok(Some(response.clone()));
@@ -51,7 +51,7 @@ impl Client for CachedXetClient {
         let result = self.inner.get_reconstruction(file_id, bytes_range).await?;
 
         if let Some(ref response) = result {
-            let mut cache = self.cache.lock().unwrap();
+            let mut cache = self.cache.lock().expect("cache poisoned");
             if cache.len() >= MAX_CACHE_ENTRIES {
                 cache.clear();
             }

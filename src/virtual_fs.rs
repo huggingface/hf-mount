@@ -3,224 +3,54 @@ use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use data::{DownloadStream, XetFileInfo};
-use tokio::sync::mpsc;
+use bytes::{Bytes, BytesMut};
+use data::XetFileInfo;
 use tracing::{debug, error, info, warn};
 
-use crate::staging::FileStaging;
 use crate::hub_api::{BatchOp, HubApiClient};
 use crate::inode::{InodeEntry, InodeKind, InodeTable};
-
-// ── VFS types ──────────────────────────────────────────────────────────
-
-pub type VirtualFsError = i32;
-pub type VirtualFsResult<T> = std::result::Result<T, VirtualFsError>;
-
-pub struct VirtualFsAttr {
-    pub ino: u64,
-    pub size: u64,
-    pub blocks: u64,
-    pub mtime: SystemTime,
-    pub kind: InodeKind,
-    pub perm: u16,
-    pub nlink: u32,
-    pub uid: u32,
-    pub gid: u32,
-}
-
-pub struct VirtualFsDirEntry {
-    pub ino: u64,
-    pub kind: InodeKind,
-    pub name: String,
-}
+use crate::prefetch::PrefetchState;
+use crate::staging::FileStaging;
 
 // ── Constants ──────────────────────────────────────────────────────────
 
+/// Block size reported in stat(2) for `st_blocks` calculation.
 const BLOCK_SIZE: u32 = 512;
-const DEBOUNCE_DURATION: Duration = Duration::from_secs(2);
-const MAX_BATCH_WINDOW: Duration = Duration::from_secs(30);
+/// Maximum entries in the negative-lookup cache (parent_path/name → Instant).
+/// Prevents repeated Hub API calls for paths known to not exist.
 const NEG_CACHE_CAPACITY: usize = 10_000;
+/// How long a negative-cache entry stays valid before being re-checked.
 const NEG_CACHE_TTL: Duration = Duration::from_secs(30);
-
-// Prefetch buffer constants
-const INITIAL_WINDOW: u64 = 8 * 1_048_576; // 8 MiB
-const MAX_WINDOW: u64 = 128 * 1_048_576; // 128 MiB
-const SEEK_WINDOW: usize = 1_048_576; // 1 MiB backward seek buffer
-const FORWARD_SKIP: u64 = 16 * 1_048_576; // 16 MiB skip without reset
-
-// ── Internal types ─────────────────────────────────────────────────────
-
-/// An open file handle — either a local fd or a lazy remote reference.
-enum OpenFile {
-    /// Local file (staging for writes, or dirty reads).
-    Local { file: Arc<File>, writable: bool },
-    /// Lazy remote — data fetched on-demand with adaptive prefetch buffer.
-    Lazy { prefetch: Arc<Mutex<PrefetchState>> },
-}
-
-/// What to do in read() after releasing the open_files lock.
-enum ReadTarget {
-    /// Hold an Arc<File> so the FD stays alive even if release() runs concurrently.
-    LocalFd(Arc<File>),
-    Remote {
-        prefetch: Arc<Mutex<PrefetchState>>,
-    },
-}
-
-/// Wraps `Arc<Mutex<Vec<u8>>>` to implement `Write + Send + 'static`
-/// for use with `FileDownloadSession::download_to_writer`.
-struct SharedBufWriter(Arc<Mutex<Vec<u8>>>);
-
-impl Write for SharedBufWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap_or_else(|e| e.into_inner()).extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-/// Per-file-handle prefetch state with adaptive window sizing.
-struct PrefetchState {
-    xet_hash: String,
-    file_size: u64,
-    // Forward buffer: bytes [buf_start .. buf_start + data.len())
-    data: Vec<u8>,
-    buf_start: u64,
-    // Backward seek window: bytes [seek_start .. seek_start + seek_data.len())
-    seek_data: VecDeque<u8>,
-    seek_start: u64,
-    // Adaptive window size
-    window_size: u64,
-    // Full-file stream for sequential reads (reuses one FileReconstructor)
-    stream: Option<DownloadStream>,
-}
-
-impl PrefetchState {
-    fn new(xet_hash: String, file_size: u64) -> Self {
-        Self {
-            xet_hash,
-            file_size,
-            data: Vec::new(),
-            buf_start: 0,
-            seek_data: VecDeque::new(),
-            seek_start: 0,
-            window_size: INITIAL_WINDOW,
-            stream: None,
-        }
-    }
-
-    /// Try to serve a read from the forward buffer.
-    /// Returns the slice if the requested range is fully contained.
-    fn try_serve_forward(&self, offset: u64, size: u32) -> Option<&[u8]> {
-        if self.data.is_empty() {
-            return None;
-        }
-        let buf_end = self.buf_start + self.data.len() as u64;
-        if offset >= self.buf_start && offset < buf_end {
-            let local_off = (offset - self.buf_start) as usize;
-            let avail = self.data.len() - local_off;
-            let to_read = (size as usize).min(avail);
-            Some(&self.data[local_off..local_off + to_read])
-        } else {
-            None
-        }
-    }
-
-    /// Try to serve a read from the backward seek window.
-    fn try_serve_seek(&mut self, offset: u64, size: u32) -> Option<&[u8]> {
-        if self.seek_data.is_empty() {
-            return None;
-        }
-        let seek_end = self.seek_start + self.seek_data.len() as u64;
-        if offset >= self.seek_start && offset < seek_end {
-            let local_off = (offset - self.seek_start) as usize;
-            let avail = self.seek_data.len() - local_off;
-            let to_read = (size as usize).min(avail);
-            let slice = self.seek_data.make_contiguous();
-            Some(&slice[local_off..local_off + to_read])
-        } else {
-            None
-        }
-    }
-
-    /// Move consumed bytes from the front of the forward buffer into the seek window.
-    fn drain_to_seek(&mut self, consumed: usize) {
-        if consumed == 0 {
-            return;
-        }
-        let to_move = consumed.min(self.data.len());
-        // Only append to seek window if contiguous with forward buffer
-        let seek_end = self.seek_start + self.seek_data.len() as u64;
-        if self.seek_data.is_empty() || seek_end == self.buf_start {
-            if to_move > SEEK_WINDOW {
-                // Fast path: only copy the last SEEK_WINDOW bytes instead of all
-                // to_move bytes (which can be up to 128 MiB).
-                let copy_start = to_move - SEEK_WINDOW;
-                self.seek_data.clear();
-                self.seek_start = self.buf_start + copy_start as u64;
-                self.seek_data.extend(&self.data[copy_start..to_move]);
-            } else {
-                self.seek_data.extend(&self.data[..to_move]);
-                if self.seek_data.len() > SEEK_WINDOW {
-                    let excess = self.seek_data.len() - SEEK_WINDOW;
-                    drop(self.seek_data.drain(..excess));
-                    self.seek_start += excess as u64;
-                }
-            }
-        } else {
-            // Gap between seek window and forward buffer — reset seek window
-            let keep = to_move.min(SEEK_WINDOW);
-            self.seek_data.clear();
-            self.seek_data.extend(&self.data[to_move - keep..to_move]);
-            self.seek_start = self.buf_start + (to_move - keep) as u64;
-        }
-        // Remove consumed bytes from forward buffer
-        if to_move == self.data.len() {
-            self.data.clear();
-        } else {
-            self.data.drain(..to_move);
-        }
-        self.buf_start += to_move as u64;
-    }
-}
-
-/// A request to flush a dirty file to CAS + bucket.
-/// Only carries the inode number; full_path and staging_path are resolved
-/// at flush time from the inode table to handle renames/unlinks correctly.
-struct FlushRequest {
-    ino: u64,
-}
 
 // ── VirtualFs ──────────────────────────────────────────────────────────
 
 pub struct VirtualFs {
     runtime: tokio::runtime::Handle,
     hub_client: Arc<HubApiClient>,
-    staging: Arc<FileStaging>,
+    file_staging: Arc<FileStaging>,
     read_only: bool,
-    inodes: Arc<Mutex<InodeTable>>,
+    inode_table: Arc<RwLock<InodeTable>>,
     /// Maps file_handle → OpenFile (local fd or lazy remote reference).
-    open_files: Mutex<HashMap<u64, OpenFile>>,
-    next_file_handle: Mutex<u64>,
+    open_files: RwLock<HashMap<u64, OpenFile>>,
+    next_file_handle: AtomicU64,
     uid: u32,
     gid: u32,
     /// Negative lookup cache: paths known to not exist (TTL-based).
-    neg_cache: Arc<Mutex<HashMap<String, Instant>>>,
-    /// Channel to send dirty files for debounced batch flush.
-    flush_tx: Mutex<Option<mpsc::UnboundedSender<FlushRequest>>>,
-    /// Handle to the background flush task, used for graceful shutdown.
-    flush_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
-    /// Handle to the background polling task, used for graceful shutdown.
+    negative_cache: Arc<RwLock<HashMap<String, Instant>>>,
+    /// Per-inode locks for staging file preparation (prevents concurrent open races).
+    staging_locks: Mutex<HashMap<u64, Arc<tokio::sync::Mutex<()>>>>,
+    /// Debounced batch flush pipeline (None when read_only).
+    flush_manager: Option<crate::flush::FlushManager>,
+    /// Background poll task handle, taken in shutdown().
     poll_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
-    /// Per-inode flush errors reported by the background flush loop.
-    /// Checked and cleared by flush to propagate errors to the application.
-    flush_errors: Arc<Mutex<HashMap<u64, String>>>,
+    /// Kernel cache invalidation callback. Set via `set_invalidator()` after mount.
+    /// The poll loop calls this to actively invalidate stale inodes when remote changes
+    /// are detected, allowing the kernel page cache to be used instead of DIRECT_IO.
+    invalidator: Arc<Mutex<Option<Box<dyn Fn(u64) + Send + Sync>>>>,
 }
 
 impl VirtualFs {
@@ -228,37 +58,34 @@ impl VirtualFs {
     pub fn new(
         runtime: tokio::runtime::Handle,
         hub_client: Arc<HubApiClient>,
-        staging: Arc<FileStaging>,
+        file_staging: Arc<FileStaging>,
         read_only: bool,
         uid: u32,
         gid: u32,
         poll_interval_secs: u64,
     ) -> Arc<Self> {
-        let inodes = Arc::new(Mutex::new(InodeTable::new()));
-        let neg_cache = Arc::new(Mutex::new(HashMap::new()));
+        let inodes = Arc::new(RwLock::new(InodeTable::new()));
+        let negative_cache = Arc::new(RwLock::new(HashMap::new()));
 
-        let flush_errors = Arc::new(Mutex::new(HashMap::new()));
-
-        let (flush_tx, flush_handle) = if !read_only {
-            let (tx, rx) = mpsc::unbounded_channel::<FlushRequest>();
-            let bg_staging = staging.clone();
-            let bg_hub = hub_client.clone();
-            let bg_inodes = inodes.clone();
-            let bg_flush_errors = flush_errors.clone();
-
-            let handle = runtime.spawn(Self::flush_loop(rx, bg_staging, bg_hub, bg_inodes, bg_flush_errors));
-
-            (Some(tx), Some(handle))
+        let flush_manager = if !read_only {
+            Some(crate::flush::FlushManager::new(
+                file_staging.clone(),
+                hub_client.clone(),
+                inodes.clone(),
+                &runtime,
+            ))
         } else {
-            (None, None)
+            None
         };
 
         // Spawn remote change polling task (if interval > 0)
+        let invalidator: Arc<Mutex<Option<Box<dyn Fn(u64) + Send + Sync>>>> = Arc::new(Mutex::new(None));
         let poll_handle = if poll_interval_secs > 0 {
             let bg_hub = hub_client.clone();
             let bg_inodes = inodes.clone();
-            let bg_staging = staging.clone();
-            let bg_neg_cache = neg_cache.clone();
+            let bg_staging = file_staging.clone();
+            let bg_neg_cache = negative_cache.clone();
+            let bg_invalidator = invalidator.clone();
             let interval = Duration::from_secs(poll_interval_secs);
 
             Some(runtime.spawn(Self::poll_remote_changes(
@@ -266,6 +93,7 @@ impl VirtualFs {
                 bg_inodes,
                 bg_staging,
                 bg_neg_cache,
+                bg_invalidator,
                 interval,
             )))
         } else {
@@ -275,234 +103,51 @@ impl VirtualFs {
         Arc::new(Self {
             runtime,
             hub_client,
-            staging,
+            file_staging,
             read_only,
-            inodes,
-            open_files: Mutex::new(HashMap::new()),
-            next_file_handle: Mutex::new(1),
+            inode_table: inodes,
+            open_files: RwLock::new(HashMap::new()),
+            next_file_handle: AtomicU64::new(1),
             uid,
             gid,
-            neg_cache,
-            flush_tx: Mutex::new(flush_tx),
-            flush_handle: Mutex::new(flush_handle),
+            negative_cache,
+            staging_locks: Mutex::new(HashMap::new()),
+            flush_manager,
             poll_handle: Mutex::new(poll_handle),
-            flush_errors,
+            invalidator,
         })
+    }
+
+    /// Set the kernel cache invalidation callback. Called after mount setup
+    /// so the poll loop can actively invalidate stale inodes on remote changes.
+    pub fn set_invalidator(&self, f: Box<dyn Fn(u64) + Send + Sync>) {
+        *self.invalidator.lock().expect("invalidator poisoned") = Some(f);
     }
 
     /// Graceful shutdown: abort polling, drain flush queue, wait for completion.
     pub fn shutdown(&self) {
         info!("Shutting down VFS, flushing pending writes...");
         // Abort the polling task.
-        if let Some(handle) = self.poll_handle.lock().unwrap().take() {
+        if let Some(handle) = self.poll_handle.lock().expect("poll_handle poisoned").take() {
             handle.abort();
         }
-        // Enqueue all dirty files that may not have received a release() yet.
-        // FUSE does not guarantee release() is called for every open handle before destroy().
-        {
-            let dirty = self.inodes.lock().unwrap().dirty_inos();
-            if let Some(tx) = self.flush_tx.lock().unwrap().as_ref() {
-                for ino in dirty {
-                    let _ = tx.send(FlushRequest { ino });
-                }
-            }
-        }
-        // Drop the sender to signal the flush loop to drain and exit.
-        self.flush_tx.lock().unwrap().take();
-        // Wait for the flush task to complete (processes remaining items).
-        if let Some(handle) = self.flush_handle.lock().unwrap().take()
-            && let Err(e) = self.runtime.block_on(handle)
-        {
-            error!("Flush task panicked: {}", e);
+        // Flush all dirty files that may not have received a release() yet.
+        if let Some(fm) = &self.flush_manager {
+            let dirty = self.inode_table.read().expect("inodes poisoned").dirty_inos();
+            fm.shutdown(dirty, &self.runtime);
         }
         info!("Flush loop finished, VFS shut down.");
     }
 
     // ── Background tasks ───────────────────────────────────────────────
 
-    /// Background task: accumulates flush requests with debounce,
-    /// then uploads all files in a single session + single batch call.
-    async fn flush_loop(
-        mut rx: mpsc::UnboundedReceiver<FlushRequest>,
-        staging: Arc<FileStaging>,
-        hub_client: Arc<HubApiClient>,
-        inodes: Arc<Mutex<InodeTable>>,
-        flush_errors: Arc<Mutex<HashMap<u64, String>>>,
-    ) {
-        loop {
-            // Wait for the first request
-            let first = match rx.recv().await {
-                Some(req) => req,
-                None => return, // channel closed, exit
-            };
-
-            let mut pending = vec![first];
-
-            // Debounce: keep collecting for DEBOUNCE_DURATION after each new item,
-            // but cap total wait at MAX_BATCH_WINDOW to avoid unbounded delay.
-            let window_deadline = tokio::time::Instant::now() + MAX_BATCH_WINDOW;
-            loop {
-                let remaining = window_deadline.saturating_duration_since(tokio::time::Instant::now());
-                if remaining.is_zero() {
-                    break;
-                }
-                let timeout = DEBOUNCE_DURATION.min(remaining);
-                match tokio::time::timeout(timeout, rx.recv()).await {
-                    Ok(Some(req)) => pending.push(req),
-                    _ => break, // timeout (debounce expired) or channel closed
-                }
-            }
-
-            let count = pending.len();
-            info!("Flushing batch of {} dirty file(s)", count);
-
-            Self::flush_batch(pending, &staging, &hub_client, &inodes, &flush_errors).await;
-        }
-    }
-
-    /// Upload a batch of files in a single session, then commit via a single /batch call.
-    /// Resolves paths from the inode table at flush time (handles renames/unlinks).
-    async fn flush_batch(
-        pending: Vec<FlushRequest>,
-        staging: &FileStaging,
-        hub_client: &HubApiClient,
-        inodes: &Mutex<InodeTable>,
-        flush_errors: &Mutex<HashMap<u64, String>>,
-    ) {
-        // Dedup by inode (keep last request per ino)
-        let mut seen = std::collections::HashSet::new();
-        let deduped: Vec<u64> = pending
-            .into_iter()
-            .rev()
-            .filter(|r| seen.insert(r.ino))
-            .map(|r| r.ino)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect();
-
-        debug!("flush_batch: deduped inos = {:?}", deduped);
-
-        // Resolve paths from inode table, skip deleted/non-dirty inodes
-        let to_flush: Vec<(u64, String, PathBuf, Vec<String>)> = {
-            let inode_table = inodes.lock().unwrap();
-            deduped
-                .into_iter()
-                .filter_map(|ino| {
-                    let entry = match inode_table.get(ino) {
-                        Some(e) => e,
-                        None => {
-                            debug!("flush: ino={} not found in inode table, skipping", ino);
-                            return None;
-                        }
-                    };
-                    if !entry.dirty {
-                        debug!("flush: ino={} path={} not dirty, skipping", ino, entry.full_path);
-                        return None;
-                    }
-                    let staging_path = staging.staging_path(ino);
-                    if !staging_path.exists() {
-                        error!("Staging file missing for ino={} path={}, skipping", ino, entry.full_path);
-                        return None;
-                    }
-                    Some((
-                        ino,
-                        entry.full_path.clone(),
-                        staging_path,
-                        entry.pending_deletes.clone(),
-                    ))
-                })
-                .collect()
-        };
-
-        if to_flush.is_empty() {
-            return;
-        }
-
-        // Upload all files through a single upload session
-        let staging_paths: Vec<&std::path::Path> = to_flush.iter().map(|(_, _, p, _)| p.as_path()).collect();
-        let upload_results = match staging.upload_files(&staging_paths).await {
-            Ok(results) => results,
-            Err(e) => {
-                error!("Batch upload failed: {}", e);
-                let msg = format!("upload failed: {e}");
-                let mut errs = flush_errors.lock().unwrap();
-                for (ino, _, _, _) in &to_flush {
-                    errs.insert(*ino, msg.clone());
-                }
-                return;
-            }
-        };
-
-        let mtime_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-
-        // Build batch operations — Hub API requires all adds before all deletes
-        let mut ops = Vec::with_capacity(to_flush.len());
-        let mut delete_ops = Vec::new();
-        let mut successes: Vec<(u64, String, u64)> = Vec::new();
-
-        for ((ino, full_path, _, pending_deletes), file_info) in to_flush.iter().zip(upload_results.iter()) {
-            info!(
-                "Uploaded file ino={} path={} xet_hash={} size={}",
-                ino,
-                full_path,
-                file_info.hash(),
-                file_info.file_size()
-            );
-
-            ops.push(BatchOp::AddFile {
-                path: full_path.clone(),
-                xet_hash: file_info.hash().to_string(),
-                mtime: mtime_ms,
-                content_type: None,
-            });
-
-            // Delete old remote paths left behind by rename of dirty files
-            for old_path in pending_deletes {
-                delete_ops.push(BatchOp::DeleteFile { path: old_path.clone() });
-            }
-
-            successes.push((*ino, file_info.hash().to_string(), file_info.file_size()));
-        }
-
-        ops.append(&mut delete_ops);
-
-        // Single batch commit
-        if let Err(e) = hub_client.batch_operations(&ops).await {
-            error!("Batch commit failed: {}", e);
-            let msg = format!("commit failed: {e}");
-            let mut errs = flush_errors.lock().unwrap();
-            for (ino, _, _, _) in &to_flush {
-                errs.insert(*ino, msg.clone());
-            }
-            return;
-        }
-
-        // Update inodes
-        let mut inode_table = inodes.lock().unwrap();
-        let now = SystemTime::now();
-        for (ino, xet_hash, size) in successes {
-            if let Some(entry) = inode_table.get_mut(ino) {
-                entry.xet_hash = Some(xet_hash);
-                entry.size = size;
-                entry.dirty = false;
-                entry.mtime = now;
-                entry.pending_deletes.clear();
-            }
-        }
-
-        info!("Batch flush completed: {} file(s) committed", to_flush.len());
-    }
-
     /// Background task: polls Hub API tree listing to detect remote changes.
     async fn poll_remote_changes(
         hub_client: Arc<HubApiClient>,
-        inodes: Arc<Mutex<InodeTable>>,
+        inodes: Arc<RwLock<InodeTable>>,
         staging: Arc<FileStaging>,
-        neg_cache: Arc<Mutex<HashMap<String, Instant>>>,
+        negative_cache: Arc<RwLock<HashMap<String, Instant>>>,
+        invalidator: Arc<Mutex<Option<Box<dyn Fn(u64) + Send + Sync>>>>,
         interval: Duration,
     ) {
         loop {
@@ -523,7 +168,7 @@ impl VirtualFs {
                 .collect();
 
             // Take snapshot under lock, then release to avoid blocking VFS ops
-            let snapshot = inodes.lock().unwrap().file_snapshot();
+            let snapshot = inodes.read().expect("inodes poisoned").file_snapshot();
 
             // Phase 1: Compute diff (no lock held)
             struct Update {
@@ -536,6 +181,7 @@ impl VirtualFs {
             let mut deletions = Vec::new();
 
             for (ino, path, local_hash, local_size, is_dirty) in &snapshot {
+                // Skip locally-modified files: local writes take precedence until flushed.
                 if *is_dirty {
                     continue;
                 }
@@ -568,12 +214,15 @@ impl VirtualFs {
                 }
             }
 
-            // Phase 2: Apply mutations under lock
+            // Phase 2: Apply mutations under lock, collect inodes to invalidate
+            let mut inos_to_invalidate: Vec<u64> = Vec::new();
+            let dirs_to_invalidate_kernel: Vec<u64>;
             {
-                let mut inode_table = inodes.lock().unwrap();
+                let mut inode_table = inodes.write().expect("inodes poisoned");
 
-                for upd in updates {
-                    inode_table.update_remote_file(upd.ino, upd.hash, upd.size, upd.mtime);
+                for update in &updates {
+                    inode_table.update_remote_file(update.ino, update.hash.clone(), update.size, update.mtime);
+                    inos_to_invalidate.push(update.ino);
                 }
 
                 for ino in &deletions {
@@ -581,13 +230,14 @@ impl VirtualFs {
                 }
 
                 // Phase 3: New remote files → invalidate parent dir + negative cache
-                // Walk up the path to find the nearest existing ancestor directory
-                // and invalidate it so the next readdir/lookup discovers the new entries.
+                // New remote files: instead of creating inodes directly, invalidate the
+                // nearest known ancestor directory so the next readdir/lookup discovers them.
+                // We walk up the path because intermediate dirs may not exist locally either
+                // (e.g. remote has "a/b/c/file.txt" but we only know "a/" → invalidate "a/").
                 let mut dirs_to_invalidate = HashSet::new();
                 let mut dir_paths_to_invalidate = Vec::new();
                 for path in remote_map.keys() {
                     if inode_table.get_by_path(path).is_none() {
-                        // Walk up to find the nearest existing ancestor directory
                         let mut ancestor = path.as_str();
                         loop {
                             ancestor = match ancestor.rsplit_once('/') {
@@ -611,13 +261,16 @@ impl VirtualFs {
                     }
                 }
 
-                for dir_ino in dirs_to_invalidate {
-                    inode_table.invalidate_children(dir_ino);
+                // Clear cached children so next readdir re-fetches from Hub API,
+                // then invalidate kernel page cache (done outside lock).
+                dirs_to_invalidate_kernel = dirs_to_invalidate.into_iter().collect();
+                for dir_ino in &dirs_to_invalidate_kernel {
+                    inode_table.invalidate_children(*dir_ino);
                 }
 
                 // Invalidate negative cache entries under changed directories
                 if !dir_paths_to_invalidate.is_empty() {
-                    let mut nc = neg_cache.lock().unwrap();
+                    let mut nc = negative_cache.write().expect("neg_cache poisoned");
                     for dir_path in &dir_paths_to_invalidate {
                         let prefix = if dir_path.is_empty() {
                             String::new()
@@ -632,6 +285,16 @@ impl VirtualFs {
                             }
                         });
                     }
+                }
+            }
+
+            // Phase 4: Invalidate kernel page cache (outside lock scope)
+            if let Some(invalidate) = invalidator.lock().expect("invalidator poisoned").as_ref() {
+                for ino in &inos_to_invalidate {
+                    invalidate(*ino);
+                }
+                for dir_ino in &dirs_to_invalidate_kernel {
+                    invalidate(*dir_ino);
                 }
             }
 
@@ -678,30 +341,40 @@ impl VirtualFs {
     }
 
     /// Ensure children of a directory inode are loaded from the Hub API.
-    fn ensure_children_loaded(&self, parent_ino: u64) {
+    /// Fetch remote children for `parent_ino` if not already loaded.
+    /// Returns ENOENT if the inode doesn't exist, ENOTDIR if it's not a directory.
+    async fn ensure_children_loaded(&self, parent_ino: u64) -> VirtualFsResult<()> {
         let prefix = {
-            let inodes = self.inodes.lock().unwrap();
+            let inodes = self.inode_table.read().expect("inodes poisoned");
             match inodes.get(parent_ino) {
-                Some(e) if !e.children_loaded && e.kind == InodeKind::Directory => e.full_path.clone(),
-                _ => return,
+                Some(e) if e.kind != InodeKind::Directory => return Err(libc::ENOTDIR),
+                Some(e) if e.children_loaded => return Ok(()),
+                Some(e) => e.full_path.clone(),
+                None => return Err(libc::ENOENT),
             }
         };
 
-        let hub = self.hub_client.clone();
-
-        let entries = match self.runtime.block_on(hub.list_tree(&prefix)) {
+        let entries = match self.hub_client.list_tree(&prefix).await {
             Ok(entries) => entries,
             Err(e) => {
                 error!("Failed to list tree for prefix '{}': {}", prefix, e);
-                return;
+                return Err(libc::EIO);
             }
         };
 
-        let mut inodes = self.inodes.lock().unwrap();
-
+        let mut inodes = self.inode_table.write().expect("inodes poisoned");
+        // Re-check: another task may have loaded children while we were fetching.
+        match inodes.get(parent_ino) {
+            Some(e) if e.children_loaded => return Ok(()),
+            Some(e) if e.kind != InodeKind::Directory => return Err(libc::ENOTDIR),
+            None => return Err(libc::ENOENT),
+            _ => {}
+        }
         let mut seen_dirs: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         for entry in entries {
+            // Convert absolute bucket path to path relative to current directory.
+            // e.g. prefix="models" → "models/bert/config.json" → "bert/config.json"
             let rel_path = if prefix.is_empty() {
                 entry.path.as_str()
             } else {
@@ -713,6 +386,7 @@ impl VirtualFs {
             };
 
             if let Some(slash_pos) = rel_path.find('/') {
+                // Nested path → create the immediate subdirectory only (lazy-loaded later)
                 let dir_name = &rel_path[..slash_pos];
                 if seen_dirs.insert(dir_name.to_string()) {
                     let dir_full_path = if prefix.is_empty() {
@@ -758,23 +432,32 @@ impl VirtualFs {
         if let Some(parent) = inodes.get_mut(parent_ino) {
             parent.children_loaded = true;
         }
+        Ok(())
     }
 
     pub fn alloc_file_handle(&self) -> u64 {
-        let mut file_handle = self.next_file_handle.lock().unwrap();
-        let val = *file_handle;
-        *file_handle += 1;
-        val
+        self.next_file_handle.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Get or create a per-inode lock for staging file preparation.
+    fn staging_lock(&self, ino: u64) -> Arc<tokio::sync::Mutex<()>> {
+        self.staging_locks
+            .lock()
+            .expect("staging_locks poisoned")
+            .entry(ino)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
     }
 
     /// Open a local file as read-only and return the file handle.
-    fn open_local_readonly(&self, path: &PathBuf) -> VirtualFsResult<u64> {
+    fn open_local_readonly(&self, ino: u64, path: &PathBuf) -> VirtualFsResult<u64> {
         match File::open(path) {
             Ok(file) => {
                 let file_handle = self.alloc_file_handle();
-                self.open_files.lock().unwrap().insert(
+                self.open_files.write().expect("open_files poisoned").insert(
                     file_handle,
                     OpenFile::Local {
+                        ino,
                         file: Arc::new(file),
                         writable: false,
                     },
@@ -789,19 +472,19 @@ impl VirtualFs {
     }
 
     /// Check if a path is in the negative cache (and not expired).
-    fn neg_cache_check(&self, path: &str) -> bool {
-        let cache = self.neg_cache.lock().unwrap();
+    fn negative_cache_check(&self, path: &str) -> bool {
+        let cache = self.negative_cache.read().expect("negative_cache poisoned");
         matches!(cache.get(path), Some(inserted) if inserted.elapsed() < NEG_CACHE_TTL)
     }
 
     /// Remove a path from the negative cache (e.g. after create/rename).
-    fn neg_cache_remove(&self, path: &str) {
-        self.neg_cache.lock().unwrap().remove(path);
+    fn negative_cache_remove(&self, path: &str) {
+        self.negative_cache.write().expect("neg_cache poisoned").remove(path);
     }
 
     /// Insert a path into the negative cache, evicting if at capacity.
-    fn neg_cache_insert(&self, path: String) {
-        let mut cache = self.neg_cache.lock().unwrap();
+    fn negative_cache_insert(&self, path: String) {
+        let mut cache = self.negative_cache.write().expect("neg_cache poisoned");
         let now = Instant::now();
         if cache.len() >= NEG_CACHE_CAPACITY {
             // Evict expired entries first
@@ -816,52 +499,62 @@ impl VirtualFs {
         cache.insert(path, now);
     }
 
-    /// Enqueue a dirty file for debounced batch flush.
-    fn enqueue_flush(&self, ino: u64) {
-        if let Some(tx) = self.flush_tx.lock().unwrap().as_ref()
-            && tx.send(FlushRequest { ino }).is_err()
-        {
-            error!("Flush channel closed, cannot enqueue ino={}", ino);
-        }
-    }
-
     // ── VFS operations ─────────────────────────────────────────────────
 
-    pub fn lookup(&self, parent: u64, name: &str) -> VirtualFsResult<VirtualFsAttr> {
+    pub async fn lookup(&self, parent: u64, name: &str) -> VirtualFsResult<VirtualFsAttr> {
         debug!("lookup: parent={}, name={}", parent, name);
 
-        // Build full path and check negative cache under a single inode lock
-        let (full_path, needs_load) = {
-            let inodes = self.inodes.lock().unwrap();
-            let parent_entry = match inodes.get(parent) {
-                Some(e) => e,
+        // Fast path: children already loaded → lookup directly, no allocation needed.
+        {
+            let inodes = self.inode_table.read().expect("inodes poisoned");
+            let parent_entry = inodes.get(parent).ok_or(libc::ENOENT)?;
+
+            if parent_entry.kind != InodeKind::Directory {
+                return Err(libc::ENOTDIR);
+            }
+
+            if parent_entry.children_loaded {
+                if let Some(entry) = inodes.lookup_child(parent, name) {
+                    return Ok(self.make_vfs_attr(entry));
+                }
+                // Children loaded but child absent → cache miss, return ENOENT.
+                // Clone path and drop inode lock before taking neg cache write lock.
+                let parent_path = parent_entry.full_path.clone();
+                drop(inodes);
+
+                let full_path = if parent_path.is_empty() {
+                    name.to_string()
+                } else {
+                    format!("{}/{}", parent_path, name)
+                };
+                self.negative_cache_insert(full_path);
+                return Err(libc::ENOENT);
+            }
+        }
+
+        // Slow path: children not loaded yet, fetch from Hub API.
+        let full_path = {
+            let inodes = self.inode_table.read().expect("inodes poisoned");
+            match inodes.get(parent) {
+                Some(e) if e.full_path.is_empty() => name.to_string(),
+                Some(e) => format!("{}/{}", e.full_path, name),
                 None => return Err(libc::ENOENT),
-            };
-            let fp = if parent_entry.full_path.is_empty() {
-                name.to_string()
-            } else {
-                format!("{}/{}", parent_entry.full_path, name)
-            };
-            let needs_load = !parent_entry.children_loaded && parent_entry.kind == InodeKind::Directory;
-            (fp, needs_load)
+            }
         };
 
-        // Check negative cache
-        if self.neg_cache_check(&full_path) {
+        if self.negative_cache_check(&full_path) {
             debug!("negative cache hit: {}", full_path);
             return Err(libc::ENOENT);
         }
 
-        if needs_load {
-            self.ensure_children_loaded(parent);
-        }
+        self.ensure_children_loaded(parent).await?;
 
-        let inodes = self.inodes.lock().unwrap();
+        let inodes = self.inode_table.read().expect("inodes poisoned");
         match inodes.lookup_child(parent, name) {
             Some(entry) => Ok(self.make_vfs_attr(entry)),
             None => {
                 drop(inodes);
-                self.neg_cache_insert(full_path);
+                self.negative_cache_insert(full_path);
                 Err(libc::ENOENT)
             }
         }
@@ -870,25 +563,22 @@ impl VirtualFs {
     pub fn getattr(&self, ino: u64) -> VirtualFsResult<VirtualFsAttr> {
         debug!("getattr: ino={}", ino);
 
-        let inodes = self.inodes.lock().unwrap();
+        let inodes = self.inode_table.read().expect("inodes poisoned");
         match inodes.get(ino) {
             Some(entry) => Ok(self.make_vfs_attr(entry)),
             None => Err(libc::ENOENT),
         }
     }
 
-    pub fn readdir(&self, ino: u64) -> VirtualFsResult<Vec<VirtualFsDirEntry>> {
+    pub async fn readdir(&self, ino: u64) -> VirtualFsResult<Vec<VirtualFsDirEntry>> {
         debug!("readdir: ino={}", ino);
 
-        self.ensure_children_loaded(ino);
+        self.ensure_children_loaded(ino).await?;
 
-        let inodes = self.inodes.lock().unwrap();
-        let entry = match inodes.get(ino) {
-            Some(e) => e,
-            None => return Err(libc::ENOENT),
-        };
+        let inodes = self.inode_table.read().expect("inodes poisoned");
+        let entry = inodes.get(ino).ok_or(libc::ENOENT)?;
 
-        let mut entries = Vec::new();
+        let mut entries = Vec::with_capacity(2 + entry.children.len());
         entries.push(VirtualFsDirEntry {
             ino,
             kind: InodeKind::Directory,
@@ -913,124 +603,134 @@ impl VirtualFs {
         Ok(entries)
     }
 
-    pub fn open(&self, ino: u64, writable: bool, truncate: bool) -> VirtualFsResult<(u64, bool)> {
+    pub async fn open(&self, ino: u64, writable: bool, truncate: bool) -> VirtualFsResult<(u64, bool)> {
         debug!("open: ino={}, writable={}, truncate={}", ino, writable, truncate);
 
         if writable && self.read_only {
             return Err(libc::EROFS);
         }
 
-        let (full_path, xet_hash, size, is_dirty) = {
-            let inodes = self.inodes.lock().unwrap();
+        let (xet_hash, size, is_dirty) = {
+            let inodes = self.inode_table.read().expect("inodes poisoned");
             let entry = match inodes.get(ino) {
                 Some(e) if e.kind == InodeKind::File => e,
                 _ => return Err(libc::ENOENT),
             };
 
-            (
-                entry.full_path.clone(),
-                entry.xet_hash.clone().unwrap_or_default(),
-                entry.size,
-                entry.dirty,
-            )
+            (entry.xet_hash.clone().unwrap_or_default(), entry.size, entry.dirty)
         };
 
-        if writable {
-            let staging_path = self.staging.staging_path(ino);
+        let staging_path = self.file_staging.staging_path(ino);
 
+        if writable {
+            // Serialize staging preparation per inode (prevents concurrent download races)
+            let staging_mutex = self.staging_lock(ino);
+            let _staging_guard = staging_mutex.lock().await;
+
+            // Re-read dirty state under the staging lock (may have changed since first check)
+            let is_dirty = self
+                .inode_table
+                .read()
+                .expect("inodes poisoned")
+                .get(ino)
+                .ok_or(libc::ENOENT)?
+                .dirty;
+
+            // Reuse existing dirty staging file (unless truncating)
+            if !(is_dirty && staging_path.exists() && !truncate) {
+                if !truncate && !xet_hash.is_empty() && size > 0 {
+                    // Download remote content for read-modify-write
+                    self.file_staging
+                        .download_to_file(&xet_hash, size, &staging_path)
+                        .await
+                        .map_err(|e| {
+                            error!("Failed to download file for write: {}", e);
+                            libc::EIO
+                        })?;
+                } else {
+                    // Truncate, new file, or empty remote → empty staging file
+                    File::create(&staging_path).map_err(|e| {
+                        error!("Failed to create staging file: {}", e);
+                        libc::EIO
+                    })?;
+                }
+            }
+
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&staging_path)
+                .map_err(|e| {
+                    error!("Failed to open staging file: {}", e);
+                    libc::EIO
+                })?;
+
+            // Re-check inode still exists before committing the open
+            {
+                let mut inodes = self.inode_table.write().expect("inodes poisoned");
+                let entry = inodes.get_mut(ino).ok_or(libc::ENOENT)?;
+                entry.dirty = true;
+                if truncate {
+                    entry.size = 0;
+                }
+            }
+
+            let file_handle = self.alloc_file_handle();
+            self.open_files.write().expect("open_files poisoned").insert(
+                file_handle,
+                OpenFile::Local {
+                    ino,
+                    file: Arc::new(file),
+                    writable: true,
+                },
+            );
+            Ok((file_handle, false))
+        } else {
+            // Dirty file not yet flushed → read from local staging
             if is_dirty && staging_path.exists() {
-                // Reuse existing staging file (preserves pending local edits)
-            } else if truncate {
-                if let Err(e) = File::create(&staging_path) {
-                    error!("Failed to create staging file: {}", e);
-                    return Err(libc::EIO);
-                }
-            } else if !xet_hash.is_empty() && size > 0 {
-                let staging = self.staging.clone();
-                if let Err(e) = self
-                    .runtime
-                    .block_on(staging.download_to_file(&xet_hash, size, &staging_path))
-                {
-                    error!("Failed to download file for write: {}", e);
-                    return Err(libc::EIO);
-                }
-            } else if let Err(e) = File::create(&staging_path) {
-                error!("Failed to create staging file: {}", e);
+                let file_handle = self.open_local_readonly(ino, &staging_path)?;
+                return Ok((file_handle, false));
+            }
+
+            // Remote file with xet hash → lazy range reads via prefetch buffer
+            if !xet_hash.is_empty() {
+                let prefetch = Arc::new(tokio::sync::Mutex::new(PrefetchState::new(xet_hash, size)));
+                let file_handle = self.alloc_file_handle();
+                self.open_files
+                    .write()
+                    .expect("open_files poisoned")
+                    .insert(file_handle, OpenFile::Lazy { prefetch });
+                // keep_cache=true: kernel page cache preserved across re-opens,
+                // the poll loop calls notify_inval_inode if the remote file changes.
+                return Ok((file_handle, true));
+            }
+
+            // No hash + non-empty → inconsistent state
+            if size > 0 {
+                error!("No xet hash for non-empty, non-dirty file ino={}", ino);
                 return Err(libc::EIO);
             }
 
-            match OpenOptions::new().read(true).write(true).open(&staging_path) {
-                Ok(file) => {
-                    let file_handle = self.alloc_file_handle();
-                    {
-                        let mut inodes = self.inodes.lock().unwrap();
-                        if let Some(entry) = inodes.get_mut(ino) {
-                            entry.dirty = true;
-                            if truncate {
-                                entry.size = 0;
-                            }
-                        }
-                    }
-                    self.open_files.lock().unwrap().insert(
-                        file_handle,
-                        OpenFile::Local {
-                            file: Arc::new(file),
-                            writable: true,
-                        },
-                    );
-                    Ok((file_handle, false))
-                }
-                Err(e) => {
-                    error!("Failed to open staging file: {}", e);
-                    Err(libc::EIO)
-                }
+            // Empty file (size=0, no hash) → temp empty file on disk
+            if !staging_path.exists() {
+                File::create(&staging_path).ok();
             }
-        } else {
-            // Read-only open: check dirty staging first, then use lazy range reads
-            let staging_path = self.staging.staging_path(ino);
-
-            if is_dirty && staging_path.exists() {
-                // Dirty file: read from staging area (handles files not yet flushed)
-                let file_handle = self.open_local_readonly(&staging_path)?;
-                Ok((file_handle, false))
-            } else if xet_hash.is_empty() {
-                if size == 0 {
-                    // Empty file with no hash: create a temp empty file to open
-                    let empty_path = self.staging.staging_path(ino);
-                    if !empty_path.exists() {
-                        File::create(&empty_path).ok();
-                    }
-                    let file_handle = self.open_local_readonly(&empty_path)?;
-                    Ok((file_handle, false))
-                } else {
-                    error!("No xet hash for non-empty, non-dirty file {}", full_path);
-                    Err(libc::EIO)
-                }
-            } else {
-                // Lazy remote: create prefetch buffer, fetch on read()
-                let prefetch = Arc::new(Mutex::new(PrefetchState::new(xet_hash, size)));
-                let file_handle = self.alloc_file_handle();
-                self.open_files
-                    .lock()
-                    .unwrap()
-                    .insert(file_handle, OpenFile::Lazy { prefetch });
-                // Bypass kernel page cache so all reads hit our prefetch buffer
-                Ok((file_handle, true))
-            }
+            let file_handle = self.open_local_readonly(ino, &staging_path)?;
+            Ok((file_handle, false))
         }
     }
 
     /// Read data from an open file. Returns `(data, eof)`.
-    pub fn read(&self, file_handle: u64, offset: u64, size: u32) -> VirtualFsResult<(Vec<u8>, bool)> {
+    pub async fn read(&self, file_handle: u64, offset: u64, size: u32) -> VirtualFsResult<(Bytes, bool)> {
         debug!("read: fh={}, offset={}, size={}", file_handle, offset, size);
 
         // Extract what we need under the lock, then release it.
         // Clone Arc<File> so the FD stays alive even if release() runs concurrently.
         let read_target = {
-            let files = self.open_files.lock().unwrap();
+            let files = self.open_files.read().expect("open_files poisoned");
             match files.get(&file_handle) {
                 Some(OpenFile::Local { file, .. }) => ReadTarget::LocalFd(file.clone()),
-                Some(OpenFile::Lazy { prefetch }) => ReadTarget::Remote {
+                Some(OpenFile::Lazy { prefetch, .. }) => ReadTarget::Remote {
                     prefetch: prefetch.clone(),
                 },
                 None => return Err(libc::EBADF),
@@ -1039,101 +739,82 @@ impl VirtualFs {
 
         match read_target {
             ReadTarget::LocalFd(file) => {
-                let fd = file.as_raw_fd();
-                let mut buf = vec![0u8; size as usize];
-                let n = unsafe { libc::pread(fd, buf.as_mut_ptr() as *mut libc::c_void, size as usize, offset as i64) };
+                let file_descriptor = file.as_raw_fd();
+                let mut buf = BytesMut::zeroed(size as usize);
+                // SAFETY: fd is valid (Arc<File> keeps it alive), buf is correctly sized.
+                // pread is thread-safe (atomic offset, no shared seek cursor).
+                let n = unsafe {
+                    libc::pread(
+                        file_descriptor,
+                        buf.as_mut_ptr() as *mut libc::c_void,
+                        size as usize,
+                        offset as i64,
+                    )
+                };
                 if n < 0 {
-                    Err(libc::EIO)
+                    Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO))
                 } else {
                     buf.truncate(n as usize);
                     let eof = (n as u32) < size;
-                    Ok((buf, eof))
+                    Ok((buf.freeze(), eof))
                 }
             }
             ReadTarget::Remote { prefetch } => {
-                let mut ps = prefetch.lock().unwrap();
+                let mut prefetch_state = prefetch.lock().await;
 
-                let file_size = ps.file_size;
+                let file_size = prefetch_state.file_size;
 
                 // Past EOF
                 if offset >= file_size {
-                    return Ok((vec![], true));
+                    return Ok((Bytes::new(), true));
                 }
 
-                // Try forward buffer
-                if let Some(data) = ps.try_serve_forward(offset, size) {
+                // Try forward buffer (zero-copy when read fits in one chunk)
+                if let Some(data) = prefetch_state.try_serve_forward(offset, size) {
                     debug!("prefetch hit (forward): offset={}, len={}", offset, data.len());
                     let eof = offset + data.len() as u64 >= file_size;
-                    return Ok((data.to_vec(), eof));
+                    return Ok((data, eof));
                 }
 
                 // Try seek window
-                if let Some(data) = ps.try_serve_seek(offset, size) {
+                if let Some(data) = prefetch_state.try_serve_seek(offset, size) {
                     debug!("prefetch hit (seek): offset={}, len={}", offset, data.len());
                     let eof = offset + data.len() as u64 >= file_size;
-                    return Ok((data.to_vec(), eof));
+                    return Ok((data, eof));
                 }
 
-                // Cache miss — compute window adjustment before draining
-                let old_buf_end = ps.buf_start + ps.data.len() as u64;
-                let is_first_fetch = ps.data.is_empty() && ps.buf_start == 0;
+                // Cache miss — drain, classify access pattern, adjust window
+                let plan = prefetch_state.prepare_fetch(offset, size);
 
-                // Drain consumed forward bytes to seek window
-                if !ps.data.is_empty() {
-                    let consumed = if offset >= ps.buf_start { ps.data.len() } else { 0 };
-                    ps.drain_to_seek(consumed);
-                }
-
-                // Classify the access pattern and adjust window
-                let is_sequential;
-                if is_first_fetch {
-                    // First fetch: use initial window as-is
-                    is_sequential = true;
-                } else if offset >= old_buf_end && offset <= old_buf_end + FORWARD_SKIP {
-                    // Sequential or small forward skip: double window (TCP slow-start)
-                    ps.window_size = (ps.window_size * 2).min(MAX_WINDOW);
-                    debug!("prefetch window doubled to {}", ps.window_size);
-                    is_sequential = true;
-                } else {
-                    // Far seek: reset to initial window, cancel stream
-                    ps.window_size = INITIAL_WINDOW;
-                    debug!("prefetch window reset to {}", ps.window_size);
-                    is_sequential = false;
-                    if let Some(s) = ps.stream.take() {
-                        debug!("prefetch: cancelling stream (far seek)");
-                        drop(s);
-                    }
-                }
-
-                // Fetch: download max(needed, window_size) bytes
-                let needed = (size as u64).min(ps.file_size - offset);
-                let fetch_size = needed.max(ps.window_size).min(ps.file_size - offset);
-
-                // Try streaming for pure sequential reads (offset must match
-                // stream position exactly — no gaps or skips).
-                let streamed = if is_sequential && offset == ps.buf_start {
-                    if ps.stream.is_none() && is_first_fetch && offset == 0 {
-                        let fi = XetFileInfo::new(ps.xet_hash.clone(), ps.file_size);
-                        match self.staging.download_session().download_stream(&fi, None) {
-                            Ok(stream) => {
-                                debug!("prefetch: started full-file stream");
-                                ps.stream = Some(stream);
-                            }
-                            Err(e) => {
-                                warn!("prefetch: stream start failed: {}", e);
-                            }
+                // Start a new stream if this is the first sequential read from offset 0
+                if matches!(plan.strategy, crate::prefetch::FetchStrategy::StartStream) {
+                    let xet_file_info = XetFileInfo::new(prefetch_state.xet_hash.clone(), prefetch_state.file_size);
+                    match self
+                        .file_staging
+                        .download_session()
+                        .download_stream(&xet_file_info, None)
+                    {
+                        Ok(stream) => {
+                            debug!("prefetch: started full-file stream");
+                            prefetch_state.stream = Some(stream);
+                        }
+                        Err(e) => {
+                            warn!("prefetch: stream start failed: {}", e);
                         }
                     }
-                    if let Some(mut stream) = ps.stream.take() {
-                        // Enter tokio runtime context so blocking_next() can
-                        // spawn tasks on FUSE threads (which lack a runtime).
-                        let _guard = self.runtime.enter();
-                        let mut buf = Vec::with_capacity(fetch_size as usize);
+                }
+
+                // Try reading from the stream for sequential access
+                let new_chunks = if plan.strategy.is_stream() {
+                    if let Some(mut stream) = prefetch_state.stream.take() {
+                        let mut chunks = VecDeque::new();
+                        let mut total = 0usize;
                         let mut stream_eof = false;
-                        while (buf.len() as u64) < fetch_size {
-                            match stream.blocking_next() {
+                        while (total as u64) < plan.fetch_size {
+                            match stream.next().await {
                                 Ok(Some(chunk)) => {
-                                    buf.extend_from_slice(&chunk);
+                                    total += chunk.len();
+                                    chunks.push_back(chunk);
                                 }
                                 Ok(None) => {
                                     stream_eof = true;
@@ -1146,51 +827,53 @@ impl VirtualFs {
                             }
                         }
                         if !stream_eof {
-                            // Put stream back for next read
-                            ps.stream = Some(stream);
+                            prefetch_state.stream = Some(stream);
                         }
-                        if !buf.is_empty() { Some(buf) } else { None }
+                        if total > 0 {
+                            debug!(
+                                "prefetch stream: offset={}, got={}, window={}",
+                                offset, total, prefetch_state.window_size
+                            );
+                            Some((chunks, total))
+                        } else {
+                            None
+                        }
                     } else {
                         None
                     }
                 } else {
-                    // Non-sequential: cancel stale stream
-                    if let Some(s) = ps.stream.take() {
-                        drop(s);
-                    }
                     None
                 };
 
                 // Fall back to range download if streaming wasn't used
-                let fetched = if let Some(buf) = streamed {
-                    debug!(
-                        "prefetch stream: offset={}, got={}, window={}",
-                        offset,
-                        buf.len(),
-                        ps.window_size
-                    );
-                    buf
+                let (chunks, total) = if let Some(fetched) = new_chunks {
+                    fetched
                 } else {
-                    let fetch_end = offset + fetch_size;
-                    let file_info = XetFileInfo::new(ps.xet_hash.clone(), ps.file_size);
-                    let buf = Arc::new(Mutex::new(Vec::with_capacity(fetch_size as usize)));
+                    let fetch_end = offset + plan.fetch_size;
+                    let file_info = XetFileInfo::new(prefetch_state.xet_hash.clone(), prefetch_state.file_size);
+                    let buf = Arc::new(Mutex::new(Vec::with_capacity(plan.fetch_size as usize)));
                     let writer = SharedBufWriter(buf.clone());
 
                     debug!(
                         "prefetch fetch: offset={}, size={}, window={}",
-                        offset, fetch_size, ps.window_size
+                        offset, plan.fetch_size, prefetch_state.window_size
                     );
 
-                    match self.runtime.block_on(self.staging.download_session().download_to_writer(
-                        &file_info,
-                        offset..fetch_end,
-                        writer,
-                        None,
-                    )) {
-                        Ok(_) => match Arc::try_unwrap(buf) {
-                            Ok(mutex) => mutex.into_inner().unwrap_or_default(),
-                            Err(arc) => arc.lock().unwrap_or_else(|e| e.into_inner()).clone(),
-                        },
+                    match self
+                        .file_staging
+                        .download_session()
+                        .download_to_writer(&file_info, offset..fetch_end, writer, None)
+                        .await
+                    {
+                        Ok(_) => {
+                            let vec = match Arc::try_unwrap(buf) {
+                                Ok(mutex) => mutex.into_inner().unwrap_or_default(),
+                                Err(arc) => arc.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+                            };
+                            let len = vec.len();
+                            let chunk = Bytes::from(vec);
+                            (VecDeque::from([chunk]), len)
+                        }
                         Err(e) => {
                             error!("Prefetch range read failed: {}", e);
                             return Err(libc::EIO);
@@ -1198,20 +881,13 @@ impl VirtualFs {
                     }
                 };
 
-                let to_read = (size as usize).min(fetched.len());
-                let eof = offset + to_read as u64 >= file_size;
-                if to_read == fetched.len() {
-                    // App wants everything — return the buffer directly, no copy
-                    ps.data = Vec::new();
-                    ps.buf_start = offset;
-                    Ok((fetched, eof))
-                } else {
-                    // App wants a prefix — copy the slice, keep rest in buffer
-                    let result = fetched[..to_read].to_vec();
-                    ps.data = fetched;
-                    ps.buf_start = offset;
-                    Ok((result, eof))
-                }
+                // Store fetched chunks and serve the read
+                prefetch_state.store_fetched(offset, chunks, total);
+
+                // Serve the read from the freshly filled buffer
+                let result = prefetch_state.try_serve_forward(offset, size).unwrap_or_default();
+                let eof = offset + result.len() as u64 >= file_size;
+                Ok((result, eof))
             }
         }
     }
@@ -1229,15 +905,16 @@ impl VirtualFs {
             return Err(libc::EROFS);
         }
 
-        // Clone Arc<File> so the FD stays alive even if release() runs concurrently.
-        let file = {
-            let files = self.open_files.lock().unwrap();
+        // Clone Arc<File> + resolve the authoritative ino from the handle.
+        let (file, handle_ino) = {
+            let files = self.open_files.read().expect("open_files poisoned");
             match files.get(&file_handle) {
-                Some(OpenFile::Local { file, writable: true }) => file.clone(),
-                Some(OpenFile::Local { writable: false, .. }) | Some(OpenFile::Lazy { .. }) => {
-                    return Err(libc::EBADF);
-                }
-                None => return Err(libc::EBADF),
+                Some(OpenFile::Local {
+                    ino,
+                    file,
+                    writable: true,
+                }) => (file.clone(), *ino),
+                _ => return Err(libc::EBADF),
             }
         };
         let fd = file.as_raw_fd();
@@ -1245,12 +922,12 @@ impl VirtualFs {
         let n = unsafe { libc::pwrite(fd, data.as_ptr() as *const libc::c_void, data.len(), offset as i64) };
 
         if n < 0 {
-            Err(libc::EIO)
+            Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO))
         } else {
             let written = n as u32;
             let new_end = offset + written as u64;
-            let mut inodes = self.inodes.lock().unwrap();
-            if let Some(entry) = inodes.get_mut(ino)
+            let mut inodes = self.inode_table.write().expect("inodes poisoned");
+            if let Some(entry) = inodes.get_mut(handle_ino)
                 && new_end > entry.size
             {
                 entry.size = new_end;
@@ -1262,62 +939,84 @@ impl VirtualFs {
     pub fn flush(&self, ino: u64) -> VirtualFsResult<()> {
         debug!("flush: ino={}", ino);
         // Check if a previous async flush failed for this inode
-        if let Some(err_msg) = self.flush_errors.lock().unwrap().remove(&ino) {
+        if let Some(fm) = &self.flush_manager
+            && let Some(err_msg) = fm.check_error(ino)
+        {
             error!("Deferred flush error for ino={}: {}", ino, err_msg);
             return Err(libc::EIO);
         }
         Ok(())
     }
 
-    pub fn release(&self, ino: u64, file_handle: u64) {
-        debug!("release: ino={}, fh={}", ino, file_handle);
+    pub fn release(&self, file_handle: u64) {
+        debug!("release: fh={}", file_handle);
 
-        let was_writable = {
-            let files = self.open_files.lock().unwrap();
-            matches!(files.get(&file_handle), Some(OpenFile::Local { writable: true, .. }))
-        };
+        let removed = self
+            .open_files
+            .write()
+            .expect("open_files poisoned")
+            .remove(&file_handle);
 
-        if was_writable && !self.read_only {
-            self.enqueue_flush(ino);
+        if let Some(OpenFile::Local {
+            ino, writable: true, ..
+        }) = removed
+        {
+            if let Some(fm) = &self.flush_manager {
+                fm.enqueue(ino);
+            }
         }
-
-        self.open_files.lock().unwrap().remove(&file_handle);
+        // staging_locks entries are intentionally not cleaned up here: removing
+        // while another open() may hold the Arc would break serialization.
+        // Entries are tiny (Arc<Mutex<()>>) and bounded by unique inodes opened.
     }
 
-    pub fn create(&self, parent: u64, name: &str) -> VirtualFsResult<(VirtualFsAttr, u64)> {
+    pub async fn create(&self, parent: u64, name: &str) -> VirtualFsResult<(VirtualFsAttr, u64)> {
         if self.read_only {
             return Err(libc::EROFS);
         }
 
         debug!("create: parent={}, name={}", parent, name);
 
-        let parent_path = {
-            let inodes = self.inodes.lock().unwrap();
-            match inodes.get(parent) {
-                Some(e) if e.kind == InodeKind::Directory => e.full_path.clone(),
-                _ => return Err(libc::ENOENT),
-            }
-        };
-
-        let full_path = if parent_path.is_empty() {
-            name.to_string()
-        } else {
-            format!("{}/{}", parent_path, name)
-        };
-
-        self.neg_cache_remove(&full_path);
+        // Fetch remote children so we can detect name collisions (also validates parent)
+        self.ensure_children_loaded(parent).await?;
 
         let now = SystemTime::now();
-        let ino = {
-            let mut inodes = self.inodes.lock().unwrap();
-            let ino = inodes.insert(parent, name.to_string(), full_path, InodeKind::File, 0, now, None);
+        // Re-check parent + EEXIST + insert under one write lock (TOCTOU guard)
+        let (ino, full_path) = {
+            let mut inodes = self.inode_table.write().expect("inodes poisoned");
+            let parent_entry = match inodes.get(parent) {
+                Some(e) if e.kind == InodeKind::Directory => e,
+                Some(_) => return Err(libc::ENOTDIR),
+                None => return Err(libc::ENOENT),
+            };
+            let full_path = if parent_entry.full_path.is_empty() {
+                name.to_string()
+            } else {
+                format!("{}/{}", parent_entry.full_path, name)
+            };
+            if inodes.lookup_child(parent, name).is_some() {
+                return Err(libc::EEXIST);
+            }
+            // Insert as dirty — content lives in local staging until flushed
+            let ino = inodes.insert(
+                parent,
+                name.to_string(),
+                full_path.clone(),
+                InodeKind::File,
+                0,
+                now,
+                None,
+            );
             if let Some(entry) = inodes.get_mut(ino) {
                 entry.dirty = true;
             }
-            ino
+            (ino, full_path)
         };
 
-        let staging_path = self.staging.staging_path(ino);
+        self.negative_cache_remove(&full_path);
+
+        // Create an empty staging file and open it for read+write
+        let staging_path = self.file_staging.staging_path(ino);
         match OpenOptions::new()
             .create(true)
             .truncate(true)
@@ -1327,124 +1026,133 @@ impl VirtualFs {
         {
             Ok(file) => {
                 let file_handle = self.alloc_file_handle();
-                self.open_files.lock().unwrap().insert(
+                self.open_files.write().expect("open_files poisoned").insert(
                     file_handle,
                     OpenFile::Local {
+                        ino,
                         file: Arc::new(file),
                         writable: true,
                     },
                 );
 
-                let inodes = self.inodes.lock().unwrap();
+                let inodes = self.inode_table.read().expect("inodes poisoned");
                 let attr = self.make_vfs_attr(inodes.get(ino).unwrap());
                 Ok((attr, file_handle))
             }
             Err(e) => {
                 error!("Failed to create staging file: {}", e);
-                // Rollback: remove the inode we just inserted
-                self.inodes.lock().unwrap().remove(ino);
+                // Staging failed — rollback the inode to avoid a ghost entry
+                self.inode_table.write().expect("inodes poisoned").remove(ino);
                 Err(libc::EIO)
             }
         }
     }
 
-    pub fn mkdir(&self, parent: u64, name: &str) -> VirtualFsResult<VirtualFsAttr> {
+    pub async fn mkdir(&self, parent: u64, name: &str) -> VirtualFsResult<VirtualFsAttr> {
         if self.read_only {
             return Err(libc::EROFS);
         }
 
         debug!("mkdir: parent={}, name={}", parent, name);
 
-        self.ensure_children_loaded(parent);
-
-        let parent_path = {
-            let inodes = self.inodes.lock().unwrap();
-            match inodes.get(parent) {
-                Some(e) if e.kind == InodeKind::Directory => e.full_path.clone(),
-                _ => return Err(libc::ENOENT),
-            }
-        };
-
-        let full_path = if parent_path.is_empty() {
-            name.to_string()
-        } else {
-            format!("{}/{}", parent_path, name)
-        };
-
-        self.neg_cache_remove(&full_path);
-
-        let mut inodes = self.inodes.lock().unwrap();
-
-        if inodes.lookup_child(parent, name).is_some() {
-            return Err(libc::EEXIST);
-        }
+        // Fetch remote children so we can detect name collisions (also validates parent)
+        self.ensure_children_loaded(parent).await?;
 
         let now = SystemTime::now();
-        let ino = inodes.insert(parent, name.to_string(), full_path, InodeKind::Directory, 0, now, None);
+        // Re-check parent + EEXIST + insert under one write lock (TOCTOU guard)
+        let (ino, full_path) = {
+            let mut inodes = self.inode_table.write().expect("inodes poisoned");
+            let parent_entry = match inodes.get(parent) {
+                Some(e) if e.kind == InodeKind::Directory => e,
+                Some(_) => return Err(libc::ENOTDIR),
+                None => return Err(libc::ENOENT),
+            };
+            let full_path = if parent_entry.full_path.is_empty() {
+                name.to_string()
+            } else {
+                format!("{}/{}", parent_entry.full_path, name)
+            };
+            if inodes.lookup_child(parent, name).is_some() {
+                return Err(libc::EEXIST);
+            }
+            // New dir starts with children_loaded=true (empty, nothing to fetch)
+            let ino = inodes.insert(
+                parent,
+                name.to_string(),
+                full_path.clone(),
+                InodeKind::Directory,
+                0,
+                now,
+                None,
+            );
+            if let Some(entry) = inodes.get_mut(ino) {
+                entry.children_loaded = true;
+            }
+            (ino, full_path)
+        };
 
-        if let Some(entry) = inodes.get_mut(ino) {
-            entry.children_loaded = true;
-        }
+        self.negative_cache_remove(&full_path);
 
+        let inodes = self.inode_table.read().expect("inodes poisoned");
         Ok(self.make_vfs_attr(inodes.get(ino).unwrap()))
     }
 
-    pub fn unlink(&self, parent: u64, name: &str) -> VirtualFsResult<()> {
+    pub async fn unlink(&self, parent: u64, name: &str) -> VirtualFsResult<()> {
         if self.read_only {
             return Err(libc::EROFS);
         }
 
         debug!("unlink: parent={}, name={}", parent, name);
 
-        self.ensure_children_loaded(parent);
+        self.ensure_children_loaded(parent).await?;
 
-        let (ino, full_path, was_dirty) = {
-            let inodes = self.inodes.lock().unwrap();
-            match inodes.lookup_child(parent, name) {
-                Some(entry) if entry.kind == InodeKind::File => (entry.inode, entry.full_path.clone(), entry.dirty),
+        let (ino, full_path, needs_remote_delete) = {
+            let inodes = self.inode_table.read().expect("inodes poisoned");
+            let entry = match inodes.lookup_child(parent, name) {
+                Some(entry) if entry.kind == InodeKind::File => entry,
                 Some(_) => return Err(libc::EISDIR),
                 None => return Err(libc::ENOENT),
-            }
+            };
+            // Remote delete needed if the file exists on the hub (has a xet_hash)
+            let needs_remote = entry.xet_hash.is_some();
+            (entry.inode, entry.full_path.clone(), needs_remote)
         };
 
-        let needs_remote_delete = !was_dirty || {
-            let inodes = self.inodes.lock().unwrap();
-            inodes.get(ino).and_then(|e| e.xet_hash.as_ref()).is_some()
-        };
+        // Remove inode + staging BEFORE the remote call so a concurrent
+        // flush_batch sees the inode as gone and skips it.
+        self.inode_table.write().expect("inodes poisoned").remove(ino);
+        let staging_path = self.file_staging.staging_path(ino);
+        std::fs::remove_file(&staging_path).ok();
 
+        // Delete from remote. Inode is already gone locally — if this fails,
+        // EIO is returned but no local rollback: the next poll will re-materialize
+        // the file from the remote source of truth.
         if needs_remote_delete {
-            let hub = self.hub_client.clone();
-            let path = full_path.clone();
-
             if let Err(e) = self
-                .runtime
-                .block_on(async { hub.batch_operations(&[BatchOp::DeleteFile { path }]).await })
+                .hub_client
+                .batch_operations(&[BatchOp::DeleteFile { path: full_path.clone() }])
+                .await
             {
-                error!("Failed to delete file {}: {}", full_path, e);
+                error!("Remote delete failed for {}: {}", full_path, e);
                 return Err(libc::EIO);
             }
         }
-
-        let staging_path = self.staging.staging_path(ino);
-        std::fs::remove_file(&staging_path).ok();
-
-        self.inodes.lock().unwrap().remove(ino);
 
         info!("Deleted file: {}", full_path);
         Ok(())
     }
 
-    pub fn rmdir(&self, parent: u64, name: &str) -> VirtualFsResult<()> {
+    pub async fn rmdir(&self, parent: u64, name: &str) -> VirtualFsResult<()> {
         if self.read_only {
             return Err(libc::EROFS);
         }
 
         debug!("rmdir: parent={}, name={}", parent, name);
 
-        self.ensure_children_loaded(parent);
+        self.ensure_children_loaded(parent).await?;
 
         let ino = {
-            let inodes = self.inodes.lock().unwrap();
+            let inodes = self.inode_table.read().expect("inodes poisoned");
             match inodes.lookup_child(parent, name) {
                 Some(entry) if entry.kind == InodeKind::Directory => {
                     if !entry.children.is_empty() {
@@ -1457,22 +1165,22 @@ impl VirtualFs {
             }
         };
 
-        self.ensure_children_loaded(ino);
+        // Load remote children so we don't miss any before the emptiness check
+        self.ensure_children_loaded(ino).await?;
 
-        {
-            let inodes = self.inodes.lock().unwrap();
-            if let Some(entry) = inodes.get(ino)
-                && !entry.children.is_empty()
-            {
-                return Err(libc::ENOTEMPTY);
-            }
+        // Re-check ENOTEMPTY + remove under a single write lock to prevent
+        // a concurrent create/mkdir from inserting a child in between.
+        let mut inodes = self.inode_table.write().expect("inodes poisoned");
+        match inodes.get(ino) {
+            Some(entry) if !entry.children.is_empty() => return Err(libc::ENOTEMPTY),
+            None => return Err(libc::ENOENT),
+            _ => {}
         }
-
-        self.inodes.lock().unwrap().remove(ino);
+        inodes.remove(ino);
         Ok(())
     }
 
-    pub fn rename(
+    pub async fn rename(
         &self,
         parent: u64,
         name: &str,
@@ -1489,43 +1197,74 @@ impl VirtualFs {
             parent, name, newparent, newname
         );
 
-        self.ensure_children_loaded(parent);
+        self.ensure_children_loaded(parent).await?;
         if parent != newparent {
-            self.ensure_children_loaded(newparent);
+            self.ensure_children_loaded(newparent).await?;
         }
 
-        let (ino, old_path, kind, xet_hash, is_dirty) = {
-            let inodes = self.inodes.lock().unwrap();
-            match inodes.lookup_child(parent, name) {
-                Some(entry) => (
-                    entry.inode,
-                    entry.full_path.clone(),
-                    entry.kind,
-                    entry.xet_hash.clone(),
-                    entry.dirty,
-                ),
-                None => return Err(libc::ENOENT),
+        // ── Phase 1: validate everything locally before any side effects ──
+
+        let (ino, old_path, kind, xet_hash, is_dirty, new_full_path) = {
+            let inodes = self.inode_table.read().expect("inodes poisoned");
+
+            // Source must exist (checked before noop so rename("missing","missing") → ENOENT)
+            let src = inodes.lookup_child(parent, name).ok_or(libc::ENOENT)?;
+
+            // Noop: renaming to same location (source verified to exist)
+            if parent == newparent && name == newname {
+                return Ok(());
             }
+            let ino = src.inode;
+            let old_path = src.full_path.clone();
+            let kind = src.kind;
+            let xet_hash = src.xet_hash.clone();
+            let is_dirty = src.dirty;
+
+            // Destination parent must exist
+            let new_parent_entry = inodes.get(newparent).ok_or(libc::ENOENT)?;
+            let new_full_path = if new_parent_entry.full_path.is_empty() {
+                newname.to_string()
+            } else {
+                format!("{}/{}", new_parent_entry.full_path, newname)
+            };
+
+            // Prevent moving a directory into its own subtree (would create a cycle)
+            if kind == InodeKind::Directory {
+                let mut ancestor = newparent;
+                while ancestor != 1 {
+                    if ancestor == ino {
+                        return Err(libc::EINVAL);
+                    }
+                    ancestor = match inodes.get(ancestor) {
+                        Some(e) => e.parent,
+                        None => break,
+                    };
+                }
+            }
+
+            // Check destination conflicts
+            if let Some(existing) = inodes.lookup_child(newparent, newname) {
+                if no_replace {
+                    return Err(libc::EEXIST);
+                }
+                // POSIX: file can only replace file, dir can only replace empty dir
+                match (kind, existing.kind) {
+                    (InodeKind::File, InodeKind::Directory) => return Err(libc::EISDIR),
+                    (InodeKind::Directory, InodeKind::File) => return Err(libc::ENOTDIR),
+                    (InodeKind::Directory, InodeKind::Directory) if !existing.children.is_empty() => {
+                        return Err(libc::ENOTEMPTY);
+                    }
+                    _ => {}
+                }
+            }
+
+            (ino, old_path, kind, xet_hash, is_dirty, new_full_path)
         };
 
-        let new_parent_path = {
-            let inodes = self.inodes.lock().unwrap();
-            match inodes.get(newparent) {
-                Some(e) => e.full_path.clone(),
-                None => return Err(libc::ENOENT),
-            }
-        };
-
-        let new_full_path = if new_parent_path.is_empty() {
-            newname.to_string()
-        } else {
-            format!("{}/{}", new_parent_path, newname)
-        };
+        // ── Phase 2: remote side effects (only for clean files with a hash) ──
 
         if kind == InodeKind::File && !is_dirty {
-            if let Some(hash) = xet_hash {
-                let hub = self.hub_client.clone();
-
+            if let Some(ref hash) = xet_hash {
                 let mtime_ms = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
@@ -1534,59 +1273,71 @@ impl VirtualFs {
                 let ops = vec![
                     BatchOp::AddFile {
                         path: new_full_path.clone(),
-                        xet_hash: hash,
+                        xet_hash: hash.clone(),
                         mtime: mtime_ms,
                         content_type: None,
                     },
                     BatchOp::DeleteFile { path: old_path.clone() },
                 ];
 
-                if let Err(e) = self.runtime.block_on(hub.batch_operations(&ops)) {
+                if let Err(e) = self.hub_client.batch_operations(&ops).await {
                     error!("Failed to rename {} -> {}: {}", old_path, new_full_path, e);
                     return Err(libc::EIO);
                 }
             }
-        } else if is_dirty && kind == InodeKind::File && xet_hash.is_some() {
-            // Dirty file with a remote presence: record old path for deletion at flush time
-            let mut inodes = self.inodes.lock().unwrap();
-            if let Some(entry) = inodes.get_mut(ino) {
-                entry.pending_deletes.push(old_path.clone());
-            }
         }
 
-        // Invalidate negative cache for the destination path (the kernel may have
-        // looked up the new name before sending the rename, caching ENOENT).
-        self.neg_cache_remove(&new_full_path);
+        // ── Phase 3: apply local mutations under one write lock ──
+
+        self.negative_cache_remove(&new_full_path);
 
         {
-            let mut inodes = self.inodes.lock().unwrap();
+            let mut inodes = self.inode_table.write().expect("inodes poisoned");
 
-            // Remove existing destination inode if it exists (POSIX rename replaces target)
+            // Re-validate source still exists (could have been unlinked concurrently)
+            if inodes.get(ino).is_none() {
+                return Err(libc::ENOENT);
+            }
+
+            // Re-check destination under write lock (a concurrent create could have
+            // inserted one between phase 1 read-lock and this write-lock).
             if let Some(existing) = inodes.lookup_child(newparent, newname) {
-                // RENAME_NOREPLACE: refuse if the target already exists
                 if no_replace {
                     return Err(libc::EEXIST);
                 }
-                let existing_ino = existing.inode;
-                let existing_kind = existing.kind;
-                // Don't allow replacing a non-empty directory
-                if existing_kind == InodeKind::Directory && !existing.children.is_empty() {
-                    return Err(libc::ENOTEMPTY);
+                // POSIX type compat: file→dir = EISDIR, dir→file = ENOTDIR
+                match (kind, existing.kind) {
+                    (InodeKind::File, InodeKind::Directory) => return Err(libc::EISDIR),
+                    (InodeKind::Directory, InodeKind::File) => return Err(libc::ENOTDIR),
+                    (InodeKind::Directory, InodeKind::Directory) if !existing.children.is_empty() => {
+                        return Err(libc::ENOTEMPTY);
+                    }
+                    _ => {}
                 }
+                let existing_ino = existing.inode;
                 inodes.remove(existing_ino);
             }
 
+            // Dirty file with a remote presence: record old path for deletion at flush time
+            if is_dirty && kind == InodeKind::File && xet_hash.is_some() {
+                if let Some(entry) = inodes.get_mut(ino) {
+                    entry.pending_deletes.push(old_path.clone());
+                }
+            }
+
+            // Detach from old parent
             if let Some(old_parent) = inodes.get_mut(parent) {
                 old_parent.children.retain(|&c| c != ino);
             }
 
-            // Update this inode's name/parent, then recursively fix all descendant paths
+            // Update name/parent, then recursively fix all descendant paths
             if let Some(entry) = inodes.get_mut(ino) {
                 entry.name = newname.to_string();
                 entry.parent = newparent;
             }
             inodes.update_subtree_paths(ino, new_full_path.clone());
 
+            // Attach to new parent
             if let Some(new_parent) = inodes.get_mut(newparent) {
                 new_parent.children.push(ino);
             }
@@ -1595,15 +1346,29 @@ impl VirtualFs {
         Ok(())
     }
 
-    pub fn setattr(&self, ino: u64, size: Option<u64>) -> VirtualFsResult<VirtualFsAttr> {
+    pub async fn setattr(&self, ino: u64, size: Option<u64>) -> VirtualFsResult<VirtualFsAttr> {
         debug!("setattr: ino={}, size={:?}", ino, size);
 
         if self.read_only {
             return Err(libc::EROFS);
         }
 
+        // Validate inode exists and is a file before any side effects
+        {
+            let inodes = self.inode_table.read().expect("inodes poisoned");
+            match inodes.get(ino) {
+                Some(e) if size.is_some() && e.kind != InodeKind::File => return Err(libc::EISDIR),
+                Some(_) => {}
+                None => return Err(libc::ENOENT),
+            }
+        }
+
         if let Some(new_size) = size {
-            let staging_path = self.staging.staging_path(ino);
+            // Serialize with open() staging preparation on the same inode
+            let staging_mutex = self.staging_lock(ino);
+            let _staging_guard = staging_mutex.lock().await;
+
+            let staging_path = self.file_staging.staging_path(ino);
 
             if new_size == 0 {
                 if let Err(e) = File::create(&staging_path) {
@@ -1614,17 +1379,15 @@ impl VirtualFs {
                 // If staging file doesn't exist, download from remote first
                 if !staging_path.exists() {
                     let (xet_hash, file_size) = {
-                        let inodes = self.inodes.lock().unwrap();
-                        match inodes.get(ino) {
-                            Some(e) => (e.xet_hash.clone().unwrap_or_default(), e.size),
-                            None => return Err(libc::ENOENT),
-                        }
+                        let inodes = self.inode_table.read().expect("inodes poisoned");
+                        let entry = inodes.get(ino).ok_or(libc::ENOENT)?;
+                        (entry.xet_hash.clone().unwrap_or_default(), entry.size)
                     };
                     if !xet_hash.is_empty() && file_size > 0 {
-                        let staging = self.staging.clone();
-                        if let Err(e) =
-                            self.runtime
-                                .block_on(staging.download_to_file(&xet_hash, file_size, &staging_path))
+                        if let Err(e) = self
+                            .file_staging
+                            .download_to_file(&xet_hash, file_size, &staging_path)
+                            .await
                         {
                             error!("Failed to download file for truncate: {}", e);
                             return Err(libc::EIO);
@@ -1644,7 +1407,7 @@ impl VirtualFs {
                 }
             }
 
-            let mut inodes = self.inodes.lock().unwrap();
+            let mut inodes = self.inode_table.write().expect("inodes poisoned");
             if let Some(entry) = inodes.get_mut(ino) {
                 entry.size = new_size;
                 entry.dirty = true;
@@ -1652,13 +1415,73 @@ impl VirtualFs {
 
             // Schedule flush so the truncation is committed to CAS/bucket
             drop(inodes);
-            self.enqueue_flush(ino);
+            if let Some(fm) = &self.flush_manager {
+                fm.enqueue(ino);
+            }
         }
 
-        let inodes = self.inodes.lock().unwrap();
+        let inodes = self.inode_table.read().expect("inodes poisoned");
         match inodes.get(ino) {
             Some(entry) => Ok(self.make_vfs_attr(entry)),
             None => Err(libc::ENOENT),
         }
+    }
+}
+
+// ── VFS types ──────────────────────────────────────────────────────────
+pub type VirtualFsError = i32;
+pub type VirtualFsResult<T> = std::result::Result<T, VirtualFsError>;
+
+pub struct VirtualFsAttr {
+    pub ino: u64,
+    pub size: u64,
+    pub blocks: u64,
+    pub mtime: SystemTime,
+    pub kind: InodeKind,
+    pub perm: u16,
+    pub nlink: u32,
+    pub uid: u32,
+    pub gid: u32,
+}
+
+pub struct VirtualFsDirEntry {
+    pub ino: u64,
+    pub kind: InodeKind,
+    pub name: String,
+}
+
+// ── Internal types ─────────────────────────────────────────────────────
+
+/// An open file handle — either a local fd or a lazy remote reference.
+enum OpenFile {
+    /// Local file (staging for writes, or dirty reads).
+    Local { ino: u64, file: Arc<File>, writable: bool },
+    /// Lazy remote — data fetched on-demand with adaptive prefetch buffer.
+    Lazy {
+        prefetch: Arc<tokio::sync::Mutex<PrefetchState>>,
+    },
+}
+
+/// What to do in read() after releasing the open_files lock.
+enum ReadTarget {
+    /// Hold an Arc<File> so the FD stays alive even if release() runs concurrently.
+    LocalFd(Arc<File>),
+    Remote {
+        prefetch: Arc<tokio::sync::Mutex<PrefetchState>>,
+    },
+}
+
+/// Wraps `Arc<Mutex<Vec<u8>>>` to implement `Write + Send + 'static`
+/// for use with `FileDownloadSession::download_to_writer`.
+struct SharedBufWriter(Arc<Mutex<Vec<u8>>>);
+
+impl Write for SharedBufWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }

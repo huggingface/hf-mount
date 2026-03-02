@@ -8,8 +8,6 @@ use fuser::{
     TimeOrNow,
 };
 
-use crate::staging::FileStaging;
-use crate::hub_api::HubApiClient;
 use crate::inode::InodeKind;
 use crate::virtual_fs::{VirtualFs, VirtualFsAttr};
 
@@ -17,26 +15,15 @@ use crate::virtual_fs::{VirtualFs, VirtualFsAttr};
 const GENERATION: Generation = Generation(0);
 
 pub struct FuseAdapter {
+    runtime: tokio::runtime::Handle,
     virtual_fs: Arc<VirtualFs>,
     /// Kernel metadata cache TTL — aligned with poll_interval_secs.
     ttl: Duration,
 }
 
 impl FuseAdapter {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        runtime: tokio::runtime::Handle,
-        hub_client: Arc<HubApiClient>,
-        staging: Arc<FileStaging>,
-        read_only: bool,
-        uid: u32,
-        gid: u32,
-        poll_interval_secs: u64,
-    ) -> Self {
-        Self {
-            virtual_fs: VirtualFs::new(runtime, hub_client, staging, read_only, uid, gid, poll_interval_secs),
-            ttl: Duration::from_secs(poll_interval_secs),
-        }
+    pub fn new(runtime: tokio::runtime::Handle, virtual_fs: Arc<VirtualFs>, ttl: Duration) -> Self {
+        Self { runtime, virtual_fs, ttl }
     }
 }
 
@@ -92,7 +79,7 @@ impl Filesystem for FuseAdapter {
     /// Resolve a child name inside a directory → returns inode attributes.
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         let name = os_to_str!(name, reply);
-        match self.virtual_fs.lookup(parent.0, name) {
+        match self.runtime.block_on(self.virtual_fs.lookup(parent.0, name)) {
             Ok(attr) => reply.entry(&self.ttl, &vfs_attr_to_fuse(&attr), GENERATION),
             Err(e) => reply.error(Errno::from_i32(e)),
         }
@@ -109,7 +96,7 @@ impl Filesystem for FuseAdapter {
     /// List directory entries. `offset` is the index of the last entry already returned;
     /// entries before it are skipped so the kernel can paginate large directories.
     fn readdir(&self, _req: &Request, ino: INodeNo, _fh: FileHandle, offset: u64, mut reply: ReplyDirectory) {
-        match self.virtual_fs.readdir(ino.0) {
+        match self.runtime.block_on(self.virtual_fs.readdir(ino.0)) {
             Ok(entries) => {
                 for (i, entry) in entries.into_iter().enumerate().skip(offset as usize) {
                     let file_type = match entry.kind {
@@ -127,18 +114,19 @@ impl Filesystem for FuseAdapter {
         }
     }
 
-    /// Open a file. Returns a file handle and whether to bypass the kernel page cache (DIRECT_IO).
+    /// Open a file. Returns a file handle and FOPEN flags.
     fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
         let accmode = flags.0 & libc::O_ACCMODE;
         let writable = accmode == libc::O_WRONLY || accmode == libc::O_RDWR;
         let truncate = (flags.0 & libc::O_TRUNC) != 0;
 
-        match self.virtual_fs.open(ino.0, writable, truncate) {
-            Ok((file_handle, direct_io)) => {
-                // DIRECT_IO bypasses the kernel page cache — used for remote files
-                // that are streamed from CAS, so the kernel doesn't cache stale data.
-                let fopen_flags = if direct_io {
-                    FopenFlags::FOPEN_DIRECT_IO
+        match self.runtime.block_on(self.virtual_fs.open(ino.0, writable, truncate)) {
+            Ok((file_handle, keep_cache)) => {
+                // KEEP_CACHE preserves the kernel page cache across re-opens.
+                // Used for remote files whose cache is invalidated via
+                // notify_inval_inode when the poll loop detects changes.
+                let fopen_flags = if keep_cache {
+                    FopenFlags::FOPEN_KEEP_CACHE
                 } else {
                     FopenFlags::empty()
                 };
@@ -160,7 +148,7 @@ impl Filesystem for FuseAdapter {
         _lock_owner: Option<fuser::LockOwner>,
         reply: ReplyData,
     ) {
-        match self.virtual_fs.read(fh.0, offset, size) {
+        match self.runtime.block_on(self.virtual_fs.read(fh.0, offset, size)) {
             Ok((data, _eof)) => reply.data(&data),
             Err(e) => reply.error(Errno::from_i32(e)),
         }
@@ -197,14 +185,14 @@ impl Filesystem for FuseAdapter {
     fn release(
         &self,
         _req: &Request,
-        ino: INodeNo,
+        _ino: INodeNo,
         fh: FileHandle,
         _flags: OpenFlags,
         _lock_owner: Option<fuser::LockOwner>,
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        self.virtual_fs.release(ino.0, fh.0);
+        self.virtual_fs.release(fh.0);
         reply.ok();
     }
 
@@ -220,7 +208,7 @@ impl Filesystem for FuseAdapter {
         reply: fuser::ReplyCreate,
     ) {
         let name = os_to_str!(name, reply);
-        match self.virtual_fs.create(parent.0, name) {
+        match self.runtime.block_on(self.virtual_fs.create(parent.0, name)) {
             Ok((attr, file_handle)) => {
                 reply.created(
                     &self.ttl,
@@ -237,7 +225,7 @@ impl Filesystem for FuseAdapter {
     /// Create a new directory.
     fn mkdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, _mode: u32, _umask: u32, reply: ReplyEntry) {
         let name = os_to_str!(name, reply);
-        match self.virtual_fs.mkdir(parent.0, name) {
+        match self.runtime.block_on(self.virtual_fs.mkdir(parent.0, name)) {
             Ok(attr) => reply.entry(&self.ttl, &vfs_attr_to_fuse(&attr), GENERATION),
             Err(e) => reply.error(Errno::from_i32(e)),
         }
@@ -246,7 +234,7 @@ impl Filesystem for FuseAdapter {
     /// Remove a file.
     fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
         let name = os_to_str!(name, reply);
-        match self.virtual_fs.unlink(parent.0, name) {
+        match self.runtime.block_on(self.virtual_fs.unlink(parent.0, name)) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(Errno::from_i32(e)),
         }
@@ -255,7 +243,7 @@ impl Filesystem for FuseAdapter {
     /// Remove an empty directory.
     fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
         let name = os_to_str!(name, reply);
-        match self.virtual_fs.rmdir(parent.0, name) {
+        match self.runtime.block_on(self.virtual_fs.rmdir(parent.0, name)) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(Errno::from_i32(e)),
         }
@@ -289,7 +277,7 @@ impl Filesystem for FuseAdapter {
         #[cfg(not(target_os = "linux"))]
         let no_replace = false;
 
-        match self.virtual_fs.rename(parent.0, name, newparent.0, newname, no_replace) {
+        match self.runtime.block_on(self.virtual_fs.rename(parent.0, name, newparent.0, newname, no_replace)) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(Errno::from_i32(e)),
         }
@@ -314,7 +302,7 @@ impl Filesystem for FuseAdapter {
         _flags: Option<fuser::BsdFileFlags>,
         reply: ReplyAttr,
     ) {
-        match self.virtual_fs.setattr(ino.0, size) {
+        match self.runtime.block_on(self.virtual_fs.setattr(ino.0, size)) {
             Ok(attr) => reply.attr(&self.ttl, &vfs_attr_to_fuse(&attr)),
             Err(e) => reply.error(Errno::from_i32(e)),
         }
@@ -326,7 +314,8 @@ impl Filesystem for FuseAdapter {
             Ok(attr) if attr.kind == InodeKind::Directory => {
                 reply.opened(FileHandle(self.virtual_fs.alloc_file_handle()), FopenFlags::empty());
             }
-            _ => reply.error(Errno::ENOENT),
+            Ok(_) => reply.error(Errno::ENOTDIR),
+            Err(e) => reply.error(Errno::from_i32(e)),
         }
     }
 

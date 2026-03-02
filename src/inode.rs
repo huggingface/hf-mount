@@ -106,9 +106,21 @@ impl InodeTable {
         xet_hash: Option<String>,
     ) -> u64 {
         // Check if already exists
-        if let Some(existing) = self.path_to_inode.get(&full_path) {
-            return *existing;
+        if let Some(&existing_ino) = self.path_to_inode.get(&full_path) {
+            debug_assert!(
+                self.inodes.get(&existing_ino).map(|e| e.kind) == Some(kind),
+                "insert(): path '{}' exists with different kind",
+                full_path
+            );
+            return existing_ino;
         }
+
+        debug_assert!(
+            self.inodes.contains_key(&parent),
+            "insert(): parent inode {} does not exist (path '{}')",
+            parent,
+            full_path
+        );
 
         let inode = self.next_inode.fetch_add(1, Ordering::Relaxed);
         let entry = InodeEntry {
@@ -237,6 +249,8 @@ impl InodeTable {
     }
 
     /// Remove an inode from the table (also removes from parent's children list).
+    /// If the inode is a directory, all descendants are removed recursively to
+    /// prevent orphaned entries in the table.
     pub fn remove(&mut self, inode: u64) -> Option<InodeEntry> {
         let entry = self.inodes.remove(&inode)?;
         self.path_to_inode.remove(&entry.full_path);
@@ -244,6 +258,15 @@ impl InodeTable {
         // Remove from parent's children
         if let Some(parent) = self.inodes.get_mut(&entry.parent) {
             parent.children.retain(|&c| c != inode);
+        }
+
+        // Recursively remove all descendants to avoid orphans
+        let mut stack = entry.children.clone();
+        while let Some(child_ino) = stack.pop() {
+            if let Some(child) = self.inodes.remove(&child_ino) {
+                self.path_to_inode.remove(&child.full_path);
+                stack.extend(child.children.iter());
+            }
         }
 
         Some(entry)
@@ -662,5 +685,109 @@ mod tests {
         // Clear after flush
         table.get_mut(ino).unwrap().pending_deletes.clear();
         assert!(table.get(ino).unwrap().pending_deletes.is_empty());
+    }
+
+    #[test]
+    fn test_remove_non_empty_dir_cleans_descendants() {
+        let mut table = InodeTable::new();
+
+        // Build: root / dir / child.txt
+        //                    / subdir / deep.txt
+        let dir_ino = table.insert(
+            ROOT_INODE,
+            "dir".to_string(),
+            "dir".to_string(),
+            InodeKind::Directory,
+            0,
+            UNIX_EPOCH,
+            None,
+        );
+        let child_ino = table.insert(
+            dir_ino,
+            "child.txt".to_string(),
+            "dir/child.txt".to_string(),
+            InodeKind::File,
+            10,
+            UNIX_EPOCH,
+            None,
+        );
+        let subdir_ino = table.insert(
+            dir_ino,
+            "subdir".to_string(),
+            "dir/subdir".to_string(),
+            InodeKind::Directory,
+            0,
+            UNIX_EPOCH,
+            None,
+        );
+        let deep_ino = table.insert(
+            subdir_ino,
+            "deep.txt".to_string(),
+            "dir/subdir/deep.txt".to_string(),
+            InodeKind::File,
+            5,
+            UNIX_EPOCH,
+            None,
+        );
+
+        // Remove the top-level dir
+        let removed = table.remove(dir_ino);
+        assert!(removed.is_some());
+
+        // All descendants must be gone from both maps
+        assert!(table.get(dir_ino).is_none());
+        assert!(table.get(child_ino).is_none());
+        assert!(table.get(subdir_ino).is_none());
+        assert!(table.get(deep_ino).is_none());
+        assert!(table.get_by_path("dir").is_none());
+        assert!(table.get_by_path("dir/child.txt").is_none());
+        assert!(table.get_by_path("dir/subdir").is_none());
+        assert!(table.get_by_path("dir/subdir/deep.txt").is_none());
+
+        // Root no longer references the removed dir
+        assert!(!table.get(ROOT_INODE).unwrap().children.contains(&dir_ino));
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "parent inode")]
+    fn test_insert_with_missing_parent_panics() {
+        let mut table = InodeTable::new();
+        // Parent inode 999 does not exist — should panic in debug
+        table.insert(
+            999,
+            "orphan.txt".to_string(),
+            "orphan.txt".to_string(),
+            InodeKind::File,
+            10,
+            UNIX_EPOCH,
+            None,
+        );
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "different kind")]
+    fn test_insert_duplicate_path_different_kind_panics() {
+        let mut table = InodeTable::new();
+        table.insert(
+            ROOT_INODE,
+            "name".to_string(),
+            "name".to_string(),
+            InodeKind::File,
+            10,
+            UNIX_EPOCH,
+            None,
+        );
+        // Same path but Directory kind — should panic in debug
+        table.insert(
+            ROOT_INODE,
+            "name".to_string(),
+            "name".to_string(),
+            InodeKind::Directory,
+            0,
+            UNIX_EPOCH,
+            None,
+        );
     }
 }
