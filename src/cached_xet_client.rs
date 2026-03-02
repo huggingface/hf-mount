@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use cas_client::adaptive_concurrency::ConnectionPermit;
@@ -13,18 +12,17 @@ use tracing::debug;
 
 type Result<T> = std::result::Result<T, cas_client::CasClientError>;
 
-const CACHE_TTL: Duration = Duration::from_secs(120);
 const MAX_CACHE_ENTRIES: usize = 1024;
 
 type CacheKey = (MerkleHash, Option<FileRange>);
-type CacheEntry = (Instant, QueryReconstructionResponse);
 
-pub struct CachingClient {
+// TODO: move this into xet-core (cas_client or file_reconstruction) so all consumers benefit.
+pub struct CachedXetClient {
     inner: Arc<dyn Client>,
-    cache: Mutex<HashMap<CacheKey, CacheEntry>>,
+    cache: Mutex<HashMap<CacheKey, QueryReconstructionResponse>>,
 }
 
-impl CachingClient {
+impl CachedXetClient {
     pub fn new(inner: Arc<dyn Client>) -> Arc<Self> {
         Arc::new(Self {
             inner,
@@ -34,7 +32,7 @@ impl CachingClient {
 }
 
 #[async_trait::async_trait]
-impl Client for CachingClient {
+impl Client for CachedXetClient {
     async fn get_reconstruction(
         &self,
         file_id: &MerkleHash,
@@ -42,33 +40,22 @@ impl Client for CachingClient {
     ) -> Result<Option<QueryReconstructionResponse>> {
         let key = (*file_id, bytes_range);
 
-        // Check cache
         {
             let cache = self.cache.lock().unwrap();
-            if let Some((inserted_at, response)) = cache.get(&key)
-                && inserted_at.elapsed() < CACHE_TTL
-            {
+            if let Some(response) = cache.get(&key) {
                 debug!("reconstruction cache hit for {file_id}");
                 return Ok(Some(response.clone()));
             }
         }
 
-        // Cache miss or expired — call inner
         let result = self.inner.get_reconstruction(file_id, bytes_range).await?;
 
         if let Some(ref response) = result {
             let mut cache = self.cache.lock().unwrap();
-            // Evict expired entries if at capacity
             if cache.len() >= MAX_CACHE_ENTRIES {
-                cache.retain(|_, (inserted_at, _)| inserted_at.elapsed() < CACHE_TTL);
+                cache.clear();
             }
-            // If still at capacity after eviction, drop oldest entry
-            if cache.len() >= MAX_CACHE_ENTRIES
-                && let Some(oldest_key) = cache.iter().min_by_key(|(_, (ts, _))| *ts).map(|(k, _)| *k)
-            {
-                cache.remove(&oldest_key);
-            }
-            cache.insert(key, (Instant::now(), response.clone()));
+            cache.insert(key, response.clone());
         }
 
         Ok(result)

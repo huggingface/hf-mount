@@ -1,12 +1,78 @@
 #![allow(dead_code)]
 
+pub mod bench;
+pub mod fs_tests;
+
 use std::path::Path;
 use std::process::{Child, Command};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use data::{FileUploadSession, XetFileInfo};
 use reqwest::Client;
+
+pub const ENDPOINT: &str = "https://huggingface.co";
+
+/// Create a bucket and return (token, bucket_id, hub). Returns None if HF_TOKEN not set.
+/// Use this for multi-file setups (e.g. fio benchmarks) where you upload files yourself.
+pub async fn setup_bucket(
+    test_name: &str,
+) -> Option<(String, String, Arc<hf_mount::hub_api::HubApiClient>)> {
+    let token = match std::env::var("HF_TOKEN") {
+        Ok(t) => t,
+        Err(_) => {
+            eprintln!("Skipping: HF_TOKEN not set");
+            return None;
+        }
+    };
+
+    let username = whoami(ENDPOINT, &token).await;
+    let bucket_id = format!("{}/hf-mount-{}-{}", username, test_name, std::process::id());
+
+    create_bucket(ENDPOINT, &token, &bucket_id).await;
+    eprintln!("Created bucket: {}", bucket_id);
+
+    let hub = hf_mount::hub_api::HubApiClient::new(ENDPOINT, &token, &bucket_id);
+    Some((token, bucket_id, hub))
+}
+
+/// Create a bucket, upload a single file, return (token, bucket_id, hub).
+/// For multi-file setups, use `setup_bucket` + `upload_file` directly.
+pub async fn setup_bucket_with_file(
+    test_name: &str,
+    filename: &str,
+    content: &[u8],
+) -> Option<(String, String, Arc<hf_mount::hub_api::HubApiClient>)> {
+    let (token, bucket_id, hub) = setup_bucket(test_name).await?;
+    let write_config = build_write_config(&hub).await;
+
+    let tmp_dir = std::env::temp_dir().join(format!("hf-mount-{}-setup", test_name));
+    std::fs::create_dir_all(&tmp_dir).ok();
+    let staging_path = tmp_dir.join(filename);
+    std::fs::write(&staging_path, content).expect("write staging file");
+
+    let file_info = upload_file(write_config, &staging_path).await;
+    let xet_hash = file_info.hash().to_string();
+    eprintln!("Uploaded: xet_hash={}, size={}", xet_hash, file_info.file_size());
+
+    let mtime_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    hub.batch_operations(&[hf_mount::hub_api::BatchOp::AddFile {
+        path: filename.to_string(),
+        xet_hash,
+        mtime: mtime_ms,
+        content_type: None,
+    }])
+    .await
+    .expect("batch add failed");
+
+    std::fs::remove_dir_all(&tmp_dir).ok();
+
+    Some((token, bucket_id, hub))
+}
 
 /// Create a bucket on the Hub. Ignores 409 (already exists).
 pub async fn create_bucket(endpoint: &str, token: &str, bucket_id: &str) {
@@ -70,17 +136,10 @@ pub async fn whoami(endpoint: &str, token: &str) -> String {
 /// Build an Arc<TranslatorConfig> for CAS writes.
 pub async fn build_write_config(
     hub: &Arc<hf_mount::hub_api::HubApiClient>,
-    bucket_id: &str,
 ) -> Arc<data::configurations::TranslatorConfig> {
-    let write_jwt = hub
-        .get_cas_write_token(bucket_id)
-        .await
-        .expect("get_cas_write_token failed");
+    let write_jwt = hub.get_cas_write_token().await.expect("get_cas_write_token failed");
 
-    let write_refresher = Arc::new(hf_mount::auth::HubTokenRefresher::for_write(
-        hub.clone(),
-        bucket_id.to_string(),
-    ));
+    let write_refresher = hub.token_refresher(false);
 
     Arc::new(
         data::data_client::default_config(
@@ -162,10 +221,23 @@ pub fn mount_bucket(bucket_id: &str, mount_point: &str, cache_dir: &str, extra_a
     child
 }
 
-/// Unmount and wait for hf-mount to exit. Waits up to `graceful_secs` for
-/// a clean exit (destroy() may flush + upload) before force-killing.
-pub fn unmount(mount_point: &str, mut child: Child, graceful_secs: u64) {
-    let _ = Command::new("fusermount").args(["-u", mount_point]).status();
+/// Unmount FUSE and wait for hf-mount to exit. Waits up to `graceful_secs`
+/// for a clean exit (destroy() may flush + upload) before force-killing.
+pub fn unmount(mount_point: &str, child: Child, graceful_secs: u64) {
+    unmount_with(mount_point, child, graceful_secs, &["fusermount", "-u"]);
+}
+
+/// Unmount NFS and wait for hf-mount to exit.
+pub fn unmount_nfs(mount_point: &str, child: Child, graceful_secs: u64) {
+    unmount_with(mount_point, child, graceful_secs, &["sudo", "umount"]);
+}
+
+fn unmount_with(mount_point: &str, mut child: Child, graceful_secs: u64, cmd: &[&str]) {
+    match Command::new(cmd[0]).args(&cmd[1..]).arg(mount_point).status() {
+        Ok(s) if !s.success() => eprintln!("Warning: unmount command exited with {}", s),
+        Err(e) => eprintln!("Warning: unmount command failed: {}", e),
+        _ => {}
+    }
 
     for _ in 0..graceful_secs {
         if let Ok(Some(status)) = child.try_wait() {
@@ -179,6 +251,15 @@ pub fn unmount(mount_point: &str, mut child: Child, graceful_secs: u64) {
         Ok(status) => eprintln!("hf-mount killed: {}", status),
         Err(e) => eprintln!("wait error: {}", e),
     }
+}
+
+/// Build test content with recognizable header/middle/footer and padding to 4 KB.
+/// Layout: "AAAA_HEADER_AAAA|BBBB_MIDDLE_BBBB|CCCC_FOOTER_CCCC|" + 'X' padding + "END"
+pub fn test_content() -> String {
+    let prefix = "AAAA_HEADER_AAAA|BBBB_MIDDLE_BBBB|CCCC_FOOTER_CCCC|";
+    let suffix = "END";
+    let pad_len = 4096 - prefix.len() - suffix.len();
+    format!("{}{}{}", prefix, "X".repeat(pad_len), suffix)
 }
 
 /// Generate deterministic content: byte[i] = (i % 251) as u8

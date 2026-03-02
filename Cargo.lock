@@ -288,6 +288,7 @@ dependencies = [
 [[package]]
 name = "cas_client"
 version = "0.14.5"
+source = "git+https://github.com/huggingface/xet-core.git?rev=4319541#4319541a200e3e9d21cdd5e3816e870ba3a10696"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -335,6 +336,7 @@ dependencies = [
 [[package]]
 name = "cas_object"
 version = "0.1.0"
+source = "git+https://github.com/huggingface/xet-core.git?rev=4319541#4319541a200e3e9d21cdd5e3816e870ba3a10696"
 dependencies = [
  "anyhow",
  "blake3",
@@ -361,6 +363,7 @@ dependencies = [
 [[package]]
 name = "cas_types"
 version = "0.1.0"
+source = "git+https://github.com/huggingface/xet-core.git?rev=4319541#4319541a200e3e9d21cdd5e3816e870ba3a10696"
 dependencies = [
  "merklehash",
  "serde",
@@ -420,6 +423,7 @@ dependencies = [
 [[package]]
 name = "chunk_cache"
 version = "0.1.0"
+source = "git+https://github.com/huggingface/xet-core.git?rev=4319541#4319541a200e3e9d21cdd5e3816e870ba3a10696"
 dependencies = [
  "async-trait",
  "base64",
@@ -657,6 +661,7 @@ checksum = "52560adf09603e58c9a7ee1fe1dcb95a16927b17c127f0ac02d6e768a0e25bc1"
 [[package]]
 name = "data"
 version = "0.14.5"
+source = "git+https://github.com/huggingface/xet-core.git?rev=4319541#4319541a200e3e9d21cdd5e3816e870ba3a10696"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -696,6 +701,7 @@ dependencies = [
 [[package]]
 name = "deduplication"
 version = "0.14.5"
+source = "git+https://github.com/huggingface/xet-core.git?rev=4319541#4319541a200e3e9d21cdd5e3816e870ba3a10696"
 dependencies = [
  "async-trait",
  "bytes",
@@ -855,6 +861,7 @@ dependencies = [
 [[package]]
 name = "error_printer"
 version = "0.14.5"
+source = "git+https://github.com/huggingface/xet-core.git?rev=4319541#4319541a200e3e9d21cdd5e3816e870ba3a10696"
 dependencies = [
  "tracing",
 ]
@@ -868,6 +875,7 @@ checksum = "37909eebbb50d72f9059c3b6d82c0463f2ff062c9e95845c43a6c9c0355411be"
 [[package]]
 name = "file_reconstruction"
 version = "0.14.5"
+source = "git+https://github.com/huggingface/xet-core.git?rev=4319541#4319541a200e3e9d21cdd5e3816e870ba3a10696"
 dependencies = [
  "async-trait",
  "bytes",
@@ -889,6 +897,7 @@ dependencies = [
 [[package]]
 name = "file_utils"
 version = "0.14.2"
+source = "git+https://github.com/huggingface/xet-core.git?rev=4319541#4319541a200e3e9d21cdd5e3816e870ba3a10696"
 dependencies = [
  "colored",
  "lazy_static",
@@ -1277,6 +1286,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "utils",
+ "uuid",
  "xet_runtime",
 ]
 
@@ -1328,6 +1338,7 @@ checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
 [[package]]
 name = "hub_client"
 version = "0.1.0"
+source = "git+https://github.com/huggingface/xet-core.git?rev=4319541#4319541a200e3e9d21cdd5e3816e870ba3a10696"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1776,6 +1787,7 @@ dependencies = [
 [[package]]
 name = "mdb_shard"
 version = "0.14.5"
+source = "git+https://github.com/huggingface/xet-core.git?rev=4319541#4319541a200e3e9d21cdd5e3816e870ba3a10696"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1820,6 +1832,7 @@ dependencies = [
 [[package]]
 name = "merklehash"
 version = "0.14.5"
+source = "git+https://github.com/huggingface/xet-core.git?rev=4319541#4319541a200e3e9d21cdd5e3816e870ba3a10696"
 dependencies = [
  "base64",
  "blake3",
@@ -2365,6 +2378,7 @@ dependencies = [
 [[package]]
 name = "progress_tracking"
 version = "0.1.0"
+source = "git+https://github.com/huggingface/xet-core.git?rev=4319541#4319541a200e3e9d21cdd5e3816e870ba3a10696"
 dependencies = [
  "async-trait",
  "merklehash",
@@ -3692,6 +3706,7 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 [[package]]
 name = "utils"
 version = "0.14.5"
+source = "git+https://github.com/huggingface/xet-core.git?rev=4319541#4319541a200e3e9d21cdd5e3816e870ba3a10696"
 dependencies = [
  "async-trait",
  "bincode",
@@ -4487,6 +4502,7 @@ checksum = "9edde0db4769d2dc68579893f2306b26c6ecfbe0ef499b013d731b7b9247e0b9"
 [[package]]
 name = "xet_config"
 version = "0.14.5"
+source = "git+https://github.com/huggingface/xet-core.git?rev=4319541#4319541a200e3e9d21cdd5e3816e870ba3a10696"
 dependencies = [
  "const-str",
  "konst",
@@ -4496,6 +4512,7 @@ dependencies = [
 [[package]]
 name = "xet_runtime"
 version = "0.1.0"
+source = "git+https://github.com/huggingface/xet-core.git?rev=4319541#4319541a200e3e9d21cdd5e3816e870ba3a10696"
 dependencies = [
  "dirs",
  "error_printer",

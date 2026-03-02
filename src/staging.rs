@@ -14,7 +14,7 @@ fn rand_u64() -> u64 {
     hasher.finish()
 }
 
-pub struct FileCache {
+pub struct FileStaging {
     staging_dir: PathBuf,
     session: Arc<FileDownloadSession>,
     upload_config: Option<Arc<TranslatorConfig>>,
@@ -22,7 +22,7 @@ pub struct FileCache {
     session_key: u64,
 }
 
-impl FileCache {
+impl FileStaging {
     pub fn new(
         cache_dir: PathBuf,
         session: Arc<FileDownloadSession>,
