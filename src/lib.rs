@@ -1,10 +1,9 @@
-pub mod auth;
-pub mod cache;
-pub mod caching_client;
+pub mod cached_xet_client;
 pub mod error;
-pub mod fs;
+pub mod fuse;
 pub mod hub_api;
 pub mod inode;
 #[cfg(feature = "nfs")]
 pub mod nfs;
-pub mod vfs;
+pub mod staging;
+pub mod virtual_fs;

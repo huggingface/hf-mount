@@ -6,11 +6,10 @@ use data::FileDownloadSession;
 use data::data_client::default_config;
 use tracing::{error, info};
 
-use hf_mount::auth::HubTokenRefresher;
-use hf_mount::cache::FileCache;
-use hf_mount::caching_client::CachingClient;
-use hf_mount::fs::HfFs;
-use hf_mount::hub_api::HubApiClient;
+use hf_mount::cached_xet_client::CachedXetClient;
+use hf_mount::fuse::FuseAdapter;
+use hf_mount::hub_api::{HubApiClient, HubTokenRefresher};
+use hf_mount::staging::FileStaging;
 
 #[derive(Parser)]
 #[command(name = "hf-mount", about = "Mount a HuggingFace bucket as a filesystem")]
@@ -42,6 +41,14 @@ struct Args {
     /// Interval in seconds for polling remote changes (0 to disable)
     #[arg(long, default_value_t = 30)]
     poll_interval_secs: u64,
+
+    /// Maximum size in bytes for the on-disk xorb chunk cache
+    #[arg(long, default_value_t = 10_000_000_000)]
+    cache_size: u64,
+
+    /// Maximum number of FUSE threads (default: 16)
+    #[arg(long, default_value_t = 16)]
+    max_threads: usize,
 
     /// Mount backend: "fuse" (default) or "nfs" (requires --features nfs)
     #[arg(long, default_value = "fuse")]
@@ -81,65 +88,63 @@ fn main() {
     }
 
     // Build tokio runtime
-    let rt = tokio::runtime::Builder::new_multi_thread()
+    let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .expect("Failed to create tokio runtime");
 
-    let hub_client = HubApiClient::new(&args.hub_endpoint, &args.hf_token);
+    let hub_client = HubApiClient::new(&args.hub_endpoint, &args.hf_token, &args.bucket_id);
 
-    // Build read CAS config
-    let read_refresher = Arc::new(HubTokenRefresher::for_read(hub_client.clone(), args.bucket_id.clone()));
-    let read_config = Arc::new(build_cas_config(&rt, &read_refresher, "read"));
+    // Build CAS config — use a write token when read-write (it can also read).
+    let refresher = hub_client.token_refresher(args.read_only);
+    let cas_config = build_cas_config(&runtime, &refresher);
 
     // Create on-disk xorb chunk cache for cross-file deduplication.
     let xorb_cache = {
         let config = data::CacheConfig {
             cache_directory: args.cache_dir.join("xorbs"),
-            cache_size: 10_000_000_000,
+            cache_size: args.cache_size,
         };
         data::get_cache(&config).expect("Failed to create xorb cache")
     };
 
     // Create CAS client with reconstruction cache wrapper
-    let raw_client = rt
-        .block_on(data::create_remote_client(&read_config, "hf-mount", false))
+    let raw_client = runtime
+        .block_on(data::create_remote_client(
+            &cas_config,
+            &uuid::Uuid::new_v4().to_string(),
+            false,
+        ))
         .expect("Failed to create CAS client");
-    let caching_client = CachingClient::new(raw_client);
+    let cached_client = CachedXetClient::new(raw_client);
 
-    let download_session = FileDownloadSession::from_client(caching_client, None, Some(xorb_cache));
+    let download_session = FileDownloadSession::from_client(cached_client, None, Some(xorb_cache));
 
-    // Build write CAS config (if not read-only)
-    let upload_config = if !args.read_only {
-        let write_refresher = Arc::new(HubTokenRefresher::for_write(hub_client.clone(), args.bucket_id.clone()));
-        Some(Arc::new(build_cas_config(&rt, &write_refresher, "write")))
-    } else {
-        None
-    };
+    let upload_config = if args.read_only { None } else { Some(cas_config) };
 
-    // Create file cache
-    let cache = FileCache::new(args.cache_dir, download_session, upload_config);
+    let staging = FileStaging::new(args.cache_dir, download_session, upload_config);
 
     // Determine uid/gid
     let uid = args.uid.unwrap_or_else(|| unsafe { libc::getuid() });
     let gid = args.gid.unwrap_or_else(|| unsafe { libc::getgid() });
 
-    // Ensure mount point exists
-    std::fs::create_dir_all(&args.mount_point).ok();
+    std::fs::create_dir_all(&args.mount_point)
+        .unwrap_or_else(|e| panic!("Failed to create mount point {:?}: {e}", args.mount_point));
 
-    let mode = if args.read_only { "read-only" } else { "read-write" };
     info!(
         "Mounting bucket {} at {:?} ({}, backend={})",
-        args.bucket_id, args.mount_point, mode, args.backend
+        hub_client.bucket_id(),
+        args.mount_point,
+        if args.read_only { "read-only" } else { "read-write" },
+        args.backend
     );
 
     match args.backend.as_str() {
         "fuse" => {
-            let hf_fs = HfFs::new(
-                rt.handle().clone(),
+            let fuse_adapter = FuseAdapter::new(
+                runtime.handle().clone(),
                 hub_client,
-                args.bucket_id.clone(),
-                cache,
+                staging,
                 args.read_only,
                 uid,
                 gid,
@@ -156,34 +161,32 @@ fn main() {
             }
             fuse_config.acl = fuser::SessionACL::All;
             fuse_config.clone_fd = true;
-            fuse_config.n_threads = Some(
-                std::thread::available_parallelism()
-                    .map(|n| n.get())
-                    .unwrap_or(4)
-                    .max(4),
-            );
+            fuse_config.n_threads = Some(args.max_threads);
 
-            if let Err(e) = fuser::mount2(hf_fs, &args.mount_point, &fuse_config) {
+            if let Err(e) = fuser::mount2(fuse_adapter, &args.mount_point, &fuse_config) {
                 error!("FUSE mount failed: {}", e);
                 std::process::exit(1);
             }
         }
         #[cfg(feature = "nfs")]
         "nfs" => {
-            use hf_mount::vfs::HfVfsCore;
+            use hf_mount::virtual_fs::VirtualFs;
 
-            let vfs = HfVfsCore::new(
-                rt.handle().clone(),
+            let virtual_fs = VirtualFs::new(
+                runtime.handle().clone(),
                 hub_client,
-                args.bucket_id.clone(),
-                cache,
+                staging,
                 args.read_only,
                 uid,
                 gid,
                 args.poll_interval_secs,
             );
 
-            if let Err(e) = rt.block_on(hf_mount::nfs::mount_nfs(vfs, &args.mount_point)) {
+            if let Err(e) = runtime.block_on(hf_mount::nfs::mount_nfs(
+                virtual_fs,
+                &args.mount_point,
+                args.poll_interval_secs,
+            )) {
                 error!("NFS mount failed: {}", e);
                 std::process::exit(1);
             }
@@ -203,20 +206,21 @@ fn main() {
 }
 
 fn build_cas_config(
-    rt: &tokio::runtime::Runtime,
+    runtime: &tokio::runtime::Runtime,
     refresher: &Arc<HubTokenRefresher>,
-    label: &str,
-) -> data::configurations::TranslatorConfig {
-    let jwt = rt.block_on(refresher.fetch_initial()).unwrap_or_else(|e| {
-        panic!("Failed to get CAS {label} token: {e}");
+) -> Arc<data::configurations::TranslatorConfig> {
+    let jwt = runtime.block_on(refresher.fetch_initial()).unwrap_or_else(|e| {
+        panic!("Failed to get CAS token: {e}");
     });
-    info!("Got CAS {label} token for endpoint: {}", jwt.cas_url);
-    default_config(
-        jwt.cas_url,
-        None,
-        Some((jwt.access_token, jwt.exp)),
-        Some(refresher.clone()),
-        None,
+    info!("Got CAS token for endpoint: {}", jwt.cas_url);
+    Arc::new(
+        default_config(
+            jwt.cas_url,
+            None,
+            Some((jwt.access_token, jwt.exp)),
+            Some(refresher.clone()),
+            None,
+        )
+        .unwrap_or_else(|e| panic!("Failed to build TranslatorConfig: {e}")),
     )
-    .unwrap_or_else(|e| panic!("Failed to build {label} TranslatorConfig: {e}"))
 }
