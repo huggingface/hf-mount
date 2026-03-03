@@ -32,8 +32,8 @@ impl NFSAdapter {
     /// Evict a handle: flush dirty data, then release.
     async fn evict_handle(&self, ino: u64, file_handle: u64) {
         // Flush commits any buffered writes to CAS+Hub before releasing.
-        let _ = self.virtual_fs.flush(ino, file_handle).await;
-        self.virtual_fs.release(file_handle);
+        let _ = self.virtual_fs.flush(ino, file_handle, None).await;
+        self.virtual_fs.release(file_handle).await;
     }
 
     /// Get or open a file handle from the pool.
@@ -43,17 +43,26 @@ impl NFSAdapter {
             return Ok(file_handle);
         }
         // Pool miss: open file (may await download)
-        let file_handle = self.virtual_fs.open(ino, false, false).await.map_err(errno_to_nfs)?;
+        let file_handle = self
+            .virtual_fs
+            .open(ino, false, false, None)
+            .await
+            .map_err(errno_to_nfs)?;
         // Insert into pool (evict LRU if full)
-        let evicted = {
+        let (evicted, dup_handle) = {
             let mut pool = self.handle_pool.lock().expect("handle_pool poisoned");
             // Double-check: another task may have opened it concurrently
             if let Some(existing) = pool.get(ino) {
-                self.virtual_fs.release(file_handle);
-                return Ok(existing);
+                (None, Some((existing, file_handle)))
+            } else {
+                (pool.insert(ino, file_handle), None)
             }
-            pool.insert(ino, file_handle)
         };
+        // Release duplicate handle outside the lock (release is async)
+        if let Some((existing, dup)) = dup_handle {
+            self.virtual_fs.release(dup).await;
+            return Ok(existing);
+        }
         if let Some((evicted_ino, evicted_handle)) = evicted {
             self.evict_handle(evicted_ino, evicted_handle).await;
         }
@@ -63,7 +72,7 @@ impl NFSAdapter {
     /// Create a file and insert the handle into the pool.
     async fn create_file(&self, dirid: fileid3, filename: &filename3) -> Result<(fileid3, fattr3), nfsstat3> {
         let name = nfs_name(filename)?;
-        let (attr, file_handle) = self.virtual_fs.create(dirid, name).await.map_err(errno_to_nfs)?;
+        let (attr, file_handle) = self.virtual_fs.create(dirid, name, None).await.map_err(errno_to_nfs)?;
         let ino = attr.ino;
         let fattr = vfs_attr_to_nfs(&attr);
         self.insert_handle(ino, file_handle).await;

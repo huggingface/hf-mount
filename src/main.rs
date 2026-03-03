@@ -216,7 +216,13 @@ fn main() {
 
     match args.backend.as_str() {
         "fuse" => {
-            let fuse_adapter = FuseAdapter::new(runtime.handle().clone(), virtual_fs.clone(), metadata_ttl);
+            let fuse_adapter = FuseAdapter::new(
+                runtime.handle().clone(),
+                virtual_fs.clone(),
+                metadata_ttl,
+                args.read_only,
+                advanced_writes,
+            );
 
             let mut fuse_config = fuser::Config::default();
             fuse_config.mount_options = vec![
