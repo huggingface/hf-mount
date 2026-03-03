@@ -9,6 +9,7 @@ use tracing::{error, info};
 use hf_mount::cached_xet_client::CachedXetClient;
 use hf_mount::fuse::FuseAdapter;
 use hf_mount::hub_api::{HubApiClient, HubTokenRefresher};
+use hf_mount::virtual_fs::VirtualFs;
 use hf_mount::xet::{StagingDir, XetSessions};
 
 #[derive(Parser)]
@@ -81,7 +82,6 @@ struct Args {
     max_threads: usize,
 
     /// Mount backend: "fuse" (default) or "nfs" (requires --features nfs).
-    /// NFS is read-only and does not support writes.
     #[arg(long, default_value = "fuse")]
     backend: String,
 }
@@ -127,8 +127,7 @@ fn main() {
     let hub_client = HubApiClient::new(&args.hub_endpoint, &args.hf_token, &args.bucket_id);
 
     // Build CAS config — use a write token when read-write (it can also read).
-    // NFS backend is always read-only, so force read token regardless of flag.
-    let cas_read_only = args.read_only || args.backend == "nfs";
+    let cas_read_only = args.read_only;
     let refresher = hub_client.token_refresher(cas_read_only);
     let cas_config = build_cas_config(&runtime, &refresher);
 
@@ -174,7 +173,11 @@ fn main() {
     let upload_config = if args.read_only { None } else { Some(cas_config) };
 
     let xet_sessions = XetSessions::new(download_session, upload_config);
-    let staging_dir = if args.advanced_writes {
+
+    // NFS has no open/close — writes go through staging files (like xetdata's approach).
+    // Force advanced_writes for writable NFS mounts.
+    let advanced_writes = args.advanced_writes || (args.backend == "nfs" && !args.read_only);
+    let staging_dir = if advanced_writes {
         Some(StagingDir::new(&args.cache_dir))
     } else {
         None
@@ -195,27 +198,24 @@ fn main() {
         args.backend
     );
 
+    let metadata_ttl = std::time::Duration::from_millis(args.metadata_ttl_ms);
+
+    let virtual_fs = VirtualFs::new(
+        runtime.handle().clone(),
+        hub_client,
+        xet_sessions,
+        staging_dir,
+        args.read_only,
+        advanced_writes,
+        uid,
+        gid,
+        args.poll_interval_secs,
+        metadata_ttl,
+        !args.metadata_ttl_minimal,
+    );
+
     match args.backend.as_str() {
         "fuse" => {
-            use hf_mount::virtual_fs::VirtualFs;
-            use std::time::Duration;
-
-            let metadata_ttl = Duration::from_millis(args.metadata_ttl_ms);
-
-            let virtual_fs = VirtualFs::new(
-                runtime.handle().clone(),
-                hub_client,
-                xet_sessions.clone(),
-                staging_dir,
-                args.read_only,
-                args.advanced_writes,
-                uid,
-                gid,
-                args.poll_interval_secs,
-                metadata_ttl,
-                !args.metadata_ttl_minimal,
-            );
-
             let fuse_adapter = FuseAdapter::new(runtime.handle().clone(), virtual_fs.clone(), metadata_ttl);
 
             let mut fuse_config = fuser::Config::default();
@@ -254,31 +254,11 @@ fn main() {
         }
         #[cfg(feature = "nfs")]
         "nfs" => {
-            use hf_mount::virtual_fs::VirtualFs;
-
-            if args.advanced_writes {
-                error!("--advanced-writes is not supported with NFS backend");
-                std::process::exit(1);
-            }
-
-            let virtual_fs = VirtualFs::new(
-                runtime.handle().clone(),
-                hub_client,
-                xet_sessions,
-                None,  // NFS is read-only, no staging dir
-                true,  // NFS backend is always read-only
-                false, // advanced_writes not supported on NFS
-                uid,
-                gid,
-                args.poll_interval_secs,
-                std::time::Duration::from_millis(args.metadata_ttl_ms),
-                !args.metadata_ttl_minimal,
-            );
-
             if let Err(e) = runtime.block_on(hf_mount::nfs::mount_nfs(
                 virtual_fs,
                 &args.mount_point,
                 args.metadata_ttl_ms,
+                args.read_only,
             )) {
                 error!("NFS mount failed: {}", e);
                 std::process::exit(1);

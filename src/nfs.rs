@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use nfsserve::nfs::{fattr3, fileid3, filename3, ftype3, nfspath3, nfsstat3, nfstime3, sattr3, specdata3};
+use nfsserve::nfs::{fattr3, fileid3, filename3, ftype3, nfspath3, nfsstat3, nfstime3, sattr3, set_size3, specdata3};
 use nfsserve::tcp::{NFSTcp, NFSTcpListener};
 use nfsserve::vfs::{DirEntry, NFSFileSystem, ReadDirResult, VFSCapabilities};
 use tracing::info;
@@ -17,14 +17,23 @@ use crate::virtual_fs::{VirtualFs, VirtualFsAttr};
 pub struct NFSAdapter {
     virtual_fs: Arc<VirtualFs>,
     handle_pool: Arc<Mutex<HandlePool>>,
+    read_only: bool,
 }
 
 impl NFSAdapter {
-    pub fn new(virtual_fs: Arc<VirtualFs>) -> Self {
+    pub fn new(virtual_fs: Arc<VirtualFs>, read_only: bool) -> Self {
         Self {
             virtual_fs,
             handle_pool: Arc::new(Mutex::new(HandlePool::new())),
+            read_only,
         }
+    }
+
+    /// Evict a handle: flush dirty data, then release.
+    async fn evict_handle(&self, ino: u64, file_handle: u64) {
+        // Flush commits any buffered writes to CAS+Hub before releasing.
+        let _ = self.virtual_fs.flush(ino, file_handle).await;
+        self.virtual_fs.release(file_handle);
     }
 
     /// Get or open a file handle from the pool.
@@ -35,17 +44,41 @@ impl NFSAdapter {
         }
         // Pool miss: open file (may await download)
         let file_handle = self.virtual_fs.open(ino, false, false).await.map_err(errno_to_nfs)?;
-        // Insert into pool
-        let mut pool = self.handle_pool.lock().expect("handle_pool poisoned");
-        // Double-check: another task may have opened it concurrently
-        if let Some(existing) = pool.get(ino) {
-            self.virtual_fs.release(file_handle);
-            return Ok(existing);
-        }
-        if let Some((_evicted_ino, evicted_handle)) = pool.insert(ino, file_handle) {
-            self.virtual_fs.release(evicted_handle);
+        // Insert into pool (evict LRU if full)
+        let evicted = {
+            let mut pool = self.handle_pool.lock().expect("handle_pool poisoned");
+            // Double-check: another task may have opened it concurrently
+            if let Some(existing) = pool.get(ino) {
+                self.virtual_fs.release(file_handle);
+                return Ok(existing);
+            }
+            pool.insert(ino, file_handle)
+        };
+        if let Some((evicted_ino, evicted_handle)) = evicted {
+            self.evict_handle(evicted_ino, evicted_handle).await;
         }
         Ok(file_handle)
+    }
+
+    /// Create a file and insert the handle into the pool.
+    async fn create_file(&self, dirid: fileid3, filename: &filename3) -> Result<(fileid3, fattr3), nfsstat3> {
+        let name = nfs_name(filename)?;
+        let (attr, file_handle) = self.virtual_fs.create(dirid, name).await.map_err(errno_to_nfs)?;
+        let ino = attr.ino;
+        let fattr = vfs_attr_to_nfs(&attr);
+        self.insert_handle(ino, file_handle).await;
+        Ok((ino, fattr))
+    }
+
+    /// Insert a writable handle into the pool (used after create).
+    async fn insert_handle(&self, ino: u64, file_handle: u64) {
+        let evicted = {
+            let mut pool = self.handle_pool.lock().expect("handle_pool poisoned");
+            pool.insert(ino, file_handle)
+        };
+        if let Some((evicted_ino, evicted_handle)) = evicted {
+            self.evict_handle(evicted_ino, evicted_handle).await;
+        }
     }
 }
 
@@ -56,11 +89,15 @@ impl NFSFileSystem for NFSAdapter {
     }
 
     fn capabilities(&self) -> VFSCapabilities {
-        VFSCapabilities::ReadOnly
+        if self.read_only {
+            VFSCapabilities::ReadOnly
+        } else {
+            VFSCapabilities::ReadWrite
+        }
     }
 
     async fn lookup(&self, dirid: fileid3, filename: &filename3) -> Result<fileid3, nfsstat3> {
-        let name = std::str::from_utf8(&filename.0).map_err(|_| nfsstat3::NFS3ERR_NOENT)?;
+        let name = nfs_name(filename).map_err(|_| nfsstat3::NFS3ERR_NOENT)?;
         self.virtual_fs
             .lookup(dirid, name)
             .await
@@ -120,45 +157,79 @@ impl NFSFileSystem for NFSAdapter {
         Ok(ReadDirResult { entries: page, end })
     }
 
-    // ── Read-only stubs ────────────────────────────────────────────────
+    // ── Write operations ────────────────────────────────────────────────
 
-    async fn setattr(&self, _id: fileid3, _setattr: sattr3) -> Result<fattr3, nfsstat3> {
-        Err(nfsstat3::NFS3ERR_ROFS)
+    async fn setattr(&self, id: fileid3, setattr: sattr3) -> Result<fattr3, nfsstat3> {
+        let size = match setattr.size {
+            set_size3::size(s) => Some(s),
+            set_size3::Void => None,
+        };
+        self.virtual_fs
+            .setattr(id, size)
+            .await
+            .map(|a| vfs_attr_to_nfs(&a))
+            .map_err(errno_to_nfs)
     }
 
-    async fn write(&self, _id: fileid3, _offset: u64, _data: &[u8]) -> Result<fattr3, nfsstat3> {
-        Err(nfsstat3::NFS3ERR_ROFS)
+    async fn write(&self, id: fileid3, offset: u64, data: &[u8]) -> Result<fattr3, nfsstat3> {
+        // Write requires a handle already in the pool (from create).
+        let file_handle = self
+            .handle_pool
+            .lock()
+            .expect("handle_pool poisoned")
+            .get(id)
+            .ok_or(nfsstat3::NFS3ERR_STALE)?;
+        // NFS always uses advanced_writes (staging files), so write() is a
+        // synchronous pwrite() — safe to call from async context.
+        self.virtual_fs
+            .write(id, file_handle, offset, data)
+            .map_err(errno_to_nfs)?;
+        self.virtual_fs
+            .getattr(id)
+            .map(|a| vfs_attr_to_nfs(&a))
+            .map_err(errno_to_nfs)
     }
 
-    async fn create(
-        &self,
-        _dirid: fileid3,
-        _filename: &filename3,
-        _attr: sattr3,
-    ) -> Result<(fileid3, fattr3), nfsstat3> {
-        Err(nfsstat3::NFS3ERR_ROFS)
+    async fn create(&self, dirid: fileid3, filename: &filename3, _attr: sattr3) -> Result<(fileid3, fattr3), nfsstat3> {
+        let (ino, fattr) = self.create_file(dirid, filename).await?;
+        Ok((ino, fattr))
     }
 
-    async fn create_exclusive(&self, _dirid: fileid3, _filename: &filename3) -> Result<fileid3, nfsstat3> {
-        Err(nfsstat3::NFS3ERR_ROFS)
+    async fn create_exclusive(&self, dirid: fileid3, filename: &filename3) -> Result<fileid3, nfsstat3> {
+        let (ino, _) = self.create_file(dirid, filename).await?;
+        Ok(ino)
     }
 
-    async fn mkdir(&self, _dirid: fileid3, _dirname: &filename3) -> Result<(fileid3, fattr3), nfsstat3> {
-        Err(nfsstat3::NFS3ERR_ROFS)
+    async fn mkdir(&self, dirid: fileid3, dirname: &filename3) -> Result<(fileid3, fattr3), nfsstat3> {
+        let name = nfs_name(dirname)?;
+        let attr = self.virtual_fs.mkdir(dirid, name).await.map_err(errno_to_nfs)?;
+        Ok((attr.ino, vfs_attr_to_nfs(&attr)))
     }
 
-    async fn remove(&self, _dirid: fileid3, _filename: &filename3) -> Result<(), nfsstat3> {
-        Err(nfsstat3::NFS3ERR_ROFS)
+    async fn remove(&self, dirid: fileid3, filename: &filename3) -> Result<(), nfsstat3> {
+        let name = nfs_name(filename)?;
+        // Check whether this is a file or directory.
+        let child_ino = self.virtual_fs.lookup(dirid, name).await.map_err(errno_to_nfs)?.ino;
+        let attr = self.virtual_fs.getattr(child_ino).map_err(errno_to_nfs)?;
+        match attr.kind {
+            InodeKind::File => self.virtual_fs.unlink(dirid, name).await.map_err(errno_to_nfs),
+            InodeKind::Directory => self.virtual_fs.rmdir(dirid, name).await.map_err(errno_to_nfs),
+        }
     }
 
     async fn rename(
         &self,
-        _from_dirid: fileid3,
-        _from_filename: &filename3,
-        _to_dirid: fileid3,
-        _to_filename: &filename3,
+        from_dirid: fileid3,
+        from_filename: &filename3,
+        to_dirid: fileid3,
+        to_filename: &filename3,
     ) -> Result<(), nfsstat3> {
-        Err(nfsstat3::NFS3ERR_ROFS)
+        let from_name = nfs_name(from_filename)?;
+        let to_name = nfs_name(to_filename)?;
+        self.virtual_fs
+            .rename(from_dirid, from_name, to_dirid, to_name, false)
+            .await
+            .map_err(errno_to_nfs)
     }
 
     async fn symlink(
@@ -178,12 +249,21 @@ impl NFSFileSystem for NFSAdapter {
 
 // ── Mount orchestration ────────────────────────────────────────────────
 
-pub async fn mount_nfs(virtual_fs: Arc<VirtualFs>, mount_point: &Path, metadata_ttl_ms: u64) -> std::io::Result<()> {
+pub async fn mount_nfs(
+    virtual_fs: Arc<VirtualFs>,
+    mount_point: &Path,
+    metadata_ttl_ms: u64,
+    read_only: bool,
+) -> std::io::Result<()> {
     let vfs_for_shutdown = virtual_fs.clone();
-    let adapter = NFSAdapter::new(virtual_fs);
-    let listener = NFSTcpListener::bind("127.0.0.1:0", adapter).await?;
+    let adapter = NFSAdapter::new(virtual_fs, read_only);
+    let mut listener = NFSTcpListener::bind("127.0.0.1:0", adapter).await?;
     let port = listener.get_listen_port();
     info!("NFS server listening on 127.0.0.1:{}", port);
+
+    // Register mount/unmount listener: nfsserve sends `false` on UMNT.
+    let (mount_tx, mut mount_rx) = tokio::sync::mpsc::channel::<bool>(1);
+    listener.set_mount_listener(mount_tx);
 
     let mount_point_str = mount_point
         .to_str()
@@ -203,22 +283,27 @@ pub async fn mount_nfs(virtual_fs: Arc<VirtualFs>, mount_point: &Path, metadata_
     // Platform-specific mount command
     #[cfg(target_os = "macos")]
     {
+        let mut opts = format!("nolocks,vers=3,tcp,rsize=1048576,actimeo={actimeo},port={port},mountport={port}");
+        if read_only {
+            opts = format!("rdonly,{opts}");
+        } else {
+            opts = format!("{opts},wsize=1048576");
+        }
         let status = std::process::Command::new("mount_nfs")
-            .args([
-                "-o",
-                &format!("rdonly,nolocks,vers=3,tcp,rsize=1048576,actimeo={actimeo},port={port},mountport={port}"),
-                "127.0.0.1:/",
-                mount_point_str,
-            ])
+            .args(["-o", &opts, "127.0.0.1:/", mount_point_str])
             .status()?;
         if !status.success() {
+            server_handle.abort();
             return Err(std::io::Error::other(format!("mount command failed with {status}")));
         }
     }
 
     #[cfg(target_os = "linux")]
     {
-        let mount_opts = format!("nolock,vers=3,tcp,rsize=1048576,actimeo={actimeo},port={port},mountport={port}");
+        let mut mount_opts = format!("nolock,vers=3,tcp,rsize=1048576,actimeo={actimeo},port={port},mountport={port}");
+        if !read_only {
+            mount_opts = format!("{mount_opts},wsize=1048576");
+        }
         let output = if unsafe { libc::getuid() } == 0 {
             std::process::Command::new("mount.nfs")
                 .args(["-o", &mount_opts, "127.0.0.1:/", mount_point_str])
@@ -229,6 +314,7 @@ pub async fn mount_nfs(virtual_fs: Arc<VirtualFs>, mount_point: &Path, metadata_
                 .output()?
         };
         if !output.status.success() {
+            server_handle.abort();
             let stderr = String::from_utf8_lossy(&output.stderr);
             let stdout = String::from_utf8_lossy(&output.stdout);
             return Err(std::io::Error::other(format!(
@@ -240,8 +326,36 @@ pub async fn mount_nfs(virtual_fs: Arc<VirtualFs>, mount_point: &Path, metadata_
 
     info!("NFS mount active at {}", mount_point_str);
 
-    // Block until the NFS server exits (e.g. on unmount)
-    let _ = server_handle.await;
+    // Wait for unmount signal or server exit.
+    // nfsserve sends `true` on MNT and `false` on UMNT — ignore mount events.
+    // handle_forever() is an infinite accept() loop that never returns on its own.
+    // On Linux, `umount` doesn't always send the UMNT RPC, so we also poll
+    // /proc/mounts as a fallback to detect when the mount disappears.
+    tokio::pin!(server_handle);
+    loop {
+        tokio::select! {
+            msg = mount_rx.recv() => {
+                match msg {
+                    Some(true) => continue,  // mount event, keep waiting
+                    _ => {
+                        info!("NFS unmount detected via UMNT, shutting down");
+                        break;
+                    }
+                }
+            }
+            _ = &mut server_handle => {
+                info!("NFS server exited");
+                break;
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {
+                if !is_mounted(mount_point_str) {
+                    info!("NFS mount disappeared, shutting down");
+                    break;
+                }
+            }
+        }
+    }
+
     vfs_for_shutdown.shutdown();
     Ok(())
 }
@@ -254,9 +368,9 @@ pub async fn mount_nfs(virtual_fs: Arc<VirtualFs>, mount_point: &Path, metadata_
 //
 // The handle pool bridges the gap: it caches VFS file handles keyed by
 // inode, evicting the least-recently-used entry when full. Eviction
-// calls virtual_fs.release(), which flushes dirty data and frees the prefetch
-// buffer. A subsequent read on an evicted file simply re-opens it (cold
-// open — slightly slower, prefetch restarts from scratch).
+// calls flush() then release() — flush commits dirty write data to
+// CAS+Hub, release frees the prefetch buffer. A subsequent read on an
+// evicted file simply re-opens it (cold open — prefetch restarts).
 //
 // Each open handle may hold a prefetch buffer (~8 MB worst case), so the
 // pool size caps memory usage at roughly capacity × 8 MB.
@@ -303,6 +417,10 @@ impl HandlePool {
 
 // ── Conversions ────────────────────────────────────────────────────────
 
+fn nfs_name(filename: &filename3) -> Result<&str, nfsstat3> {
+    std::str::from_utf8(&filename.0).map_err(|_| nfsstat3::NFS3ERR_INVAL)
+}
+
 fn errno_to_nfs(e: i32) -> nfsstat3 {
     match e {
         libc::ENOENT => nfsstat3::NFS3ERR_NOENT,
@@ -325,6 +443,36 @@ fn system_time_to_nfstime(t: SystemTime) -> nfstime3 {
     nfstime3 {
         seconds: d.as_secs() as u32,
         nseconds: d.subsec_nanos(),
+    }
+}
+
+/// Check if a path is still an active mount point.
+fn is_mounted(path: &str) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_to_string("/proc/mounts")
+            .map(|s| s.lines().any(|line| line.split_whitespace().nth(1) == Some(path)))
+            .unwrap_or(false)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // On macOS, check via statfs: a mounted NFS will have f_fstypename = "nfs"
+        use std::ffi::CString;
+        use std::mem::MaybeUninit;
+        let c_path = match CString::new(path) {
+            Ok(p) => p,
+            Err(_) => return false,
+        };
+        unsafe {
+            let mut buf = MaybeUninit::<libc::statfs>::uninit();
+            if libc::statfs(c_path.as_ptr(), buf.as_mut_ptr()) == 0 {
+                let buf = buf.assume_init();
+                let fstype = std::ffi::CStr::from_ptr(buf.f_fstypename.as_ptr());
+                fstype.to_bytes() == b"nfs"
+            } else {
+                false
+            }
+        }
     }
 }
 
