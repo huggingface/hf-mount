@@ -33,7 +33,7 @@ impl NFSAdapter {
     async fn evict_handle(&self, ino: u64, file_handle: u64) {
         // Flush commits any buffered writes to CAS+Hub before releasing.
         let _ = self.virtual_fs.flush(ino, file_handle).await;
-        self.virtual_fs.release(file_handle);
+        self.virtual_fs.release(file_handle).await;
     }
 
     /// Get or open a file handle from the pool.
@@ -49,7 +49,7 @@ impl NFSAdapter {
             let mut pool = self.handle_pool.lock().expect("handle_pool poisoned");
             // Double-check: another task may have opened it concurrently
             if let Some(existing) = pool.get(ino) {
-                self.virtual_fs.release(file_handle);
+                self.virtual_fs.release(file_handle).await;
                 return Ok(existing);
             }
             pool.insert(ino, file_handle)

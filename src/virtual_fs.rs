@@ -1166,81 +1166,15 @@ impl VirtualFs {
         };
 
         if let Some(channel) = streaming_channel {
-            // Check for pending_info first (retry after previous Hub commit failure)
-            let file_info = {
-                let pending = channel.pending_info.lock().unwrap().take();
-                if let Some(info) = pending {
-                    info
-                } else {
-                    // Send Finish to the background worker and await the CAS upload result.
-                    // If the channel is closed, the worker already finished (previous flush
-                    // succeeded) — flush() can be called multiple times (dup/fork), so this
-                    // is a valid no-op.
-                    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
-                    if channel.tx.send(WriteMsg::Finish(result_tx)).await.is_err() {
-                        debug!("flush: channel already closed for ino={}, already committed", ino);
-                        return Ok(());
-                    }
-                    match result_rx.await {
-                        Ok(Ok(info)) => info,
-                        Ok(Err(e)) => {
-                            error!("Streaming upload failed for ino={}: {}", ino, e);
-                            return Err(libc::EIO);
-                        }
-                        Err(_) => {
-                            error!("Streaming worker dropped for ino={}", ino);
-                            return Err(libc::EIO);
-                        }
-                    }
-                }
-            };
-
-            // Commit to Hub
-            let (full_path, pending_deletes) = {
-                let inodes = self.inode_table.read().expect("inodes poisoned");
-                let entry = inodes.get(ino).ok_or(libc::ENOENT)?;
-                (entry.full_path.clone(), entry.pending_deletes.clone())
-            };
-
-            let mtime_ms = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64;
-
-            let mut ops: Vec<BatchOp> = vec![BatchOp::AddFile {
-                path: full_path.clone(),
-                xet_hash: file_info.hash().to_string(),
-                mtime: mtime_ms,
-                content_type: None,
-            }];
-            for old_path in &pending_deletes {
-                ops.push(BatchOp::DeleteFile { path: old_path.clone() });
-            }
-
-            if let Err(e) = self.hub_client.batch_operations(&ops).await {
-                error!("Failed to commit file {}: {}", full_path, e);
-                // CAS upload succeeded but Hub commit failed — preserve file_info for retry
-                *channel.pending_info.lock().unwrap() = Some(file_info);
+            // Streaming writes are finalized in release(), not flush().
+            // flush() is called on every close(2) — including dup'd fds — so committing
+            // here would finalize the file before all writes are done (e.g. shell
+            // redirections like `echo 1 > file` dup the fd and close the original
+            // before the builtin writes).
+            // Just check for worker errors so callers see EIO on close().
+            if channel.error.lock().unwrap().is_some() {
                 return Err(libc::EIO);
             }
-
-            // Update inode: clean, with hash
-            let mut inodes = self.inode_table.write().expect("inodes poisoned");
-            if let Some(entry) = inodes.get_mut(ino) {
-                entry.xet_hash = Some(file_info.hash().to_string());
-                entry.size = file_info.file_size();
-                entry.dirty = false;
-                entry.mtime = SystemTime::now();
-                entry.pending_deletes.clear();
-            }
-
-            info!(
-                "Committed file: {} (hash={}, size={})",
-                full_path,
-                file_info.hash(),
-                file_info.file_size()
-            );
-
             return Ok(());
         }
 
@@ -1254,7 +1188,7 @@ impl VirtualFs {
         Ok(())
     }
 
-    pub fn release(&self, file_handle: u64) {
+    pub async fn release(&self, file_handle: u64) {
         debug!("release: fh={}", file_handle);
 
         let removed = self
@@ -1272,14 +1206,94 @@ impl VirtualFs {
                     fm.enqueue(ino);
                 }
             }
-            Some(OpenFile::Streaming { .. }) => {
-                // Simple mode: upload already happened in flush(), just drop the handle.
+            Some(OpenFile::Streaming { ino, channel }) => {
+                // Simple mode: finalize streaming write, upload to CAS, and commit to Hub.
+                // This runs in release() (not flush()) because flush() fires on every
+                // close(2) of dup'd fds — shell redirections like `echo 1 > file` close
+                // the original fd before the builtin writes. release() fires only once
+                // when the last reference is dropped, so all data has been written.
+                if let Err(e) = self.streaming_commit(ino, &channel).await {
+                    error!("Streaming commit failed in release for ino={}: errno={}", ino, e);
+                }
             }
             _ => {}
         }
         // staging_locks entries are intentionally not cleaned up here: removing
         // while another open() may hold the Arc would break serialization.
         // Entries are tiny (Arc<Mutex<()>>) and bounded by unique inodes opened.
+    }
+
+    /// Finalize a streaming write: send Finish to the worker, await CAS upload, commit to Hub.
+    async fn streaming_commit(&self, ino: u64, channel: &StreamingChannel) -> Result<(), i32> {
+        let file_info = {
+            let pending = channel.pending_info.lock().unwrap().take();
+            if let Some(info) = pending {
+                info
+            } else {
+                let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+                if channel.tx.send(WriteMsg::Finish(result_tx)).await.is_err() {
+                    debug!("release: channel already closed for ino={}, already committed", ino);
+                    return Ok(());
+                }
+                match result_rx.await {
+                    Ok(Ok(info)) => info,
+                    Ok(Err(e)) => {
+                        error!("Streaming upload failed for ino={}: {}", ino, e);
+                        return Err(libc::EIO);
+                    }
+                    Err(_) => {
+                        error!("Streaming worker dropped for ino={}", ino);
+                        return Err(libc::EIO);
+                    }
+                }
+            }
+        };
+
+        // Commit to Hub
+        let (full_path, pending_deletes) = {
+            let inodes = self.inode_table.read().expect("inodes poisoned");
+            let entry = inodes.get(ino).ok_or(libc::ENOENT)?;
+            (entry.full_path.clone(), entry.pending_deletes.clone())
+        };
+
+        let mtime_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        let mut ops: Vec<BatchOp> = vec![BatchOp::AddFile {
+            path: full_path.clone(),
+            xet_hash: file_info.hash().to_string(),
+            mtime: mtime_ms,
+            content_type: None,
+        }];
+        for old_path in &pending_deletes {
+            ops.push(BatchOp::DeleteFile { path: old_path.clone() });
+        }
+
+        if let Err(e) = self.hub_client.batch_operations(&ops).await {
+            error!("Failed to commit file {}: {}", full_path, e);
+            return Err(libc::EIO);
+        }
+
+        // Update inode: clean, with hash
+        let mut inodes = self.inode_table.write().expect("inodes poisoned");
+        if let Some(entry) = inodes.get_mut(ino) {
+            entry.xet_hash = Some(file_info.hash().to_string());
+            entry.size = file_info.file_size();
+            entry.dirty = false;
+            entry.mtime = SystemTime::now();
+            entry.pending_deletes.clear();
+        }
+
+        info!(
+            "Committed file: {} (hash={}, size={})",
+            full_path,
+            file_info.hash(),
+            file_info.file_size()
+        );
+
+        Ok(())
     }
 
     pub async fn create(&self, parent: u64, name: &str) -> VirtualFsResult<(VirtualFsAttr, u64)> {

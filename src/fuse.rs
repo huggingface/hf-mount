@@ -193,7 +193,7 @@ impl Filesystem for FuseAdapter {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        self.virtual_fs.release(fh.0);
+        self.runtime.block_on(self.virtual_fs.release(fh.0));
         reply.ok();
     }
 
