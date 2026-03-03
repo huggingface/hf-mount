@@ -757,12 +757,6 @@ impl VirtualFs {
             return Err(libc::EROFS);
         }
 
-        // Simple mode: open(writable) on existing files is not supported.
-        // Only create() produces writable handles. EPERM.
-        if writable && !self.advanced_writes {
-            return Err(libc::EPERM);
-        }
-
         let (xet_hash, size, is_dirty) = {
             let inodes = self.inode_table.read().expect("inodes poisoned");
             let entry = match inodes.get(ino) {
@@ -775,7 +769,7 @@ impl VirtualFs {
 
         let staging_path = self.staging_dir.as_ref().map(|sd| sd.path(ino));
 
-        if writable {
+        if writable && self.advanced_writes {
             // Advanced writes mode: staging file + async flush
             let staging_path = staging_path.expect("staging_dir required for advanced writes");
 
@@ -841,6 +835,44 @@ impl VirtualFs {
                 },
             );
             Ok(file_handle)
+        } else if writable {
+            // Simple mode: truncating write on existing file → new streaming writer.
+            // Wait for any in-progress commit to finish first.
+            let staging_mutex = self.staging_lock(ino);
+            let _staging_guard = staging_mutex.lock().await;
+
+            let streaming_writer = self.xet_sessions.create_streaming_writer().await.map_err(|e| {
+                error!("Failed to create streaming writer: {}", e);
+                libc::EIO
+            })?;
+
+            let (tx, rx) = tokio::sync::mpsc::channel::<WriteMsg>(4);
+            let error: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
+            self.runtime
+                .spawn(streaming_worker(streaming_writer, rx, error.clone()));
+
+            let channel = Arc::new(StreamingChannel {
+                tx,
+                bytes_written: AtomicU64::new(0),
+                error,
+                pending_info: std::sync::Mutex::new(None),
+            });
+
+            // Mark inode as dirty with size 0 (truncated)
+            {
+                let mut inodes = self.inode_table.write().expect("inodes poisoned");
+                let entry = inodes.get_mut(ino).ok_or(libc::ENOENT)?;
+                entry.dirty = true;
+                entry.size = 0;
+                entry.xet_hash = None;
+            }
+
+            let file_handle = self.alloc_file_handle();
+            self.open_files
+                .write()
+                .expect("open_files poisoned")
+                .insert(file_handle, OpenFile::Streaming { ino, channel });
+            Ok(file_handle)
         } else {
             // Dirty file not yet flushed → read from local staging (advanced mode only)
             if let Some(ref staging_path) = staging_path
@@ -849,6 +881,31 @@ impl VirtualFs {
             {
                 let file_handle = self.open_local_readonly(ino, staging_path)?;
                 return Ok(file_handle);
+            }
+
+            // Dirty file in simple mode (no staging): a streaming commit is in
+            // progress in release(). Wait for it to finish by acquiring the
+            // staging lock (held by release during commit), then re-read the
+            // inode to pick up the xet_hash set by streaming_commit.
+            if is_dirty && staging_path.is_none() && xet_hash.is_empty() && size > 0 {
+                let staging_mutex = self.staging_lock(ino);
+                let _guard = staging_mutex.lock().await;
+                // Re-read inode after commit completed
+                let (new_xet_hash, new_size) = {
+                    let inodes = self.inode_table.read().expect("inodes poisoned");
+                    let entry = inodes.get(ino).ok_or(libc::ENOENT)?;
+                    (entry.xet_hash.clone().unwrap_or_default(), entry.size)
+                };
+                if !new_xet_hash.is_empty() {
+                    let prefetch = Arc::new(tokio::sync::Mutex::new(PrefetchState::new(new_xet_hash, new_size)));
+                    let file_handle = self.alloc_file_handle();
+                    self.open_files
+                        .write()
+                        .expect("open_files poisoned")
+                        .insert(file_handle, OpenFile::Lazy { prefetch });
+                    return Ok(file_handle);
+                }
+                // If still no hash after waiting, fall through to error below
             }
 
             // Remote file with xet hash → lazy range reads via prefetch buffer
@@ -1212,6 +1269,11 @@ impl VirtualFs {
                 // close(2) of dup'd fds — shell redirections like `echo 1 > file` close
                 // the original fd before the builtin writes. release() fires only once
                 // when the last reference is dropped, so all data has been written.
+                //
+                // Hold the staging lock during commit so that concurrent readers
+                // (open read-only) can wait for the commit to finish before reading.
+                let staging_mutex = self.staging_lock(ino);
+                let _staging_guard = staging_mutex.lock().await;
                 if let Err(e) = self.streaming_commit(ino, &channel).await {
                     error!("Streaming commit failed in release for ino={}: errno={}", ino, e);
                 }
@@ -1842,8 +1904,9 @@ impl VirtualFs {
             return Err(libc::EROFS);
         }
 
-        // Simple mode: truncate via setattr not supported
-        if size.is_some() && !self.advanced_writes {
+        // Simple mode: only truncate-to-zero is supported (for O_TRUNC opens).
+        // Non-zero truncation requires staging files (advanced_writes mode).
+        if size.is_some() && !self.advanced_writes && size != Some(0) {
             return Err(libc::EPERM);
         }
 
@@ -1862,53 +1925,62 @@ impl VirtualFs {
             let staging_mutex = self.staging_lock(ino);
             let _staging_guard = staging_mutex.lock().await;
 
-            let staging_path = self
-                .staging_dir
-                .as_ref()
-                .expect("staging_dir required for advanced writes")
-                .path(ino);
+            if self.advanced_writes {
+                // Advanced mode: truncation is applied to the staging file on disk
+                let staging_path = self
+                    .staging_dir
+                    .as_ref()
+                    .expect("staging_dir required for advanced writes")
+                    .path(ino);
 
-            if new_size == 0 {
-                if let Err(e) = File::create(&staging_path) {
-                    error!("Failed to truncate staging file: {}", e);
-                    return Err(libc::EIO);
-                }
-            } else {
-                // If staging file doesn't exist, download from remote first
-                if !staging_path.exists() {
-                    let (xet_hash, file_size) = {
-                        let inodes = self.inode_table.read().expect("inodes poisoned");
-                        let entry = inodes.get(ino).ok_or(libc::ENOENT)?;
-                        (entry.xet_hash.clone().unwrap_or_default(), entry.size)
-                    };
-                    if !xet_hash.is_empty() && file_size > 0 {
-                        if let Err(e) = self
-                            .xet_sessions
-                            .download_to_file(&xet_hash, file_size, &staging_path)
-                            .await
-                        {
-                            error!("Failed to download file for truncate: {}", e);
+                if new_size == 0 {
+                    if let Err(e) = File::create(&staging_path) {
+                        error!("Failed to truncate staging file: {}", e);
+                        return Err(libc::EIO);
+                    }
+                } else {
+                    // If staging file doesn't exist, download from remote first
+                    if !staging_path.exists() {
+                        let (xet_hash, file_size) = {
+                            let inodes = self.inode_table.read().expect("inodes poisoned");
+                            let entry = inodes.get(ino).ok_or(libc::ENOENT)?;
+                            (entry.xet_hash.clone().unwrap_or_default(), entry.size)
+                        };
+                        if !xet_hash.is_empty() && file_size > 0 {
+                            if let Err(e) = self
+                                .xet_sessions
+                                .download_to_file(&xet_hash, file_size, &staging_path)
+                                .await
+                            {
+                                error!("Failed to download file for truncate: {}", e);
+                                return Err(libc::EIO);
+                            }
+                        } else if let Err(e) = File::create(&staging_path) {
+                            error!("Failed to create staging file for truncate: {}", e);
                             return Err(libc::EIO);
                         }
-                    } else if let Err(e) = File::create(&staging_path) {
-                        error!("Failed to create staging file for truncate: {}", e);
+                    }
+                    if let Err(e) = OpenOptions::new()
+                        .write(true)
+                        .open(&staging_path)
+                        .and_then(|f| f.set_len(new_size))
+                    {
+                        error!("Failed to set staging file length: {}", e);
                         return Err(libc::EIO);
                     }
                 }
-                if let Err(e) = OpenOptions::new()
-                    .write(true)
-                    .open(&staging_path)
-                    .and_then(|f| f.set_len(new_size))
-                {
-                    error!("Failed to set staging file length: {}", e);
-                    return Err(libc::EIO);
-                }
             }
+            // Simple mode with new_size == 0: no staging file needed — just update
+            // the inode metadata. The actual content comes via the streaming writer
+            // that open() will set up immediately after this setattr call.
 
             let mut inodes = self.inode_table.write().expect("inodes poisoned");
             if let Some(entry) = inodes.get_mut(ino) {
                 entry.size = new_size;
                 entry.dirty = true;
+                if new_size == 0 {
+                    entry.xet_hash = None;
+                }
             }
 
             // Schedule flush so the truncation is committed to CAS/bucket
