@@ -7,8 +7,8 @@ Mount [Hugging Face Buckets](https://huggingface.co/docs/hub/buckets) as a local
 - **FUSE & NFS backends** — FUSE for standard Linux/macOS, NFS for environments without `/dev/fuse` (e.g., Kubernetes CSI)
 - **Adaptive prefetch** — 8 MB initial window, grows up to 128 MB for sequential reads
 - **Lazy loading** — files are fetched on demand from CAS, not eagerly downloaded
-- **Simple writes (default)** — append-only, in-memory buffer, synchronous upload on close (S3-like semantics)
-- **Advanced writes** (`--advanced-writes`) — staging files on disk, random writes + seek, async debounced flush
+- **Simple writes (default, FUSE only)** — append-only, in-memory streaming to CAS, synchronous upload on close
+- **Advanced writes** (`--advanced-writes`, auto-enabled for NFS) — staging files on disk, random writes + seek, async debounced flush
 - **Remote sync** — background polling detects remote changes and updates the local view
 - **Read-only mode** — `--read-only` flag for safe, read-only mounts
 
@@ -183,7 +183,7 @@ hf-mount detects remote file changes through two mechanisms:
 
 2. **Background polling** — A poll loop (default every 30 s) lists the full tree and detects additions, modifications, and deletions. This catches changes to files that haven't been individually accessed.
 
-### FUSE vs NFS consistency
+### FUSE vs NFS
 
 | Capability                  | FUSE                          | NFS                                      |
 | --------------------------- | ----------------------------- | ---------------------------------------- |
@@ -191,8 +191,14 @@ hf-mount detects remote file changes through two mechanisms:
 | Background poll             | Yes                           | Yes                                      |
 | Page cache invalidation     | `notify_inval_inode`          | Not supported by NFS protocol            |
 | Staleness window            | ~100 ms (metadata TTL)        | Up to poll interval (default 30 s)       |
+| Write mode                  | Simple (streaming) by default | Advanced (staging files) always           |
+| Re-read throughput          | ~800 MB/s (HEAD per TTL)      | ~2 GB/s (pure kernel cache)              |
 
-FUSE is more consistent: it detects per-file remote changes within the metadata TTL window via HEAD, while NFS relies solely on the poll loop. For latency-sensitive workloads where consistency matters, prefer FUSE.
+**Consistency**: FUSE detects per-file remote changes within the metadata TTL window via HEAD, while NFS relies solely on the poll loop. For latency-sensitive workloads where consistency matters, prefer FUSE.
+
+**Write modes**: FUSE defaults to simple streaming writes — data is buffered in memory and uploaded to CAS on close (`flush`/`release`). This supports shell redirection (`echo > file`), sequential writes, and PID-aware dup'd fd handling. NFS always uses advanced writes (staging files on disk) because NFS v3 has no open/close lifecycle — writes arrive as stateless RPCs, so data must be persisted to disk immediately.
+
+**Re-read performance**: FUSE re-reads trigger a HEAD revalidation when the metadata TTL expires (default 100 ms), adding ~170 ms latency per lookup. NFS re-reads are served entirely from the kernel page cache with no re-lookup. For read-heavy workloads with repeated access, NFS delivers ~2.5x higher re-read throughput. Increasing `--metadata-ttl-ms` on FUSE narrows this gap at the cost of slower remote change detection.
 
 ### Metadata TTL modes
 
@@ -206,12 +212,14 @@ FUSE is more consistent: it detects per-file remote changes within the metadata 
 
 | Metric                    | hf-mount FUSE | hf-mount NFS | mountpoint-s3 |
 | ------------------------- | ------------- | ------------ | ------------- |
-| Sequential read (cold)    | 221 MB/s      | 220 MB/s     | 104 MB/s      |
-| Sequential re-read (warm) | 284 MB/s      | 2.1 GB/s     | 141 MB/s      |
-| Range read (1 MB @ 25 MB) | 0.5 ms        | 0.2 ms       | 27 ms         |
+| Sequential read (cold)    | 251 MB/s      | 244 MB/s     | 104 MB/s      |
+| Sequential re-read (warm) | 806 MB/s      | 2.1 GB/s     | 141 MB/s      |
+| Range read (1 MB @ 25 MB) | 0.5 ms        | 0.3 ms       | 27 ms         |
 | Random reads (100 x 4 KB) | < 0.1 ms      | < 0.1 ms     | 30 ms         |
+| Write end-to-end (500 MB) | 1001 MB/s     | —            | —             |
+| Dedup write (same data)   | 1322 MB/s     | —            | —             |
 
-FUSE re-read includes one HEAD round-trip (~170 ms) per metadata TTL expiry. NFS re-reads are pure kernel page cache (no re-lookup). mountpoint-s3 uses `--metadata-ttl minimal` (its default), which does `HeadObject` on every lookup.
+FUSE re-read includes one HEAD round-trip (~170 ms) per metadata TTL expiry. NFS re-reads are pure kernel page cache (no re-lookup). mountpoint-s3 uses `--metadata-ttl minimal` (its default), which does `HeadObject` on every lookup. Write benchmarks use FUSE simple streaming mode; NFS writes use staging files (advanced mode, auto-enabled).
 
 ## Testing
 
