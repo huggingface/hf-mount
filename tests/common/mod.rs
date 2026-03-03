@@ -15,9 +15,7 @@ pub const ENDPOINT: &str = "https://huggingface.co";
 
 /// Create a bucket and return (token, bucket_id, hub). Returns None if HF_TOKEN not set.
 /// Use this for multi-file setups (e.g. fio benchmarks) where you upload files yourself.
-pub async fn setup_bucket(
-    test_name: &str,
-) -> Option<(String, String, Arc<hf_mount::hub_api::HubApiClient>)> {
+pub async fn setup_bucket(test_name: &str) -> Option<(String, String, Arc<hf_mount::hub_api::HubApiClient>)> {
     let token = match std::env::var("HF_TOKEN") {
         Ok(t) => t,
         Err(_) => {
@@ -270,4 +268,74 @@ pub fn generate_pattern(size: usize) -> Vec<u8> {
 /// Verify content matches the deterministic pattern at a given offset.
 pub fn verify_pattern(data: &[u8], offset: usize) -> bool {
     data.iter().enumerate().all(|(i, &b)| b == ((offset + i) % 251) as u8)
+}
+
+// ── mount-s3 reference benchmark helpers ─────────────────────────────
+
+/// Check if mount-s3 and AWS credentials are available.
+pub fn s3_bench_available() -> bool {
+    Command::new("mount-s3").arg("--version").output().is_ok() && std::env::var("AWS_ACCESS_KEY_ID").is_ok()
+}
+
+/// Create an S3 bucket, upload a pattern file, return the bucket name.
+/// Caller must call `cleanup_s3_bench` after use.
+pub fn setup_s3_bench(data: &[u8]) -> String {
+    let bucket = format!("hf-mount-bench-s3-{}", std::process::id());
+
+    let status = Command::new("aws")
+        .args(["s3", "mb", &format!("s3://{bucket}"), "--region", "us-east-1"])
+        .status()
+        .expect("aws s3 mb failed");
+    assert!(status.success(), "failed to create S3 bucket");
+
+    let tmp_path = std::env::temp_dir().join("s3_bench_file.bin");
+    std::fs::write(&tmp_path, data).expect("write s3 bench file");
+
+    let status = Command::new("aws")
+        .args([
+            "s3",
+            "cp",
+            tmp_path.to_str().unwrap(),
+            &format!("s3://{bucket}/bench_file.bin"),
+        ])
+        .status()
+        .expect("aws s3 cp failed");
+    assert!(status.success(), "failed to upload to S3");
+
+    std::fs::remove_file(&tmp_path).ok();
+    eprintln!("Created S3 bucket: {bucket}");
+    bucket
+}
+
+/// Mount an S3 bucket with mount-s3 (read-only). Returns the child process.
+pub fn mount_s3(bucket: &str, mount_point: &str) -> Child {
+    std::fs::create_dir_all(mount_point).ok();
+
+    let child = Command::new("mount-s3")
+        .args(["--read-only", bucket, mount_point])
+        .spawn()
+        .expect("failed to spawn mount-s3");
+
+    for i in 0..30 {
+        std::thread::sleep(Duration::from_millis(500));
+        if let Ok(mounts) = std::fs::read_to_string("/proc/mounts")
+            && mounts.lines().any(|line| line.contains(mount_point))
+        {
+            eprintln!("mount-s3 ready after {}ms", (i + 1) * 500);
+            return child;
+        }
+    }
+    eprintln!("Warning: mount-s3 may not be ready after 15s");
+    child
+}
+
+/// Unmount mount-s3 and clean up the S3 bucket.
+pub fn cleanup_s3_bench(mount_point: &str, child: Child, bucket: &str) {
+    unmount_with(mount_point, child, 5, &["fusermount", "-u"]);
+    std::fs::remove_dir_all(mount_point).ok();
+
+    let _ = Command::new("aws")
+        .args(["s3", "rb", "--force", &format!("s3://{bucket}")])
+        .status();
+    eprintln!("Cleaned up S3 bucket: {bucket}");
 }

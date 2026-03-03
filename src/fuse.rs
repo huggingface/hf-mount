@@ -17,16 +17,17 @@ const GENERATION: Generation = Generation(0);
 pub struct FuseAdapter {
     runtime: tokio::runtime::Handle,
     virtual_fs: Arc<VirtualFs>,
-    /// Kernel metadata cache TTL — aligned with poll_interval_secs.
-    ttl: Duration,
+    /// Kernel metadata cache TTL. Short enough to detect remote changes quickly,
+    /// long enough to avoid cascade re-lookups in the kernel.
+    metadata_ttl: Duration,
 }
 
 impl FuseAdapter {
-    pub fn new(runtime: tokio::runtime::Handle, virtual_fs: Arc<VirtualFs>, ttl: Duration) -> Self {
+    pub fn new(runtime: tokio::runtime::Handle, virtual_fs: Arc<VirtualFs>, metadata_ttl: Duration) -> Self {
         Self {
             runtime,
             virtual_fs,
-            ttl,
+            metadata_ttl,
         }
     }
 }
@@ -85,7 +86,7 @@ impl Filesystem for FuseAdapter {
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         let name = os_to_str!(name, reply);
         match self.runtime.block_on(self.virtual_fs.lookup(parent.0, name)) {
-            Ok(attr) => reply.entry(&self.ttl, &vfs_attr_to_fuse(&attr), GENERATION),
+            Ok(attr) => reply.entry(&self.metadata_ttl, &vfs_attr_to_fuse(&attr), GENERATION),
             Err(e) => reply.error(Errno::from_i32(e)),
         }
     }
@@ -93,7 +94,7 @@ impl Filesystem for FuseAdapter {
     /// Get file/directory attributes (stat).
     fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
         match self.virtual_fs.getattr(ino.0) {
-            Ok(attr) => reply.attr(&self.ttl, &vfs_attr_to_fuse(&attr)),
+            Ok(attr) => reply.attr(&self.metadata_ttl, &vfs_attr_to_fuse(&attr)),
             Err(e) => reply.error(Errno::from_i32(e)),
         }
     }
@@ -126,16 +127,11 @@ impl Filesystem for FuseAdapter {
         let truncate = (flags.0 & libc::O_TRUNC) != 0;
 
         match self.runtime.block_on(self.virtual_fs.open(ino.0, writable, truncate)) {
-            Ok((file_handle, keep_cache)) => {
+            Ok(file_handle) => {
                 // KEEP_CACHE preserves the kernel page cache across re-opens.
-                // Used for remote files whose cache is invalidated via
-                // notify_inval_inode when the poll loop detects changes.
-                let fopen_flags = if keep_cache {
-                    FopenFlags::FOPEN_KEEP_CACHE
-                } else {
-                    FopenFlags::empty()
-                };
-                reply.opened(FileHandle(file_handle), fopen_flags);
+                // The poll loop calls notify_inval_inode on remote changes;
+                // the short metadata TTL handles local change visibility.
+                reply.opened(FileHandle(file_handle), FopenFlags::FOPEN_KEEP_CACHE);
             }
             Err(e) => reply.error(Errno::from_i32(e)),
         }
@@ -216,7 +212,7 @@ impl Filesystem for FuseAdapter {
         match self.runtime.block_on(self.virtual_fs.create(parent.0, name)) {
             Ok((attr, file_handle)) => {
                 reply.created(
-                    &self.ttl,
+                    &self.metadata_ttl,
                     &vfs_attr_to_fuse(&attr),
                     GENERATION,
                     FileHandle(file_handle),
@@ -231,7 +227,7 @@ impl Filesystem for FuseAdapter {
     fn mkdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, _mode: u32, _umask: u32, reply: ReplyEntry) {
         let name = os_to_str!(name, reply);
         match self.runtime.block_on(self.virtual_fs.mkdir(parent.0, name)) {
-            Ok(attr) => reply.entry(&self.ttl, &vfs_attr_to_fuse(&attr), GENERATION),
+            Ok(attr) => reply.entry(&self.metadata_ttl, &vfs_attr_to_fuse(&attr), GENERATION),
             Err(e) => reply.error(Errno::from_i32(e)),
         }
     }
@@ -311,7 +307,7 @@ impl Filesystem for FuseAdapter {
         reply: ReplyAttr,
     ) {
         match self.runtime.block_on(self.virtual_fs.setattr(ino.0, size)) {
-            Ok(attr) => reply.attr(&self.ttl, &vfs_attr_to_fuse(&attr)),
+            Ok(attr) => reply.attr(&self.metadata_ttl, &vfs_attr_to_fuse(&attr)),
             Err(e) => reply.error(Errno::from_i32(e)),
         }
     }

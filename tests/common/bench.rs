@@ -27,11 +27,7 @@ pub struct WriteBenchResult {
 
 /// Run the standard read benchmark suite on a mounted filesystem.
 /// Returns structured results for comparison or printing.
-pub fn run_read_benchmarks(
-    mount_point: &str,
-    test_filename: &str,
-    expected: &[u8],
-) -> Result<BenchResult, BenchError> {
+pub fn run_read_benchmarks(mount_point: &str, test_filename: &str, expected: &[u8]) -> Result<BenchResult, BenchError> {
     let file_path = format!("{}/{}", mount_point, test_filename);
     let file_size = expected.len();
     let size_mb = file_size as f64 / (1024.0 * 1024.0);
@@ -68,10 +64,7 @@ pub fn run_read_benchmarks(
         let mut buf = vec![0u8; read_size];
         f.read_exact(&mut buf)?;
         range_read_ms = t.elapsed().as_secs_f64() * 1000.0;
-        assert!(
-            super::verify_pattern(&buf, offset),
-            "range read content mismatch"
-        );
+        assert!(super::verify_pattern(&buf, offset), "range read content mismatch");
     }
 
     // 4. Random reads: 100x 4KB
@@ -82,9 +75,7 @@ pub fn run_read_benchmarks(
         let mut rng_state: u64 = 42;
         let mut total = Duration::ZERO;
         for _ in 0..100 {
-            rng_state = rng_state
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1);
+            rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
             let offset = (rng_state % max_offset as u64) as usize;
 
             let mut f = std::fs::File::open(&file_path)?;
@@ -197,10 +188,7 @@ pub fn run_write_benchmark(mount_point: &str, size_bytes: usize) -> Result<Write
 
 /// Measure raw SingleFileCleaner::add_data() throughput — no FUSE, no kernel.
 /// This is the theoretical ceiling for streaming writes.
-pub async fn run_raw_cleaner_benchmark(
-    xet: &hf_mount::xet::XetSessions,
-    size_bytes: usize,
-) -> Result<f64, BenchError> {
+pub async fn run_raw_cleaner_benchmark(xet: &hf_mount::xet::XetSessions, size_bytes: usize) -> Result<f64, BenchError> {
     let size_mb = size_bytes as f64 / (1024.0 * 1024.0);
     let chunk = super::generate_pattern(1024 * 1024);
 

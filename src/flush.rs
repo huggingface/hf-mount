@@ -127,7 +127,15 @@ async fn flush_loop(
         let count = pending.len();
         info!("Flushing batch of {} dirty file(s)", count);
 
-        flush_batch(pending, &xet_sessions, &staging_dir, &hub_client, &inodes, &flush_errors).await;
+        flush_batch(
+            pending,
+            &xet_sessions,
+            &staging_dir,
+            &hub_client,
+            &inodes,
+            &flush_errors,
+        )
+        .await;
     }
 }
 

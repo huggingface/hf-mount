@@ -160,7 +160,12 @@ impl PrefetchState {
         let logical_off = (offset - self.buf_start) as usize;
         let avail = self.chunks_len - logical_off;
         let to_read = (size as usize).min(avail);
-        Some(read_chunk_range(&self.chunks, self.chunks_front_offset, logical_off, to_read))
+        Some(read_chunk_range(
+            &self.chunks,
+            self.chunks_front_offset,
+            logical_off,
+            to_read,
+        ))
     }
 
     /// Try to serve a read from the backward seek window.

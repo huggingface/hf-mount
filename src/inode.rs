@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 pub const ROOT_INODE: u64 = 1;
 
@@ -25,6 +25,9 @@ pub struct InodeEntry {
     pub children: Vec<u64>,
     /// Old remote paths that should be deleted on next flush (set by rename of dirty files).
     pub pending_deletes: Vec<String>,
+    /// When this inode's metadata was last validated against the remote (via HEAD).
+    /// Used to avoid redundant HEAD requests within the revalidation TTL.
+    pub last_revalidated: Option<Instant>,
 }
 
 pub struct InodeTable {
@@ -61,6 +64,7 @@ impl InodeTable {
             children_loaded: false,
             children: Vec::new(),
             pending_deletes: Vec::new(),
+            last_revalidated: None,
         };
         table.inodes.insert(ROOT_INODE, root);
         table.path_to_inode.insert(String::new(), ROOT_INODE);
@@ -136,6 +140,7 @@ impl InodeTable {
             children_loaded: kind == InodeKind::File, // files don't have children to load
             children: Vec::new(),
             pending_deletes: Vec::new(),
+            last_revalidated: Some(Instant::now()),
         };
 
         self.inodes.insert(inode, entry);
@@ -789,5 +794,86 @@ mod tests {
             UNIX_EPOCH,
             None,
         );
+    }
+
+    #[test]
+    fn test_dirty_inos_excludes_directories() {
+        let mut table = InodeTable::new();
+        let file_ino = table.insert(
+            ROOT_INODE,
+            "dirty.txt".to_string(),
+            "dirty.txt".to_string(),
+            InodeKind::File,
+            1,
+            UNIX_EPOCH,
+            None,
+        );
+        let dir_ino = table.insert(
+            ROOT_INODE,
+            "dir".to_string(),
+            "dir".to_string(),
+            InodeKind::Directory,
+            0,
+            UNIX_EPOCH,
+            None,
+        );
+        table.get_mut(file_ino).unwrap().dirty = true;
+        table.get_mut(dir_ino).unwrap().dirty = true;
+
+        let dirty = table.dirty_inos();
+        assert_eq!(dirty, vec![file_ino]);
+    }
+
+    #[test]
+    fn test_update_subtree_paths_missing_inode_is_noop() {
+        let mut table = InodeTable::new();
+        table.insert(
+            ROOT_INODE,
+            "file.txt".to_string(),
+            "file.txt".to_string(),
+            InodeKind::File,
+            10,
+            UNIX_EPOCH,
+            None,
+        );
+
+        let before = table.file_snapshot();
+        table.update_subtree_paths(999_999, "does/not/matter".to_string());
+        let after = table.file_snapshot();
+
+        assert_eq!(before, after);
+        assert!(table.get_by_path("file.txt").is_some());
+    }
+
+    #[test]
+    fn test_remove_directory_with_already_removed_child() {
+        let mut table = InodeTable::new();
+        let dir_ino = table.insert(
+            ROOT_INODE,
+            "dir".to_string(),
+            "dir".to_string(),
+            InodeKind::Directory,
+            0,
+            UNIX_EPOCH,
+            None,
+        );
+        let child_ino = table.insert(
+            dir_ino,
+            "child.txt".to_string(),
+            "dir/child.txt".to_string(),
+            InodeKind::File,
+            1,
+            UNIX_EPOCH,
+            None,
+        );
+
+        // Simulate a stale children list entry in parent by removing child first.
+        table.remove(child_ino).unwrap();
+        assert!(table.get(child_ino).is_none());
+
+        // Removing parent should still succeed and clean mappings.
+        table.remove(dir_ino).unwrap();
+        assert!(table.get(dir_ino).is_none());
+        assert!(table.get_by_path("dir").is_none());
     }
 }

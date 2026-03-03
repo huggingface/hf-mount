@@ -22,8 +22,7 @@ async fn test_fuse_simple_writes() {
         r
     }));
 
-    let hub_check =
-        common::fs_tests::verify_simple_hub_state(&hub, &remote_file, test_content.len() as u64).await;
+    let hub_check = common::fs_tests::verify_simple_hub_state(&hub, &remote_file, test_content.len() as u64).await;
 
     common::delete_bucket(common::ENDPOINT, &token, &bucket_id).await;
     std::fs::remove_dir_all(&mount_point).ok();
@@ -75,5 +74,41 @@ async fn test_fuse_advanced_writes() {
     }
     if let Err(e) = hub_check {
         panic!("Hub state check failed: {}", e);
+    }
+}
+
+/// Test HEAD revalidation: remote file changes are detected via lookup() HEAD
+/// and the kernel page cache is invalidated so re-reads return fresh content.
+#[tokio::test]
+async fn test_fuse_revalidation() {
+    let test_content = common::test_content();
+    let remote_file = format!("test_{}.txt", std::process::id());
+    let (token, bucket_id, hub) =
+        match common::setup_bucket_with_file("fuse-reval", &remote_file, test_content.as_bytes()).await {
+            Some(cfg) => cfg,
+            None => return,
+        };
+
+    let mount_point = format!("/tmp/hf-mount-fuse-reval-{}", std::process::id());
+    let cache_dir = format!("/tmp/hf-mount-fuse-reval-cache-{}", std::process::id());
+
+    let child = common::mount_bucket(&bucket_id, &mount_point, &cache_dir, &[]);
+
+    let result = common::fs_tests::run_revalidation_test(
+        &mount_point,
+        &remote_file,
+        &test_content,
+        &hub,
+        100, // metadata_ttl_ms (default)
+    )
+    .await;
+
+    common::unmount(&mount_point, child, 30);
+    common::delete_bucket(common::ENDPOINT, &token, &bucket_id).await;
+    std::fs::remove_dir_all(&mount_point).ok();
+    std::fs::remove_dir_all(&cache_dir).ok();
+
+    if let Err(e) = result {
+        panic!("FUSE revalidation test failed: {}", e);
     }
 }

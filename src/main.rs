@@ -14,27 +14,35 @@ use hf_mount::xet::{StagingDir, XetSessions};
 #[derive(Parser)]
 #[command(name = "hf-mount", about = "Mount a HuggingFace bucket as a filesystem")]
 struct Args {
+    /// HuggingFace bucket ID (e.g. "username/my-bucket")
     #[arg(long)]
     bucket_id: String,
 
+    /// Local directory where the bucket will be mounted
     #[arg(long)]
     mount_point: PathBuf,
 
+    /// HuggingFace API token (also read from HF_TOKEN env var)
     #[arg(long, env = "HF_TOKEN")]
     hf_token: String,
 
+    /// HuggingFace Hub endpoint URL
     #[arg(long, default_value = "https://huggingface.co")]
     hub_endpoint: String,
 
+    /// Directory for on-disk caches (xorb chunks, staging files)
     #[arg(long, default_value = "/tmp/hf-mount-cache")]
     cache_dir: PathBuf,
 
+    /// Override the UID for all files and directories (defaults to current user)
     #[arg(long)]
     uid: Option<u32>,
 
+    /// Override the GID for all files and directories (defaults to current group)
     #[arg(long)]
     gid: Option<u32>,
 
+    /// Mount in read-only mode (no writes allowed)
     #[arg(long, default_value_t = false)]
     read_only: bool,
 
@@ -43,19 +51,37 @@ struct Args {
     #[arg(long, default_value_t = false)]
     advanced_writes: bool,
 
-    /// Interval in seconds for polling remote changes (0 to disable)
+    /// Interval in seconds for polling remote changes (0 to disable).
+    /// The poll loop detects remote file additions, modifications, and deletions,
+    /// and invalidates the kernel cache accordingly.
     #[arg(long, default_value_t = 30)]
     poll_interval_secs: u64,
 
-    /// Maximum size in bytes for the on-disk xorb chunk cache
+    /// Maximum size in bytes for the on-disk xorb chunk cache.
+    /// This cache stores CAS chunks locally to avoid re-downloading across files
+    /// that share deduplicated content.
     #[arg(long, default_value_t = 10_000_000_000)]
     cache_size: u64,
 
-    /// Maximum number of FUSE threads (default: 16)
+    /// Kernel metadata cache TTL in milliseconds. The kernel caches file/directory
+    /// attributes for this duration before re-validating. Lower values detect remote
+    /// changes faster, higher values reduce kernel-to-FUSE round-trips.
+    #[arg(long, default_value_t = 100)]
+    metadata_ttl_ms: u64,
+
+    /// Minimal metadata mode: always HEAD on every lookup to check for remote changes,
+    /// even within the metadata TTL window.
+    /// `--metadata-ttl minimal` behavior. Without this flag, lookups within the TTL
+    /// window skip HEAD and serve from the in-memory cache (faster re-reads).
+    #[arg(long, default_value_t = false)]
+    metadata_ttl_minimal: bool,
+
+    /// Maximum number of FUSE worker threads
     #[arg(long, default_value_t = 16)]
     max_threads: usize,
 
-    /// Mount backend: "fuse" (default) or "nfs" (requires --features nfs)
+    /// Mount backend: "fuse" (default) or "nfs" (requires --features nfs).
+    /// NFS is read-only and does not support writes.
     #[arg(long, default_value = "fuse")]
     backend: String,
 }
@@ -106,6 +132,24 @@ fn main() {
     let refresher = hub_client.token_refresher(cas_read_only);
     let cas_config = build_cas_config(&runtime, &refresher);
 
+    // Ensure cache directory exists and is writable by the current user.
+    std::fs::create_dir_all(&args.cache_dir)
+        .unwrap_or_else(|e| panic!("Failed to create cache dir {:?}: {e}", args.cache_dir));
+    let xorbs_dir = args.cache_dir.join("xorbs");
+    std::fs::create_dir_all(&xorbs_dir).unwrap_or_else(|e| panic!("Failed to create xorbs dir {:?}: {e}", xorbs_dir));
+    // Check write access — a previous run as a different user (e.g. root) may have
+    // left directories owned by that user, causing cryptic errors later.
+    let probe = xorbs_dir.join(".write-check");
+    if let Err(e) = std::fs::write(&probe, b"") {
+        let user = std::env::var("USER").unwrap_or_default();
+        panic!(
+            "Cache dir {:?} is not writable: {e}\n\
+             Fix with: sudo chown -R {user} {:?}",
+            xorbs_dir, args.cache_dir
+        );
+    }
+    std::fs::remove_file(&probe).ok();
+
     // Create on-disk xorb chunk cache for cross-file deduplication.
     let xorb_cache = {
         let config = data::CacheConfig {
@@ -129,9 +173,12 @@ fn main() {
 
     let upload_config = if args.read_only { None } else { Some(cas_config) };
 
-    std::fs::create_dir_all(&args.cache_dir).ok();
     let xet_sessions = XetSessions::new(download_session, upload_config);
-    let staging_dir = if args.advanced_writes { Some(StagingDir::new(&args.cache_dir)) } else { None };
+    let staging_dir = if args.advanced_writes {
+        Some(StagingDir::new(&args.cache_dir))
+    } else {
+        None
+    };
 
     // Determine uid/gid
     let uid = args.uid.unwrap_or_else(|| unsafe { libc::getuid() });
@@ -153,6 +200,8 @@ fn main() {
             use hf_mount::virtual_fs::VirtualFs;
             use std::time::Duration;
 
+            let metadata_ttl = Duration::from_millis(args.metadata_ttl_ms);
+
             let virtual_fs = VirtualFs::new(
                 runtime.handle().clone(),
                 hub_client,
@@ -163,13 +212,11 @@ fn main() {
                 uid,
                 gid,
                 args.poll_interval_secs,
+                metadata_ttl,
+                !args.metadata_ttl_minimal,
             );
 
-            let fuse_adapter = FuseAdapter::new(
-                runtime.handle().clone(),
-                virtual_fs.clone(),
-                Duration::from_secs(args.poll_interval_secs),
-            );
+            let fuse_adapter = FuseAdapter::new(runtime.handle().clone(), virtual_fs.clone(), metadata_ttl);
 
             let mut fuse_config = fuser::Config::default();
             fuse_config.mount_options = vec![
@@ -218,18 +265,20 @@ fn main() {
                 runtime.handle().clone(),
                 hub_client,
                 xet_sessions,
-                None, // NFS is read-only, no staging dir
-                args.read_only,
+                None,  // NFS is read-only, no staging dir
+                true,  // NFS backend is always read-only
                 false, // advanced_writes not supported on NFS
                 uid,
                 gid,
                 args.poll_interval_secs,
+                std::time::Duration::from_millis(args.metadata_ttl_ms),
+                !args.metadata_ttl_minimal,
             );
 
             if let Err(e) = runtime.block_on(hf_mount::nfs::mount_nfs(
                 virtual_fs,
                 &args.mount_point,
-                args.poll_interval_secs,
+                args.metadata_ttl_ms,
             )) {
                 error!("NFS mount failed: {}", e);
                 std::process::exit(1);

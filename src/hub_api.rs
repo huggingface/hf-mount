@@ -34,6 +34,14 @@ pub struct TreeEntry {
     pub mtime: Option<String>,
 }
 
+/// Metadata returned by HEAD on the resolve endpoint
+#[derive(Debug)]
+pub struct HeadFileInfo {
+    pub xet_hash: Option<String>,
+    pub size: Option<u64>,
+    pub last_modified: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CasTokenInfo {
@@ -44,6 +52,9 @@ pub struct CasTokenInfo {
 
 pub struct HubApiClient {
     client: Client,
+    /// Client that does NOT follow redirects — used for HEAD requests where we
+    /// need response headers from the Hub (not from the CAS redirect target).
+    head_client: Client,
     endpoint: String,
     token: String,
     bucket_id: String,
@@ -53,6 +64,10 @@ impl HubApiClient {
     pub fn new(endpoint: &str, token: &str, bucket_id: &str) -> Arc<Self> {
         Arc::new(Self {
             client: Client::new(),
+            head_client: Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .expect("failed to build head_client"),
             endpoint: endpoint.trim_end_matches('/').to_string(),
             token: token.to_string(),
             bucket_id: bucket_id.to_string(),
@@ -100,6 +115,47 @@ impl HubApiClient {
         }
 
         Ok(all_entries)
+    }
+
+    /// Fetch metadata for a single file via HEAD on the resolve endpoint
+    /// Returns xet_hash, size, and last_modified from response
+    /// headers without downloading the file body.
+    /// Returns `None` if 404 (file does not exist remotely).
+    pub async fn head_file(&self, path: &str) -> Result<Option<HeadFileInfo>> {
+        // Resolve endpoint: /{repoType}/{namespace}/{repo}/resolve/{path}
+        // (no /api/ prefix — it's a user-facing route that also serves HEAD)
+        let url = format!("{}/buckets/{}/resolve/{}", self.endpoint, self.bucket_id, path);
+        let resp = self.head_client.head(&url).bearer_auth(&self.token).send().await?;
+
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        // Follow 302 redirects — reqwest follows by default, but HEAD on a
+        // redirect returns the redirect response itself. We only need headers
+        // from the *original* response (X-Xet-Hash, X-Linked-Size, Last-Modified).
+        if !resp.status().is_success() && !resp.status().is_redirection() {
+            return Err(Error::Hub(format!("head_file failed: {}", resp.status())));
+        }
+
+        let headers = resp.headers();
+        let xet_hash = headers
+            .get("x-xet-hash")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+        let size = headers
+            .get("x-linked-size")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok());
+        let last_modified = headers
+            .get("last-modified")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+
+        Ok(Some(HeadFileInfo {
+            xet_hash,
+            size,
+            last_modified,
+        }))
     }
 
     /// Get a CAS read token for the bucket.
@@ -181,6 +237,15 @@ impl HubApiClient {
 
     pub fn mtime_from_str(s: &str) -> SystemTime {
         chrono::DateTime::parse_from_rfc3339(s)
+            .ok()
+            .and_then(|dt| u64::try_from(dt.timestamp()).ok())
+            .map(|secs| UNIX_EPOCH + std::time::Duration::from_secs(secs))
+            .unwrap_or(UNIX_EPOCH)
+    }
+
+    /// Parse HTTP-date format (e.g. "Sat, 28 Feb 2026 14:52:39 GMT") from Last-Modified header.
+    pub fn mtime_from_http_date(s: &str) -> SystemTime {
+        chrono::DateTime::parse_from_rfc2822(s)
             .ok()
             .and_then(|dt| u64::try_from(dt.timestamp()).ok())
             .map(|secs| UNIX_EPOCH + std::time::Duration::from_secs(secs))
@@ -300,5 +365,35 @@ mod tests {
         assert_eq!(parsed["path"], "readme.txt");
         assert_eq!(parsed["xetHash"], "hash999");
         assert_eq!(parsed["mtime"], 1234567890000u64);
+    }
+
+    #[test]
+    fn test_parse_link_next_picks_next_relation() {
+        let header = r#"<https://api.example.com/page=1>; rel="prev", <https://api.example.com/page=3>; rel="next""#;
+        assert_eq!(
+            parse_link_next(header),
+            Some("https://api.example.com/page=3".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_link_next_returns_none_when_missing() {
+        let header = r#"<https://api.example.com/page=1>; rel="prev", <https://api.example.com/page=2>; rel="last""#;
+        assert_eq!(parse_link_next(header), None);
+    }
+
+    #[test]
+    fn test_mtime_parsers_fallback_to_unix_epoch_on_invalid_input() {
+        assert_eq!(HubApiClient::mtime_from_str("not-a-date"), UNIX_EPOCH);
+        assert_eq!(HubApiClient::mtime_from_http_date("still-not-a-date"), UNIX_EPOCH);
+    }
+
+    #[test]
+    fn test_mtime_parsers_support_valid_formats() {
+        let rfc3339 = HubApiClient::mtime_from_str("2026-02-28T14:52:39Z");
+        let http_date = HubApiClient::mtime_from_http_date("Sat, 28 Feb 2026 14:52:39 GMT");
+        assert!(rfc3339 > UNIX_EPOCH);
+        assert!(http_date > UNIX_EPOCH);
+        assert_eq!(rfc3339, http_date);
     }
 }

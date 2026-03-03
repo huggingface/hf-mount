@@ -1,4 +1,5 @@
 use std::io::{Read, Seek, SeekFrom};
+use std::sync::Arc;
 
 type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
@@ -27,7 +28,9 @@ pub fn run_read_tests(mp: &str, remote_file: &str, remote_content: &str) -> Test
     // range read: extract "BBBB_MIDDLE_BBBB" by finding its offset in the content
     eprintln!("  [read] range read");
     {
-        let middle_offset = remote_content.find("BBBB_MIDDLE_BBBB").expect("test content missing middle marker") as u64;
+        let middle_offset = remote_content
+            .find("BBBB_MIDDLE_BBBB")
+            .expect("test content missing middle marker") as u64;
         let mut f = std::fs::File::open(&path)?;
         f.seek(SeekFrom::Start(middle_offset))?;
         let mut buf = vec![0u8; 16];
@@ -42,13 +45,22 @@ pub fn run_read_tests(mp: &str, remote_file: &str, remote_content: &str) -> Test
     // tail read: seek to "CCCC_FOOTER_CCCC" offset, read to EOF
     eprintln!("  [read] tail read");
     {
-        let footer_offset = remote_content.find("CCCC_FOOTER_CCCC").expect("test content missing footer marker") as u64;
+        let footer_offset = remote_content
+            .find("CCCC_FOOTER_CCCC")
+            .expect("test content missing footer marker") as u64;
         let mut f = std::fs::File::open(&path)?;
         f.seek(SeekFrom::Start(footer_offset))?;
         let mut tail = String::new();
         f.read_to_string(&mut tail)?;
-        assert!(tail.starts_with("CCCC_FOOTER_CCCC"), "tail read should start with footer");
-        assert_eq!(tail.len(), remote_content.len() - footer_offset as usize, "tail read length mismatch");
+        assert!(
+            tail.starts_with("CCCC_FOOTER_CCCC"),
+            "tail read should start with footer"
+        );
+        assert_eq!(
+            tail.len(),
+            remote_content.len() - footer_offset as usize,
+            "tail read length mismatch"
+        );
     }
 
     // stat
@@ -104,7 +116,9 @@ pub fn run_write_tests(mp: &str, remote_file: &str, remote_content: &str) -> Tes
     // 4. Truncate remote file to non-zero
     // Truncate to just past "AAAA_HEADER_AAAA|" so we keep a recognizable prefix.
     eprintln!("  [write] truncate remote to non-zero");
-    let trunc_len = remote_content.find("BBBB_MIDDLE_BBBB").expect("test content missing middle marker") as u64;
+    let trunc_len = remote_content
+        .find("BBBB_MIDDLE_BBBB")
+        .expect("test content missing middle marker") as u64;
     {
         let path = format!("{}/{}", mp, remote_file);
         let f = std::fs::OpenOptions::new().write(true).open(&path)?;
@@ -113,7 +127,11 @@ pub fn run_write_tests(mp: &str, remote_file: &str, remote_content: &str) -> Tes
         let meta = std::fs::metadata(&path)?;
         assert_eq!(meta.len(), trunc_len, "truncated remote should have expected size");
         let content = std::fs::read_to_string(&path)?;
-        assert_eq!(content, &remote_content[..trunc_len as usize], "truncated remote content mismatch");
+        assert_eq!(
+            content,
+            &remote_content[..trunc_len as usize],
+            "truncated remote content mismatch"
+        );
     }
 
     // 5. Read past EOF
@@ -137,8 +155,15 @@ pub fn run_write_tests(mp: &str, remote_file: &str, remote_content: &str) -> Tes
         let new_path = format!("{}/moved_remote.txt", mp);
         std::fs::rename(&old_path, &new_path)?;
         let content = std::fs::read_to_string(&new_path)?;
-        assert_eq!(content, &remote_content[..trunc_len as usize], "renamed file should still have truncated content");
-        assert!(std::fs::metadata(&old_path).is_err(), "old path should not exist after rename");
+        assert_eq!(
+            content,
+            &remote_content[..trunc_len as usize],
+            "renamed file should still have truncated content"
+        );
+        assert!(
+            std::fs::metadata(&old_path).is_err(),
+            "old path should not exist after rename"
+        );
     }
 
     // 7. Mkdir + nested file
@@ -154,7 +179,10 @@ pub fn run_write_tests(mp: &str, remote_file: &str, remote_content: &str) -> Tes
             .filter_map(|e| e.ok())
             .map(|e| e.file_name().to_string_lossy().to_string())
             .collect();
-        assert!(entries.contains(&"child.txt".to_string()), "readdir should list child.txt");
+        assert!(
+            entries.contains(&"child.txt".to_string()),
+            "readdir should list child.txt"
+        );
     }
 
     // 8. Directory rename with children
@@ -214,7 +242,12 @@ pub fn run_write_tests(mp: &str, remote_file: &str, remote_content: &str) -> Tes
         use std::io::{Seek, SeekFrom, Write};
         use std::os::unix::io::AsRawFd;
         let path = format!("{}/duptest.txt", mp);
-        let f = std::fs::OpenOptions::new().create(true).truncate(true).read(true).write(true).open(&path)?;
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&path)?;
         let fd2 = unsafe { libc::dup(f.as_raw_fd()) };
         assert!(fd2 >= 0, "dup() should succeed");
         let mut f = f;
@@ -255,7 +288,11 @@ pub fn run_write_tests(mp: &str, remote_file: &str, remote_content: &str) -> Tes
         std::fs::write(&a, "source")?;
         std::fs::write(&b, "destination")?;
         std::fs::rename(&a, &b)?;
-        assert_eq!(std::fs::read_to_string(&b)?, "source", "destination should have source content");
+        assert_eq!(
+            std::fs::read_to_string(&b)?,
+            "source",
+            "destination should have source content"
+        );
         assert!(std::fs::metadata(&a).is_err(), "source should be gone");
     }
 
@@ -305,7 +342,10 @@ pub fn run_write_tests(mp: &str, remote_file: &str, remote_content: &str) -> Tes
         std::fs::write(format!("{}/xdir_src/file.txt", mp), "cross")?;
         std::fs::rename(format!("{}/xdir_src/file.txt", mp), format!("{}/xdir_dst/file.txt", mp))?;
         assert_eq!(std::fs::read_to_string(format!("{}/xdir_dst/file.txt", mp))?, "cross");
-        assert!(std::fs::metadata(format!("{}/xdir_src/file.txt", mp)).is_err(), "old path gone");
+        assert!(
+            std::fs::metadata(format!("{}/xdir_src/file.txt", mp)).is_err(),
+            "old path gone"
+        );
         // cleanup
         std::fs::remove_file(format!("{}/xdir_dst/file.txt", mp))?;
         std::fs::remove_dir(&dst_dir)?;
@@ -334,11 +374,11 @@ pub async fn verify_hub_state(
     // Expected files with sizes (from write test steps)
     let expected: &[(&str, u64)] = &[
         ("moved_remote.txt", trunc_size), // step 4: truncated, step 6: renamed
-        ("renamed_dir/child.txt", 14), // step 7: "nested content", step 8: dir renamed
-        ("empty.txt", 0),         // step 1
-        ("data.txt", 0),          // step 2: wrote "hello world", step 3: truncated to 0
-        ("small.txt", 3),         // step 5: "abc"
-        ("overwrite.txt", 19),    // step 11: "version 2 is longer"
+        ("renamed_dir/child.txt", 14),    // step 7: "nested content", step 8: dir renamed
+        ("empty.txt", 0),                 // step 1
+        ("data.txt", 0),                  // step 2: wrote "hello world", step 3: truncated to 0
+        ("small.txt", 3),                 // step 5: "abc"
+        ("overwrite.txt", 19),            // step 11: "version 2 is longer"
     ];
 
     for &(path, expected_size) in expected {
@@ -421,7 +461,10 @@ pub fn run_simple_write_tests(mp: &str, remote_file: &str) -> TestResult {
         std::fs::rename(format!("{}/mydir", mp), format!("{}/renamed_dir", mp))?;
         let content = std::fs::read_to_string(format!("{}/renamed_dir/child.txt", mp))?;
         assert_eq!(content, "nested content", "child should be readable at new parent path");
-        assert!(std::fs::metadata(format!("{}/mydir", mp)).is_err(), "old directory should not exist");
+        assert!(
+            std::fs::metadata(format!("{}/mydir", mp)).is_err(),
+            "old directory should not exist"
+        );
     }
 
     // 5. Rename clean remote file
@@ -464,7 +507,10 @@ pub fn run_simple_write_tests(mp: &str, remote_file: &str) -> TestResult {
     {
         let path = format!("{}/data.txt", mp);
         let result = std::fs::OpenOptions::new().write(true).open(&path);
-        assert!(result.is_err(), "opening existing file for write should fail in simple mode");
+        assert!(
+            result.is_err(),
+            "opening existing file for write should fail in simple mode"
+        );
     }
 
     // 9. Truncate via ftruncate should fail (EPERM)
@@ -616,7 +662,7 @@ pub fn run_simple_write_tests(mp: &str, remote_file: &str) -> TestResult {
 pub async fn verify_simple_hub_state(
     hub: &hf_mount::hub_api::HubApiClient,
     remote_file: &str,
-    remote_content_len: u64,
+    _remote_content_len: u64,
 ) -> Result<(), String> {
     eprintln!("=== Verifying Hub state (simple mode) ===");
 
@@ -671,4 +717,75 @@ pub async fn verify_simple_hub_state(
     } else {
         Err(format!("Hub state errors:\n  - {}", errors.join("\n  - ")))
     }
+}
+
+/// HEAD revalidation test: verifies that lookup() detects remote file changes
+/// via HEAD and invalidates the kernel page cache so re-reads return fresh content.
+///
+/// Flow:
+/// 1. Read the file (kernel caches pages via FOPEN_KEEP_CACHE)
+/// 2. Upload new content remotely (bypassing the mount)
+/// 3. Wait for metadata TTL to expire
+/// 4. Re-read the file → should see new content (HEAD detects hash change)
+pub async fn run_revalidation_test(
+    mp: &str,
+    remote_file: &str,
+    original_content: &str,
+    hub: &Arc<hf_mount::hub_api::HubApiClient>,
+    metadata_ttl_ms: u64,
+) -> TestResult {
+    let path = format!("{}/{}", mp, remote_file);
+
+    // 1. Read original content (populates kernel page cache)
+    eprintln!("  [revalidation] initial read");
+    let content = std::fs::read_to_string(&path)?;
+    assert_eq!(content, original_content, "initial read should match uploaded content");
+
+    // 2. Upload new content remotely (bypass the mount)
+    eprintln!("  [revalidation] uploading new content remotely");
+    let new_content = "REVALIDATION_TEST_NEW_CONTENT_12345";
+    let write_config = super::build_write_config(hub).await;
+
+    let tmp_dir = std::env::temp_dir().join("hf-mount-reval-test");
+    std::fs::create_dir_all(&tmp_dir)?;
+    let staging_path = tmp_dir.join(remote_file);
+    std::fs::write(&staging_path, new_content)?;
+
+    let file_info = super::upload_file(write_config, &staging_path).await;
+    let xet_hash = file_info.hash().to_string();
+    eprintln!(
+        "  [revalidation] new xet_hash={}, size={}",
+        xet_hash,
+        file_info.file_size()
+    );
+
+    let mtime_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    hub.batch_operations(&[hf_mount::hub_api::BatchOp::AddFile {
+        path: remote_file.to_string(),
+        xet_hash,
+        mtime: mtime_ms,
+        content_type: None,
+    }])
+    .await?;
+
+    std::fs::remove_dir_all(&tmp_dir).ok();
+
+    // 3. Wait for metadata TTL to expire so next lookup triggers HEAD
+    eprintln!("  [revalidation] waiting {}ms for TTL expiry", metadata_ttl_ms + 100);
+    std::thread::sleep(std::time::Duration::from_millis(metadata_ttl_ms + 100));
+
+    // 4. Re-read — lookup() should HEAD, detect hash change, invalidate page cache
+    eprintln!("  [revalidation] re-reading file (expecting new content)");
+    let content = std::fs::read_to_string(&path)?;
+    assert_eq!(
+        content, new_content,
+        "re-read after remote update should return new content (HEAD revalidation)"
+    );
+
+    eprintln!("  [revalidation] passed");
+    Ok(())
 }

@@ -14,8 +14,7 @@ async fn test_nfs_read_only() {
     let cache_dir = format!("/tmp/hf-mount-nfs-cache-{}", std::process::id());
 
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let child =
-            common::mount_bucket(&bucket_id, &mount_point, &cache_dir, &["--backend=nfs", "--read-only"]);
+        let child = common::mount_bucket(&bucket_id, &mount_point, &cache_dir, &["--backend=nfs", "--read-only"]);
         let r = common::fs_tests::run_read_tests(&mount_point, &remote_file, &test_content).map(|_| {
             // Read-only enforcement: writes must fail
             eprintln!("  [nfs] read-only enforcement");

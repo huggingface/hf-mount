@@ -34,7 +34,7 @@ impl NFSAdapter {
             return Ok(file_handle);
         }
         // Pool miss: open file (may await download)
-        let (file_handle, _direct_io) = self.virtual_fs.open(ino, false, false).await.map_err(errno_to_nfs)?;
+        let file_handle = self.virtual_fs.open(ino, false, false).await.map_err(errno_to_nfs)?;
         // Insert into pool
         let mut pool = self.handle_pool.lock().expect("handle_pool poisoned");
         // Double-check: another task may have opened it concurrently
@@ -61,11 +61,18 @@ impl NFSFileSystem for NFSAdapter {
 
     async fn lookup(&self, dirid: fileid3, filename: &filename3) -> Result<fileid3, nfsstat3> {
         let name = std::str::from_utf8(&filename.0).map_err(|_| nfsstat3::NFS3ERR_NOENT)?;
-        self.virtual_fs.lookup(dirid, name).await.map(|a| a.ino).map_err(errno_to_nfs)
+        self.virtual_fs
+            .lookup(dirid, name)
+            .await
+            .map(|a| a.ino)
+            .map_err(errno_to_nfs)
     }
 
     async fn getattr(&self, id: fileid3) -> Result<fattr3, nfsstat3> {
-        self.virtual_fs.getattr(id).map(|a| vfs_attr_to_nfs(&a)).map_err(errno_to_nfs)
+        self.virtual_fs
+            .getattr(id)
+            .map(|a| vfs_attr_to_nfs(&a))
+            .map_err(errno_to_nfs)
     }
 
     async fn read(&self, id: fileid3, offset: u64, count: u32) -> Result<(Vec<u8>, bool), nfsstat3> {
@@ -171,7 +178,7 @@ impl NFSFileSystem for NFSAdapter {
 
 // ── Mount orchestration ────────────────────────────────────────────────
 
-pub async fn mount_nfs(virtual_fs: Arc<VirtualFs>, mount_point: &Path, poll_interval_secs: u64) -> std::io::Result<()> {
+pub async fn mount_nfs(virtual_fs: Arc<VirtualFs>, mount_point: &Path, metadata_ttl_ms: u64) -> std::io::Result<()> {
     let vfs_for_shutdown = virtual_fs.clone();
     let adapter = NFSAdapter::new(virtual_fs);
     let listener = NFSTcpListener::bind("127.0.0.1:0", adapter).await?;
@@ -190,17 +197,16 @@ pub async fn mount_nfs(virtual_fs: Arc<VirtualFs>, mount_point: &Path, poll_inte
         }
     });
 
+    // Convert ms to seconds (rounding up so 100ms → 1s, not 0s which disables caching entirely)
+    let actimeo = metadata_ttl_ms.div_ceil(1000);
+
     // Platform-specific mount command
     #[cfg(target_os = "macos")]
     {
-        let status = std::process::Command::new("/sbin/mount")
+        let status = std::process::Command::new("mount_nfs")
             .args([
-                "-t",
-                "nfs",
                 "-o",
-                &format!(
-                    "rdonly,nolocks,vers=3,tcp,rsize=1048576,actimeo={poll_interval_secs},port={port},mountport={port}"
-                ),
+                &format!("rdonly,nolocks,vers=3,tcp,rsize=1048576,actimeo={actimeo},port={port},mountport={port}"),
                 "127.0.0.1:/",
                 mount_point_str,
             ])
@@ -212,8 +218,7 @@ pub async fn mount_nfs(virtual_fs: Arc<VirtualFs>, mount_point: &Path, poll_inte
 
     #[cfg(target_os = "linux")]
     {
-        let mount_opts =
-            format!("nolock,vers=3,tcp,rsize=1048576,actimeo={poll_interval_secs},port={port},mountport={port}");
+        let mount_opts = format!("nolock,vers=3,tcp,rsize=1048576,actimeo={actimeo},port={port},mountport={port}");
         let output = if unsafe { libc::getuid() } == 0 {
             std::process::Command::new("mount.nfs")
                 .args(["-o", &mount_opts, "127.0.0.1:/", mount_point_str])
@@ -295,7 +300,6 @@ impl HandlePool {
         evicted
     }
 }
-
 
 // ── Conversions ────────────────────────────────────────────────────────
 

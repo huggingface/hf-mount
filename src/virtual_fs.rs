@@ -37,9 +37,6 @@ pub struct VirtualFs {
     staging_dir: Option<StagingDir>,
     read_only: bool,
     advanced_writes: bool,
-    /// True when the background poll loop is active (poll_interval > 0).
-    /// Controls whether kernel cache is safe to use for remote files.
-    poll_active: bool,
     inode_table: Arc<RwLock<InodeTable>>,
     /// Maps file_handle → OpenFile (local fd or lazy remote reference).
     open_files: RwLock<HashMap<u64, OpenFile>>,
@@ -58,6 +55,13 @@ pub struct VirtualFs {
     /// The poll loop calls this to actively invalidate stale inodes when remote changes
     /// are detected, allowing the kernel page cache to be used instead of DIRECT_IO.
     invalidator: Invalidator,
+    /// How long a file's metadata is trusted before re-checking via HEAD.
+    /// Matches the kernel metadata TTL so HEAD is called at most once per TTL window.
+    metadata_ttl: Duration,
+    /// When false (minimal mode), every lookup triggers a HEAD request regardless
+    /// of `last_revalidated`.
+    /// When true, lookups within the metadata TTL window skip HEAD.
+    serve_lookup_from_cache: bool,
 }
 
 impl VirtualFs {
@@ -72,6 +76,8 @@ impl VirtualFs {
         uid: u32,
         gid: u32,
         poll_interval_secs: u64,
+        metadata_ttl: Duration,
+        serve_lookup_from_cache: bool,
     ) -> Arc<Self> {
         let inodes = Arc::new(RwLock::new(InodeTable::new()));
         let negative_cache = Arc::new(RwLock::new(HashMap::new()));
@@ -118,7 +124,6 @@ impl VirtualFs {
             staging_dir,
             read_only,
             advanced_writes,
-            poll_active: poll_interval_secs > 0,
             inode_table: inodes,
             open_files: RwLock::new(HashMap::new()),
             next_file_handle: AtomicU64::new(1),
@@ -129,6 +134,8 @@ impl VirtualFs {
             flush_manager,
             poll_handle: Mutex::new(poll_handle),
             invalidator,
+            metadata_ttl,
+            serve_lookup_from_cache,
         })
     }
 
@@ -352,6 +359,71 @@ impl VirtualFs {
         }
     }
 
+    /// Revalidate a remote file by checking the Hub for metadata changes.
+    /// Skips HEAD if the inode was validated within `metadata_ttl`.
+    /// If the file's xet_hash changed, updates the inode and invalidates kernel cache.
+    /// If the file was deleted (404), removes the inode.
+    /// On network errors, silently returns (graceful degradation).
+    async fn revalidate_file(&self, ino: u64, full_path: &str, current_hash: &str) {
+        // When serve_lookup_from_cache is true, skip HEAD if recently validated.
+        // When false (minimal mode), always HEAD on every lookup.
+        if self.serve_lookup_from_cache {
+            let inodes = self.inode_table.read().expect("inodes poisoned");
+            if let Some(entry) = inodes.get(ino) {
+                if let Some(last) = entry.last_revalidated {
+                    if last.elapsed() < self.metadata_ttl {
+                        return;
+                    }
+                }
+            }
+        }
+
+        let remote = match self.hub_client.head_file(full_path).await {
+            Ok(r) => r,
+            Err(e) => {
+                debug!("head_file({}) failed, using cached: {}", full_path, e);
+                return;
+            }
+        };
+
+        match remote {
+            None => {
+                // File deleted remotely → remove from inode table
+                info!("Remote deletion detected via HEAD: {}", full_path);
+                let mut inodes = self.inode_table.write().expect("inodes poisoned");
+                if let Some(entry) = inodes.get(ino) {
+                    let parent_ino = entry.parent;
+                    if let Some(invalidate) = self.invalidator.lock().expect("invalidator poisoned").as_ref() {
+                        invalidate(parent_ino);
+                        invalidate(ino);
+                    }
+                }
+                inodes.remove(ino);
+            }
+            Some(head_info) => {
+                let remote_hash = head_info.xet_hash.as_deref();
+                let mut inodes = self.inode_table.write().expect("inodes poisoned");
+                if remote_hash != Some(current_hash) {
+                    let remote_size = head_info.size.unwrap_or(0);
+                    let remote_mtime = head_info
+                        .last_modified
+                        .as_deref()
+                        .map(HubApiClient::mtime_from_http_date)
+                        .unwrap_or(SystemTime::now());
+                    debug!("Remote change detected via HEAD: {} (hash changed)", full_path);
+                    inodes.update_remote_file(ino, remote_hash.map(|s| s.to_string()), remote_size, remote_mtime);
+                    if let Some(invalidate) = self.invalidator.lock().expect("invalidator poisoned").as_ref() {
+                        invalidate(ino);
+                    }
+                }
+                // Stamp revalidation time regardless of whether content changed
+                if let Some(entry) = inodes.get_mut(ino) {
+                    entry.last_revalidated = Some(Instant::now());
+                }
+            }
+        }
+    }
+
     /// Ensure children of a directory inode are loaded from the Hub API.
     /// Fetch remote children for `parent_ino` if not already loaded.
     /// Returns ENOENT if the inode doesn't exist, ENOTDIR if it's not a directory.
@@ -540,7 +612,18 @@ impl VirtualFs {
         debug!("lookup: parent={}, name={}", parent, name);
 
         // Fast path: children already loaded → lookup directly, no allocation needed.
-        {
+        // Revalidation info extracted from the lock scope so we can await outside it.
+        enum FastResult {
+            Hit(VirtualFsAttr),
+            NeedsRevalidation {
+                ino: u64,
+                full_path: String,
+                current_hash: String,
+            },
+            Miss(String), // full_path for negative cache
+            NotLoaded,
+        }
+        let fast = {
             let inodes = self.inode_table.read().expect("inodes poisoned");
             let parent_entry = inodes.get(parent).ok_or(libc::ENOENT)?;
 
@@ -550,21 +633,50 @@ impl VirtualFs {
 
             if parent_entry.children_loaded {
                 if let Some(entry) = inodes.lookup_child(parent, name) {
-                    return Ok(self.make_vfs_attr(entry));
-                }
-                // Children loaded but child absent → cache miss, return ENOENT.
-                // Clone path and drop inode lock before taking neg cache write lock.
-                let parent_path = parent_entry.full_path.clone();
-                drop(inodes);
-
-                let full_path = if parent_path.is_empty() {
-                    name.to_string()
+                    // Revalidate remote files via HEAD
+                    // Only for non-dirty files that have a remote xet_hash.
+                    if entry.kind == InodeKind::File && !entry.dirty && entry.xet_hash.is_some() {
+                        FastResult::NeedsRevalidation {
+                            ino: entry.inode,
+                            full_path: entry.full_path.clone(),
+                            current_hash: entry.xet_hash.clone().unwrap(),
+                        }
+                    } else {
+                        FastResult::Hit(self.make_vfs_attr(entry))
+                    }
                 } else {
-                    format!("{}/{}", parent_path, name)
+                    let parent_path = &parent_entry.full_path;
+                    let full_path = if parent_path.is_empty() {
+                        name.to_string()
+                    } else {
+                        format!("{}/{}", parent_path, name)
+                    };
+                    FastResult::Miss(full_path)
+                }
+            } else {
+                FastResult::NotLoaded
+            }
+        }; // inodes lock dropped here
+
+        match fast {
+            FastResult::Hit(attr) => return Ok(attr),
+            FastResult::NeedsRevalidation {
+                ino,
+                full_path,
+                current_hash,
+            } => {
+                self.revalidate_file(ino, &full_path, &current_hash).await;
+                let inodes = self.inode_table.read().expect("inodes poisoned");
+                return match inodes.get(ino) {
+                    Some(entry) => Ok(self.make_vfs_attr(entry)),
+                    None => Err(libc::ENOENT),
                 };
+            }
+            FastResult::Miss(full_path) => {
                 self.negative_cache_insert(full_path);
                 return Err(libc::ENOENT);
             }
+            FastResult::NotLoaded => {} // fall through to slow path
         }
 
         // Slow path: children not loaded yet, fetch from Hub API.
@@ -638,7 +750,7 @@ impl VirtualFs {
         Ok(entries)
     }
 
-    pub async fn open(&self, ino: u64, writable: bool, truncate: bool) -> VirtualFsResult<(u64, bool)> {
+    pub async fn open(&self, ino: u64, writable: bool, truncate: bool) -> VirtualFsResult<u64> {
         debug!("open: ino={}, writable={}, truncate={}", ino, writable, truncate);
 
         if writable && self.read_only {
@@ -646,7 +758,7 @@ impl VirtualFs {
         }
 
         // Simple mode: open(writable) on existing files is not supported.
-        // Only create() produces writable handles. Like mountpoint-s3, EPERM.
+        // Only create() produces writable handles. EPERM.
         if writable && !self.advanced_writes {
             return Err(libc::EPERM);
         }
@@ -728,7 +840,7 @@ impl VirtualFs {
                     writable: true,
                 },
             );
-            Ok((file_handle, false))
+            Ok(file_handle)
         } else {
             // Dirty file not yet flushed → read from local staging (advanced mode only)
             if let Some(ref staging_path) = staging_path
@@ -736,7 +848,7 @@ impl VirtualFs {
                 && staging_path.exists()
             {
                 let file_handle = self.open_local_readonly(ino, staging_path)?;
-                return Ok((file_handle, false));
+                return Ok(file_handle);
             }
 
             // Remote file with xet hash → lazy range reads via prefetch buffer
@@ -747,10 +859,7 @@ impl VirtualFs {
                     .write()
                     .expect("open_files poisoned")
                     .insert(file_handle, OpenFile::Lazy { prefetch });
-                // keep_cache: preserve kernel page cache across re-opens only when
-                // the poll loop is active to invalidate stale inodes on remote changes.
-                // Without polling, use direct I/O to avoid serving stale cached data.
-                return Ok((file_handle, self.poll_active));
+                return Ok(file_handle);
             }
 
             // No hash + non-empty → inconsistent state
@@ -766,7 +875,7 @@ impl VirtualFs {
                 .write()
                 .expect("open_files poisoned")
                 .insert(file_handle, OpenFile::Lazy { prefetch });
-            Ok((file_handle, false))
+            Ok(file_handle)
         }
     }
 
@@ -1590,7 +1699,9 @@ impl VirtualFs {
                     mtime: mtime_ms,
                     content_type: None,
                 },
-                BatchOp::DeleteFile { path: info.old_path.clone() },
+                BatchOp::DeleteFile {
+                    path: info.old_path.clone(),
+                },
             ]
         } else if info.kind == InodeKind::Directory && !info.descendant_files.is_empty() {
             // Hub batch API requires all adds before all deletes
@@ -1667,6 +1778,29 @@ impl VirtualFs {
             entry.pending_deletes.push(info.old_path.clone());
         }
 
+        // Dirty descendants of a renamed directory: record their old remote paths
+        // for deletion at flush time (clean descendants are handled in rename_remote).
+        if info.kind == InodeKind::Directory {
+            let mut stack = vec![info.ino];
+            while let Some(dir_ino) = stack.pop() {
+                let children: Vec<u64> = inodes.get(dir_ino).map(|e| e.children.clone()).unwrap_or_default();
+                for child_ino in children {
+                    if let Some(child) = inodes.get(child_ino) {
+                        match child.kind {
+                            InodeKind::File if child.dirty && child.xet_hash.is_some() => {
+                                let old_path = child.full_path.clone();
+                                if let Some(child_mut) = inodes.get_mut(child_ino) {
+                                    child_mut.pending_deletes.push(old_path);
+                                }
+                            }
+                            InodeKind::Directory => stack.push(child_ino),
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+
         // Detach from old parent
         if let Some(old_parent) = inodes.get_mut(parent) {
             old_parent.children.retain(|&c| c != info.ino);
@@ -1694,7 +1828,7 @@ impl VirtualFs {
             return Err(libc::EROFS);
         }
 
-        // Simple mode: truncate via setattr not supported (like mountpoint-s3)
+        // Simple mode: truncate via setattr not supported
         if size.is_some() && !self.advanced_writes {
             return Err(libc::EPERM);
         }
