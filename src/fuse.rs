@@ -3,9 +3,9 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use fuser::{
-    Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo, KernelConfig, OpenFlags,
-    ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request,
-    TimeOrNow,
+    Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo, InitFlags, KernelConfig,
+    OpenFlags, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite,
+    Request, TimeOrNow,
 };
 
 use crate::inode::InodeKind;
@@ -20,14 +20,24 @@ pub struct FuseAdapter {
     /// Kernel metadata cache TTL. Short enough to detect remote changes quickly,
     /// long enough to avoid cascade re-lookups in the kernel.
     metadata_ttl: Duration,
+    read_only: bool,
+    advanced_writes: bool,
 }
 
 impl FuseAdapter {
-    pub fn new(runtime: tokio::runtime::Handle, virtual_fs: Arc<VirtualFs>, metadata_ttl: Duration) -> Self {
+    pub fn new(
+        runtime: tokio::runtime::Handle,
+        virtual_fs: Arc<VirtualFs>,
+        metadata_ttl: Duration,
+        read_only: bool,
+        advanced_writes: bool,
+    ) -> Self {
         Self {
             runtime,
             virtual_fs,
             metadata_ttl,
+            read_only,
+            advanced_writes,
         }
     }
 }
@@ -79,6 +89,24 @@ impl Filesystem for FuseAdapter {
         // and rely on our userspace PrefetchState instead.
         let _ = config.set_max_readahead(16 * 1_048_576); // 16 MiB
         let _ = config.set_max_write(16 * 1_048_576); // 16 MiB — fewer round-trips for large sequential writes
+
+        // Receive O_TRUNC in open() flags instead of a separate setattr(size=0) call.
+        if !self.read_only {
+            let trunc_ok = config.add_capabilities(InitFlags::FUSE_ATOMIC_O_TRUNC).is_ok();
+            if !trunc_ok && !self.advanced_writes {
+                // Simple streaming mode requires atomic O_TRUNC — setattr truncation
+                // is rejected, so without this capability overwrites would silently fail.
+                tracing::error!(
+                    "Kernel does not support FUSE_ATOMIC_O_TRUNC; \
+                     simple streaming write mode cannot function. \
+                     Use --advanced-writes or upgrade your kernel."
+                );
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "FUSE_ATOMIC_O_TRUNC not supported by kernel",
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -121,12 +149,15 @@ impl Filesystem for FuseAdapter {
     }
 
     /// Open a file. Returns a file handle and FOPEN flags.
-    fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
+    fn open(&self, req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
         let accmode = flags.0 & libc::O_ACCMODE;
         let writable = accmode == libc::O_WRONLY || accmode == libc::O_RDWR;
         let truncate = (flags.0 & libc::O_TRUNC) != 0;
 
-        match self.runtime.block_on(self.virtual_fs.open(ino.0, writable, truncate)) {
+        match self
+            .runtime
+            .block_on(self.virtual_fs.open(ino.0, writable, truncate, Some(req.pid())))
+        {
             Ok(file_handle) => {
                 // KEEP_CACHE preserves the kernel page cache across re-opens.
                 // The poll loop calls notify_inval_inode on remote changes;
@@ -175,8 +206,11 @@ impl Filesystem for FuseAdapter {
     }
 
     /// Called on close(2). For streaming writes, synchronously uploads and commits.
-    fn flush(&self, _req: &Request, ino: INodeNo, fh: FileHandle, _lock_owner: fuser::LockOwner, reply: ReplyEmpty) {
-        match self.runtime.block_on(self.virtual_fs.flush(ino.0, fh.0)) {
+    fn flush(&self, req: &Request, ino: INodeNo, fh: FileHandle, _lock_owner: fuser::LockOwner, reply: ReplyEmpty) {
+        match self
+            .runtime
+            .block_on(self.virtual_fs.flush(ino.0, fh.0, Some(req.pid())))
+        {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(Errno::from_i32(e)),
         }
@@ -200,7 +234,7 @@ impl Filesystem for FuseAdapter {
     /// Create and open a new file in one call (O_CREAT).
     fn create(
         &self,
-        _req: &Request,
+        req: &Request,
         parent: INodeNo,
         name: &OsStr,
         _mode: u32,
@@ -209,7 +243,10 @@ impl Filesystem for FuseAdapter {
         reply: fuser::ReplyCreate,
     ) {
         let name = os_to_str!(name, reply);
-        match self.runtime.block_on(self.virtual_fs.create(parent.0, name)) {
+        match self
+            .runtime
+            .block_on(self.virtual_fs.create(parent.0, name, Some(req.pid())))
+        {
             Ok((attr, file_handle)) => {
                 reply.created(
                     &self.metadata_ttl,

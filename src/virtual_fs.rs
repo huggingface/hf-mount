@@ -47,6 +47,9 @@ pub struct VirtualFs {
     negative_cache: Arc<RwLock<HashMap<String, Instant>>>,
     /// Per-inode locks for staging file preparation (prevents concurrent open races).
     staging_locks: Mutex<HashMap<u64, Arc<tokio::sync::Mutex<()>>>>,
+    /// Per-inode pending commit receivers. release() publishes the commit result here;
+    /// open() awaits it instead of blindly blocking on staging_lock.
+    pending_commits: Mutex<HashMap<u64, tokio::sync::watch::Receiver<Option<Result<(), i32>>>>>,
     /// Debounced batch flush pipeline (None when read_only).
     flush_manager: Option<crate::flush::FlushManager>,
     /// Background poll task handle, taken in shutdown().
@@ -131,6 +134,7 @@ impl VirtualFs {
             gid,
             negative_cache,
             staging_locks: Mutex::new(HashMap::new()),
+            pending_commits: Mutex::new(HashMap::new()),
             flush_manager,
             poll_handle: Mutex::new(poll_handle),
             invalidator,
@@ -556,6 +560,93 @@ impl VirtualFs {
             .clone()
     }
 
+    /// Install a pending commit watch hook on a streaming channel.
+    /// Called in flush() before commit or deferral so open() can await the result.
+    /// No-op if a hook is already installed (prevents replacing a receiver that
+    /// an open() caller may already be awaiting).
+    fn install_commit_hook(&self, ino: u64, channel: &StreamingChannel) {
+        let mut hook = channel.commit_hook.lock().unwrap();
+        if hook.is_some() {
+            return; // already installed — don't replace
+        }
+        let (tx, rx) = tokio::sync::watch::channel(None);
+        *hook = Some(tx);
+        self.pending_commits
+            .lock()
+            .expect("pending_commits poisoned")
+            .insert(ino, rx);
+    }
+
+    /// Fulfill the pending commit hook with a result, then clean up the map.
+    fn fulfill_commit_hook(&self, ino: u64, channel: &StreamingChannel, result: Result<(), i32>) {
+        if let Some(tx) = channel.commit_hook.lock().unwrap().take() {
+            let _ = tx.send(Some(result));
+        }
+        self.pending_commits
+            .lock()
+            .expect("pending_commits poisoned")
+            .remove(&ino);
+    }
+
+    /// Wait for any in-flight streaming commit on this inode to complete.
+    /// Returns Ok(()) if no pending commit or commit succeeded, Err(errno) if it failed.
+    async fn await_pending_commit(&self, ino: u64) -> VirtualFsResult<()> {
+        let pending_rx = self
+            .pending_commits
+            .lock()
+            .expect("pending_commits poisoned")
+            .get(&ino)
+            .cloned();
+
+        if let Some(mut rx) = pending_rx {
+            while rx.borrow().is_none() {
+                if rx.changed().await.is_err() {
+                    // Sender dropped without publishing a result — treat as failure.
+                    error!("await_pending_commit: sender dropped for ino={}", ino);
+                    return Err(libc::EIO);
+                }
+            }
+            if let Some(Err(e)) = &*rx.borrow() {
+                debug!("await_pending_commit: commit failed for ino={}: errno={}", ino, e);
+                // Inode was reverted — not an error for the caller, just informational.
+            }
+        }
+        Ok(())
+    }
+
+    /// Set up a new streaming writer + channel. Returns (file_handle, channel).
+    /// Used by both create() and open(O_TRUNC) in simple mode.
+    async fn setup_streaming_writer(
+        &self,
+        _ino: u64,
+        pid: Option<u32>,
+        snapshot: InodeSnapshot,
+    ) -> VirtualFsResult<(u64, Arc<StreamingChannel>)> {
+        let streaming_writer = self.xet_sessions.create_streaming_writer().await.map_err(|e| {
+            error!("Failed to create streaming writer: {}", e);
+            libc::EIO
+        })?;
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<WriteMsg>(4);
+        let error: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
+        self.runtime
+            .spawn(streaming_worker(streaming_writer, rx, error.clone()));
+
+        let channel = Arc::new(StreamingChannel {
+            tx,
+            bytes_written: AtomicU64::new(0),
+            error,
+            state: std::sync::Mutex::new(CommitState::Writing),
+            pending_info: std::sync::Mutex::new(None),
+            open_pid: pid,
+            snapshot,
+            commit_hook: std::sync::Mutex::new(None),
+        });
+
+        let file_handle = self.alloc_file_handle();
+        Ok((file_handle, channel))
+    }
+
     /// Open a local file as read-only and return the file handle.
     fn open_local_readonly(&self, ino: u64, path: &PathBuf) -> VirtualFsResult<u64> {
         match File::open(path) {
@@ -750,8 +841,11 @@ impl VirtualFs {
         Ok(entries)
     }
 
-    pub async fn open(&self, ino: u64, writable: bool, truncate: bool) -> VirtualFsResult<u64> {
-        debug!("open: ino={}, writable={}, truncate={}", ino, writable, truncate);
+    pub async fn open(&self, ino: u64, writable: bool, truncate: bool, pid: Option<u32>) -> VirtualFsResult<u64> {
+        debug!(
+            "open: ino={}, writable={}, truncate={}, pid={:?}",
+            ino, writable, truncate, pid
+        );
 
         if writable && self.read_only {
             return Err(libc::EROFS);
@@ -763,177 +857,198 @@ impl VirtualFs {
                 Some(e) if e.kind == InodeKind::File => e,
                 _ => return Err(libc::ENOENT),
             };
-
             (entry.xet_hash.clone().unwrap_or_default(), entry.size, entry.dirty)
         };
 
         let staging_path = self.staging_dir.as_ref().map(|sd| sd.path(ino));
 
         if writable && self.advanced_writes {
-            // Advanced writes mode: staging file + async flush
-            let staging_path = staging_path.expect("staging_dir required for advanced writes");
+            // Staging file + async flush (supports random writes and seek)
+            self.open_advanced_write(ino, &xet_hash, size, staging_path, truncate)
+                .await
+        } else if writable && truncate {
+            // Simple streaming write (append-only, synchronous commit on close)
+            self.open_streaming_write(ino, pid).await
+        } else if writable {
+            // Simple mode without O_TRUNC: random writes not supported
+            Err(libc::EPERM)
+        } else {
+            // Read-only: staging file, pending commit, or lazy remote read
+            self.open_readonly(ino, &xet_hash, size, is_dirty, staging_path).await
+        }
+    }
 
-            // Serialize staging preparation per inode (prevents concurrent download races)
-            let staging_mutex = self.staging_lock(ino);
-            let _staging_guard = staging_mutex.lock().await;
+    /// Advanced writes: prepare a staging file and open it for read-write.
+    async fn open_advanced_write(
+        &self,
+        ino: u64,
+        xet_hash: &str,
+        size: u64,
+        staging_path: Option<PathBuf>,
+        truncate: bool,
+    ) -> VirtualFsResult<u64> {
+        let staging_path = staging_path.expect("staging_dir required for advanced writes");
 
-            // Re-read dirty state under the staging lock (may have changed since first check)
-            let is_dirty = self
-                .inode_table
-                .read()
-                .expect("inodes poisoned")
-                .get(ino)
-                .ok_or(libc::ENOENT)?
-                .dirty;
+        // Serialize staging preparation per inode (prevents concurrent download races)
+        let staging_mutex = self.staging_lock(ino);
+        let _staging_guard = staging_mutex.lock().await;
 
-            // Reuse existing dirty staging file (unless truncating)
-            if !(is_dirty && staging_path.exists() && !truncate) {
-                if !truncate && !xet_hash.is_empty() && size > 0 {
-                    // Download remote content for read-modify-write
-                    self.xet_sessions
-                        .download_to_file(&xet_hash, size, &staging_path)
-                        .await
-                        .map_err(|e| {
-                            error!("Failed to download file for write: {}", e);
-                            libc::EIO
-                        })?;
-                } else {
-                    // Truncate, new file, or empty remote → empty staging file
-                    File::create(&staging_path).map_err(|e| {
-                        error!("Failed to create staging file: {}", e);
+        // Re-read dirty state under the staging lock (may have changed since first check)
+        let is_dirty = self
+            .inode_table
+            .read()
+            .expect("inodes poisoned")
+            .get(ino)
+            .ok_or(libc::ENOENT)?
+            .dirty;
+
+        // Reuse existing dirty staging file (unless truncating)
+        if !(is_dirty && staging_path.exists() && !truncate) {
+            if !truncate && !xet_hash.is_empty() && size > 0 {
+                // Download remote content for read-modify-write
+                self.xet_sessions
+                    .download_to_file(xet_hash, size, &staging_path)
+                    .await
+                    .map_err(|e| {
+                        error!("Failed to download file for write: {}", e);
                         libc::EIO
                     })?;
-                }
-            }
-
-            let file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&staging_path)
-                .map_err(|e| {
-                    error!("Failed to open staging file: {}", e);
+            } else {
+                // Truncate, new file, or empty remote → empty staging file
+                File::create(&staging_path).map_err(|e| {
+                    error!("Failed to create staging file: {}", e);
                     libc::EIO
                 })?;
-
-            // Re-check inode still exists before committing the open
-            {
-                let mut inodes = self.inode_table.write().expect("inodes poisoned");
-                let entry = inodes.get_mut(ino).ok_or(libc::ENOENT)?;
-                entry.dirty = true;
-                if truncate {
-                    entry.size = 0;
-                }
             }
+        }
 
-            let file_handle = self.alloc_file_handle();
-            self.open_files.write().expect("open_files poisoned").insert(
-                file_handle,
-                OpenFile::Local {
-                    ino,
-                    file: Arc::new(file),
-                    writable: true,
-                },
-            );
-            Ok(file_handle)
-        } else if writable {
-            // Simple mode: truncating write on existing file → new streaming writer.
-            // Wait for any in-progress commit to finish first.
-            let staging_mutex = self.staging_lock(ino);
-            let _staging_guard = staging_mutex.lock().await;
-
-            let streaming_writer = self.xet_sessions.create_streaming_writer().await.map_err(|e| {
-                error!("Failed to create streaming writer: {}", e);
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&staging_path)
+            .map_err(|e| {
+                error!("Failed to open staging file: {}", e);
                 libc::EIO
             })?;
 
-            let (tx, rx) = tokio::sync::mpsc::channel::<WriteMsg>(4);
-            let error: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
-            self.runtime
-                .spawn(streaming_worker(streaming_writer, rx, error.clone()));
-
-            let channel = Arc::new(StreamingChannel {
-                tx,
-                bytes_written: AtomicU64::new(0),
-                error,
-                pending_info: std::sync::Mutex::new(None),
-            });
-
-            // Mark inode as dirty with size 0 (truncated)
-            {
-                let mut inodes = self.inode_table.write().expect("inodes poisoned");
-                let entry = inodes.get_mut(ino).ok_or(libc::ENOENT)?;
-                entry.dirty = true;
+        // Re-check inode still exists before committing the open
+        {
+            let mut inodes = self.inode_table.write().expect("inodes poisoned");
+            let entry = inodes.get_mut(ino).ok_or(libc::ENOENT)?;
+            entry.dirty = true;
+            if truncate {
                 entry.size = 0;
-                entry.xet_hash = None;
             }
-
-            let file_handle = self.alloc_file_handle();
-            self.open_files
-                .write()
-                .expect("open_files poisoned")
-                .insert(file_handle, OpenFile::Streaming { ino, channel });
-            Ok(file_handle)
-        } else {
-            // Dirty file not yet flushed → read from local staging (advanced mode only)
-            if let Some(ref staging_path) = staging_path
-                && is_dirty
-                && staging_path.exists()
-            {
-                let file_handle = self.open_local_readonly(ino, staging_path)?;
-                return Ok(file_handle);
-            }
-
-            // Dirty file in simple mode (no staging): a streaming commit is in
-            // progress in release(). Wait for it to finish by acquiring the
-            // staging lock (held by release during commit), then re-read the
-            // inode to pick up the xet_hash set by streaming_commit.
-            if is_dirty && staging_path.is_none() && xet_hash.is_empty() && size > 0 {
-                let staging_mutex = self.staging_lock(ino);
-                let _guard = staging_mutex.lock().await;
-                // Re-read inode after commit completed
-                let (new_xet_hash, new_size) = {
-                    let inodes = self.inode_table.read().expect("inodes poisoned");
-                    let entry = inodes.get(ino).ok_or(libc::ENOENT)?;
-                    (entry.xet_hash.clone().unwrap_or_default(), entry.size)
-                };
-                if !new_xet_hash.is_empty() {
-                    let prefetch = Arc::new(tokio::sync::Mutex::new(PrefetchState::new(new_xet_hash, new_size)));
-                    let file_handle = self.alloc_file_handle();
-                    self.open_files
-                        .write()
-                        .expect("open_files poisoned")
-                        .insert(file_handle, OpenFile::Lazy { prefetch });
-                    return Ok(file_handle);
-                }
-                // If still no hash after waiting, fall through to error below
-            }
-
-            // Remote file with xet hash → lazy range reads via prefetch buffer
-            if !xet_hash.is_empty() {
-                let prefetch = Arc::new(tokio::sync::Mutex::new(PrefetchState::new(xet_hash, size)));
-                let file_handle = self.alloc_file_handle();
-                self.open_files
-                    .write()
-                    .expect("open_files poisoned")
-                    .insert(file_handle, OpenFile::Lazy { prefetch });
-                return Ok(file_handle);
-            }
-
-            // No hash + non-empty → inconsistent state
-            if size > 0 {
-                error!("No xet hash for non-empty, non-dirty file ino={}", ino);
-                return Err(libc::EIO);
-            }
-
-            // Empty file (size=0, no hash) → serve as lazy with 0 bytes
-            let prefetch = Arc::new(tokio::sync::Mutex::new(PrefetchState::new(String::new(), 0)));
-            let file_handle = self.alloc_file_handle();
-            self.open_files
-                .write()
-                .expect("open_files poisoned")
-                .insert(file_handle, OpenFile::Lazy { prefetch });
-            Ok(file_handle)
         }
+
+        let file_handle = self.alloc_file_handle();
+        self.open_files.write().expect("open_files poisoned").insert(
+            file_handle,
+            OpenFile::Local {
+                ino,
+                file: Arc::new(file),
+                writable: true,
+            },
+        );
+        Ok(file_handle)
+    }
+
+    /// Simple streaming write: truncate existing file and set up a new streaming writer.
+    async fn open_streaming_write(&self, ino: u64, pid: Option<u32>) -> VirtualFsResult<u64> {
+        // Wait for any in-flight commit to complete before starting a new writer.
+        self.await_pending_commit(ino).await?;
+
+        let staging_mutex = self.staging_lock(ino);
+        let _staging_guard = staging_mutex.lock().await;
+
+        // Capture inode snapshot before mutation (for revert on commit failure)
+        let snapshot = {
+            let inodes = self.inode_table.read().expect("inodes poisoned");
+            let entry = inodes.get(ino).ok_or(libc::ENOENT)?;
+            InodeSnapshot {
+                xet_hash: entry.xet_hash.clone(),
+                size: entry.size,
+                mtime: entry.mtime,
+                pending_deletes: entry.pending_deletes.clone(),
+                existed_before: true,
+            }
+        };
+
+        let (file_handle, channel) = self.setup_streaming_writer(ino, pid, snapshot).await?;
+
+        // Mark inode as dirty with size 0 (truncated)
+        {
+            let mut inodes = self.inode_table.write().expect("inodes poisoned");
+            let entry = inodes.get_mut(ino).ok_or(libc::ENOENT)?;
+            entry.dirty = true;
+            entry.size = 0;
+            entry.xet_hash = None;
+        }
+
+        self.open_files
+            .write()
+            .expect("open_files poisoned")
+            .insert(file_handle, OpenFile::Streaming { ino, channel });
+        Ok(file_handle)
+    }
+
+    /// Open a file for reading. Handles dirty staging files, pending commits, and lazy remote reads.
+    async fn open_readonly(
+        &self,
+        ino: u64,
+        xet_hash: &str,
+        size: u64,
+        is_dirty: bool,
+        staging_path: Option<PathBuf>,
+    ) -> VirtualFsResult<u64> {
+        // Dirty file not yet flushed → read from local staging (advanced mode only)
+        if let Some(ref staging_path) = staging_path
+            && is_dirty
+            && staging_path.exists()
+        {
+            return self.open_local_readonly(ino, staging_path);
+        }
+
+        // Dirty file in simple mode (no staging): a streaming commit may be
+        // in progress in release(). Await the pending commit result if one exists,
+        // then re-read the inode to pick up the xet_hash set by streaming_commit.
+        if is_dirty && staging_path.is_none() && xet_hash.is_empty() && size > 0 {
+            self.await_pending_commit(ino).await?;
+
+            // Re-read inode after commit completed (or reverted) and return
+            // directly with fresh values — the original xet_hash/size are stale.
+            let (new_xet_hash, new_size) = {
+                let inodes = self.inode_table.read().expect("inodes poisoned");
+                let entry = inodes.get(ino).ok_or(libc::ENOENT)?;
+                (entry.xet_hash.clone().unwrap_or_default(), entry.size)
+            };
+            return self.open_lazy(new_xet_hash, new_size);
+        }
+
+        // Remote file with xet hash → lazy range reads via prefetch buffer
+        if !xet_hash.is_empty() {
+            return self.open_lazy(xet_hash.to_string(), size);
+        }
+
+        // No hash + non-empty → inconsistent state
+        if size > 0 {
+            error!("No xet hash for non-empty, non-dirty file ino={}", ino);
+            return Err(libc::EIO);
+        }
+
+        // Empty file (size=0, no hash)
+        self.open_lazy(String::new(), 0)
+    }
+
+    /// Allocate a lazy file handle backed by a prefetch buffer.
+    fn open_lazy(&self, xet_hash: String, size: u64) -> VirtualFsResult<u64> {
+        let prefetch = Arc::new(tokio::sync::Mutex::new(PrefetchState::new(xet_hash, size)));
+        let file_handle = self.alloc_file_handle();
+        self.open_files
+            .write()
+            .expect("open_files poisoned")
+            .insert(file_handle, OpenFile::Lazy { prefetch });
+        Ok(file_handle)
     }
 
     /// Read data from an open file. Returns `(data, eof)`.
@@ -1210,8 +1325,8 @@ impl VirtualFs {
         }
     }
 
-    pub async fn flush(&self, ino: u64, file_handle: u64) -> VirtualFsResult<()> {
-        debug!("flush: ino={}, fh={}", ino, file_handle);
+    pub async fn flush(&self, ino: u64, file_handle: u64, pid: Option<u32>) -> VirtualFsResult<()> {
+        debug!("flush: ino={}, fh={}, pid={:?}", ino, file_handle, pid);
 
         // Check if this is a streaming handle → synchronous upload + commit
         let streaming_channel = {
@@ -1223,14 +1338,62 @@ impl VirtualFs {
         };
 
         if let Some(channel) = streaming_channel {
-            // Streaming writes are finalized in release(), not flush().
-            // flush() is called on every close(2) — including dup'd fds — so committing
-            // here would finalize the file before all writes are done (e.g. shell
-            // redirections like `echo 1 > file` dup the fd and close the original
-            // before the builtin writes).
-            // Just check for worker errors so callers see EIO on close().
+            // Check for worker errors first.
             if channel.error.lock().unwrap().is_some() {
                 return Err(libc::EIO);
+            }
+
+            // Check current commit state.
+            {
+                let state = channel.state.lock().unwrap();
+                match &*state {
+                    CommitState::Committed => return Ok(()),
+                    CommitState::Failed(msg) => {
+                        debug!("flush: already failed for ino={}: {}", ino, msg);
+                        return Err(libc::EIO);
+                    }
+                    CommitState::Writing | CommitState::Deferred => {}
+                }
+            }
+
+            // PID-aware deferral: if the flushing process isn't the opener,
+            // this is a dup'd fd (e.g. shell redirection) — defer to release().
+            if let (Some(open_pid), Some(flush_pid)) = (channel.open_pid, pid) {
+                if !same_process(open_pid, flush_pid) {
+                    debug!(
+                        "flush: deferring commit for ino={} (open_pid={}, flush_pid={})",
+                        ino, open_pid, flush_pid
+                    );
+                    self.install_commit_hook(ino, &channel);
+                    *channel.state.lock().unwrap() = CommitState::Deferred;
+                    return Ok(());
+                }
+            }
+
+            // Secondary gate: skip commit if no data was written (covers NFS
+            // and zero-write cases like `touch`). release() will handle it.
+            if channel.bytes_written.load(Ordering::Relaxed) == 0 {
+                self.install_commit_hook(ino, &channel);
+                *channel.state.lock().unwrap() = CommitState::Deferred;
+                return Ok(());
+            }
+
+            // Install hook before commit so concurrent open() can wait on us.
+            self.install_commit_hook(ino, &channel);
+
+            match self.streaming_commit(ino, &channel).await {
+                Ok(()) => {
+                    *channel.state.lock().unwrap() = CommitState::Committed;
+                    self.fulfill_commit_hook(ino, &channel, Ok(()));
+                }
+                Err(e) => {
+                    // CAS upload may have succeeded — file_info is preserved
+                    // in pending_info for retry in release(). Don't fulfill the
+                    // hook here: release() will retry and publish the final outcome.
+                    // Keeping the hook active ensures concurrent open(O_TRUNC) waits
+                    // for release() instead of racing with the retry.
+                    return Err(e);
+                }
             }
             return Ok(());
         }
@@ -1264,18 +1427,44 @@ impl VirtualFs {
                 }
             }
             Some(OpenFile::Streaming { ino, channel }) => {
-                // Simple mode: finalize streaming write, upload to CAS, and commit to Hub.
-                // This runs in release() (not flush()) because flush() fires on every
-                // close(2) of dup'd fds — shell redirections like `echo 1 > file` close
-                // the original fd before the builtin writes. release() fires only once
-                // when the last reference is dropped, so all data has been written.
-                //
-                // Hold the staging lock during commit so that concurrent readers
-                // (open read-only) can wait for the commit to finish before reading.
-                let staging_mutex = self.staging_lock(ino);
-                let _staging_guard = staging_mutex.lock().await;
-                if let Err(e) = self.streaming_commit(ino, &channel).await {
-                    error!("Streaming commit failed in release for ino={}: errno={}", ino, e);
+                let needs_commit = {
+                    let state = channel.state.lock().unwrap();
+                    matches!(&*state, CommitState::Writing | CommitState::Deferred)
+                };
+                if needs_commit {
+                    // If flush() didn't defer (e.g. Writing state from a direct
+                    // release without flush), install the hook now.
+                    if channel.commit_hook.lock().unwrap().is_none() {
+                        self.install_commit_hook(ino, &channel);
+                    }
+
+                    let result = match self.streaming_commit(ino, &channel).await {
+                        Ok(()) => Ok(()),
+                        Err(e) => {
+                            // Retry only if CAS upload succeeded but Hub commit failed
+                            // (pending_info is preserved). If the worker itself died,
+                            // there's nothing to retry — the data is gone.
+                            if channel.pending_info.lock().unwrap().is_some() {
+                                tokio::time::sleep(Duration::from_secs(1)).await;
+                                self.streaming_commit(ino, &channel).await
+                            } else {
+                                Err(e)
+                            }
+                        }
+                    };
+
+                    match &result {
+                        Ok(()) => {
+                            *channel.state.lock().unwrap() = CommitState::Committed;
+                        }
+                        Err(e) => {
+                            error!("data loss: streaming commit failed for ino={}: errno={}", ino, e);
+                            self.revert_inode(ino, &channel.snapshot);
+                            *channel.state.lock().unwrap() = CommitState::Failed("commit failed".into());
+                        }
+                    }
+
+                    self.fulfill_commit_hook(ino, &channel, result);
                 }
             }
             _ => {}
@@ -1283,6 +1472,27 @@ impl VirtualFs {
         // staging_locks entries are intentionally not cleaned up here: removing
         // while another open() may hold the Arc would break serialization.
         // Entries are tiny (Arc<Mutex<()>>) and bounded by unique inodes opened.
+    }
+
+    /// Revert an inode to its pre-write state after a failed streaming commit.
+    fn revert_inode(&self, ino: u64, snapshot: &InodeSnapshot) {
+        let mut inodes = self.inode_table.write().expect("inodes poisoned");
+        if !snapshot.existed_before {
+            // File was created in this session — remove it entirely.
+            inodes.remove(ino);
+            info!("Reverted ino={}: removed (was newly created)", ino);
+        } else if let Some(entry) = inodes.get_mut(ino) {
+            // Overwrite — restore to pre-truncate state.
+            entry.xet_hash = snapshot.xet_hash.clone();
+            entry.size = snapshot.size;
+            entry.mtime = snapshot.mtime;
+            entry.pending_deletes = snapshot.pending_deletes.clone();
+            entry.dirty = false;
+            info!(
+                "Reverted ino={}: restored (hash={:?}, size={})",
+                ino, snapshot.xet_hash, snapshot.size
+            );
+        }
     }
 
     /// Finalize a streaming write: send Finish to the worker, await CAS upload, commit to Hub.
@@ -1294,8 +1504,15 @@ impl VirtualFs {
             } else {
                 let (result_tx, result_rx) = tokio::sync::oneshot::channel();
                 if channel.tx.send(WriteMsg::Finish(result_tx)).await.is_err() {
-                    debug!("release: channel already closed for ino={}, already committed", ino);
-                    return Ok(());
+                    // Channel closed: only treat as success if already committed.
+                    // If the worker died from an error, this is a real failure.
+                    let already_committed = matches!(&*channel.state.lock().unwrap(), CommitState::Committed);
+                    if already_committed {
+                        debug!("streaming_commit: channel closed but already committed for ino={}", ino);
+                        return Ok(());
+                    }
+                    error!("streaming_commit: channel closed with no prior commit for ino={}", ino);
+                    return Err(libc::EIO);
                 }
                 match result_rx.await {
                     Ok(Ok(info)) => info,
@@ -1335,6 +1552,8 @@ impl VirtualFs {
 
         if let Err(e) = self.hub_client.batch_operations(&ops).await {
             error!("Failed to commit file {}: {}", full_path, e);
+            // CAS upload succeeded — preserve file_info for retry in release()
+            *channel.pending_info.lock().unwrap() = Some(file_info);
             return Err(libc::EIO);
         }
 
@@ -1358,7 +1577,7 @@ impl VirtualFs {
         Ok(())
     }
 
-    pub async fn create(&self, parent: u64, name: &str) -> VirtualFsResult<(VirtualFsAttr, u64)> {
+    pub async fn create(&self, parent: u64, name: &str, pid: Option<u32>) -> VirtualFsResult<(VirtualFsAttr, u64)> {
         if self.read_only {
             return Err(libc::EROFS);
         }
@@ -1440,30 +1659,21 @@ impl VirtualFs {
             }
         } else {
             // Simple mode: streaming writer with channel-based decoupling.
-            // Data enqueued by write() is drained by a background tokio task
-            // that feeds the CAS cleaner — no block_on() on the write hot path.
-            let streaming_writer = match self.xet_sessions.create_streaming_writer().await {
-                Ok(w) => w,
+            let snapshot = InodeSnapshot {
+                xet_hash: None,
+                size: 0,
+                mtime: now,
+                pending_deletes: Vec::new(),
+                existed_before: false,
+            };
+            let (file_handle, channel) = match self.setup_streaming_writer(ino, pid, snapshot).await {
+                Ok(r) => r,
                 Err(e) => {
-                    error!("Failed to create streaming writer: {}", e);
                     self.inode_table.write().expect("inodes poisoned").remove(ino);
-                    return Err(libc::EIO);
+                    return Err(e);
                 }
             };
 
-            let (tx, rx) = tokio::sync::mpsc::channel::<WriteMsg>(4);
-            let error: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
-            self.runtime
-                .spawn(streaming_worker(streaming_writer, rx, error.clone()));
-
-            let channel = Arc::new(StreamingChannel {
-                tx,
-                bytes_written: AtomicU64::new(0),
-                error,
-                pending_info: std::sync::Mutex::new(None),
-            });
-
-            let file_handle = self.alloc_file_handle();
             self.open_files
                 .write()
                 .expect("open_files poisoned")
@@ -1904,9 +2114,10 @@ impl VirtualFs {
             return Err(libc::EROFS);
         }
 
-        // Simple mode: only truncate-to-zero is supported (for O_TRUNC opens).
+        // Simple mode: truncation is not supported via setattr. O_TRUNC opens
+        // go through open() directly (FUSE_ATOMIC_O_TRUNC is negotiated).
         // Non-zero truncation requires staging files (advanced_writes mode).
-        if size.is_some() && !self.advanced_writes && size != Some(0) {
+        if size.is_some() && !self.advanced_writes {
             return Err(libc::EPERM);
         }
 
@@ -1970,9 +2181,7 @@ impl VirtualFs {
                     }
                 }
             }
-            // Simple mode with new_size == 0: no staging file needed — just update
-            // the inode metadata. The actual content comes via the streaming writer
-            // that open() will set up immediately after this setattr call.
+            // Advanced mode only past this point (simple mode returns EPERM above).
 
             let mut inodes = self.inode_table.write().expect("inodes poisoned");
             if let Some(entry) = inodes.get_mut(ino) {
@@ -2042,6 +2251,29 @@ enum WriteMsg {
     Finish(tokio::sync::oneshot::Sender<crate::error::Result<XetFileInfo>>),
 }
 
+/// Snapshot of inode state captured when a streaming writer is opened.
+/// Used to revert the inode on commit failure (data loss recovery).
+struct InodeSnapshot {
+    xet_hash: Option<String>,
+    size: u64,
+    mtime: SystemTime,
+    pending_deletes: Vec<String>,
+    /// false for create() (new file), true for open(O_TRUNC) (overwrite).
+    existed_before: bool,
+}
+
+/// Lifecycle state of a streaming write channel's commit.
+enum CommitState {
+    /// Streaming writes in progress. Worker is running.
+    Writing,
+    /// flush() deferred commit (dup'd fd or zero writes). release() will handle it.
+    Deferred,
+    /// Commit completed successfully.
+    Committed,
+    /// Unrecoverable error — inode has been reverted.
+    Failed(String),
+}
+
 /// Channel-based streaming handle. Decouples the sync write() caller from the
 /// async add_data() pipeline: writes enqueue data into a bounded channel, a background
 /// tokio task drains it and feeds the CAS cleaner.
@@ -2050,8 +2282,17 @@ struct StreamingChannel {
     bytes_written: AtomicU64,
     /// Set by the background worker if add_data() fails. Shared with worker via Arc.
     error: Arc<std::sync::Mutex<Option<String>>>,
-    /// CAS upload succeeded but Hub commit failed — stored for retry on next flush().
+    /// Commit lifecycle state machine.
+    state: std::sync::Mutex<CommitState>,
+    /// CAS upload succeeded but Hub commit failed — stored for retry.
     pending_info: std::sync::Mutex<Option<XetFileInfo>>,
+    /// PID of the process that opened this file (for dup'd fd detection).
+    open_pid: Option<u32>,
+    /// Pre-write inode snapshot for revert on commit failure.
+    snapshot: InodeSnapshot,
+    /// Watch sender for the pending commit hook. Created in flush() on deferral,
+    /// fulfilled in release() when the commit completes (or fails).
+    commit_hook: std::sync::Mutex<Option<tokio::sync::watch::Sender<Option<Result<(), i32>>>>>,
 }
 
 /// An open file handle — either a local fd, lazy remote reference, or streaming writer.
@@ -2064,6 +2305,37 @@ enum OpenFile {
     },
     /// Streaming append-only writer (default write mode).
     Streaming { ino: u64, channel: Arc<StreamingChannel> },
+}
+
+/// Check whether two PIDs belong to the same process.
+/// On Linux, compares thread-group IDs via /proc to handle PID namespaces.
+/// On macOS (no /proc), falls back to direct PID comparison.
+fn same_process(pid_a: u32, pid_b: u32) -> bool {
+    if pid_a == pid_b {
+        return true;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        fn read_tgid(pid: u32) -> Option<u32> {
+            let path = format!("/proc/{}/status", pid);
+            let status = std::fs::read_to_string(path).ok()?;
+            for line in status.lines() {
+                if let Some(val) = line.strip_prefix("Tgid:\t") {
+                    return val.trim().parse().ok();
+                }
+            }
+            None
+        }
+        match (read_tgid(pid_a), read_tgid(pid_b)) {
+            (Some(a), Some(b)) => a == b,
+            _ => false,
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
 }
 
 /// Background task: drains the write channel and feeds data into the CAS streaming writer.

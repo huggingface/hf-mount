@@ -502,24 +502,27 @@ pub fn run_simple_write_tests(mp: &str, remote_file: &str) -> TestResult {
         std::fs::remove_dir(&dir)?;
     }
 
-    // 8. Open existing for write should fail (EPERM)
-    eprintln!("  [simple-write] open existing for write → EPERM");
+    // 8. Open existing for write without truncate should fail (EPERM)
+    eprintln!("  [simple-write] open existing for write (no truncate) → EPERM");
     {
         let path = format!("{}/data.txt", mp);
         let result = std::fs::OpenOptions::new().write(true).open(&path);
         assert!(
             result.is_err(),
-            "opening existing file for write should fail in simple mode"
+            "opening existing file for write without truncate should fail in simple mode"
         );
     }
 
-    // 9. Truncate via ftruncate should fail (EPERM)
-    eprintln!("  [simple-write] truncate → EPERM");
+    // 9. Overwrite existing file via truncate + write + read-back
+    eprintln!("  [simple-write] overwrite existing file (O_TRUNC)");
     {
         let path = format!("{}/data.txt", mp);
-        // truncate(2) goes through setattr, which returns EPERM in simple mode
-        let result = std::fs::OpenOptions::new().write(true).truncate(true).open(&path);
-        assert!(result.is_err(), "truncate should fail in simple mode");
+        std::fs::write(&path, "overwritten")?;
+        let content = std::fs::read_to_string(&path)?;
+        assert_eq!(
+            content, "overwritten",
+            "file should contain new content after overwrite"
+        );
     }
 
     // 10. Non-sequential write → EINVAL (append-only enforcement)
@@ -590,24 +593,87 @@ pub fn run_simple_write_tests(mp: &str, remote_file: &str) -> TestResult {
         assert_eq!(content, "dup content", "file should be readable after double flush");
     }
 
+    // ── Shell redirection (echo) tests ──
+
+    // 15. Echo via shell redirection (the dup-fd pattern that caused the original bug)
+    eprintln!("  [simple-write] echo via shell (sh -c)");
+    {
+        let path = format!("{}/echo_test.txt", mp);
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("echo hello > '{}'", path))
+            .status()?;
+        assert!(status.success(), "echo via shell should succeed");
+        let content = std::fs::read_to_string(&path)?;
+        assert_eq!(content.trim(), "hello", "echo content should be readable");
+    }
+
+    // 16. Overwrite via shell echo (echo > existing_file)
+    eprintln!("  [simple-write] overwrite via shell echo");
+    {
+        let path = format!("{}/echo_test.txt", mp);
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("echo world > '{}'", path))
+            .status()?;
+        assert!(status.success(), "echo overwrite should succeed");
+        let content = std::fs::read_to_string(&path)?;
+        assert_eq!(content.trim(), "world", "overwritten echo content should be new value");
+    }
+
+    // 17. Counter loop: repeated overwrite via printf (most sensitive to flush/release timing)
+    eprintln!("  [simple-write] counter loop (printf > file, 3 iterations)");
+    {
+        let path = format!("{}/counter.txt", mp);
+        for i in 1..=3 {
+            let status = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!("printf '{}' > '{}'", i, path))
+                .status()?;
+            assert!(status.success(), "printf iteration {i} should succeed");
+            let content = std::fs::read_to_string(&path)?;
+            assert_eq!(content, format!("{i}"), "counter should read {i} after iteration {i}");
+        }
+    }
+
+    // 18. Write/read-back stress loop (10 iterations of echo > file + cat)
+    eprintln!("  [simple-write] write/read-back loop (10 iterations)");
+    {
+        let path = format!("{}/wr_loop.txt", mp);
+        for i in 1..=10 {
+            let status = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!("echo {} > '{}'", i, path))
+                .status()?;
+            assert!(status.success(), "echo iteration {i} should succeed");
+            let content = std::fs::read_to_string(&path)?;
+            assert_eq!(
+                content.trim(),
+                format!("{i}"),
+                "write/read-back mismatch at iteration {i}"
+            );
+        }
+        std::fs::remove_file(&path)?;
+    }
+
     // ── Rename edge cases ──
 
-    // 15. Rename noop (same location)
+    // 19. Rename noop (same location)
     eprintln!("  [simple-write] rename noop");
     {
         let path = format!("{}/data.txt", mp);
         std::fs::rename(&path, &path)?;
-        assert_eq!(std::fs::read_to_string(&path)?, "hello world");
+        assert_eq!(std::fs::read_to_string(&path)?, "overwritten");
     }
 
-    // 16. Rename non-existent → ENOENT
+    // 19. Rename non-existent → ENOENT
     eprintln!("  [simple-write] rename non-existent → ENOENT");
     {
         let result = std::fs::rename(format!("{}/does_not_exist.txt", mp), format!("{}/ghost.txt", mp));
         assert!(result.is_err(), "renaming non-existent file should fail");
     }
 
-    // 17. Rename file over existing file (replace)
+    // 20. Rename file over existing file (replace)
     eprintln!("  [simple-write] rename file replaces existing");
     {
         let a = format!("{}/replace_src.txt", mp);
@@ -621,7 +687,7 @@ pub fn run_simple_write_tests(mp: &str, remote_file: &str) -> TestResult {
         std::fs::remove_file(&b)?;
     }
 
-    // 18. Rename dir over non-empty dir → ENOTEMPTY
+    // 21. Rename dir over non-empty dir → ENOTEMPTY
     eprintln!("  [simple-write] rename dir over non-empty dir → ENOTEMPTY");
     {
         let d1 = format!("{}/ren_src_dir", mp);
@@ -637,7 +703,7 @@ pub fn run_simple_write_tests(mp: &str, remote_file: &str) -> TestResult {
         std::fs::remove_dir(&d1)?;
     }
 
-    // 19. Rename file across directories
+    // 22. Rename file across directories
     eprintln!("  [simple-write] rename file across directories");
     {
         let src_dir = format!("{}/xdir_src", mp);
@@ -674,10 +740,12 @@ pub async fn verify_simple_hub_state(
 
     let expected: &[(&str, u64)] = &[
         ("empty.txt", 0),              // step 1
-        ("data.txt", 11),              // step 2: "hello world"
+        ("data.txt", 11),              // step 9: "overwritten"
         ("renamed_dir/child.txt", 14), // step 3: created, step 4: dir renamed
         ("renamed.txt", 9),            // step 11: "rename me"
         ("duptest.txt", 11),           // step 14: "dup content"
+        ("echo_test.txt", 6),          // step 16: "world\n"
+        ("counter.txt", 1),            // step 17: "3"
     ];
 
     for &(path, expected_size) in expected {
