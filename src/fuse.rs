@@ -23,7 +23,11 @@ pub struct FuseAdapter {
 
 impl FuseAdapter {
     pub fn new(runtime: tokio::runtime::Handle, virtual_fs: Arc<VirtualFs>, ttl: Duration) -> Self {
-        Self { runtime, virtual_fs, ttl }
+        Self {
+            runtime,
+            virtual_fs,
+            ttl,
+        }
     }
 }
 
@@ -72,7 +76,8 @@ impl Filesystem for FuseAdapter {
         let _ = config.set_max_background(64);
         // Readahead benefits local/cached files; remote lazy files use DIRECT_IO
         // and rely on our userspace PrefetchState instead.
-        let _ = config.set_max_readahead(1_048_576); // 1 MiB
+        let _ = config.set_max_readahead(16 * 1_048_576); // 16 MiB
+        let _ = config.set_max_write(16 * 1_048_576); // 16 MiB — fewer round-trips for large sequential writes
         Ok(())
     }
 
@@ -173,9 +178,9 @@ impl Filesystem for FuseAdapter {
         }
     }
 
-    /// Called on close(2). Checks for pending flush errors (upload failures).
-    fn flush(&self, _req: &Request, ino: INodeNo, _fh: FileHandle, _lock_owner: fuser::LockOwner, reply: ReplyEmpty) {
-        match self.virtual_fs.flush(ino.0) {
+    /// Called on close(2). For streaming writes, synchronously uploads and commits.
+    fn flush(&self, _req: &Request, ino: INodeNo, fh: FileHandle, _lock_owner: fuser::LockOwner, reply: ReplyEmpty) {
+        match self.runtime.block_on(self.virtual_fs.flush(ino.0, fh.0)) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(Errno::from_i32(e)),
         }
@@ -277,7 +282,10 @@ impl Filesystem for FuseAdapter {
         #[cfg(not(target_os = "linux"))]
         let no_replace = false;
 
-        match self.runtime.block_on(self.virtual_fs.rename(parent.0, name, newparent.0, newname, no_replace)) {
+        match self
+            .runtime
+            .block_on(self.virtual_fs.rename(parent.0, name, newparent.0, newname, no_replace))
+        {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(Errno::from_i32(e)),
         }

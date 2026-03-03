@@ -8,7 +8,7 @@ use tracing::{debug, error, info};
 
 use crate::hub_api::{BatchOp, HubApiClient};
 use crate::inode::InodeTable;
-use crate::staging::FileStaging;
+use crate::xet::{StagingDir, XetSessions};
 
 // ── Constants ──────────────────────────────────────────────────────────
 
@@ -30,7 +30,8 @@ pub(crate) struct FlushManager {
 
 impl FlushManager {
     pub(crate) fn new(
-        staging: Arc<FileStaging>,
+        xet_sessions: Arc<XetSessions>,
+        staging_dir: StagingDir,
         hub_client: Arc<HubApiClient>,
         inodes: Arc<RwLock<InodeTable>>,
         runtime: &tokio::runtime::Handle,
@@ -39,7 +40,7 @@ impl FlushManager {
         let (tx, rx) = mpsc::unbounded_channel::<FlushRequest>();
 
         let bg_errors = errors.clone();
-        let handle = runtime.spawn(flush_loop(rx, staging, hub_client, inodes, bg_errors));
+        let handle = runtime.spawn(flush_loop(rx, xet_sessions, staging_dir, hub_client, inodes, bg_errors));
 
         Self {
             tx: Mutex::new(Some(tx)),
@@ -69,11 +70,22 @@ impl FlushManager {
         }
         // Drop the sender to signal the flush loop to drain and exit
         self.tx.lock().expect("flush_tx poisoned").take();
-        // Wait for the flush task to complete
-        if let Some(handle) = self.handle.lock().expect("flush_handle poisoned").take()
-            && let Err(e) = runtime.block_on(handle)
-        {
-            error!("Flush task panicked: {}", e);
+        // Wait for the flush task to complete.
+        // Use block_in_place so this is safe even when called from within the tokio runtime
+        // (e.g. NFS shutdown path which runs inside an async context).
+        if let Some(handle) = self.handle.lock().expect("flush_handle poisoned").take() {
+            let wait = || {
+                if let Err(e) = runtime.block_on(handle) {
+                    error!("Flush task panicked: {}", e);
+                }
+            };
+            // block_in_place is required when called from within the Tokio runtime
+            // (e.g. NFS shutdown), but panics on non-Tokio threads (e.g. FUSE destroy).
+            if tokio::runtime::Handle::try_current().is_ok() {
+                tokio::task::block_in_place(wait);
+            } else {
+                wait();
+            }
         }
     }
 }
@@ -82,7 +94,8 @@ impl FlushManager {
 
 async fn flush_loop(
     mut rx: mpsc::UnboundedReceiver<FlushRequest>,
-    staging: Arc<FileStaging>,
+    xet_sessions: Arc<XetSessions>,
+    staging_dir: StagingDir,
     hub_client: Arc<HubApiClient>,
     inodes: Arc<RwLock<InodeTable>>,
     flush_errors: Arc<Mutex<HashMap<u64, String>>>,
@@ -114,13 +127,14 @@ async fn flush_loop(
         let count = pending.len();
         info!("Flushing batch of {} dirty file(s)", count);
 
-        flush_batch(pending, &staging, &hub_client, &inodes, &flush_errors).await;
+        flush_batch(pending, &xet_sessions, &staging_dir, &hub_client, &inodes, &flush_errors).await;
     }
 }
 
 async fn flush_batch(
     pending: Vec<FlushRequest>,
-    staging: &FileStaging,
+    xet_sessions: &XetSessions,
+    staging_dir: &StagingDir,
     hub_client: &HubApiClient,
     inodes: &RwLock<InodeTable>,
     flush_errors: &Mutex<HashMap<u64, String>>,
@@ -155,7 +169,7 @@ async fn flush_batch(
                     debug!("flush: ino={} path={} not dirty, skipping", ino, entry.full_path);
                     return None;
                 }
-                let staging_path = staging.staging_path(ino);
+                let staging_path = staging_dir.path(ino);
                 if !staging_path.exists() {
                     let msg = format!("staging file missing for {}", entry.full_path);
                     error!("flush: ino={} {}, skipping", ino, msg);
@@ -178,7 +192,7 @@ async fn flush_batch(
 
     // Upload all files through a single upload session
     let staging_paths: Vec<&std::path::Path> = to_flush.iter().map(|(_, _, p, _)| p.as_path()).collect();
-    let upload_results = match staging.upload_files(&staging_paths).await {
+    let upload_results = match xet_sessions.upload_files(&staging_paths).await {
         Ok(results) => results,
         Err(e) => {
             error!("Batch upload failed: {}", e);

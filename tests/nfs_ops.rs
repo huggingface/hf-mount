@@ -16,13 +16,12 @@ async fn test_nfs_read_only() {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let child =
             common::mount_bucket(&bucket_id, &mount_point, &cache_dir, &["--backend=nfs", "--read-only"]);
-        let r = common::fs_tests::run_read_tests(&mount_point, &remote_file, &test_content).and_then(|_| {
+        let r = common::fs_tests::run_read_tests(&mount_point, &remote_file, &test_content).map(|_| {
             // Read-only enforcement: writes must fail
             eprintln!("  [nfs] read-only enforcement");
             let result = std::fs::write(format!("{}/should_fail.txt", mount_point), "nope");
             assert!(result.is_err(), "write should fail on read-only NFS mount");
             eprintln!("  [nfs] write correctly rejected: {:?}", result.unwrap_err().kind());
-            Ok(())
         });
         common::unmount_nfs(&mount_point, child, 5);
         r

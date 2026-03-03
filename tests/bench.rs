@@ -1,13 +1,14 @@
 mod common;
 
 const FILE_SIZE: usize = 50 * 1024 * 1024; // 50 MB
+const WRITE_SIZE: usize = 500 * 1024 * 1024; // 500 MB for write benchmarks
 
 #[tokio::test]
 async fn test_bench() {
     let test_filename = format!("bench_{}.bin", std::process::id());
     let expected = common::generate_pattern(FILE_SIZE);
 
-    let (token, bucket_id, _hub) =
+    let (token, bucket_id, hub) =
         match common::setup_bucket_with_file("bench", &test_filename, &expected).await {
             Some(cfg) => cfg,
             None => return,
@@ -23,18 +24,11 @@ async fn test_bench() {
         let child = common::mount_bucket(&bucket_id, &fuse_mount, &fuse_cache, &[]);
         let r = common::bench::run_read_benchmarks(&fuse_mount, &test_filename, &expected);
 
-        // Write benchmark (FUSE only)
-        let write_ok = (|| -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-            let write_data = common::generate_pattern(1024 * 1024);
-            let write_path = format!("{}/bench_write_test.bin", fuse_mount);
-            std::fs::write(&write_path, &write_data)?;
-            let read_back = std::fs::read(&write_path)?;
-            assert_eq!(read_back, write_data, "write+readback content mismatch");
-            Ok(())
-        })();
+        // Write benchmark: 50 MB sequential write
+        let write_result = common::bench::run_write_benchmark(&fuse_mount, WRITE_SIZE);
 
-        common::unmount(&fuse_mount, child, 30);
-        (r, write_ok)
+        common::unmount(&fuse_mount, child, 60);
+        (r, write_result)
     }));
 
     std::fs::remove_dir_all(&fuse_mount).ok();
@@ -59,15 +53,31 @@ async fn test_bench() {
     std::fs::remove_dir_all(&nfs_mount).ok();
     std::fs::remove_dir_all(&nfs_cache).ok();
 
+    // --- Raw cleaner benchmark (no FUSE, no kernel) ---
+    let raw_mbps = {
+        let write_config = common::build_write_config(&hub).await;
+        let download_session = data::FileDownloadSession::new(write_config.clone(), None, None)
+            .await
+            .expect("download session");
+        let xet_sessions = hf_mount::xet::XetSessions::new(download_session, Some(write_config));
+        match common::bench::run_raw_cleaner_benchmark(&xet_sessions, WRITE_SIZE).await {
+            Ok(mbps) => Some(mbps),
+            Err(e) => {
+                eprintln!("Raw cleaner bench error: {}", e);
+                None
+            }
+        }
+    };
+
     // Cleanup bucket
     common::delete_bucket(common::ENDPOINT, &token, &bucket_id).await;
 
     // --- Extract results ---
-    let (fuse, write_ok) = match fuse_result {
+    let (fuse, write) = match fuse_result {
         Ok((Ok(r), w)) => (Some(r), w),
         Ok((Err(e), _)) => {
             eprintln!("FUSE bench error: {}", e);
-            (None, Ok(()))
+            (None, Err(e))
         }
         Err(e) => std::panic::resume_unwind(e),
     };
@@ -121,10 +131,43 @@ async fn test_bench() {
         );
     }
 
-    eprintln!("  {:30} {:>12}", "Write+readback (1MB)", if write_ok.is_ok() { "OK" } else { "FAIL" });
+    if let Ok(ref w) = write {
+        eprintln!(
+            "  {:30} {:>9.1} MB/s",
+            "Sequential write (500MB)", w.write_mbps
+        );
+        eprintln!(
+            "  {:30} {:>9.3} s",
+            "Close latency (CAS+Hub)", w.close_secs
+        );
+        eprintln!(
+            "  {:30} {:>9.1} MB/s",
+            "Write end-to-end", w.total_mbps
+        );
+        eprintln!(
+            "  {:30} {:>9.1} MB/s",
+            "Dedup write (same data)", w.dedup_write_mbps
+        );
+        eprintln!(
+            "  {:30} {:>9.3} s",
+            "Dedup close latency", w.dedup_close_secs
+        );
+        eprintln!(
+            "  {:30} {:>9.1} MB/s",
+            "Dedup end-to-end", w.dedup_total_mbps
+        );
+    } else {
+        eprintln!("  {:30} {:>12}", "Write benchmark", "FAIL");
+    }
+    if let Some(raw) = raw_mbps {
+        eprintln!(
+            "  {:30} {:>9.1} MB/s",
+            "Raw add_data() (no FUSE)", raw
+        );
+    }
     eprintln!("============================================================\n");
 
     assert!(fuse.is_some(), "FUSE benchmark failed");
     assert!(nfs.is_some(), "NFS benchmark failed");
-    write_ok.unwrap();
+    write.expect("Write benchmark failed");
 }

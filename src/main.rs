@@ -9,7 +9,7 @@ use tracing::{error, info};
 use hf_mount::cached_xet_client::CachedXetClient;
 use hf_mount::fuse::FuseAdapter;
 use hf_mount::hub_api::{HubApiClient, HubTokenRefresher};
-use hf_mount::staging::FileStaging;
+use hf_mount::xet::{StagingDir, XetSessions};
 
 #[derive(Parser)]
 #[command(name = "hf-mount", about = "Mount a HuggingFace bucket as a filesystem")]
@@ -37,6 +37,11 @@ struct Args {
 
     #[arg(long, default_value_t = false)]
     read_only: bool,
+
+    /// Use staging files + async flush for writes (supports random writes and seek).
+    /// Default mode is append-only with synchronous close.
+    #[arg(long, default_value_t = false)]
+    advanced_writes: bool,
 
     /// Interval in seconds for polling remote changes (0 to disable)
     #[arg(long, default_value_t = 30)]
@@ -96,7 +101,9 @@ fn main() {
     let hub_client = HubApiClient::new(&args.hub_endpoint, &args.hf_token, &args.bucket_id);
 
     // Build CAS config — use a write token when read-write (it can also read).
-    let refresher = hub_client.token_refresher(args.read_only);
+    // NFS backend is always read-only, so force read token regardless of flag.
+    let cas_read_only = args.read_only || args.backend == "nfs";
+    let refresher = hub_client.token_refresher(cas_read_only);
     let cas_config = build_cas_config(&runtime, &refresher);
 
     // Create on-disk xorb chunk cache for cross-file deduplication.
@@ -122,7 +129,9 @@ fn main() {
 
     let upload_config = if args.read_only { None } else { Some(cas_config) };
 
-    let staging = FileStaging::new(args.cache_dir, download_session, upload_config);
+    std::fs::create_dir_all(&args.cache_dir).ok();
+    let xet_sessions = XetSessions::new(download_session, upload_config);
+    let staging_dir = if args.advanced_writes { Some(StagingDir::new(&args.cache_dir)) } else { None };
 
     // Determine uid/gid
     let uid = args.uid.unwrap_or_else(|| unsafe { libc::getuid() });
@@ -147,8 +156,10 @@ fn main() {
             let virtual_fs = VirtualFs::new(
                 runtime.handle().clone(),
                 hub_client,
-                staging,
+                xet_sessions.clone(),
+                staging_dir,
                 args.read_only,
+                args.advanced_writes,
                 uid,
                 gid,
                 args.poll_interval_secs,
@@ -198,11 +209,18 @@ fn main() {
         "nfs" => {
             use hf_mount::virtual_fs::VirtualFs;
 
+            if args.advanced_writes {
+                error!("--advanced-writes is not supported with NFS backend");
+                std::process::exit(1);
+            }
+
             let virtual_fs = VirtualFs::new(
                 runtime.handle().clone(),
                 hub_client,
-                staging,
+                xet_sessions,
+                None, // NFS is read-only, no staging dir
                 args.read_only,
+                false, // advanced_writes not supported on NFS
                 uid,
                 gid,
                 args.poll_interval_secs,

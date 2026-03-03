@@ -7,8 +7,8 @@ Mount [Hugging Face Buckets](https://huggingface.co/docs/hub/buckets) as a local
 - **FUSE & NFS backends** — FUSE for standard Linux/macOS, NFS for environments without `/dev/fuse` (e.g., Kubernetes CSI)
 - **Adaptive prefetch** — 8 MB initial window, grows up to 128 MB for sequential reads
 - **Lazy loading** — files are fetched on demand from CAS, not eagerly downloaded
-- **Read-write support** — create, write, rename, delete files; changes are batched and uploaded asynchronously
-- **Debounced flush** — writes are coalesced (2s debounce, 30s max window) into a single CAS upload + Hub API call
+- **Simple writes (default)** — append-only, in-memory buffer, synchronous upload on close (S3-like semantics)
+- **Advanced writes** (`--advanced-writes`) — staging files on disk, random writes + seek, async debounced flush
 - **Remote sync** — background polling detects remote changes and updates the local view
 - **Read-only mode** — `--read-only` flag for safe, read-only mounts
 
@@ -75,7 +75,18 @@ sequenceDiagram
         VFS-->>App: bytes
     end
 
-    Note over App,Hub: Write path (async flush)
+    Note over App,Hub: Write path (default: simple mode)
+    App->>VFS: create(parent, name)
+    VFS-->>App: file handle (streaming)
+    App->>VFS: write(fh, data) [append-only]
+    VFS->>VFS: buffer in memory
+    App->>VFS: close(fh)
+    VFS->>Staging: upload_buffer (CAS)
+    Staging->>CAS: PUT file
+    VFS->>Hub: batch_operations (commit)
+    VFS-->>App: close returns (sync)
+
+    Note over App,Hub: Write path (--advanced-writes)
     App->>VFS: write(ino, fh, offset, data)
     VFS->>Staging: pwrite to staging file
     App->>VFS: close(fh)
@@ -127,6 +138,7 @@ hf-mount \
 | `--cache-size` | `10000000000` | Max size in bytes for the on-disk xorb chunk cache |
 | `--backend` | `fuse` | `fuse` or `nfs` (NFS requires `--features nfs`) |
 | `--read-only` | `false` | Mount read-only |
+| `--advanced-writes` | `false` | Staging files + async flush (supports random writes, seek, overwrite) |
 | `--poll-interval-secs` | `30` | Remote change polling interval (0 to disable) |
 | `--max-threads` | `16` | Maximum number of FUSE threads |
 | `--uid` | current user | UID for mounted files |
@@ -179,7 +191,7 @@ RUST_LOG=hf_mount=debug hf-mount ...
 cargo test
 
 # Integration tests (require HF_TOKEN and network)
-HF_TOKEN=... cargo test --release --test fuse_ops
+HF_TOKEN=... cargo test --release --test fuse_ops  # both simple + advanced write modes
 HF_TOKEN=... cargo test --release --test nfs_ops --features nfs
 
 # Benchmarks

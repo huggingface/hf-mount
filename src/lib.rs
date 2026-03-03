@@ -7,5 +7,5 @@ pub mod inode;
 #[cfg(feature = "nfs")]
 pub mod nfs;
 mod prefetch;
-pub mod staging;
+pub mod xet;
 pub mod virtual_fs;

@@ -1,4 +1,4 @@
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::time::{Duration, Instant};
 
 type BenchError = Box<dyn std::error::Error + Send + Sync>;
@@ -10,6 +10,19 @@ pub struct BenchResult {
     pub random_avg_ms: f64,
     pub neg_cache_first_ms: f64,
     pub neg_cache_second_ms: f64,
+}
+
+pub struct WriteBenchResult {
+    pub size_mb: f64,
+    pub write_mbps: f64,
+    pub close_secs: f64,
+    pub total_mbps: f64,
+    /// Second write of identical data (dedup should make close near-instant).
+    pub dedup_write_mbps: f64,
+    pub dedup_close_secs: f64,
+    pub dedup_total_mbps: f64,
+    /// Raw add_data() throughput without FUSE overhead.
+    pub raw_add_data_mbps: f64,
 }
 
 /// Run the standard read benchmark suite on a mounted filesystem.
@@ -119,4 +132,92 @@ pub fn run_read_benchmarks(
         neg_cache_first_ms,
         neg_cache_second_ms,
     })
+}
+
+/// Write benchmark: create a file of `size_bytes` via 1 MB chunks, measure
+/// write throughput and close latency (close = CAS finalize + Hub commit).
+pub fn run_write_benchmark(mount_point: &str, size_bytes: usize) -> Result<WriteBenchResult, BenchError> {
+    let size_mb = size_bytes as f64 / (1024.0 * 1024.0);
+    let path = format!("{}/bench_write_{}.bin", mount_point, std::process::id());
+    let chunk = super::generate_pattern(1024 * 1024); // 1 MB chunk
+
+    // Write phase: measure wall time for all write() calls
+    let mut f = std::fs::File::create(&path)?;
+    let write_start = Instant::now();
+    let mut remaining = size_bytes;
+    while remaining > 0 {
+        let n = remaining.min(chunk.len());
+        f.write_all(&chunk[..n])?;
+        remaining -= n;
+    }
+    let write_elapsed = write_start.elapsed();
+
+    // Close phase: flush + drop triggers CAS finalize + Hub commit
+    let close_start = Instant::now();
+    drop(f);
+    let close_elapsed = close_start.elapsed();
+
+    let total = write_elapsed + close_elapsed;
+    let write_mbps = size_mb / write_elapsed.as_secs_f64();
+    let total_mbps = size_mb / total.as_secs_f64();
+
+    // Verify size
+    let meta = std::fs::metadata(&path)?;
+    assert_eq!(meta.len(), size_bytes as u64, "written file size mismatch");
+
+    // Second write: identical data → CAS dedup should make close near-instant
+    let path2 = format!("{}/bench_write_dedup_{}.bin", mount_point, std::process::id());
+    let mut f2 = std::fs::File::create(&path2)?;
+    let write2_start = Instant::now();
+    let mut remaining = size_bytes;
+    while remaining > 0 {
+        let n = remaining.min(chunk.len());
+        f2.write_all(&chunk[..n])?;
+        remaining -= n;
+    }
+    let write2_elapsed = write2_start.elapsed();
+
+    let close2_start = Instant::now();
+    drop(f2);
+    let close2_elapsed = close2_start.elapsed();
+
+    let total2 = write2_elapsed + close2_elapsed;
+
+    Ok(WriteBenchResult {
+        size_mb,
+        write_mbps,
+        close_secs: close_elapsed.as_secs_f64(),
+        total_mbps,
+        dedup_write_mbps: size_mb / write2_elapsed.as_secs_f64(),
+        dedup_close_secs: close2_elapsed.as_secs_f64(),
+        dedup_total_mbps: size_mb / total2.as_secs_f64(),
+        raw_add_data_mbps: 0.0, // filled by run_raw_cleaner_benchmark
+    })
+}
+
+/// Measure raw SingleFileCleaner::add_data() throughput — no FUSE, no kernel.
+/// This is the theoretical ceiling for streaming writes.
+pub async fn run_raw_cleaner_benchmark(
+    xet: &hf_mount::xet::XetSessions,
+    size_bytes: usize,
+) -> Result<f64, BenchError> {
+    let size_mb = size_bytes as f64 / (1024.0 * 1024.0);
+    let chunk = super::generate_pattern(1024 * 1024);
+
+    let mut writer = xet.create_streaming_writer().await.map_err(|e| e.to_string())?;
+
+    let start = Instant::now();
+    let mut remaining = size_bytes;
+    while remaining > 0 {
+        let n = remaining.min(chunk.len());
+        writer.write(&chunk[..n]).await.map_err(|e| e.to_string())?;
+        remaining -= n;
+    }
+    let elapsed = start.elapsed();
+    let mbps = size_mb / elapsed.as_secs_f64();
+
+    // Finish to clean up the session
+    let _ = writer.finish().await;
+
+    Ok(mbps)
 }

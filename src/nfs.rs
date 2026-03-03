@@ -220,7 +220,7 @@ pub async fn mount_nfs(virtual_fs: Arc<VirtualFs>, mount_point: &Path, poll_inte
                 .output()?
         } else {
             std::process::Command::new("sudo")
-                .args(["mount.nfs", "-o", &mount_opts, "127.0.0.1:/", mount_point_str])
+                .args(["-n", "mount.nfs", "-o", &mount_opts, "127.0.0.1:/", mount_point_str])
                 .output()?
         };
         if !output.status.success() {
