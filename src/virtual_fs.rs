@@ -1022,13 +1022,18 @@ impl VirtualFs {
                     .root()
                     .join(format!("http_{:x}_s{}_t{}", ino, fe.size, mtime_ms));
                 if !dest.exists() {
-                    self.hub_client
-                        .download_file_http(&fe.full_path, &dest)
-                        .await
-                        .map_err(|e| {
-                            error!("HTTP download failed for {}: {}", fe.full_path, e);
-                            libc::EIO
-                        })?;
+                    let lock = self.staging_lock(ino);
+                    let _guard = lock.lock().await;
+                    // Double-check after acquiring lock (another thread may have downloaded).
+                    if !dest.exists() {
+                        self.hub_client
+                            .download_file_http(&fe.full_path, &dest)
+                            .await
+                            .map_err(|e| {
+                                error!("HTTP download failed for {}: {}", fe.full_path, e);
+                                libc::EIO
+                            })?;
+                    }
                 }
                 self.open_local_readonly(ino, &dest)
             }
