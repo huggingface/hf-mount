@@ -220,8 +220,13 @@ pub fn setup(is_nfs: bool) -> MountSetup {
     let uid = args.uid.unwrap_or_else(|| unsafe { libc::getuid() });
     let gid = args.gid.unwrap_or_else(|| unsafe { libc::getgid() });
 
-    std::fs::create_dir_all(&mount_point)
-        .unwrap_or_else(|e| panic!("Failed to create mount point {:?}: {e}", mount_point));
+    // Ignore EEXIST: the directory may already exist from a previous (possibly
+    // stale) mount. FUSE/NFS will fail at mount time if it's actually busy.
+    if let Err(e) = std::fs::create_dir_all(&mount_point)
+        && e.raw_os_error() != Some(libc::EEXIST)
+    {
+        panic!("Failed to create mount point {:?}: {e}", mount_point);
+    }
 
     let backend_name = if is_nfs { "nfs" } else { "fuse" };
     info!(
