@@ -1,10 +1,39 @@
+use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
+use bytes::Bytes;
 use data::configurations::TranslatorConfig;
 use data::{FileDownloadSession, FileUploadSession, SingleFileCleaner, XetFileInfo};
 
 use crate::error::{Error, Result};
+
+// ── Traits ───────────────────────────────────────────────────────────
+
+/// Trait abstracting CAS operations used by VirtualFs and FlushManager.
+#[async_trait::async_trait]
+pub trait XetOps: Send + Sync {
+    async fn create_streaming_writer(&self) -> Result<Box<dyn StreamingWriterOps>>;
+    async fn download_to_file(&self, xet_hash: &str, file_size: u64, dest: &Path) -> Result<()>;
+    async fn upload_files(&self, paths: &[&Path]) -> Result<Vec<XetFileInfo>>;
+    fn download_stream_boxed(&self, file_info: &XetFileInfo) -> Result<Box<dyn DownloadStreamOps>>;
+    async fn download_range_to_vec(&self, file_info: &XetFileInfo, range: Range<u64>) -> Result<Vec<u8>>;
+}
+
+/// Append-only streaming writer trait (abstracts StreamingWriter for testing).
+#[async_trait::async_trait]
+pub trait StreamingWriterOps: Send {
+    async fn write(&mut self, data: &[u8]) -> Result<()>;
+    async fn finish_boxed(self: Box<Self>) -> Result<XetFileInfo>;
+    fn len(&self) -> u64;
+    fn is_empty(&self) -> bool;
+}
+
+/// Streaming download trait (abstracts data::DownloadStream for testing).
+#[async_trait::async_trait]
+pub trait DownloadStreamOps: Send {
+    async fn next(&mut self) -> Result<Option<Bytes>>;
+}
 
 // ── XetSessions ───────────────────────────────────────────────────────
 
@@ -31,7 +60,7 @@ impl XetSessions {
     pub async fn download_to_writer<W: std::io::Write + Send + 'static>(
         &self,
         file_info: &XetFileInfo,
-        range: std::ops::Range<u64>,
+        range: Range<u64>,
         writer: W,
     ) -> Result<u64> {
         self.session
@@ -39,9 +68,29 @@ impl XetSessions {
             .await
             .map_err(|e| Error::Xet(e.to_string()))
     }
+}
 
-    /// Download a file directly to a destination path (for writable opens).
-    pub async fn download_to_file(&self, xet_hash: &str, file_size: u64, dest: &Path) -> Result<()> {
+#[async_trait::async_trait]
+impl XetOps for XetSessions {
+    async fn create_streaming_writer(&self) -> Result<Box<dyn StreamingWriterOps>> {
+        let config = self
+            .upload_config
+            .as_ref()
+            .ok_or_else(|| Error::Hub("no upload config (read-only mode)".into()))?;
+        let session = FileUploadSession::new(config.clone(), None)
+            .await
+            .map_err(|e| Error::Xet(e.to_string()))?;
+        let cleaner = session
+            .start_clean(None, None, Some(mdb_shard::Sha256::default()))
+            .await;
+        Ok(Box::new(StreamingWriter {
+            cleaner,
+            session,
+            bytes_written: 0,
+        }))
+    }
+
+    async fn download_to_file(&self, xet_hash: &str, file_size: u64, dest: &Path) -> Result<()> {
         let file_info = XetFileInfo::new(xet_hash.to_string(), file_size);
         self.session
             .download_file(&file_info, dest, None)
@@ -50,9 +99,7 @@ impl XetSessions {
         Ok(())
     }
 
-    /// Upload multiple files in a single session.
-    /// Returns one XetFileInfo per file, in the same order.
-    pub async fn upload_files(&self, paths: &[&Path]) -> Result<Vec<XetFileInfo>> {
+    async fn upload_files(&self, paths: &[&Path]) -> Result<Vec<XetFileInfo>> {
         let config = self
             .upload_config
             .as_ref()
@@ -62,10 +109,6 @@ impl XetSessions {
             .await
             .map_err(|e| Error::Xet(e.to_string()))?;
 
-        // Pass a dummy (all-zeros) SHA-256: bucket uploads don't need a real SHA-256
-        // in shard metadata (sha_index GSI is only used for LFS pointer resolution).
-        // Using ProvidedValue skips the SHA-256 computation in the upload pipeline.
-        // Wait for https://github.com/huggingface/xet-core/pull/679 to avoid the need for this hack.
         let files: Vec<_> = paths
             .iter()
             .map(|p| (p.to_path_buf(), Some(mdb_shard::Sha256::default())))
@@ -81,25 +124,50 @@ impl XetSessions {
         Ok(results)
     }
 
-    /// Create a new StreamingWriter that streams data directly to CAS.
-    pub async fn create_streaming_writer(&self) -> Result<StreamingWriter> {
-        let config = self
-            .upload_config
-            .as_ref()
-            .ok_or_else(|| Error::Hub("no upload config (read-only mode)".into()))?;
-        let session = FileUploadSession::new(config.clone(), None)
+    fn download_stream_boxed(&self, file_info: &XetFileInfo) -> Result<Box<dyn DownloadStreamOps>> {
+        let stream = self.download_stream(file_info)?;
+        Ok(Box::new(DownloadStreamWrapper(stream)))
+    }
+
+    async fn download_range_to_vec(&self, file_info: &XetFileInfo, range: Range<u64>) -> Result<Vec<u8>> {
+        let capacity = (range.end - range.start) as usize;
+        let buf = Arc::new(Mutex::new(Vec::with_capacity(capacity)));
+        let writer = SharedBufWriter(buf.clone());
+        self.session
+            .download_to_writer(file_info, range, writer, None)
             .await
             .map_err(|e| Error::Xet(e.to_string()))?;
-        // Pass a dummy (all-zeros) SHA-256: bucket uploads don't need a real SHA-256
-        // in shard metadata (sha_index GSI is only used for LFS pointer resolution).
-        // Using ProvidedValue skips the SHA-256 computation in the upload pipeline.
-        // Wait for https://github.com/huggingface/xet-core/pull/679 to avoid the need for this hack.
-        let cleaner = session.start_clean(None, 0, Some(mdb_shard::Sha256::default())).await;
-        Ok(StreamingWriter {
-            cleaner,
-            session,
-            bytes_written: 0,
-        })
+        let vec = match Arc::try_unwrap(buf) {
+            Ok(mutex) => mutex.into_inner().unwrap_or_default(),
+            Err(arc) => arc.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+        };
+        Ok(vec)
+    }
+}
+
+// ── SharedBufWriter ───────────────────────────────────────────────────
+
+/// Writer that appends to a shared buffer. Used internally by download_range_to_vec.
+struct SharedBufWriter(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for SharedBufWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+// ── DownloadStreamWrapper ─────────────────────────────────────────────
+
+struct DownloadStreamWrapper(data::DownloadStream);
+
+#[async_trait::async_trait]
+impl DownloadStreamOps for DownloadStreamWrapper {
+    async fn next(&mut self) -> Result<Option<Bytes>> {
+        self.0.next().await.map_err(|e| Error::Xet(e.to_string()))
     }
 }
 
@@ -147,16 +215,15 @@ fn rand_u64() -> u64 {
 // ── StreamingWriter ────────────────────────────────────────────────────
 
 /// Append-only writer that streams data directly to CAS via SingleFileCleaner.
-/// Each write() call feeds data incrementally (no full-file buffering).
-/// finish() finalizes the upload session and returns the file info.
 pub struct StreamingWriter {
     cleaner: SingleFileCleaner,
     session: Arc<FileUploadSession>,
     bytes_written: u64,
 }
 
-impl StreamingWriter {
-    pub async fn write(&mut self, data: &[u8]) -> Result<()> {
+#[async_trait::async_trait]
+impl StreamingWriterOps for StreamingWriter {
+    async fn write(&mut self, data: &[u8]) -> Result<()> {
         self.cleaner
             .add_data(data)
             .await
@@ -165,18 +232,17 @@ impl StreamingWriter {
         Ok(())
     }
 
-    pub fn len(&self) -> u64 {
-        self.bytes_written
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.bytes_written == 0
-    }
-
-    /// Finish the upload: finalize the cleaner, commit xorbs, return file info.
-    pub async fn finish(self) -> Result<XetFileInfo> {
+    async fn finish_boxed(self: Box<Self>) -> Result<XetFileInfo> {
         let (info, _metrics) = self.cleaner.finish().await.map_err(|e| Error::Xet(e.to_string()))?;
         self.session.finalize().await.map_err(|e| Error::Xet(e.to_string()))?;
         Ok(info)
+    }
+
+    fn len(&self) -> u64 {
+        self.bytes_written
+    }
+
+    fn is_empty(&self) -> bool {
+        self.bytes_written == 0
     }
 }

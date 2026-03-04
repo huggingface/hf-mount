@@ -5,15 +5,15 @@ edition = "2024"
 
 [dependencies]
 # xet-core crates
-data = { git = "https://github.com/huggingface/xet-core.git", rev = "4af99f4" }
-mdb_shard = { git = "https://github.com/huggingface/xet-core.git", rev = "4af99f4" }
-utils = { git = "https://github.com/huggingface/xet-core.git", rev = "4af99f4" }
-hub_client = { git = "https://github.com/huggingface/xet-core.git", rev = "4af99f4" }
-xet_runtime = { git = "https://github.com/huggingface/xet-core.git", rev = "4af99f4" }
-cas_client = { git = "https://github.com/huggingface/xet-core.git", rev = "4af99f4" }
-cas_types = { git = "https://github.com/huggingface/xet-core.git", rev = "4af99f4" }
-cas_object = { git = "https://github.com/huggingface/xet-core.git", rev = "4af99f4" }
-merklehash = { git = "https://github.com/huggingface/xet-core.git", rev = "4af99f4" }
+data = { git = "https://github.com/huggingface/xet-core.git", rev = "ed9c095" }
+mdb_shard = { git = "https://github.com/huggingface/xet-core.git", rev = "ed9c095" }
+utils = { git = "https://github.com/huggingface/xet-core.git", rev = "ed9c095" }
+hub_client = { git = "https://github.com/huggingface/xet-core.git", rev = "ed9c095" }
+xet_runtime = { git = "https://github.com/huggingface/xet-core.git", rev = "ed9c095" }
+cas_client = { git = "https://github.com/huggingface/xet-core.git", rev = "ed9c095" }
+cas_types = { git = "https://github.com/huggingface/xet-core.git", rev = "ed9c095" }
+cas_object = { git = "https://github.com/huggingface/xet-core.git", rev = "ed9c095" }
+merklehash = { git = "https://github.com/huggingface/xet-core.git", rev = "ed9c095" }
 
 # External crates
 fuser = { version = "0.17", features = ["macos-no-mount"] }
