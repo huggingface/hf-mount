@@ -571,7 +571,7 @@ impl HubApiClient {
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let tmp = dest.with_extension("tmp");
+        let tmp = dest.with_extension(format!("tmp.{}", std::process::id()));
         let mut file = tokio::fs::File::create(&tmp).await?;
         let mut stream = resp.bytes_stream();
         use futures::StreamExt;
