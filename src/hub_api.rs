@@ -235,7 +235,7 @@ impl HubApiClient {
             .as_str()
             .ok_or_else(|| Error::Hub("repo info missing 'id' field".to_string()))?;
 
-        if resolved_id == repo_id {
+        if resolved_id.eq_ignore_ascii_case(&repo_id) {
             return Ok(None);
         }
 

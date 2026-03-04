@@ -209,6 +209,8 @@ pub fn setup(is_nfs: bool) -> MountSetup {
     let xet_sessions = XetSessions::new(download_session, upload_config);
 
     let advanced_writes = args.advanced_writes || (is_nfs && !read_only);
+    // Repos need a staging dir for HTTP download cache (open_readonly),
+    // even when advanced_writes is disabled.
     let staging_dir = if advanced_writes || hub_client.is_repo() {
         Some(StagingDir::new(&args.cache_dir))
     } else {

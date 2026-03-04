@@ -1001,6 +1001,12 @@ impl VirtualFs {
             // Advanced write in progress — read from local staging file.
             (true, Some(path)) if path.exists() => self.open_local_readonly(ino, path),
 
+            // Dirty file but staging file is missing — should not happen.
+            (true, Some(_)) => {
+                error!("Dirty file ino={} has missing staging file", ino);
+                Err(libc::EIO)
+            }
+
             // Streaming write in progress (simple mode) — wait for commit.
             (true, None) if fe.xet_hash.is_empty() && fe.size > 0 => {
                 self.await_pending_commit(ino).await?;
@@ -1017,7 +1023,6 @@ impl VirtualFs {
                     error!("No staging dir for HTTP download of ino={}", ino);
                     libc::EIO
                 })?;
-                let mtime_ms = fe.mtime.duration_since(UNIX_EPOCH).unwrap_or_default().as_millis();
                 let path_hash = {
                     use std::hash::{Hash, Hasher};
                     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -1025,9 +1030,7 @@ impl VirtualFs {
                     fe.full_path.hash(&mut h);
                     h.finish()
                 };
-                let dest = staging
-                    .root()
-                    .join(format!("http_{:x}_s{}_t{}", path_hash, fe.size, mtime_ms));
+                let dest = staging.root().join(format!("http_{:x}", path_hash));
                 {
                     let lock = self.staging_lock(ino);
                     let _guard = lock.lock().await;
@@ -2227,7 +2230,6 @@ impl VirtualFs {
             size: entry.size,
             dirty: entry.dirty,
             full_path: entry.full_path.clone(),
-            mtime: entry.mtime,
         })
     }
 }
@@ -2275,7 +2277,6 @@ struct FileEntry {
     size: u64,
     dirty: bool,
     full_path: String,
-    mtime: SystemTime,
 }
 
 /// State machine for streaming writes.
