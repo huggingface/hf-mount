@@ -1,4 +1,5 @@
 use std::ffi::OsStr;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -7,6 +8,7 @@ use fuser::{
     OpenFlags, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite,
     Request, TimeOrNow,
 };
+use tracing::error;
 
 use crate::inode::InodeKind;
 use crate::virtual_fs::{VirtualFs, VirtualFsAttr};
@@ -377,4 +379,57 @@ impl Filesystem for FuseAdapter {
     fn destroy(&mut self) {
         self.virtual_fs.shutdown();
     }
+}
+
+/// Mount the VFS as a FUSE filesystem and block until unmount.
+pub fn mount_fuse(
+    virtual_fs: Arc<VirtualFs>,
+    mount_point: &Path,
+    metadata_ttl: Duration,
+    read_only: bool,
+    advanced_writes: bool,
+    max_threads: usize,
+    runtime: &tokio::runtime::Runtime,
+) {
+    let adapter = FuseAdapter::new(
+        runtime.handle().clone(),
+        virtual_fs.clone(),
+        metadata_ttl,
+        read_only,
+        advanced_writes,
+    );
+
+    let mut config = fuser::Config::default();
+    config.mount_options = vec![
+        fuser::MountOption::FSName("hf-mount".to_string()),
+        fuser::MountOption::DefaultPermissions,
+    ];
+    if read_only {
+        config.mount_options.push(fuser::MountOption::RO);
+    }
+    config.acl = fuser::SessionACL::All;
+    config.clone_fd = true;
+    config.n_threads = Some(max_threads);
+
+    let session = match fuser::Session::new(adapter, mount_point, &config) {
+        Ok(s) => s,
+        Err(e) => {
+            error!("FUSE session failed: {}", e);
+            std::process::exit(1);
+        }
+    };
+    let notifier = session.notifier();
+    virtual_fs.set_invalidator(Box::new(move |ino| {
+        if let Err(e) = notifier.inval_inode(fuser::INodeNo(ino), 0, -1) {
+            tracing::debug!("inval_inode({}) failed: {}", ino, e);
+        }
+    }));
+    let bg = match session.spawn() {
+        Ok(bg) => bg,
+        Err(e) => {
+            error!("FUSE spawn failed: {}", e);
+            std::process::exit(1);
+        }
+    };
+    let _ = bg.join();
 }
