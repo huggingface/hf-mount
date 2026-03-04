@@ -195,7 +195,7 @@ pub struct HubApiClient {
     /// need response headers from the Hub (not from the CAS redirect target).
     head_client: Client,
     endpoint: String,
-    token: String,
+    token: Option<String>,
     source: SourceKind,
     /// Last modification time (from repo/bucket info endpoint).
     /// Used as default mtime when per-file mtime is unavailable.
@@ -229,10 +229,16 @@ impl HubApiClient {
     /// Create a client from a `SourceKind` (bucket or repo).
     /// Create a client from a source kind. For repos, resolves aliases
     /// (e.g. "gpt2" → "openai-community/gpt2") and fetches repo metadata.
-    pub async fn from_source(endpoint: &str, token: &str, source: SourceKind) -> Result<Arc<Self>> {
+    pub async fn from_source(endpoint: &str, token: Option<&str>, source: SourceKind) -> Result<Arc<Self>> {
         let (client, head_client) = make_clients();
         let endpoint = endpoint.trim_end_matches('/').to_string();
-        let token = token.to_string();
+
+        let auth = |req: reqwest::RequestBuilder| -> reqwest::RequestBuilder {
+            match token {
+                Some(t) => req.bearer_auth(t),
+                None => req,
+            }
+        };
 
         let (source, last_modified) = match source {
             SourceKind::Repo {
@@ -241,7 +247,7 @@ impl HubApiClient {
                 revision,
             } => {
                 let url = format!("{}/api/{}/{}", endpoint, repo_type.api_prefix(), repo_id);
-                let resp = client.get(&url).bearer_auth(&token).send().await?;
+                let resp = auth(client.get(&url)).send().await?;
                 if !resp.status().is_success() {
                     return Err(Error::Hub(format!(
                         "Failed to resolve repo {}: {} {}",
@@ -269,7 +275,7 @@ impl HubApiClient {
             }
             SourceKind::Bucket { bucket_id } => {
                 let url = format!("{}/api/buckets/{}", endpoint, bucket_id);
-                let resp = client.get(&url).bearer_auth(&token).send().await?;
+                let resp = auth(client.get(&url)).send().await?;
                 if !resp.status().is_success() {
                     return Err(Error::Hub(format!(
                         "Bucket not found: {} ({})",
@@ -287,25 +293,33 @@ impl HubApiClient {
             client,
             head_client,
             endpoint,
-            token,
+            token: token.map(|t| t.to_string()),
             source,
             last_modified,
         }))
     }
 
     /// Create a client for a HuggingFace bucket.
-    pub fn new(endpoint: &str, token: &str, bucket_id: &str) -> Arc<Self> {
+    pub fn new(endpoint: &str, token: Option<&str>, bucket_id: &str) -> Arc<Self> {
         let (client, head_client) = make_clients();
         Arc::new(Self {
             client,
             head_client,
             endpoint: endpoint.trim_end_matches('/').to_string(),
-            token: token.to_string(),
+            token: token.map(|t| t.to_string()),
             source: SourceKind::Bucket {
                 bucket_id: bucket_id.to_string(),
             },
             last_modified: UNIX_EPOCH,
         })
+    }
+
+    /// Attach bearer auth to a request if a token is configured.
+    fn auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match &self.token {
+            Some(t) => req.bearer_auth(t),
+            None => req,
+        }
     }
 
     pub fn source(&self) -> &SourceKind {
@@ -347,7 +361,7 @@ impl HubApiClient {
         };
 
         loop {
-            let resp = self.client.get(&url).bearer_auth(&self.token).send().await?;
+            let resp = self.auth(self.client.get(&url)).send().await?;
 
             if !resp.status().is_success() {
                 return Err(Error::Hub(format!(
@@ -409,7 +423,7 @@ impl HubApiClient {
         };
 
         loop {
-            let resp = self.client.get(&url).bearer_auth(&self.token).send().await?;
+            let resp = self.auth(self.client.get(&url)).send().await?;
 
             if !resp.status().is_success() {
                 return Err(Error::Hub(format!(
@@ -478,7 +492,7 @@ impl HubApiClient {
                 )
             }
         };
-        let resp = self.head_client.head(&url).bearer_auth(&self.token).send().await?;
+        let resp = self.auth(self.head_client.head(&url)).send().await?;
 
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
@@ -535,7 +549,7 @@ impl HubApiClient {
             }
         };
 
-        let resp = self.client.get(&url).bearer_auth(&self.token).send().await?;
+        let resp = self.auth(self.client.get(&url)).send().await?;
 
         if !resp.status().is_success() {
             return Err(Error::Hub(format!(
@@ -559,7 +573,7 @@ impl HubApiClient {
         };
         let url = format!("{}/api/buckets/{}/xet-write-token", self.endpoint, bucket_id);
 
-        let resp = self.client.get(&url).bearer_auth(&self.token).send().await?;
+        let resp = self.auth(self.client.get(&url)).send().await?;
 
         if !resp.status().is_success() {
             return Err(Error::Hub(format!(
@@ -591,9 +605,7 @@ impl HubApiClient {
         }
 
         let resp = self
-            .client
-            .post(&url)
-            .bearer_auth(&self.token)
+            .auth(self.client.post(&url))
             .header("content-type", "application/x-ndjson")
             .body(body)
             .send()
@@ -645,7 +657,7 @@ impl HubApiClient {
             None
         };
 
-        let mut req = self.client.get(&url).bearer_auth(&self.token);
+        let mut req = self.auth(self.client.get(&url));
         if let Some(ref etag) = cached_etag {
             // Re-quote for RFC 7232 compliance (sidecar stores unquoted value).
             req = req.header("If-None-Match", format!("\"{}\"", etag.trim()));

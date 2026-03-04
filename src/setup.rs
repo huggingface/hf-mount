@@ -38,9 +38,10 @@ pub struct Args {
     #[command(subcommand)]
     pub source: Source,
 
-    /// HuggingFace API token (also read from HF_TOKEN env var)
+    /// HuggingFace API token (also read from HF_TOKEN env var).
+    /// Required for private repos/buckets, optional for public repos.
     #[arg(long, env = "HF_TOKEN")]
-    pub hf_token: String,
+    pub hf_token: Option<String>,
 
     /// HuggingFace Hub endpoint URL
     #[arg(long, default_value = "https://huggingface.co")]
@@ -166,7 +167,7 @@ pub fn setup(is_nfs: bool) -> MountSetup {
     };
 
     let hub_client = runtime.block_on(async {
-        HubApiClient::from_source(&args.hub_endpoint, &args.hf_token, source)
+        HubApiClient::from_source(&args.hub_endpoint, args.hf_token.as_deref(), source)
             .await
             .unwrap_or_else(|e| panic!("Failed to initialize Hub client: {e}"))
     });
