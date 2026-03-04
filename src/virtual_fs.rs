@@ -153,8 +153,14 @@ impl VirtualFs {
             }
         }
 
-        // Pre-load root directory listing so the first `ls` is instant.
-        if let Err(e) = vfs
+        // Pre-load directory listing so the first traversal is instant.
+        // For repos, load the entire tree in one API call.
+        // For buckets, only load the root directory (bucket trees can be huge).
+        if vfs.hub_client.is_repo() {
+            if let Err(e) = vfs.runtime.block_on(vfs.preload_tree_recursive()) {
+                error!("Failed to preload repo tree: errno={}", e);
+            }
+        } else if let Err(e) = vfs
             .runtime
             .block_on(vfs.ensure_children_loaded(crate::inode::ROOT_INODE))
         {
@@ -579,6 +585,88 @@ impl VirtualFs {
         if let Some(parent) = inodes.get_mut(parent_ino) {
             parent.children_loaded = true;
         }
+        Ok(())
+    }
+
+    /// Preload the entire tree in a single recursive API call.
+    /// For repos this avoids N per-directory API calls during traversal.
+    async fn preload_tree_recursive(&self) -> VirtualFsResult<()> {
+        let entries = match self.hub_client.list_tree_recursive().await {
+            Ok(entries) => entries,
+            Err(e) => {
+                error!("Failed to preload recursive tree: {}", e);
+                return Err(libc::EIO);
+            }
+        };
+
+        let mut inodes = self.inode_table.write().expect("inodes poisoned");
+        // Track which directories we've seen so we can mark them children_loaded.
+        let mut dirs_seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        dirs_seen.insert(crate::inode::ROOT_INODE);
+
+        for entry in entries {
+            // Walk the path components, creating intermediate directories as needed.
+            let parts: Vec<&str> = entry.path.split('/').collect();
+            let mut current_parent = crate::inode::ROOT_INODE;
+
+            // Create/find intermediate directories (all but last component).
+            for (i, part) in parts.iter().enumerate() {
+                if i == parts.len() - 1 {
+                    // Last component: insert the actual entry.
+                    let kind = if entry.entry_type == "directory" {
+                        InodeKind::Directory
+                    } else {
+                        InodeKind::File
+                    };
+                    let size = entry.size.unwrap_or(0);
+                    let mtime = entry
+                        .mtime
+                        .as_deref()
+                        .map(HubApiClient::mtime_from_str)
+                        .unwrap_or_else(|| self.hub_client.default_mtime());
+
+                    let ino = inodes.insert(
+                        current_parent,
+                        part.to_string(),
+                        entry.path.clone(),
+                        kind,
+                        size,
+                        mtime,
+                        entry.xet_hash.clone(),
+                    );
+                    if let Some(oid) = &entry.oid
+                        && let Some(e) = inodes.get_mut(ino)
+                    {
+                        e.etag = Some(oid.clone());
+                    }
+                    if kind == InodeKind::Directory {
+                        dirs_seen.insert(ino);
+                    }
+                } else {
+                    // Intermediate directory.
+                    let dir_full_path = parts[..=i].join("/");
+                    let ino = inodes.insert(
+                        current_parent,
+                        part.to_string(),
+                        dir_full_path,
+                        InodeKind::Directory,
+                        0,
+                        self.hub_client.default_mtime(),
+                        None,
+                    );
+                    dirs_seen.insert(ino);
+                    current_parent = ino;
+                }
+            }
+        }
+
+        // Mark all directories we touched as children_loaded.
+        for dir_ino in dirs_seen {
+            if let Some(d) = inodes.get_mut(dir_ino) {
+                d.children_loaded = true;
+            }
+        }
+
         Ok(())
     }
 

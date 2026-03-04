@@ -75,8 +75,12 @@ pub struct Args {
     #[arg(long, default_value_t = 10_000_000_000)]
     pub cache_size: u64,
 
-    /// Kernel metadata cache TTL in milliseconds.
-    #[arg(long, default_value_t = 100)]
+    /// Kernel metadata cache TTL in milliseconds. Controls how long file
+    /// attributes are trusted before re-checking via HEAD. Lower values
+    /// give fresher metadata but increase latency on directory traversals
+    /// (e.g. `du`, `find`, `ls -lR`) since each file lookup triggers a
+    /// HEAD request after the TTL expires.
+    #[arg(long, default_value_t = 10_000)]
     pub metadata_ttl_ms: u64,
 
     /// Always HEAD on every lookup (skip in-memory TTL cache).

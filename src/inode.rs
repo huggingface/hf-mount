@@ -119,6 +119,10 @@ impl InodeTable {
                 "insert(): path '{}' exists with different kind",
                 full_path
             );
+            // Stamp revalidation so subsequent lookups skip the HEAD request.
+            if let Some(entry) = self.inodes.get_mut(&existing_ino) {
+                entry.last_revalidated = Some(Instant::now());
+            }
             return existing_ino;
         }
 
