@@ -1,16 +1,21 @@
 # hf-mount
 
-Mount [Hugging Face Buckets](https://huggingface.co/docs/hub/buckets) as a local filesystem using FUSE or NFS.
+Mount [Hugging Face Buckets](https://huggingface.co/docs/hub/buckets) and repos as a local filesystem using FUSE or NFS.
 
 ## Features
 
 - **FUSE & NFS backends** — FUSE for standard Linux/macOS, NFS for environments without `/dev/fuse` (e.g., Kubernetes CSI)
+- **Buckets & repos** — mount buckets (read-write) or model/dataset/space repos (read-only)
+- **Repo alias resolution** — short names like `gpt2` are resolved to their canonical ID (`openai-community/gpt2`)
+- **Auto repo type detection** — `datasets/user/ds` and `spaces/user/app` prefixes are detected automatically, otherwise defaults to model
 - **Adaptive prefetch** — 8 MB initial window, grows up to 128 MB for sequential reads
 - **Lazy loading** — files are fetched on demand from CAS, not eagerly downloaded
+- **ETag-based caching** — plain git/LFS files use HTTP conditional requests (`If-None-Match`) for efficient cache revalidation
 - **Simple writes (default, FUSE only)** — append-only, in-memory streaming to CAS, synchronous upload on close
 - **Advanced writes** (`--advanced-writes`, auto-enabled for NFS) — staging files on disk, random writes + seek, async debounced flush
 - **Remote sync** — background polling detects remote changes and updates the local view
-- **Read-only mode** — `--read-only` flag for safe, read-only mounts
+- **HEAD revalidation** — per-file revalidation on lookup for both xet-backed and plain git/LFS files
+- **Read-only mode** — `--read-only` flag for safe, read-only mounts (always on for repos)
 
 ## Architecture
 
@@ -115,29 +120,49 @@ cargo build --release
 cargo build --release --features nfs
 ```
 
-The binary is at `target/release/hf-mount`.
+This produces two binaries:
+- `target/release/hf-mount-fuse` — FUSE backend
+- `target/release/hf-mount-nfs` — NFS backend (requires `--features nfs`)
 
 ## Usage
 
+### Mount a bucket
+
 ```bash
-hf-mount \
-  --bucket-id <USER/BUCKET> \
-  --mount-point <PATH> \
-  --hf-token <TOKEN>
+hf-mount-fuse --hf-token $HF_TOKEN bucket myuser/my-bucket /mnt/data
+```
+
+### Mount a repo (read-only)
+
+```bash
+# Model (default type)
+hf-mount-fuse --hf-token $HF_TOKEN repo openai-community/gpt2 /mnt/gpt2
+
+# Short name (auto-resolved)
+hf-mount-fuse --hf-token $HF_TOKEN repo gpt2 /mnt/gpt2
+
+# Dataset (auto-detected from prefix)
+hf-mount-fuse --hf-token $HF_TOKEN repo datasets/squad /mnt/squad
+
+# Specific revision
+hf-mount-fuse --hf-token $HF_TOKEN repo openai-community/gpt2 /mnt/gpt2 --revision v1.0
+```
+
+### NFS backend
+
+```bash
+hf-mount-nfs --hf-token $HF_TOKEN bucket myuser/my-bucket /mnt/data
 ```
 
 ### Options
 
 | Flag                     | Default                  | Description                                                           |
 | ------------------------ | ------------------------ | --------------------------------------------------------------------- |
-| `--bucket-id`            | _required_               | Hugging Face bucket ID (e.g. `myuser/mybucket`)                       |
-| `--mount-point`          | _required_               | Local directory to mount on                                           |
 | `--hf-token`             | _required_               | HF API token (or `HF_TOKEN` env var)                                  |
 | `--hub-endpoint`         | `https://huggingface.co` | Hub API endpoint                                                      |
 | `--cache-dir`            | `/tmp/hf-mount-cache`    | Local cache directory                                                 |
 | `--cache-size`           | `10000000000`            | Max size in bytes for the on-disk xorb chunk cache                    |
-| `--backend`              | `fuse`                   | `fuse` or `nfs` (NFS requires `--features nfs`)                       |
-| `--read-only`            | `false`                  | Mount read-only                                                       |
+| `--read-only`            | `false`                  | Mount read-only (always on for repos)                                 |
 | `--advanced-writes`      | `false`                  | Staging files + async flush (supports random writes, seek, overwrite) |
 | `--poll-interval-secs`   | `30`                     | Remote change polling interval (0 to disable)                         |
 | `--max-threads`          | `16`                     | Maximum number of FUSE threads                                        |
@@ -146,40 +171,17 @@ hf-mount \
 | `--uid`                  | current user             | UID for mounted files                                                 |
 | `--gid`                  | current group            | GID for mounted files                                                 |
 
-### Examples
-
-```bash
-# Read-write FUSE mount
-hf-mount --bucket-id myuser/data \
-         --mount-point /mnt/data \
-         --hf-token $HF_TOKEN
-
-# Read-only NFS mount (e.g. in a container without /dev/fuse)
-hf-mount --bucket-id myuser/models \
-         --mount-point /mnt/models \
-         --hf-token $HF_TOKEN \
-         --backend nfs \
-         --read-only
-
-# Custom cache and polling
-hf-mount --bucket-id myuser/data \
-         --mount-point /mnt/data \
-         --hf-token $HF_TOKEN \
-         --cache-dir /var/cache/hf-mount \
-         --poll-interval-secs 60
-```
-
 ### Logging
 
 ```bash
-RUST_LOG=hf_mount=debug hf-mount ...
+RUST_LOG=hf_mount=debug hf-mount-fuse ...
 ```
 
 ## Consistency model
 
 hf-mount detects remote file changes through two mechanisms:
 
-1. **HEAD revalidation on lookup** (FUSE only) — When the kernel metadata TTL expires (default 100 ms), the next file access triggers a `HEAD` request on the Hub resolve endpoint. If the `xet_hash` changed, the kernel page cache is invalidated and subsequent reads return fresh content.
+1. **HEAD revalidation on lookup** (FUSE only) — When the kernel metadata TTL expires (default 100 ms), the next file access triggers a `HEAD` request on the Hub resolve endpoint. For xet-backed files, changes are detected via `xet_hash`. For plain git/LFS files, changes are detected via size comparison, and ETag-based conditional downloads in `open()` catch same-size content changes.
 
 2. **Background polling** — A poll loop (default every 30 s) lists the full tree and detects additions, modifications, and deletions. This catches changes to files that haven't been individually accessed.
 
@@ -228,8 +230,9 @@ FUSE re-read includes one HEAD round-trip (~170 ms) per metadata TTL expiry. NFS
 cargo test
 
 # Integration tests (require HF_TOKEN and network)
-HF_TOKEN=... cargo test --release --test fuse_ops  # both simple + advanced write modes
+HF_TOKEN=... cargo test --release --test fuse_ops
 HF_TOKEN=... cargo test --release --test nfs_ops --features nfs
+HF_TOKEN=... cargo test --release --test repo_ops
 
 # Benchmarks
 HF_TOKEN=... cargo test --release --test bench --features nfs
