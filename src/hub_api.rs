@@ -182,9 +182,9 @@ pub struct HubApiClient {
     endpoint: String,
     token: String,
     source: SourceKind,
-    /// Last modification time of the repo (from `/api/{type}/{id}` response).
-    /// Used as default mtime for repo files (tree listing has no per-file mtime).
-    repo_last_modified: Option<SystemTime>,
+    /// Last modification time (from repo/bucket info endpoint).
+    /// Used as default mtime when per-file mtime is unavailable.
+    last_modified: SystemTime,
 }
 
 /// Parse a repo ID, extracting the type from an optional prefix.
@@ -212,60 +212,76 @@ fn make_clients() -> (Client, Client) {
 
 impl HubApiClient {
     /// Create a client from a `SourceKind` (bucket or repo).
-    pub fn from_source(endpoint: &str, token: &str, source: SourceKind) -> Arc<Self> {
+    /// Create a client from a source kind. For repos, resolves aliases
+    /// (e.g. "gpt2" → "openai-community/gpt2") and fetches repo metadata.
+    pub async fn from_source(endpoint: &str, token: &str, source: SourceKind) -> Result<Arc<Self>> {
         let (client, head_client) = make_clients();
-        Arc::new(Self {
-            client,
-            head_client,
-            endpoint: endpoint.trim_end_matches('/').to_string(),
-            token: token.to_string(),
-            source,
-            repo_last_modified: None,
-        })
-    }
+        let endpoint = endpoint.trim_end_matches('/').to_string();
+        let token = token.to_string();
 
-    /// Resolve repo aliases (e.g. "gpt2" → "openai-community/gpt2").
-    /// The Hub 307-redirects short names on most endpoints, but some (like
-    /// xet-read-token) return 404 instead. Call this once at startup to
-    /// canonicalize the repo ID.
-    pub async fn resolve_repo_id(&self) -> Result<Option<Arc<Self>>> {
-        let (repo_id, repo_type, revision) = match &self.source {
+        let (source, last_modified) = match source {
             SourceKind::Repo {
                 repo_id,
                 repo_type,
                 revision,
-            } => (repo_id.clone(), *repo_type, revision.clone()),
-            _ => return Ok(None),
+            } => {
+                let url = format!("{}/api/{}/{}", endpoint, repo_type.api_prefix(), repo_id);
+                let resp = client.get(&url).bearer_auth(&token).send().await?;
+                if !resp.status().is_success() {
+                    return Err(Error::Hub(format!(
+                        "Failed to resolve repo {}: {} {}",
+                        repo_id,
+                        resp.status(),
+                        resp.text().await.unwrap_or_default()
+                    )));
+                }
+                let body: serde_json::Value = resp.json().await?;
+                let resolved_id = body["id"]
+                    .as_str()
+                    .ok_or_else(|| Error::Hub("repo info missing 'id' field".to_string()))?;
+                if resolved_id != repo_id {
+                    info!("Resolved repo alias: {} → {}", repo_id, resolved_id);
+                }
+                let last_modified = body["lastModified"]
+                    .as_str()
+                    .map(Self::mtime_from_str)
+                    .unwrap_or(UNIX_EPOCH);
+                (
+                    SourceKind::Repo {
+                        repo_id: resolved_id.to_string(),
+                        repo_type,
+                        revision,
+                    },
+                    last_modified,
+                )
+            }
+            SourceKind::Bucket { bucket_id } => {
+                let url = format!("{}/api/buckets/{}", endpoint, bucket_id);
+                let resp = client.get(&url).bearer_auth(&token).send().await?;
+                if !resp.status().is_success() {
+                    return Err(Error::Hub(format!(
+                        "Bucket not found: {} ({})",
+                        bucket_id,
+                        resp.status(),
+                    )));
+                }
+                let body: serde_json::Value = resp.json().await?;
+                let last_modified = body["updatedAt"]
+                    .as_str()
+                    .map(Self::mtime_from_str)
+                    .unwrap_or(UNIX_EPOCH);
+                (SourceKind::Bucket { bucket_id }, last_modified)
+            }
         };
 
-        let url = format!("{}/api/{}/{}", self.endpoint, repo_type.api_prefix(), repo_id,);
-        let resp = self.client.get(&url).bearer_auth(&self.token).send().await?;
-        if !resp.status().is_success() {
-            return Err(Error::Hub(format!(
-                "Failed to resolve repo {}: {} {}",
-                repo_id,
-                resp.status(),
-                resp.text().await.unwrap_or_default()
-            )));
-        }
-        let body: serde_json::Value = resp.json().await?;
-        let resolved_id = body["id"]
-            .as_str()
-            .ok_or_else(|| Error::Hub("repo info missing 'id' field".to_string()))?;
-
-        if resolved_id != repo_id {
-            info!("Resolved repo alias: {} → {}", repo_id, resolved_id);
-        }
-        let last_modified = body["lastModified"].as_str().map(Self::mtime_from_str);
-
-        let new_source = SourceKind::Repo {
-            repo_id: resolved_id.to_string(),
-            repo_type,
-            revision,
-        };
-        let mut client = Self::from_source(&self.endpoint, &self.token, new_source);
-        Arc::get_mut(&mut client).unwrap().repo_last_modified = last_modified;
-        Ok(Some(client))
+        Ok(Arc::new(Self {
+            client,
+            head_client,
+            endpoint,
+            token,
+            source,
+            last_modified,
+        }))
     }
 
     /// Create a client for a HuggingFace bucket.
@@ -279,7 +295,7 @@ impl HubApiClient {
             source: SourceKind::Bucket {
                 bucket_id: bucket_id.to_string(),
             },
-            repo_last_modified: None,
+            last_modified: UNIX_EPOCH,
         })
     }
 
@@ -287,9 +303,9 @@ impl HubApiClient {
         &self.source
     }
 
-    /// Default mtime for repo files (from the repo's lastModified field).
+    /// Default mtime when per-file mtime is unavailable.
     pub fn default_mtime(&self) -> SystemTime {
-        self.repo_last_modified.unwrap_or(UNIX_EPOCH)
+        self.last_modified
     }
 
     pub fn is_repo(&self) -> bool {
@@ -297,6 +313,7 @@ impl HubApiClient {
     }
 
     /// List tree entries at the given prefix (follows `Link` header pagination).
+    /// For repos this returns a single directory level; for buckets it's recursive.
     pub async fn list_tree(&self, prefix: &str) -> Result<Vec<TreeEntry>> {
         match &self.source {
             SourceKind::Bucket { bucket_id } => self.list_tree_bucket(bucket_id, prefix).await,
@@ -304,7 +321,20 @@ impl HubApiClient {
                 repo_id,
                 repo_type,
                 revision,
-            } => self.list_tree_repo(repo_id, *repo_type, revision, prefix).await,
+            } => self.list_tree_repo(repo_id, *repo_type, revision, prefix, false).await,
+        }
+    }
+
+    /// List all tree entries recursively (for poll loop).
+    /// For buckets, list_tree is already recursive. For repos, uses `?recursive=true`.
+    pub async fn list_tree_recursive(&self) -> Result<Vec<TreeEntry>> {
+        match &self.source {
+            SourceKind::Bucket { bucket_id } => self.list_tree_bucket(bucket_id, "").await,
+            SourceKind::Repo {
+                repo_id,
+                repo_type,
+                revision,
+            } => self.list_tree_repo(repo_id, *repo_type, revision, "", true).await,
         }
     }
 
@@ -351,14 +381,17 @@ impl HubApiClient {
         repo_type: RepoType,
         revision: &str,
         prefix: &str,
+        recursive: bool,
     ) -> Result<Vec<TreeEntry>> {
         let mut all_entries = Vec::new();
-        // /api/{type}/{id}/tree/{revision}[/{prefix}]?expand=true
+        // /api/{type}/{id}/tree/{revision}[/{prefix}]?expand=true[&recursive=true]
         // expand=true fetches per-file lastCommit (date, id, title) from Gitaly.
+        // recursive=true returns all files in the subtree (used by poll loop).
         // TODO: monitor if expand=true adds too much latency on large repos.
+        let recursive_param = if recursive { "&recursive=true" } else { "" };
         let mut url = if prefix.is_empty() {
             format!(
-                "{}/api/{}/{}/tree/{}?expand=true",
+                "{}/api/{}/{}/tree/{}?expand=true{recursive_param}",
                 self.endpoint,
                 repo_type.api_prefix(),
                 repo_id,
@@ -366,7 +399,7 @@ impl HubApiClient {
             )
         } else {
             format!(
-                "{}/api/{}/{}/tree/{}/{}?expand=true",
+                "{}/api/{}/{}/tree/{}/{}?expand=true{recursive_param}",
                 self.endpoint,
                 repo_type.api_prefix(),
                 repo_id,
