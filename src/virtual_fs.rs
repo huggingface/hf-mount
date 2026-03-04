@@ -145,6 +145,14 @@ impl VirtualFs {
             serve_lookup_from_cache,
         });
 
+        // Set root inode mtime (repos use the last commit date).
+        {
+            let mut inodes = vfs.inode_table.write().expect("inodes poisoned");
+            if let Some(root) = inodes.get_mut(crate::inode::ROOT_INODE) {
+                root.mtime = vfs.hub_client.default_mtime();
+            }
+        }
+
         // Pre-load root directory listing so the first `ls` is instant.
         if let Err(e) = vfs
             .runtime
@@ -534,7 +542,7 @@ impl VirtualFs {
                         dir_full_path,
                         InodeKind::Directory,
                         0,
-                        UNIX_EPOCH,
+                        self.hub_client.default_mtime(),
                         None,
                     );
                 }
@@ -549,7 +557,7 @@ impl VirtualFs {
                     .mtime
                     .as_deref()
                     .map(HubApiClient::mtime_from_str)
-                    .unwrap_or(UNIX_EPOCH);
+                    .unwrap_or_else(|| self.hub_client.default_mtime());
 
                 let ino = inodes.insert(
                     parent_ino,

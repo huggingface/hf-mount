@@ -137,6 +137,14 @@ struct RepoTreeEntry {
     xet_hash: Option<String>,
     #[serde(default)]
     lfs: Option<LfsInfo>,
+    #[serde(default)]
+    last_commit: Option<CommitInfo>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CommitInfo {
+    date: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -174,6 +182,9 @@ pub struct HubApiClient {
     endpoint: String,
     token: String,
     source: SourceKind,
+    /// Last modification time of the repo (from `/api/{type}/{id}` response).
+    /// Used as default mtime for repo files (tree listing has no per-file mtime).
+    repo_last_modified: Option<SystemTime>,
 }
 
 /// Parse a repo ID, extracting the type from an optional prefix.
@@ -209,6 +220,7 @@ impl HubApiClient {
             endpoint: endpoint.trim_end_matches('/').to_string(),
             token: token.to_string(),
             source,
+            repo_last_modified: None,
         })
     }
 
@@ -244,12 +256,16 @@ impl HubApiClient {
         if resolved_id != repo_id {
             info!("Resolved repo alias: {} → {}", repo_id, resolved_id);
         }
+        let last_modified = body["lastModified"].as_str().map(Self::mtime_from_str);
+
         let new_source = SourceKind::Repo {
             repo_id: resolved_id.to_string(),
             repo_type,
             revision,
         };
-        Ok(Some(Self::from_source(&self.endpoint, &self.token, new_source)))
+        let mut client = Self::from_source(&self.endpoint, &self.token, new_source);
+        Arc::get_mut(&mut client).unwrap().repo_last_modified = last_modified;
+        Ok(Some(client))
     }
 
     /// Create a client for a HuggingFace bucket.
@@ -263,11 +279,17 @@ impl HubApiClient {
             source: SourceKind::Bucket {
                 bucket_id: bucket_id.to_string(),
             },
+            repo_last_modified: None,
         })
     }
 
     pub fn source(&self) -> &SourceKind {
         &self.source
+    }
+
+    /// Default mtime for repo files (from the repo's lastModified field).
+    pub fn default_mtime(&self) -> SystemTime {
+        self.repo_last_modified.unwrap_or(UNIX_EPOCH)
     }
 
     pub fn is_repo(&self) -> bool {
@@ -331,10 +353,12 @@ impl HubApiClient {
         prefix: &str,
     ) -> Result<Vec<TreeEntry>> {
         let mut all_entries = Vec::new();
-        // /api/{type}/{id}/tree/{revision}[/{prefix}]
+        // /api/{type}/{id}/tree/{revision}[/{prefix}]?expand=true
+        // expand=true fetches per-file lastCommit (date, id, title) from Gitaly.
+        // TODO: monitor if expand=true adds too much latency on large repos.
         let mut url = if prefix.is_empty() {
             format!(
-                "{}/api/{}/{}/tree/{}",
+                "{}/api/{}/{}/tree/{}?expand=true",
                 self.endpoint,
                 repo_type.api_prefix(),
                 repo_id,
@@ -342,7 +366,7 @@ impl HubApiClient {
             )
         } else {
             format!(
-                "{}/api/{}/{}/tree/{}/{}",
+                "{}/api/{}/{}/tree/{}/{}?expand=true",
                 self.endpoint,
                 repo_type.api_prefix(),
                 repo_id,
@@ -384,8 +408,7 @@ impl HubApiClient {
                     size,
                     xet_hash: raw.xet_hash,
                     oid: raw.oid,
-                    // Repos don't expose per-file mtime in the tree listing
-                    mtime: None,
+                    mtime: raw.last_commit.and_then(|c| c.date),
                 });
             }
 
