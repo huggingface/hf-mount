@@ -591,7 +591,8 @@ impl HubApiClient {
 
         let mut req = self.client.get(&url).bearer_auth(&self.token);
         if let Some(ref etag) = cached_etag {
-            req = req.header("If-None-Match", etag.trim());
+            // Re-quote for RFC 7232 compliance (sidecar stores unquoted value).
+            req = req.header("If-None-Match", format!("\"{}\"", etag.trim()));
         }
 
         info!("HTTP download: {} → {:?}", path, dest);
