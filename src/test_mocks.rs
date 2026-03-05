@@ -1,7 +1,6 @@
 //! Mock implementations for unit testing VirtualFs.
 
 use std::collections::HashMap;
-use std::ops::Range;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -219,6 +218,10 @@ pub struct MockXet {
     upload_fail: AtomicBool,
     download_fail: AtomicBool,
     writer_fail_after: AtomicU64,
+    /// Number of range download calls that should fail before succeeding.
+    range_fail_count: AtomicU32,
+    /// Number of range download calls that should return empty before succeeding.
+    range_empty_count: AtomicU32,
 }
 
 impl MockXet {
@@ -230,6 +233,8 @@ impl MockXet {
             upload_fail: AtomicBool::new(false),
             download_fail: AtomicBool::new(false),
             writer_fail_after: AtomicU64::new(u64::MAX),
+            range_fail_count: AtomicU32::new(0),
+            range_empty_count: AtomicU32::new(0),
         })
     }
 
@@ -247,6 +252,16 @@ impl MockXet {
 
     pub fn fail_writer_after(&self, bytes: u64) {
         self.writer_fail_after.store(bytes, Ordering::SeqCst);
+    }
+
+    /// Make the next N range downloads return Err before succeeding.
+    pub fn fail_range_downloads(&self, n: u32) {
+        self.range_fail_count.store(n, Ordering::SeqCst);
+    }
+
+    /// Make the next N range downloads return Ok(empty) before succeeding.
+    pub fn empty_range_downloads(&self, n: u32) {
+        self.range_empty_count.store(n, Ordering::SeqCst);
     }
 
     fn next_hash_string(&self) -> String {
@@ -297,25 +312,28 @@ impl XetOps for MockXet {
         Ok(results)
     }
 
-    fn download_stream_boxed(&self, file_info: &XetFileInfo) -> Result<Box<dyn DownloadStreamOps>> {
+    fn download_stream_boxed(&self, file_info: &XetFileInfo, offset: u64) -> Result<Box<dyn DownloadStreamOps>> {
+        let prev_fail = self.range_fail_count.load(Ordering::SeqCst);
+        if prev_fail > 0 {
+            self.range_fail_count.fetch_sub(1, Ordering::SeqCst);
+            return Err(Error::Xet("mock stream open failure".into()));
+        }
+        let prev_empty = self.range_empty_count.load(Ordering::SeqCst);
+        if prev_empty > 0 {
+            self.range_empty_count.fetch_sub(1, Ordering::SeqCst);
+            return Ok(Box::new(MockDownloadStream {
+                data: Vec::new(),
+                offset: 0,
+                chunk_size: 4096,
+            }));
+        }
         let files = self.files.lock().unwrap();
         let content = files.get(file_info.hash()).cloned().unwrap_or_default();
         Ok(Box::new(MockDownloadStream {
             data: content,
-            offset: 0,
+            offset: offset as usize,
             chunk_size: 4096,
         }))
-    }
-
-    async fn download_range_to_vec(&self, file_info: &XetFileInfo, range: Range<u64>) -> Result<Vec<u8>> {
-        let files = self.files.lock().unwrap();
-        let content = files.get(file_info.hash()).cloned().unwrap_or_default();
-        let start = range.start as usize;
-        let end = (range.end as usize).min(content.len());
-        if start >= content.len() {
-            return Ok(Vec::new());
-        }
-        Ok(content[start..end].to_vec())
     }
 }
 
