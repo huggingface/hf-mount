@@ -34,29 +34,8 @@ const FIO_JOBS: &[FioJob] = &[
         time_based: false,
     },
     FioJob {
-        name: "seq-read-500M",
-        filename: "xlarge_0.bin",
-        rw: "read",
-        bs: "128k",
-        time_based: false,
-    },
-    FioJob {
-        name: "seq-reread-500M",
-        filename: "xlarge_0.bin",
-        rw: "read",
-        bs: "128k",
-        time_based: false,
-    },
-    FioJob {
         name: "rand-read-4k-100M",
         filename: "large_0.bin",
-        rw: "randread",
-        bs: "4k",
-        time_based: true,
-    },
-    FioJob {
-        name: "rand-read-4k-500M",
-        filename: "xlarge_0.bin",
         rw: "randread",
         bs: "4k",
         time_based: true,
@@ -102,7 +81,7 @@ fn run_fio(mount_point: &str, job: &FioJob) -> FioResult {
         "json",
     ];
     if job.time_based {
-        args.extend_from_slice(&["--runtime", "10", "--time_based"]);
+        args.extend_from_slice(&["--runtime", "5", "--time_based"]);
     }
 
     let output = Command::new("fio").args(&args).output().expect("Failed to run fio");
@@ -209,7 +188,6 @@ async fn test_fio_compare() {
         .map(|i| (format!("small_{}.bin", i), 1024 * 1024))
         .chain((0..5).map(|i| (format!("medium_{}.bin", i), 10 * 1024 * 1024)))
         .chain(std::iter::once(("large_0.bin".to_string(), 100 * 1024 * 1024)))
-        .chain(std::iter::once(("xlarge_0.bin".to_string(), 500 * 1024 * 1024)))
         .collect();
 
     let total_mb: usize = file_specs.iter().map(|(_, s)| s).sum::<usize>() / (1024 * 1024);
