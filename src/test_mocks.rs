@@ -219,6 +219,10 @@ pub struct MockXet {
     upload_fail: AtomicBool,
     download_fail: AtomicBool,
     writer_fail_after: AtomicU64,
+    /// Number of range download calls that should fail before succeeding.
+    range_fail_count: AtomicU32,
+    /// Number of range download calls that should return empty before succeeding.
+    range_empty_count: AtomicU32,
 }
 
 impl MockXet {
@@ -230,6 +234,8 @@ impl MockXet {
             upload_fail: AtomicBool::new(false),
             download_fail: AtomicBool::new(false),
             writer_fail_after: AtomicU64::new(u64::MAX),
+            range_fail_count: AtomicU32::new(0),
+            range_empty_count: AtomicU32::new(0),
         })
     }
 
@@ -247,6 +253,16 @@ impl MockXet {
 
     pub fn fail_writer_after(&self, bytes: u64) {
         self.writer_fail_after.store(bytes, Ordering::SeqCst);
+    }
+
+    /// Make the next N range downloads return Err before succeeding.
+    pub fn fail_range_downloads(&self, n: u32) {
+        self.range_fail_count.store(n, Ordering::SeqCst);
+    }
+
+    /// Make the next N range downloads return Ok(empty) before succeeding.
+    pub fn empty_range_downloads(&self, n: u32) {
+        self.range_empty_count.store(n, Ordering::SeqCst);
     }
 
     fn next_hash_string(&self) -> String {
@@ -308,6 +324,16 @@ impl XetOps for MockXet {
     }
 
     async fn download_range_to_vec(&self, file_info: &XetFileInfo, range: Range<u64>) -> Result<Vec<u8>> {
+        let prev_fail = self.range_fail_count.load(Ordering::SeqCst);
+        if prev_fail > 0 {
+            self.range_fail_count.fetch_sub(1, Ordering::SeqCst);
+            return Err(Error::Xet("mock range download failure".into()));
+        }
+        let prev_empty = self.range_empty_count.load(Ordering::SeqCst);
+        if prev_empty > 0 {
+            self.range_empty_count.fetch_sub(1, Ordering::SeqCst);
+            return Ok(Vec::new());
+        }
         let files = self.files.lock().unwrap();
         let content = files.get(file_info.hash()).cloned().unwrap_or_default();
         let start = range.start as usize;

@@ -449,7 +449,6 @@ impl VirtualFs {
             Some(head_info) => {
                 let remote_hash = head_info.xet_hash.as_deref();
                 let remote_etag = head_info.etag.as_deref();
-                let remote_size = head_info.size.unwrap_or(0);
                 // Detect changes via xet_hash (preferred) or ETag.
                 let changed = if current_hash.is_some() || remote_hash.is_some() {
                     remote_hash != current_hash
@@ -458,6 +457,10 @@ impl VirtualFs {
                 };
                 let mut inodes = self.inode_table.write().expect("inodes poisoned");
                 if changed {
+                    // Use remote size from HEAD, falling back to existing inode size
+                    // when the response lacks x-linked-size (avoids clobbering with 0).
+                    let existing_size = inodes.get(ino).map(|e| e.size).unwrap_or(0);
+                    let remote_size = head_info.size.unwrap_or(existing_size);
                     let remote_mtime = head_info
                         .last_modified
                         .as_deref()
@@ -1271,6 +1274,17 @@ impl VirtualFs {
 
                 // Cache miss — drain, classify access pattern, adjust window
                 let plan = prefetch_state.prepare_fetch(offset, size);
+                debug!(
+                    "prefetch miss: offset={}, size={}, strategy={:?}, fetch_size={}, \
+                     buf_start={}, file_size={}, has_stream={}",
+                    offset,
+                    size,
+                    plan.strategy,
+                    plan.fetch_size,
+                    prefetch_state.buf_start,
+                    file_size,
+                    prefetch_state.stream.is_some(),
+                );
 
                 // Start a new stream if this is the first sequential read from offset 0
                 if matches!(plan.strategy, crate::prefetch::FetchStrategy::StartStream) {
@@ -1303,12 +1317,28 @@ impl VirtualFs {
                                     break;
                                 }
                                 Err(e) => {
-                                    error!("prefetch: stream error: {}", e);
+                                    error!(
+                                        "prefetch: stream error at offset={}, got={}/{}: {}",
+                                        offset, total, plan.fetch_size, e
+                                    );
                                     break;
                                 }
                             }
                         }
-                        if !stream_eof {
+                        if stream_eof {
+                            let stream_total = offset + total as u64;
+                            if stream_total < file_size {
+                                warn!(
+                                    "prefetch: stream EOF at offset={} after {} bytes (file_size={}, \
+                                     shortfall={}, hash={})",
+                                    offset,
+                                    total,
+                                    file_size,
+                                    file_size - stream_total,
+                                    prefetch_state.xet_hash,
+                                );
+                            }
+                        } else {
                             prefetch_state.stream = Some(stream);
                         }
                         if total > 0 {
@@ -1318,9 +1348,17 @@ impl VirtualFs {
                             );
                             Some((chunks, total))
                         } else {
+                            warn!(
+                                "prefetch: stream returned 0 bytes at offset={}, strategy={:?}",
+                                offset, plan.strategy,
+                            );
                             None
                         }
                     } else {
+                        warn!(
+                            "prefetch: stream strategy={:?} but no stream at offset={}",
+                            plan.strategy, offset,
+                        );
                         None
                     }
                 } else {
@@ -1335,22 +1373,64 @@ impl VirtualFs {
                     let file_info = XetFileInfo::new(prefetch_state.xet_hash.clone(), prefetch_state.file_size);
 
                     debug!(
-                        "prefetch fetch: offset={}, size={}, window={}",
+                        "prefetch range: offset={}, size={}, window={}",
                         offset, plan.fetch_size, prefetch_state.window_size
                     );
 
-                    match self
-                        .xet_sessions
-                        .download_range_to_vec(&file_info, offset..fetch_end)
-                        .await
-                    {
-                        Ok(vec) => {
-                            let len = vec.len();
-                            let chunk = Bytes::from(vec);
-                            (VecDeque::from([chunk]), len)
+                    // Retry range downloads: CAS range requests can fail transiently
+                    // (network errors, xorb fetch failures). Without retry, a single
+                    // failure causes SIGBUS for mmap or "unexpected EOF" for seeks.
+                    const MAX_RANGE_ATTEMPTS: u32 = 3;
+                    let mut fetch_result = None;
+                    for attempt in 0..MAX_RANGE_ATTEMPTS {
+                        match self
+                            .xet_sessions
+                            .download_range_to_vec(&file_info, offset..fetch_end)
+                            .await
+                        {
+                            Ok(vec) if vec.is_empty() => {
+                                warn!(
+                                    "range download returned empty: offset={}, range={}..{}, attempt={}/{}",
+                                    offset,
+                                    offset,
+                                    fetch_end,
+                                    attempt + 1,
+                                    MAX_RANGE_ATTEMPTS,
+                                );
+                            }
+                            Ok(vec) => {
+                                let len = vec.len();
+                                let expected = (fetch_end - offset) as usize;
+                                if len < expected {
+                                    debug!("range download partial: got={}/{} at offset={}", len, expected, offset,);
+                                }
+                                let chunk = Bytes::from(vec);
+                                fetch_result = Some((VecDeque::from([chunk]), len));
+                                break;
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "range download failed: offset={}, range={}..{}, attempt={}/{}: {}",
+                                    offset,
+                                    offset,
+                                    fetch_end,
+                                    attempt + 1,
+                                    MAX_RANGE_ATTEMPTS,
+                                    e,
+                                );
+                            }
                         }
-                        Err(e) => {
-                            error!("Prefetch range read failed: {}", e);
+                        if attempt + 1 < MAX_RANGE_ATTEMPTS {
+                            tokio::time::sleep(Duration::from_millis(100 * (attempt as u64 + 1))).await;
+                        }
+                    }
+                    match fetch_result {
+                        Some(result) => result,
+                        None => {
+                            error!(
+                                "range download failed after {} attempts: offset={}, range={}..{}, hash={}",
+                                MAX_RANGE_ATTEMPTS, offset, offset, fetch_end, prefetch_state.xet_hash,
+                            );
                             return Err(libc::EIO);
                         }
                     }
@@ -1360,7 +1440,17 @@ impl VirtualFs {
                 prefetch_state.store_fetched(offset, chunks, total);
 
                 // Serve the read from the freshly filled buffer
-                let result = prefetch_state.try_serve_forward(offset, size).unwrap_or_default();
+                let result = match prefetch_state.try_serve_forward(offset, size) {
+                    Some(data) => data,
+                    None => {
+                        error!(
+                            "BUG: try_serve_forward returned None after store_fetched: \
+                             offset={}, size={}, buf_start={}, chunks_len={}, file_size={}",
+                            offset, size, prefetch_state.buf_start, prefetch_state.chunks_len, file_size,
+                        );
+                        Bytes::new()
+                    }
+                };
                 let eof = offset + result.len() as u64 >= file_size;
                 Ok((result, eof))
             }

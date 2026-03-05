@@ -1694,6 +1694,78 @@ fn read_seek_backward() {
     });
 }
 
+/// Range download that fails once then succeeds on retry.
+#[test]
+fn read_range_retry_on_error() {
+    let hub = MockHub::new();
+    let content: Vec<u8> = (0..=255).collect();
+    hub.add_file("data.bin", content.len() as u64, Some("h1"), None);
+    let xet = MockXet::new();
+    xet.add_file("h1", &content);
+    // First range download fails, second succeeds
+    xet.fail_range_downloads(1);
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let attr = vfs.lookup(ROOT_INODE, "data.bin").await.unwrap();
+        let fh = vfs.open(attr.ino, false, false, None).await.unwrap();
+
+        // Read at non-zero offset to force range download (not streaming)
+        let (data, _) = vfs.read(fh, 64, 32).await.unwrap();
+        assert_eq!(data[0], 64);
+        assert_eq!(data.len(), 32);
+
+        vfs.release(fh).await;
+    });
+}
+
+/// Range download that returns empty once then succeeds on retry.
+#[test]
+fn read_range_retry_on_empty() {
+    let hub = MockHub::new();
+    let content: Vec<u8> = (0..=255).collect();
+    hub.add_file("data.bin", content.len() as u64, Some("h2"), None);
+    let xet = MockXet::new();
+    xet.add_file("h2", &content);
+    // First range download returns empty, second succeeds
+    xet.empty_range_downloads(1);
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let attr = vfs.lookup(ROOT_INODE, "data.bin").await.unwrap();
+        let fh = vfs.open(attr.ino, false, false, None).await.unwrap();
+
+        let (data, _) = vfs.read(fh, 64, 32).await.unwrap();
+        assert_eq!(data[0], 64);
+        assert_eq!(data.len(), 32);
+
+        vfs.release(fh).await;
+    });
+}
+
+/// Range download that fails all 3 attempts returns EIO.
+#[test]
+fn read_range_all_retries_exhausted() {
+    let hub = MockHub::new();
+    let content: Vec<u8> = (0..=255).collect();
+    hub.add_file("data.bin", content.len() as u64, Some("h3"), None);
+    let xet = MockXet::new();
+    xet.add_file("h3", &content);
+    // All 3 attempts fail
+    xet.fail_range_downloads(3);
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let attr = vfs.lookup(ROOT_INODE, "data.bin").await.unwrap();
+        let fh = vfs.open(attr.ino, false, false, None).await.unwrap();
+
+        let result = vfs.read(fh, 64, 32).await;
+        assert_eq!(result.unwrap_err(), libc::EIO);
+
+        vfs.release(fh).await;
+    });
+}
+
 // ── advanced write local read/write ─────────────────────────────────
 
 /// Advanced mode write at arbitrary offset (random write).
