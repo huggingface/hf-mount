@@ -1,11 +1,10 @@
 mod common;
 
-const READ_SIZES: &[(usize, &str)] = &[
+const BENCH_SIZES: &[(usize, &str)] = &[
     (50 * 1024 * 1024, "50MB"),
     (200 * 1024 * 1024, "200MB"),
     (500 * 1024 * 1024, "500MB"),
 ];
-const WRITE_SIZE: usize = 500 * 1024 * 1024;
 
 #[tokio::test]
 async fn test_bench() {
@@ -16,7 +15,7 @@ async fn test_bench() {
     };
 
     let mut files: Vec<(String, Vec<u8>)> = Vec::new();
-    for &(size, label) in READ_SIZES {
+    for &(size, label) in BENCH_SIZES {
         let filename = format!("bench_{}.bin", label);
         let data = common::generate_pattern(size);
         let write_config = common::build_write_config(&hub).await;
@@ -50,7 +49,7 @@ async fn test_bench() {
 
     let pid = std::process::id();
 
-    // --- FUSE benchmark ---
+    // --- FUSE benchmark (read + write per size) ---
     let fuse_mount = format!("/tmp/hf-bench-fuse-{}", pid);
     let fuse_cache = format!("/tmp/hf-bench-fuse-cache-{}", pid);
 
@@ -62,15 +61,19 @@ async fn test_bench() {
             reads.push(common::bench::run_read_benchmarks(&fuse_mount, filename, expected));
         }
 
-        let write_result = common::bench::run_write_benchmark(&fuse_mount, WRITE_SIZE);
+        let mut writes = Vec::new();
+        for &(size, _) in BENCH_SIZES {
+            writes.push(common::bench::run_write_benchmark(&fuse_mount, size));
+        }
+
         common::unmount(&fuse_mount, child, 60);
-        (reads, write_result)
+        (reads, writes)
     }));
 
     std::fs::remove_dir_all(&fuse_mount).ok();
     std::fs::remove_dir_all(&fuse_cache).ok();
 
-    // --- NFS benchmark ---
+    // --- NFS benchmark (read only) ---
     let nfs_mount = format!("/tmp/hf-bench-nfs-{}", pid);
     let nfs_cache = format!("/tmp/hf-bench-nfs-cache-{}", pid);
 
@@ -87,28 +90,12 @@ async fn test_bench() {
     std::fs::remove_dir_all(&nfs_mount).ok();
     std::fs::remove_dir_all(&nfs_cache).ok();
 
-    // --- Raw cleaner benchmark ---
-    let raw_mbps = {
-        let write_config = common::build_write_config(&hub).await;
-        let download_session = data::FileDownloadSession::new(write_config.clone(), None, None)
-            .await
-            .expect("download session");
-        let xet_sessions = hf_mount::xet::XetSessions::new(download_session, Some(write_config));
-        match common::bench::run_raw_cleaner_benchmark(&xet_sessions, WRITE_SIZE).await {
-            Ok(mbps) => Some(mbps),
-            Err(e) => {
-                eprintln!("Raw cleaner bench error: {}", e);
-                None
-            }
-        }
-    };
-
     // Cleanup
     common::delete_bucket(&common::endpoint(), &token, &bucket_id).await;
 
     // --- Extract results ---
-    let (fuse_reads, write) = match fuse_result {
-        Ok((reads, w)) => (reads, w),
+    let (fuse_reads, fuse_writes) = match fuse_result {
+        Ok((reads, writes)) => (reads, writes),
         Err(e) => std::panic::resume_unwind(e),
     };
 
@@ -117,13 +104,14 @@ async fn test_bench() {
         Err(e) => std::panic::resume_unwind(e),
     };
 
-    // --- Print comparison tables per size ---
-    for (i, &(_, label)) in READ_SIZES.iter().enumerate() {
+    // --- Print tables per size ---
+    for (i, &(_, label)) in BENCH_SIZES.iter().enumerate() {
         let fuse = fuse_reads[i].as_ref().ok();
         let nfs = nfs_reads[i].as_ref().ok();
+        let write = fuse_writes[i].as_ref().ok();
 
         eprintln!("\n============================================================");
-        eprintln!("  FUSE vs NFS Read Benchmark — {} file", label);
+        eprintln!("  Benchmark — {}", label);
         eprintln!("============================================================");
         eprintln!("  {:30} {:>12} {:>12}", "Metric", "FUSE", "NFS");
         eprintln!("  {:-<30} {:-<12} {:-<12}", "", "", "");
@@ -147,38 +135,31 @@ async fn test_bench() {
             );
         } else {
             if fuse.is_none() {
-                eprintln!("  FUSE: FAILED");
+                eprintln!("  FUSE read: FAILED");
             }
             if nfs.is_none() {
-                eprintln!("  NFS: FAILED");
+                eprintln!("  NFS read: FAILED");
             }
+        }
+
+        if let Some(w) = write {
+            eprintln!("  {:30} {:>9.1} MB/s", "Sequential write (FUSE)", w.write_mbps);
+            eprintln!("  {:30} {:>9.3} s", "Close latency (CAS+Hub)", w.close_secs);
+            eprintln!("  {:30} {:>9.1} MB/s", "Write end-to-end", w.total_mbps);
+            eprintln!("  {:30} {:>9.1} MB/s", "Dedup write", w.dedup_write_mbps);
+            eprintln!("  {:30} {:>9.3} s", "Dedup close latency", w.dedup_close_secs);
+            eprintln!("  {:30} {:>9.1} MB/s", "Dedup end-to-end", w.dedup_total_mbps);
+        } else {
+            eprintln!("  Write: FAILED");
         }
         eprintln!("============================================================");
     }
-
-    // --- Write benchmark table ---
-    eprintln!("\n============================================================");
-    eprintln!("  Write Benchmark — 500 MB");
-    eprintln!("============================================================");
-    if let Ok(ref w) = write {
-        eprintln!("  {:30} {:>9.1} MB/s", "Sequential write", w.write_mbps);
-        eprintln!("  {:30} {:>9.3} s", "Close latency (CAS+Hub)", w.close_secs);
-        eprintln!("  {:30} {:>9.1} MB/s", "Write end-to-end", w.total_mbps);
-        eprintln!("  {:30} {:>9.1} MB/s", "Dedup write (same data)", w.dedup_write_mbps);
-        eprintln!("  {:30} {:>9.3} s", "Dedup close latency", w.dedup_close_secs);
-        eprintln!("  {:30} {:>9.1} MB/s", "Dedup end-to-end", w.dedup_total_mbps);
-    } else {
-        eprintln!("  Write benchmark FAILED");
-    }
-    if let Some(raw) = raw_mbps {
-        eprintln!("  {:30} {:>9.1} MB/s", "Raw add_data() (no FUSE)", raw);
-    }
-    eprintln!("============================================================\n");
+    eprintln!();
 
     // Assertions
-    for (i, &(_, label)) in READ_SIZES.iter().enumerate() {
+    for (i, &(_, label)) in BENCH_SIZES.iter().enumerate() {
         assert!(fuse_reads[i].is_ok(), "FUSE read benchmark failed for {}", label);
         assert!(nfs_reads[i].is_ok(), "NFS read benchmark failed for {}", label);
+        assert!(fuse_writes[i].is_ok(), "Write benchmark failed for {}", label);
     }
-    write.expect("Write benchmark failed");
 }

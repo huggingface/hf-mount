@@ -110,7 +110,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           # Extract all benchmark tables (multiple sections delimited by === lines)
-          TABLES=$(awk '/^  ====/{found=1} found{print} found && /^  ====/ && ++c%2==0{print ""}' bench_output.txt)
+          TABLES=$(awk '/====/{found=1} found{print}' bench_output.txt)
           if [ -z "$TABLES" ]; then
             echo "No benchmark table found in output"
             exit 0
