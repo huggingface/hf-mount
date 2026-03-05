@@ -81,6 +81,143 @@ jobs:
           HF_ENDPOINT: https://huggingface.co
         run: unset HF_TOKEN && cargo test --release --test repo_ops -- --test-threads=1 --nocapture
 
+  pjdfstest:
+    name: POSIX Compliance (pjdfstest)
+    runs-on:
+      group: hf-mount-ci
+    needs: lint-test
+    env:
+      HF_TOKEN: ${{ secrets.HF_TOKEN_HUB_CI }}
+      HF_ENDPOINT: https://hub-ci.huggingface.co
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fuse3 libfuse3-dev autoconf automake gcc make perl
+
+      - name: Build hf-mount
+        run: cargo build --release
+
+      - name: Build pjdfstest
+        run: |
+          git clone --depth 1 https://github.com/pjd/pjdfstest.git /tmp/pjdfstest
+          cd /tmp/pjdfstest
+          autoreconf -ifs
+          ./configure
+          make pjdfstest
+
+      - name: Create bucket and mount
+        run: |
+          BUCKET_ID="pjdfstest-$(date +%s)"
+          echo "BUCKET_ID=$BUCKET_ID" >> "$GITHUB_ENV"
+
+          # Create ephemeral bucket
+          curl -sf -X POST "${HF_ENDPOINT}/api/buckets/${BUCKET_ID}" \
+            -H "Authorization: Bearer ${HF_TOKEN}" \
+            -H "Content-Type: application/json" -d '{}'
+
+          # Mount it
+          echo 'user_allow_other' | sudo tee -a /etc/fuse.conf
+          MOUNT_POINT="/tmp/pjdfs-mount"
+          mkdir -p "$MOUNT_POINT"
+          echo "MOUNT_POINT=$MOUNT_POINT" >> "$GITHUB_ENV"
+
+          sudo -E ./target/release/hf-mount-fuse \
+            --poll-interval-secs 0 --advanced-writes \
+            bucket "$BUCKET_ID" "$MOUNT_POINT" &
+          echo "MOUNT_PID=$!" >> "$GITHUB_ENV"
+
+          # Wait for mount
+          for i in $(seq 1 30); do
+            if mountpoint -q "$MOUNT_POINT" 2>/dev/null; then
+              echo "Mounted at $MOUNT_POINT"
+              break
+            fi
+            sleep 1
+          done
+          mountpoint -q "$MOUNT_POINT" || (echo "Mount failed"; cat /tmp/hf-mount-cache/*.log 2>/dev/null; exit 1)
+
+      - name: Run pjdfstest
+        run: |
+          cd "$MOUNT_POINT"
+          # Run tests, capture output (don't fail the job yet)
+          sudo prove -r /tmp/pjdfstest/tests/ 2>&1 | tee /tmp/pjdfstest-results.txt || true
+
+      - name: Parse and report results
+        if: always()
+        run: |
+          # Extract summary line: "Files=N, Tests=N, ..."
+          SUMMARY=$(grep '^Files=' /tmp/pjdfstest-results.txt || echo "No summary found")
+          echo "## pjdfstest summary"
+          echo "$SUMMARY"
+
+          # Count passed/failed per category
+          echo ""
+          echo "### Per-category results"
+          for dir in /tmp/pjdfstest/tests/*/; do
+            cat=$(basename "$dir")
+            line=$(grep "^/tmp/pjdfstest/tests/${cat}/" /tmp/pjdfstest-results.txt | grep -c "ok$" || true)
+            total=$(grep -c "^/tmp/pjdfstest/tests/${cat}/" /tmp/pjdfstest-results.txt || true)
+            echo "${cat}: ${line}/${total} files passed"
+          done
+
+      - name: Post results on PR
+        if: github.event_name == 'pull_request' && always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          SUMMARY=$(grep '^Files=' /tmp/pjdfstest-results.txt || echo "No summary found")
+          FAILURES=$(grep -A1 'Test Summary Report' /tmp/pjdfstest-results.txt | head -1 || true)
+
+          # Build per-category table
+          TABLE="| Category | Files | Passed | Failed |\n|----------|-------|--------|--------|\n"
+          for dir in /tmp/pjdfstest/tests/*/; do
+            cat=$(basename "$dir")
+            total=$(grep -c "^/tmp/pjdfstest/tests/${cat}/" /tmp/pjdfstest-results.txt 2>/dev/null || echo 0)
+            passed=$(grep "^/tmp/pjdfstest/tests/${cat}/" /tmp/pjdfstest-results.txt 2>/dev/null | grep -c "ok$" || echo 0)
+            failed=$((total - passed))
+            TABLE="${TABLE}| ${cat} | ${total} | ${passed} | ${failed} |\n"
+          done
+
+          PR="${{ github.event.pull_request.number }}"
+          MARKER="<!-- pjdfstest-results -->"
+          BODY="${MARKER}
+          ## POSIX Compliance (pjdfstest)
+
+          \`\`\`
+          ${SUMMARY}
+          \`\`\`
+
+          $(echo -e "$TABLE")
+          "
+
+          COMMENT_ID=$(gh api "repos/${{ github.repository }}/issues/${PR}/comments" \
+            --jq ".[] | select(.body | startswith(\"${MARKER}\")) | .id" | head -1)
+
+          if [ -n "$COMMENT_ID" ]; then
+            gh api "repos/${{ github.repository }}/issues/comments/${COMMENT_ID}" \
+              -X PATCH -f body="$BODY"
+          else
+            gh pr comment "$PR" --body "$BODY"
+          fi
+
+      - name: Cleanup
+        if: always()
+        run: |
+          # Unmount
+          sudo umount -l "$MOUNT_POINT" 2>/dev/null || true
+          kill "$MOUNT_PID" 2>/dev/null || true
+
+          # Delete bucket
+          curl -sf -X DELETE "${HF_ENDPOINT}/api/buckets/${BUCKET_ID}" \
+            -H "Authorization: Bearer ${HF_TOKEN}" || true
+
   bench:
     name: Benchmarks
     runs-on:
