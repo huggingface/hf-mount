@@ -109,22 +109,18 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Extract the benchmark table from output
-          TABLE=$(sed -n '/^  =====/,/^  =====/p' bench_output.txt)
-          if [ -z "$TABLE" ]; then
+          # Extract all benchmark tables (multiple sections delimited by === lines)
+          TABLES=$(awk '/^  ====/{found=1} found{print} found && /^  ====/ && ++c%2==0{print ""}' bench_output.txt)
+          if [ -z "$TABLES" ]; then
             echo "No benchmark table found in output"
             exit 0
           fi
 
-          # Build markdown comment
-          BODY=$(cat <<'HEADER'
+          gh pr comment "${{ github.event.pull_request.number }}" --body "$(cat <<EOF
           ## Benchmark Results
 
-          ```
-          HEADER
-          )
-          BODY="${BODY}
-          ${TABLE}
-          \`\`\`"
-
-          gh pr comment "${{ github.event.pull_request.number }}" --body "$BODY"
+          \`\`\`
+          ${TABLES}
+          \`\`\`
+          EOF
+          )"
