@@ -500,11 +500,12 @@ fn rename_replaces_destination() {
             .unwrap();
 
         // Inode-level check
-        let inodes = vfs.inode_table.read().unwrap();
-        let entry = inodes.get(src_ino).unwrap();
-        assert_eq!(entry.full_path, "dst.txt");
-        assert!(inodes.get(dst_ino).is_none());
-        drop(inodes);
+        {
+            let inodes = vfs.inode_table.read().unwrap();
+            let entry = inodes.get(src_ino).unwrap();
+            assert_eq!(entry.full_path, "dst.txt");
+            assert!(inodes.get(dst_ino).is_none());
+        }
 
         // Lookup-level check: src gone, dst resolves to src_ino
         assert_eq!(vfs.lookup(ROOT_INODE, "src.txt").await.unwrap_err(), libc::ENOENT);
@@ -1477,10 +1478,11 @@ fn open_advanced_write_truncate() {
 
         let fh = vfs.open(ino, true, true, None).await.unwrap();
         // File should be truncated to 0
-        let inodes = vfs.inode_table.read().unwrap();
-        assert_eq!(inodes.get(ino).unwrap().size, 0);
-        assert!(inodes.get(ino).unwrap().dirty);
-        drop(inodes);
+        {
+            let inodes = vfs.inode_table.read().unwrap();
+            assert_eq!(inodes.get(ino).unwrap().size, 0);
+            assert!(inodes.get(ino).unwrap().dirty);
+        }
         vfs.release(fh).await;
     });
 }
@@ -1518,7 +1520,7 @@ fn setattr_truncate_nonzero() {
     let hub = MockHub::new();
     hub.add_file("file.txt", 100, Some("hash1"), None);
     let xet = MockXet::new();
-    xet.add_file("hash1", &vec![b'X'; 100]);
+    xet.add_file("hash1", &[b'X'; 100]);
     let (rt, vfs) = vfs_advanced(&hub, &xet);
 
     rt.block_on(async {

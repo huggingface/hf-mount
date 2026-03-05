@@ -193,7 +193,7 @@ impl HubOps for MockHub {
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent).ok();
         }
-        std::fs::write(dest, b"").map_err(|e| Error::Io(e))?;
+        std::fs::write(dest, b"").map_err(Error::Io)?;
         Ok(())
     }
 

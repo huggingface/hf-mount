@@ -125,6 +125,7 @@ mod tests {
     use tokio::task::JoinSet;
 
     #[derive(Clone, Copy)]
+    #[allow(clippy::enum_variant_names)]
     enum MockMode {
         ReturnSome,
         ReturnNone,
