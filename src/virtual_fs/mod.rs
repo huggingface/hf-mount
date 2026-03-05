@@ -457,7 +457,7 @@ impl VirtualFs {
                 };
                 let mut inodes = self.inode_table.write().expect("inodes poisoned");
                 if changed {
-                    let remote_size = head_info.size.unwrap_or(0);
+                    let remote_size = head_info.size.expect("Hub HEAD response missing X-Linked-Size");
                     let remote_mtime = head_info
                         .last_modified
                         .as_deref()
