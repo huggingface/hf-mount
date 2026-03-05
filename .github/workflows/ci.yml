@@ -64,6 +64,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y fuse3 libfuse3-dev nfs-common
+          echo 'user_allow_other' | sudo tee -a /etc/fuse.conf
 
       - name: Build release binaries
         run: cargo build --release --features nfs
@@ -90,6 +91,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y fuse3 libfuse3-dev nfs-common
+          echo 'user_allow_other' | sudo tee -a /etc/fuse.conf
 
       - name: Build release binaries
         run: cargo build --release --features nfs
