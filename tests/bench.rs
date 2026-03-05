@@ -89,7 +89,7 @@ async fn test_bench() {
     };
 
     // Cleanup bucket
-    common::delete_bucket(common::ENDPOINT, &token, &bucket_id).await;
+    common::delete_bucket(&common::endpoint(), &token, &bucket_id).await;
 
     // --- Extract results ---
     let (fuse, write) = match fuse_result {

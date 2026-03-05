@@ -26,7 +26,7 @@ async fn test_nfs_read_only() {
         r
     }));
 
-    common::delete_bucket(common::ENDPOINT, &token, &bucket_id).await;
+    common::delete_bucket(&common::endpoint(), &token, &bucket_id).await;
     std::fs::remove_dir_all(&mount_point).ok();
     std::fs::remove_dir_all(&cache_dir).ok();
 
@@ -62,7 +62,7 @@ async fn test_nfs_writes() {
     let trunc_size = test_content.find("BBBB_MIDDLE_BBBB").unwrap() as u64;
     let hub_check = common::fs_tests::verify_hub_state(&hub, &remote_file, trunc_size).await;
 
-    common::delete_bucket(common::ENDPOINT, &token, &bucket_id).await;
+    common::delete_bucket(&common::endpoint(), &token, &bucket_id).await;
     std::fs::remove_dir_all(&mount_point).ok();
     std::fs::remove_dir_all(&cache_dir).ok();
 
