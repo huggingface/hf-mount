@@ -16,7 +16,7 @@ pub trait XetOps: Send + Sync {
     async fn create_streaming_writer(&self) -> Result<Box<dyn StreamingWriterOps>>;
     async fn download_to_file(&self, xet_hash: &str, file_size: u64, dest: &Path) -> Result<()>;
     async fn upload_files(&self, paths: &[&Path]) -> Result<Vec<XetFileInfo>>;
-    fn download_stream_boxed(&self, file_info: &XetFileInfo) -> Result<Box<dyn DownloadStreamOps>>;
+    fn download_stream_boxed(&self, file_info: &XetFileInfo, offset: u64) -> Result<Box<dyn DownloadStreamOps>>;
     async fn download_range_to_vec(&self, file_info: &XetFileInfo, range: Range<u64>) -> Result<Vec<u8>>;
 }
 
@@ -49,10 +49,10 @@ impl XetSessions {
         Arc::new(Self { session, upload_config })
     }
 
-    /// Start a streaming download (sync, returns an iterator-like stream).
-    pub fn download_stream(&self, file_info: &XetFileInfo) -> Result<data::DownloadStream> {
+    /// Start a streaming download from a byte offset (sync, returns an iterator-like stream).
+    pub fn download_stream(&self, file_info: &XetFileInfo, offset: u64) -> Result<data::DownloadStream> {
         self.session
-            .download_stream(file_info, None)
+            .download_stream_from_offset(file_info, offset, None)
             .map_err(|e| Error::Xet(e.to_string()))
     }
 
@@ -124,8 +124,8 @@ impl XetOps for XetSessions {
         Ok(results)
     }
 
-    fn download_stream_boxed(&self, file_info: &XetFileInfo) -> Result<Box<dyn DownloadStreamOps>> {
-        let stream = self.download_stream(file_info)?;
+    fn download_stream_boxed(&self, file_info: &XetFileInfo, offset: u64) -> Result<Box<dyn DownloadStreamOps>> {
+        let stream = self.download_stream(file_info, offset)?;
         Ok(Box::new(DownloadStreamWrapper(stream)))
     }
 

@@ -313,12 +313,12 @@ impl XetOps for MockXet {
         Ok(results)
     }
 
-    fn download_stream_boxed(&self, file_info: &XetFileInfo) -> Result<Box<dyn DownloadStreamOps>> {
+    fn download_stream_boxed(&self, file_info: &XetFileInfo, offset: u64) -> Result<Box<dyn DownloadStreamOps>> {
         let files = self.files.lock().unwrap();
         let content = files.get(file_info.hash()).cloned().unwrap_or_default();
         Ok(Box::new(MockDownloadStream {
             data: content,
-            offset: 0,
+            offset: offset as usize,
             chunk_size: 4096,
         }))
     }
