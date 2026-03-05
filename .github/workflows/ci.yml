@@ -64,12 +64,18 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y fuse3 libfuse3-dev nfs-common
+          echo 'user_allow_other' | sudo tee -a /etc/fuse.conf
 
       - name: Build release binaries
         run: cargo build --release --features nfs
 
-      - name: Integration tests
-        run: cargo test --release --test fuse_ops --test repo_ops --test nfs_ops -- --test-threads=1 --nocapture
+      - name: Integration tests (buckets)
+        run: cargo test --release --test fuse_ops --test nfs_ops -- --test-threads=1 --nocapture
+
+      - name: Integration tests (repo mount)
+        env:
+          HF_ENDPOINT: https://huggingface.co
+        run: unset HF_TOKEN && cargo test --release --test repo_ops -- --test-threads=1 --nocapture
 
   bench:
     name: Benchmarks
@@ -90,6 +96,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y fuse3 libfuse3-dev nfs-common
+          echo 'user_allow_other' | sudo tee -a /etc/fuse.conf
 
       - name: Build release binaries
         run: cargo build --release --features nfs
