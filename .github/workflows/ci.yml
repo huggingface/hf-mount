@@ -117,10 +117,16 @@ jobs:
           BUCKET_ID="pjdfstest-$(date +%s)"
           echo "BUCKET_ID=$BUCKET_ID" >> "$GITHUB_ENV"
 
-          # Create ephemeral bucket
-          curl -sf -X POST "${HF_ENDPOINT}/api/buckets/${BUCKET_ID}" \
+          # Create ephemeral bucket (ignore 409 = already exists)
+          HTTP_CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+            "${HF_ENDPOINT}/api/buckets/${BUCKET_ID}" \
             -H "Authorization: Bearer ${HF_TOKEN}" \
-            -H "Content-Type: application/json" -d '{}'
+            -H "Content-Type: application/json" -d '{}')
+          if [ "$HTTP_CODE" -ne 200 ] && [ "$HTTP_CODE" -ne 409 ]; then
+            echo "Bucket creation failed with HTTP $HTTP_CODE"
+            exit 1
+          fi
+          echo "Bucket $BUCKET_ID ready (HTTP $HTTP_CODE)"
 
           # Mount it
           echo 'user_allow_other' | sudo tee -a /etc/fuse.conf
