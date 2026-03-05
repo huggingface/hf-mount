@@ -116,18 +116,30 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Extract all benchmark tables (multiple sections delimited by === lines)
           TABLES=$(awk '/====/{found=1} found{print}' bench_output.txt)
           if [ -z "$TABLES" ]; then
             echo "No benchmark table found in output"
             exit 0
           fi
 
-          gh pr comment "${{ github.event.pull_request.number }}" --body "$(cat <<EOF
+          PR="${{ github.event.pull_request.number }}"
+          MARKER="<!-- bench-results -->"
+          BODY="${MARKER}
           ## Benchmark Results
 
           \`\`\`
           ${TABLES}
-          \`\`\`
-          EOF
-          )"
+          \`\`\`"
+
+          # Find existing comment with our marker
+          COMMENT_ID=$(gh api "repos/${{ github.repository }}/issues/${PR}/comments" \
+            --jq ".[] | select(.body | startswith(\"${MARKER}\")) | .id" | head -1)
+
+          if [ -n "$COMMENT_ID" ]; then
+            gh api "repos/${{ github.repository }}/issues/comments/${COMMENT_ID}" \
+              -X PATCH -f body="$BODY"
+            echo "Updated existing comment $COMMENT_ID"
+          else
+            gh pr comment "$PR" --body "$BODY"
+            echo "Created new comment"
+          fi
