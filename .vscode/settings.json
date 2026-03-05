@@ -3,5 +3,5 @@
   "[rust]": {
     "editor.defaultFormatter": "rust-lang.rust-analyzer"
   },
-  "rust-analyzer.cargo.features": ["nfs"]
+  "rust-analyzer.cargo.features": "all"
 }

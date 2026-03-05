@@ -44,7 +44,7 @@ jobs:
         run: cargo +nightly fmt --check
 
       - name: Clippy
-        run: cargo clippy --features nfs -- -D warnings
+        run: cargo clippy -- -D warnings
 
       - name: Unit tests
         run: cargo test --lib
@@ -71,7 +71,7 @@ jobs:
           echo 'user_allow_other' | sudo tee -a /etc/fuse.conf
 
       - name: Build release binaries
-        run: cargo build --release --features nfs
+        run: cargo build --release
 
       - name: Integration tests (buckets)
         run: cargo test --release --test fuse_ops --test nfs_ops -- --test-threads=1 --nocapture
@@ -103,7 +103,7 @@ jobs:
           echo 'user_allow_other' | sudo tee -a /etc/fuse.conf
 
       - name: Build release binaries
-        run: cargo build --release --features nfs
+        run: cargo build --release
 
       - name: Install fio
         run: sudo apt-get install -y fio

@@ -30,7 +30,7 @@ async-trait = "0.1"
 bytes = "1"
 chrono = "0.4"
 uuid = { version = "1", features = ["v4"] }
-nfsserve = { version = "0.10", optional = true }
+nfsserve = "0.10"
 
 [[bin]]
 name = "hf-mount-fuse"
@@ -39,7 +39,3 @@ path = "src/bin/hf-mount-fuse.rs"
 [[bin]]
 name = "hf-mount-nfs"
 path = "src/bin/hf-mount-nfs.rs"
-required-features = ["nfs"]
-
-[features]
-nfs = ["dep:nfsserve"]

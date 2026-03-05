@@ -287,8 +287,7 @@ pub fn mount_bucket_nfs(bucket_id: &str, mount_point: &str, cache_dir: &str, ext
     eprintln!("Mounting NFS with binary: {:?}", binary);
 
     if !binary.exists() {
-        eprintln!("NFS binary not found (build with --features nfs)");
-        panic!("hf-mount-nfs binary not found");
+        panic!("hf-mount-nfs binary not found, run cargo build --release first");
     }
 
     std::fs::create_dir_all(mount_point).ok();
