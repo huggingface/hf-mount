@@ -101,6 +101,11 @@ pub struct Args {
     /// within this time regardless of ongoing writes resetting the debounce.
     #[arg(long, default_value_t = 30_000)]
     pub flush_max_batch_window_ms: u64,
+
+    /// Disable filtering of OS junk files (.DS_Store, Thumbs.db, etc.).
+    /// By default these files are rejected on create/mkdir/rename.
+    #[arg(long, default_value_t = false)]
+    pub no_filter_os_files: bool,
 }
 
 /// Everything needed to run a mount backend (FUSE or NFS).
@@ -259,6 +264,7 @@ pub fn setup(is_nfs: bool) -> MountSetup {
         args.poll_interval_secs,
         metadata_ttl,
         !args.metadata_ttl_minimal,
+        !args.no_filter_os_files,
         std::time::Duration::from_millis(args.flush_debounce_ms),
         std::time::Duration::from_millis(args.flush_max_batch_window_ms),
     );

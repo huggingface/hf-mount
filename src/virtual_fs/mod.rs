@@ -29,6 +29,14 @@ type Invalidator = Arc<Mutex<Option<Box<dyn Fn(u64) + Send + Sync>>>>;
 type CommitHookTx = tokio::sync::watch::Sender<Option<Result<(), i32>>>;
 type CommitHookRx = tokio::sync::watch::Receiver<Option<Result<(), i32>>>;
 
+/// Returns `true` for OS-generated junk files that should not be synced to remote storage.
+fn is_os_junk(name: &str) -> bool {
+    matches!(
+        name,
+        ".DS_Store" | ".Spotlight-V100" | ".Trashes" | ".fseventsd" | "__MACOSX" | "Thumbs.db" | "desktop.ini"
+    ) || name.starts_with("._")
+}
+
 // ── VirtualFs ──────────────────────────────────────────────────────────
 
 pub struct VirtualFs {
@@ -66,6 +74,8 @@ pub struct VirtualFs {
     /// of `last_revalidated`.
     /// When true, lookups within the metadata TTL window skip HEAD.
     serve_lookup_from_cache: bool,
+    /// When true, reject creation of OS junk files (.DS_Store, Thumbs.db, etc.).
+    filter_os_files: bool,
 }
 
 /// Where to read file content from when opening read-only.
@@ -83,6 +93,7 @@ impl VirtualFs {
         poll_interval_secs: u64,
         metadata_ttl: Duration,
         serve_lookup_from_cache: bool,
+        filter_os_files: bool,
         flush_debounce: Duration,
         flush_max_batch_window: Duration,
     ) -> Arc<Self> {
@@ -146,6 +157,7 @@ impl VirtualFs {
             invalidator,
             metadata_ttl,
             serve_lookup_from_cache,
+            filter_os_files,
         });
 
         // Set root inode mtime (repos use the last commit date).
@@ -1728,6 +1740,10 @@ impl VirtualFs {
         if self.read_only {
             return Err(libc::EROFS);
         }
+        if self.filter_os_files && is_os_junk(name) {
+            debug!("create: rejecting OS junk file: {}", name);
+            return Err(libc::EACCES);
+        }
 
         debug!("create: parent={}, name={}", parent, name);
 
@@ -1835,6 +1851,10 @@ impl VirtualFs {
     pub async fn mkdir(&self, parent: u64, name: &str) -> VirtualFsResult<VirtualFsAttr> {
         if self.read_only {
             return Err(libc::EROFS);
+        }
+        if self.filter_os_files && is_os_junk(name) {
+            debug!("mkdir: rejecting OS junk directory: {}", name);
+            return Err(libc::EACCES);
         }
 
         debug!("mkdir: parent={}, name={}", parent, name);
@@ -1980,6 +2000,10 @@ impl VirtualFs {
     ) -> VirtualFsResult<()> {
         if self.read_only {
             return Err(libc::EROFS);
+        }
+        if self.filter_os_files && is_os_junk(newname) {
+            debug!("rename: rejecting rename to OS junk name: {}", newname);
+            return Err(libc::EACCES);
         }
 
         debug!(
