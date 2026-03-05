@@ -1258,58 +1258,38 @@ impl VirtualFs {
                 // Maximum bytes we should return (capped at file boundary).
                 let to_read = ((size as u64).min(file_size - offset)) as usize;
 
-                // Fast path: forward buffer has enough data (common case, zero-copy).
                 // IMPORTANT: Never return a short read unless at real EOF.
                 // The Linux FUSE kernel module shrinks i_size on short reads
                 // (fuse_read_update_size), which makes subsequent reads return
                 // 0 bytes and truncates the file from the application's view.
-                if let Some(data) = prefetch_state.try_serve_forward(offset, size)
-                    && data.len() == to_read
-                {
-                    debug!("prefetch hit (forward): offset={}, len={}", offset, data.len());
-                    let eof = offset + data.len() as u64 >= file_size;
-                    return Ok((data, eof));
-                }
 
-                // Seek window fast path (also zero-copy)
-                if let Some(data) = prefetch_state.try_serve_seek(offset, size)
-                    && data.len() == to_read
-                {
-                    debug!("prefetch hit (seek): offset={}, len={}", offset, data.len());
-                    let eof = offset + data.len() as u64 >= file_size;
-                    return Ok((data, eof));
-                }
-
-                // Assembly loop: serve available bytes, fetch more, repeat.
-                // Only reached at prefetch window boundaries or cache misses.
                 let mut response = BytesMut::with_capacity(to_read);
                 let mut cursor = offset;
 
-                loop {
-                    // Drain forward buffer into response
-                    let remaining = (to_read - response.len()) as u32;
-                    if let Some(data) = prefetch_state.try_serve_forward(cursor, remaining) {
-                        cursor += data.len() as u64;
-                        response.extend_from_slice(&data);
-                        if response.len() == to_read {
-                            break;
-                        }
+                // Fast path: forward buffer has enough data (common case, zero-copy).
+                if let Some(data) = prefetch_state.try_serve_forward(offset, size) {
+                    if data.len() == to_read {
+                        debug!("prefetch hit (forward): offset={}, len={}", offset, data.len());
+                        let eof = offset + data.len() as u64 >= file_size;
+                        return Ok((data, eof));
                     }
-
-                    // Also try seek window; if it produces data, loop back to
-                    // retry try_serve_forward at the new cursor before fetching.
-                    if response.len() < to_read {
-                        let remaining = (to_read - response.len()) as u32;
-                        if let Some(data) = prefetch_state.try_serve_seek(cursor, remaining) {
-                            cursor += data.len() as u64;
-                            response.extend_from_slice(&data);
-                            if response.len() == to_read {
-                                break;
-                            }
-                            continue;
-                        }
+                    cursor += data.len() as u64;
+                    response.extend_from_slice(&data);
+                } else if let Some(data) = prefetch_state.try_serve_seek(offset, size) {
+                    // Seek window: only reachable when forward buffer has no data
+                    // at this offset (backward seek). Zero-copy on full hit.
+                    if data.len() == to_read {
+                        debug!("prefetch hit (seek): offset={}, len={}", offset, data.len());
+                        let eof = offset + data.len() as u64 >= file_size;
+                        return Ok((data, eof));
                     }
+                    cursor += data.len() as u64;
+                    response.extend_from_slice(&data);
+                }
 
+                // Assembly loop: fetch more data until we have to_read bytes.
+                // Only reached at prefetch window boundaries or cache misses.
+                while response.len() < to_read {
                     // Fetch more data
                     let remaining = (to_read - response.len()) as u32;
                     let plan = prefetch_state.prepare_fetch(cursor, remaining);
@@ -1334,6 +1314,7 @@ impl VirtualFs {
                                 prefetch_state.stream = Some(stream);
                             }
                             Err(e) => {
+                                // Not fatal: falls through to range download below
                                 warn!("prefetch: stream start failed: {}", e);
                             }
                         }
@@ -1478,7 +1459,7 @@ impl VirtualFs {
                         }
                     };
 
-                    // Store fetched chunks and loop back to drain them
+                    // Store fetched chunks
                     prefetch_state.store_fetched(cursor, chunks, total);
 
                     // No-progress guard: return EIO rather than a short read
@@ -1493,6 +1474,13 @@ impl VirtualFs {
                             prefetch_state.xet_hash,
                         );
                         return Err(libc::EIO);
+                    }
+
+                    // Drain freshly filled buffer into response
+                    let remaining = (to_read - response.len()) as u32;
+                    if let Some(data) = prefetch_state.try_serve_forward(cursor, remaining) {
+                        cursor += data.len() as u64;
+                        response.extend_from_slice(&data);
                     }
                 }
 
