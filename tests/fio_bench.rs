@@ -193,7 +193,7 @@ async fn test_fio_compare() {
     std::fs::remove_dir_all(&nfs_cache).ok();
 
     // Cleanup
-    common::delete_bucket(common::ENDPOINT, &token, &bucket_id).await;
+    common::delete_bucket(&common::endpoint(), &token, &bucket_id).await;
 
     if let Err(e) = fuse_result {
         std::panic::resume_unwind(e);

@@ -11,7 +11,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use data::{FileUploadSession, XetFileInfo};
 use reqwest::Client;
 
-pub const ENDPOINT: &str = "https://huggingface.co";
+pub fn endpoint() -> String {
+    std::env::var("HF_ENDPOINT").unwrap_or_else(|_| "https://huggingface.co".to_string())
+}
 
 /// Create a bucket and return (token, bucket_id, hub). Returns None if HF_TOKEN not set.
 /// Use this for multi-file setups (e.g. fio benchmarks) where you upload files yourself.
@@ -24,13 +26,14 @@ pub async fn setup_bucket(test_name: &str) -> Option<(String, String, Arc<hf_mou
         }
     };
 
-    let username = whoami(ENDPOINT, &token).await;
+    let ep = endpoint();
+    let username = whoami(&ep, &token).await;
     let bucket_id = format!("{}/hf-mount-{}-{}", username, test_name, std::process::id());
 
-    create_bucket(ENDPOINT, &token, &bucket_id).await;
+    create_bucket(&ep, &token, &bucket_id).await;
     eprintln!("Created bucket: {}", bucket_id);
 
-    let hub = hf_mount::hub_api::HubApiClient::new(ENDPOINT, Some(&token), &bucket_id);
+    let hub = hf_mount::hub_api::HubApiClient::new(&ep, Some(&token), &bucket_id);
     Some((token, bucket_id, hub))
 }
 
@@ -188,10 +191,13 @@ pub fn mount_bucket(bucket_id: &str, mount_point: &str, cache_dir: &str, extra_a
     std::fs::create_dir_all(mount_point).ok();
     std::fs::create_dir_all(cache_dir).ok();
 
+    let ep = endpoint();
     let child = Command::new(binary)
         .args([
             "--hf-token",
             &token,
+            "--hub-endpoint",
+            &ep,
             "--cache-dir",
             cache_dir,
             "--poll-interval-secs",
@@ -233,10 +239,13 @@ pub fn mount_repo(repo_id: &str, mount_point: &str, cache_dir: &str, extra_args:
     std::fs::create_dir_all(mount_point).ok();
     std::fs::create_dir_all(cache_dir).ok();
 
+    let ep = endpoint();
     let child = Command::new(binary)
         .args([
             "--hf-token",
             &token,
+            "--hub-endpoint",
+            &ep,
             "--cache-dir",
             cache_dir,
             "--poll-interval-secs",
@@ -283,10 +292,13 @@ pub fn mount_bucket_nfs(bucket_id: &str, mount_point: &str, cache_dir: &str, ext
     std::fs::create_dir_all(mount_point).ok();
     std::fs::create_dir_all(cache_dir).ok();
 
+    let ep = endpoint();
     let child = Command::new(binary)
         .args([
             "--hf-token",
             &token,
+            "--hub-endpoint",
+            &ep,
             "--cache-dir",
             cache_dir,
             "--poll-interval-secs",
