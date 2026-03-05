@@ -414,7 +414,15 @@ pub fn mount_fuse(
     let session = match fuser::Session::new(adapter, mount_point, &config) {
         Ok(s) => s,
         Err(e) => {
-            error!("FUSE session failed: {}", e);
+            if e.kind() == std::io::ErrorKind::PermissionDenied {
+                error!(
+                    "Permission denied: mounting a FUSE filesystem requires root privileges. \
+                     Try running with: sudo {}",
+                    std::env::args().collect::<Vec<_>>().join(" ")
+                );
+            } else {
+                error!("FUSE session failed: {}", e);
+            }
             std::process::exit(1);
         }
     };
