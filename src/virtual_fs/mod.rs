@@ -457,10 +457,7 @@ impl VirtualFs {
                 };
                 let mut inodes = self.inode_table.write().expect("inodes poisoned");
                 if changed {
-                    // Use remote size from HEAD, falling back to existing inode size
-                    // when the response lacks x-linked-size (avoids clobbering with 0).
-                    let existing_size = inodes.get(ino).map(|e| e.size).unwrap_or(0);
-                    let remote_size = head_info.size.unwrap_or(existing_size);
+                    let remote_size = head_info.size.unwrap_or(0);
                     let remote_mtime = head_info
                         .last_modified
                         .as_deref()
