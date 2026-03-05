@@ -647,6 +647,40 @@ fn concurrent_create_eexist() {
     });
 }
 
+// ── OS junk file filtering ──────────────────────────────────────────
+
+/// create/mkdir/rename reject OS junk file names with EACCES.
+#[test]
+fn os_junk_files_rejected() {
+    let hub = MockHub::new();
+    hub.add_file("legit.txt", 10, Some("h"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        for name in [".DS_Store", "._metadata", "Thumbs.db", "desktop.ini", "__MACOSX"] {
+            assert_eq!(
+                vfs.create(ROOT_INODE, name, Some(1)).await.unwrap_err(),
+                libc::EACCES,
+                "create({name})"
+            );
+            assert_eq!(
+                vfs.mkdir(ROOT_INODE, name).await.unwrap_err(),
+                libc::EACCES,
+                "mkdir({name})"
+            );
+        }
+        // rename to a junk destination name is also blocked
+        let _ = vfs.lookup(ROOT_INODE, "legit.txt").await.unwrap();
+        assert_eq!(
+            vfs.rename(ROOT_INODE, "legit.txt", ROOT_INODE, ".DS_Store", false)
+                .await
+                .unwrap_err(),
+            libc::EACCES
+        );
+    });
+}
+
 // ── Lookup / revalidation / poll ────────────────────────────────────
 
 /// HEAD failure is silently ignored (graceful degradation, cached data served).
