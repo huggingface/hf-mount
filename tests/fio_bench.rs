@@ -94,6 +94,60 @@ fn run_fio_suite(mount_point: &str) {
             "normal",
         ],
     );
+
+    run_fio(
+        mount_point,
+        "seq-read-500M",
+        &[
+            "--filename",
+            "xlarge_0.bin",
+            "--rw",
+            "read",
+            "--bs",
+            "128k",
+            "--ioengine",
+            "sync",
+            "--output-format",
+            "normal",
+        ],
+    );
+
+    run_fio(
+        mount_point,
+        "seq-reread-500M",
+        &[
+            "--filename",
+            "xlarge_0.bin",
+            "--rw",
+            "read",
+            "--bs",
+            "128k",
+            "--ioengine",
+            "sync",
+            "--output-format",
+            "normal",
+        ],
+    );
+
+    run_fio(
+        mount_point,
+        "rand-read-500M",
+        &[
+            "--filename",
+            "xlarge_0.bin",
+            "--rw",
+            "randread",
+            "--bs",
+            "4k",
+            "--ioengine",
+            "sync",
+            "--runtime",
+            "10",
+            "--time_based",
+            "--output-format",
+            "normal",
+        ],
+    );
 }
 
 #[tokio::test]
@@ -126,6 +180,7 @@ async fn test_fio_compare() {
         .map(|i| (format!("small_{}.bin", i), 1024 * 1024))
         .chain((0..5).map(|i| (format!("medium_{}.bin", i), 10 * 1024 * 1024)))
         .chain(std::iter::once(("large_0.bin".to_string(), 100 * 1024 * 1024)))
+        .chain(std::iter::once(("xlarge_0.bin".to_string(), 500 * 1024 * 1024)))
         .collect();
 
     let total_mb: usize = file_specs.iter().map(|(_, s)| s).sum::<usize>() / (1024 * 1024);
