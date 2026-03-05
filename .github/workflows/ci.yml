@@ -114,7 +114,10 @@ jobs:
 
       - name: Create bucket and mount
         run: |
-          BUCKET_ID="pjdfstest-$(date +%s)"
+          # Resolve username for bucket namespace
+          USERNAME=$(curl -sf "${HF_ENDPOINT}/api/whoami-v2" \
+            -H "Authorization: Bearer ${HF_TOKEN}" | jq -r '.name')
+          BUCKET_ID="${USERNAME}/pjdfstest-$(date +%s)"
           echo "BUCKET_ID=$BUCKET_ID" >> "$GITHUB_ENV"
 
           # Create ephemeral bucket (ignore 409 = already exists)
