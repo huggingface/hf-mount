@@ -457,7 +457,8 @@ impl VirtualFs {
                 };
                 let mut inodes = self.inode_table.write().expect("inodes poisoned");
                 if changed {
-                    let remote_size = head_info.size.expect("Hub HEAD response missing X-Linked-Size");
+                    let current_size = inodes.get(ino).map_or(0, |e| e.size);
+                    let remote_size = head_info.size.unwrap_or(current_size);
                     let remote_mtime = head_info
                         .last_modified
                         .as_deref()
@@ -1255,239 +1256,249 @@ impl VirtualFs {
                     return Ok((Bytes::new(), true));
                 }
 
-                // Try forward buffer (zero-copy when read fits in one chunk).
+                // Maximum bytes we should return (capped at file boundary).
+                let to_read = ((size as u64).min(file_size - offset)) as usize;
+
+                // Fast path: forward buffer has enough data (common case, zero-copy).
                 // IMPORTANT: Never return a short read unless at real EOF.
                 // The Linux FUSE kernel module shrinks i_size on short reads
                 // (fuse_read_update_size), which makes subsequent reads return
                 // 0 bytes and truncates the file from the application's view.
-                if let Some(data) = prefetch_state.try_serve_forward(offset, size) {
-                    let at_eof = offset + data.len() as u64 >= file_size;
-                    if data.len() >= size as usize || at_eof {
-                        debug!("prefetch hit (forward): offset={}, len={}", offset, data.len());
-                        return Ok((data, at_eof));
-                    }
-                    // Buffer has data but not enough — fall through to fetch more
-                    debug!(
-                        "prefetch partial (forward): offset={}, have={}, need={}, fetching more",
-                        offset,
-                        data.len(),
-                        size,
-                    );
+                if let Some(data) = prefetch_state.try_serve_forward(offset, size)
+                    && data.len() >= to_read
+                {
+                    debug!("prefetch hit (forward): offset={}, len={}", offset, data.len());
+                    let eof = offset + data.len() as u64 >= file_size;
+                    return Ok((data, eof));
                 }
 
-                // Try seek window (same short-read protection)
-                if let Some(data) = prefetch_state.try_serve_seek(offset, size) {
-                    let at_eof = offset + data.len() as u64 >= file_size;
-                    if data.len() >= size as usize || at_eof {
-                        debug!("prefetch hit (seek): offset={}, len={}", offset, data.len());
-                        return Ok((data, at_eof));
-                    }
-                    debug!(
-                        "prefetch partial (seek): offset={}, have={}, need={}, fetching more",
-                        offset,
-                        data.len(),
-                        size,
-                    );
+                // Seek window fast path (also zero-copy)
+                if let Some(data) = prefetch_state.try_serve_seek(offset, size)
+                    && data.len() >= to_read
+                {
+                    debug!("prefetch hit (seek): offset={}, len={}", offset, data.len());
+                    let eof = offset + data.len() as u64 >= file_size;
+                    return Ok((data, eof));
                 }
 
-                // Cache miss — drain, classify access pattern, adjust window
-                let plan = prefetch_state.prepare_fetch(offset, size);
-                debug!(
-                    "prefetch miss: offset={}, size={}, strategy={:?}, fetch_size={}, \
-                     buf_start={}, file_size={}, has_stream={}",
-                    offset,
-                    size,
-                    plan.strategy,
-                    plan.fetch_size,
-                    prefetch_state.buf_start,
-                    file_size,
-                    prefetch_state.stream.is_some(),
-                );
+                // Assembly loop: serve available bytes, fetch more, repeat.
+                // Only reached at prefetch window boundaries or cache misses.
+                let mut response = BytesMut::with_capacity(to_read);
+                let mut cursor = offset;
 
-                // Start a new stream if this is the first sequential read from offset 0
-                if matches!(plan.strategy, crate::prefetch::FetchStrategy::StartStream) {
-                    let xet_file_info = XetFileInfo::new(prefetch_state.xet_hash.clone(), prefetch_state.file_size);
-                    match self.xet_sessions.download_stream_boxed(&xet_file_info) {
-                        Ok(stream) => {
-                            debug!("prefetch: started full-file stream");
-                            prefetch_state.stream = Some(stream);
-                        }
-                        Err(e) => {
-                            warn!("prefetch: stream start failed: {}", e);
+                loop {
+                    // Drain forward buffer into response
+                    let remaining = (to_read - response.len()) as u32;
+                    if let Some(data) = prefetch_state.try_serve_forward(cursor, remaining) {
+                        cursor += data.len() as u64;
+                        response.extend_from_slice(&data);
+                        if response.len() >= to_read {
+                            break;
                         }
                     }
-                }
 
-                // Try reading from the stream for sequential access
-                let new_chunks = if plan.strategy.is_stream() {
-                    if let Some(mut stream) = prefetch_state.stream.take() {
-                        let mut chunks = VecDeque::new();
-                        let mut total = 0usize;
-                        let mut stream_eof = false;
-                        while (total as u64) < plan.fetch_size {
-                            match stream.next().await {
-                                Ok(Some(chunk)) => {
-                                    total += chunk.len();
-                                    chunks.push_back(chunk);
+                    // Also try seek window; if it produces data, loop back to
+                    // retry try_serve_forward at the new cursor before fetching.
+                    if response.len() < to_read {
+                        let remaining = (to_read - response.len()) as u32;
+                        if let Some(data) = prefetch_state.try_serve_seek(cursor, remaining) {
+                            cursor += data.len() as u64;
+                            response.extend_from_slice(&data);
+                            if response.len() >= to_read {
+                                break;
+                            }
+                            continue;
+                        }
+                    }
+
+                    // Fetch more data
+                    let remaining = (to_read - response.len()) as u32;
+                    let plan = prefetch_state.prepare_fetch(cursor, remaining);
+                    debug!(
+                        "prefetch miss: cursor={}, remaining={}, strategy={:?}, fetch_size={}, \
+                         buf_start={}, file_size={}, has_stream={}",
+                        cursor,
+                        remaining,
+                        plan.strategy,
+                        plan.fetch_size,
+                        prefetch_state.buf_start,
+                        file_size,
+                        prefetch_state.stream.is_some(),
+                    );
+
+                    // Start a new stream if this is the first sequential read from offset 0
+                    if matches!(plan.strategy, crate::prefetch::FetchStrategy::StartStream) {
+                        let xet_file_info = XetFileInfo::new(prefetch_state.xet_hash.clone(), prefetch_state.file_size);
+                        match self.xet_sessions.download_stream_boxed(&xet_file_info) {
+                            Ok(stream) => {
+                                debug!("prefetch: started full-file stream");
+                                prefetch_state.stream = Some(stream);
+                            }
+                            Err(e) => {
+                                warn!("prefetch: stream start failed: {}", e);
+                            }
+                        }
+                    }
+
+                    // Try reading from the stream for sequential access
+                    let new_chunks = if plan.strategy.is_stream() {
+                        if let Some(mut stream) = prefetch_state.stream.take() {
+                            let mut chunks = VecDeque::new();
+                            let mut total = 0usize;
+                            let mut stream_eof = false;
+                            while (total as u64) < plan.fetch_size {
+                                match stream.next().await {
+                                    Ok(Some(chunk)) => {
+                                        total += chunk.len();
+                                        chunks.push_back(chunk);
+                                    }
+                                    Ok(None) => {
+                                        stream_eof = true;
+                                        break;
+                                    }
+                                    Err(e) => {
+                                        error!(
+                                            "prefetch: stream error at cursor={}, got={}/{}: {}",
+                                            cursor, total, plan.fetch_size, e
+                                        );
+                                        break;
+                                    }
                                 }
-                                Ok(None) => {
-                                    stream_eof = true;
-                                    break;
-                                }
-                                Err(e) => {
-                                    error!(
-                                        "prefetch: stream error at offset={}, got={}/{}: {}",
-                                        offset, total, plan.fetch_size, e
+                            }
+                            if stream_eof {
+                                let stream_total = cursor + total as u64;
+                                if stream_total < file_size {
+                                    warn!(
+                                        "prefetch: stream EOF at cursor={} after {} bytes (file_size={}, \
+                                         shortfall={}, hash={})",
+                                        cursor,
+                                        total,
+                                        file_size,
+                                        file_size - stream_total,
+                                        prefetch_state.xet_hash,
                                     );
-                                    break;
                                 }
+                            } else {
+                                prefetch_state.stream = Some(stream);
                             }
-                        }
-                        if stream_eof {
-                            let stream_total = offset + total as u64;
-                            if stream_total < file_size {
-                                warn!(
-                                    "prefetch: stream EOF at offset={} after {} bytes (file_size={}, \
-                                     shortfall={}, hash={})",
-                                    offset,
-                                    total,
-                                    file_size,
-                                    file_size - stream_total,
-                                    prefetch_state.xet_hash,
+                            if total > 0 {
+                                debug!(
+                                    "prefetch stream: cursor={}, got={}, window={}",
+                                    cursor, total, prefetch_state.window_size
                                 );
+                                Some((chunks, total))
+                            } else {
+                                warn!(
+                                    "prefetch: stream returned 0 bytes at cursor={}, strategy={:?}",
+                                    cursor, plan.strategy,
+                                );
+                                None
                             }
-                        } else {
-                            prefetch_state.stream = Some(stream);
-                        }
-                        if total > 0 {
-                            debug!(
-                                "prefetch stream: offset={}, got={}, window={}",
-                                offset, total, prefetch_state.window_size
-                            );
-                            Some((chunks, total))
                         } else {
                             warn!(
-                                "prefetch: stream returned 0 bytes at offset={}, strategy={:?}",
-                                offset, plan.strategy,
+                                "prefetch: stream strategy={:?} but no stream at cursor={}",
+                                plan.strategy, cursor,
                             );
                             None
                         }
                     } else {
-                        warn!(
-                            "prefetch: stream strategy={:?} but no stream at offset={}",
-                            plan.strategy, offset,
-                        );
                         None
-                    }
-                } else {
-                    None
-                };
+                    };
 
-                // Fall back to range download if streaming wasn't used
-                let (chunks, total) = if let Some(fetched) = new_chunks {
-                    fetched
-                } else {
-                    let fetch_end = offset + plan.fetch_size;
-                    let file_info = XetFileInfo::new(prefetch_state.xet_hash.clone(), prefetch_state.file_size);
+                    // Fall back to range download if streaming wasn't used
+                    let (chunks, total) = if let Some(fetched) = new_chunks {
+                        fetched
+                    } else {
+                        let fetch_end = cursor + plan.fetch_size;
+                        let file_info = XetFileInfo::new(prefetch_state.xet_hash.clone(), prefetch_state.file_size);
 
-                    debug!(
-                        "prefetch range: offset={}, size={}, window={}",
-                        offset, plan.fetch_size, prefetch_state.window_size
-                    );
+                        debug!(
+                            "prefetch range: cursor={}, size={}, window={}",
+                            cursor, plan.fetch_size, prefetch_state.window_size
+                        );
 
-                    // Retry range downloads: CAS range requests can fail transiently
-                    // (network errors, xorb fetch failures). Without retry, a single
-                    // failure causes SIGBUS for mmap or "unexpected EOF" for seeks.
-                    const MAX_RANGE_ATTEMPTS: u32 = 3;
-                    let mut fetch_result = None;
-                    for attempt in 0..MAX_RANGE_ATTEMPTS {
-                        match self
-                            .xet_sessions
-                            .download_range_to_vec(&file_info, offset..fetch_end)
-                            .await
-                        {
-                            Ok(vec) if vec.is_empty() => {
-                                warn!(
-                                    "range download returned empty: offset={}, range={}..{}, attempt={}/{}",
-                                    offset,
-                                    offset,
-                                    fetch_end,
-                                    attempt + 1,
-                                    MAX_RANGE_ATTEMPTS,
-                                );
-                            }
-                            Ok(vec) => {
-                                let len = vec.len();
-                                let expected = (fetch_end - offset) as usize;
-                                if len < expected {
-                                    debug!("range download partial: got={}/{} at offset={}", len, expected, offset,);
+                        // Retry range downloads: CAS range requests can fail transiently
+                        // (network errors, xorb fetch failures). Without retry, a single
+                        // failure causes SIGBUS for mmap or "unexpected EOF" for seeks.
+                        const MAX_RANGE_ATTEMPTS: u32 = 3;
+                        let mut fetch_result = None;
+                        for attempt in 0..MAX_RANGE_ATTEMPTS {
+                            match self
+                                .xet_sessions
+                                .download_range_to_vec(&file_info, cursor..fetch_end)
+                                .await
+                            {
+                                Ok(vec) if vec.is_empty() => {
+                                    warn!(
+                                        "range download returned empty: cursor={}, range={}..{}, \
+                                         attempt={}/{}",
+                                        cursor,
+                                        cursor,
+                                        fetch_end,
+                                        attempt + 1,
+                                        MAX_RANGE_ATTEMPTS,
+                                    );
                                 }
-                                let chunk = Bytes::from(vec);
-                                fetch_result = Some((VecDeque::from([chunk]), len));
-                                break;
+                                Ok(vec) => {
+                                    let len = vec.len();
+                                    let expected = (fetch_end - cursor) as usize;
+                                    if len < expected {
+                                        debug!("range download partial: got={}/{} at cursor={}", len, expected, cursor,);
+                                    }
+                                    let chunk = Bytes::from(vec);
+                                    fetch_result = Some((VecDeque::from([chunk]), len));
+                                    break;
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        "range download failed: cursor={}, range={}..{}, \
+                                         attempt={}/{}: {}",
+                                        cursor,
+                                        cursor,
+                                        fetch_end,
+                                        attempt + 1,
+                                        MAX_RANGE_ATTEMPTS,
+                                        e,
+                                    );
+                                }
                             }
-                            Err(e) => {
-                                warn!(
-                                    "range download failed: offset={}, range={}..{}, attempt={}/{}: {}",
-                                    offset,
-                                    offset,
-                                    fetch_end,
-                                    attempt + 1,
-                                    MAX_RANGE_ATTEMPTS,
-                                    e,
+                            if attempt + 1 < MAX_RANGE_ATTEMPTS {
+                                tokio::time::sleep(Duration::from_millis(100 * (attempt as u64 + 1))).await;
+                            }
+                        }
+                        match fetch_result {
+                            Some(result) => result,
+                            None => {
+                                error!(
+                                    "range download failed after {} attempts: cursor={}, \
+                                     range={}..{}, hash={}",
+                                    MAX_RANGE_ATTEMPTS, cursor, cursor, fetch_end, prefetch_state.xet_hash,
                                 );
+                                return Err(libc::EIO);
                             }
                         }
-                        if attempt + 1 < MAX_RANGE_ATTEMPTS {
-                            tokio::time::sleep(Duration::from_millis(100 * (attempt as u64 + 1))).await;
-                        }
-                    }
-                    match fetch_result {
-                        Some(result) => result,
-                        None => {
-                            error!(
-                                "range download failed after {} attempts: offset={}, range={}..{}, hash={}",
-                                MAX_RANGE_ATTEMPTS, offset, offset, fetch_end, prefetch_state.xet_hash,
-                            );
-                            return Err(libc::EIO);
-                        }
-                    }
-                };
+                    };
 
-                // Store fetched chunks and serve the read
-                prefetch_state.store_fetched(offset, chunks, total);
+                    // Store fetched chunks and loop back to drain them
+                    prefetch_state.store_fetched(cursor, chunks, total);
 
-                // Serve the read from the freshly filled buffer.
-                // Same short-read protection: clamp to `size` so we never
-                // return fewer bytes than requested (which would cause the
-                // kernel to shrink i_size and poison the page cache).
-                let result = match prefetch_state.try_serve_forward(offset, size) {
-                    Some(data) if data.len() >= size as usize || offset + data.len() as u64 >= file_size => data,
-                    Some(data) => {
-                        // Partial fetch — shouldn't happen since fetch_size >= size,
-                        // but guard against it. Clamp reply to avoid short FUSE read.
-                        warn!(
-                            "prefetch: partial data after fetch: have={}, need={}, offset={}, \
-                             fetched_total={}, file_size={}",
-                            data.len(),
-                            size,
-                            offset,
-                            total,
-                            file_size,
-                        );
-                        data
-                    }
-                    None => {
+                    // No-progress guard: return EIO rather than a short read
+                    if total == 0 {
                         error!(
-                            "BUG: try_serve_forward returned None after store_fetched: \
-                             offset={}, size={}, buf_start={}, chunks_len={}, file_size={}",
-                            offset, size, prefetch_state.buf_start, prefetch_state.chunks_len, file_size,
+                            "prefetch: fetch returned 0 bytes at cursor={}, need={} more, \
+                             offset={}, file_size={}, hash={}",
+                            cursor,
+                            to_read - response.len(),
+                            offset,
+                            file_size,
+                            prefetch_state.xet_hash,
                         );
-                        Bytes::new()
+                        return Err(libc::EIO);
                     }
-                };
-                let eof = offset + result.len() as u64 >= file_size;
-                Ok((result, eof))
+                }
+
+                let eof = cursor >= file_size;
+                Ok((response.freeze(), eof))
             }
         }
     }
