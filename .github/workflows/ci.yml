@@ -117,9 +117,12 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Strip ANSI codes, cargo output lines, and empty test result noise
-          CLEAN=$(sed 's/\x1b\[[0-9;]*m//g' bench_output.txt | grep -v '^\s*Running\|^\s*Compiling\|^\s*Finished\|^running \|^test \|^test result:')
-          TABLES=$(echo "$CLEAN" | awk '/====/{found=1} found{print}')
+          # Strip ANSI codes, then extract only ==== delimited blocks
+          CLEAN=$(sed 's/\x1b\[[0-9;]*m//g' bench_output.txt)
+          TABLES=$(echo "$CLEAN" | awk '
+            /^=====*$/ { inside=!inside; print; next }
+            inside { print }
+          ')
           if [ -z "$TABLES" ]; then
             echo "No benchmark table found in output"
             exit 0

@@ -111,7 +111,7 @@ fn run_fio(mount_point: &str, job: &FioJob) -> FioResult {
 fn print_table(fuse_results: &[FioResult], nfs_results: &[FioResult]) {
     eprintln!("\n============================================================");
     eprintln!("  fio Benchmark Results");
-    eprintln!("============================================================");
+    eprintln!("------------------------------------------------------------");
     eprintln!(
         "  {:25} {:>10} {:>10} {:>10} {:>10}",
         "Job", "FUSE MB/s", "NFS MB/s", "FUSE IOPS", "NFS IOPS"
@@ -138,8 +138,6 @@ fn print_table(fuse_results: &[FioResult], nfs_results: &[FioResult]) {
         }
     }
 
-    eprintln!("============================================================");
-
     // Latency sub-table for random reads
     let randoms: Vec<_> = fuse_results
         .iter()
@@ -148,7 +146,7 @@ fn print_table(fuse_results: &[FioResult], nfs_results: &[FioResult]) {
         .collect();
 
     if !randoms.is_empty() {
-        eprintln!("\n  {:25} {:>12} {:>12}", "Random Read Latency", "FUSE avg", "NFS avg");
+        eprintln!("  {:25} {:>12} {:>12}", "Random Read Latency", "FUSE avg", "NFS avg");
         eprintln!(
             "  {:25} {:>12} {:>12}",
             "-------------------------", "------------", "------------"
@@ -156,8 +154,9 @@ fn print_table(fuse_results: &[FioResult], nfs_results: &[FioResult]) {
         for (f, n) in &randoms {
             eprintln!("  {:25} {:>9.1} us {:>9.1} us", f.name, f.lat_avg_us, n.lat_avg_us);
         }
-        eprintln!();
     }
+
+    eprintln!("============================================================");
 }
 
 #[tokio::test]
