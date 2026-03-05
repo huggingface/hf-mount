@@ -1,6 +1,5 @@
-use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use bytes::Bytes;
 use data::configurations::TranslatorConfig;
@@ -17,7 +16,6 @@ pub trait XetOps: Send + Sync {
     async fn download_to_file(&self, xet_hash: &str, file_size: u64, dest: &Path) -> Result<()>;
     async fn upload_files(&self, paths: &[&Path]) -> Result<Vec<XetFileInfo>>;
     fn download_stream_boxed(&self, file_info: &XetFileInfo, offset: u64) -> Result<Box<dyn DownloadStreamOps>>;
-    async fn download_range_to_vec(&self, file_info: &XetFileInfo, range: Range<u64>) -> Result<Vec<u8>>;
 }
 
 /// Append-only streaming writer trait (abstracts StreamingWriter for testing).
@@ -53,19 +51,6 @@ impl XetSessions {
     pub fn download_stream(&self, file_info: &XetFileInfo, offset: u64) -> Result<data::DownloadStream> {
         self.session
             .download_stream_from_offset(file_info, offset, None)
-            .map_err(|e| Error::Xet(e.to_string()))
-    }
-
-    /// Download a byte range into a writer.
-    pub async fn download_to_writer<W: std::io::Write + Send + 'static>(
-        &self,
-        file_info: &XetFileInfo,
-        range: Range<u64>,
-        writer: W,
-    ) -> Result<u64> {
-        self.session
-            .download_to_writer(file_info, range, writer, None)
-            .await
             .map_err(|e| Error::Xet(e.to_string()))
     }
 }
@@ -127,36 +112,6 @@ impl XetOps for XetSessions {
     fn download_stream_boxed(&self, file_info: &XetFileInfo, offset: u64) -> Result<Box<dyn DownloadStreamOps>> {
         let stream = self.download_stream(file_info, offset)?;
         Ok(Box::new(DownloadStreamWrapper(stream)))
-    }
-
-    async fn download_range_to_vec(&self, file_info: &XetFileInfo, range: Range<u64>) -> Result<Vec<u8>> {
-        let capacity = (range.end - range.start) as usize;
-        let buf = Arc::new(Mutex::new(Vec::with_capacity(capacity)));
-        let writer = SharedBufWriter(buf.clone());
-        self.session
-            .download_to_writer(file_info, range, writer, None)
-            .await
-            .map_err(|e| Error::Xet(e.to_string()))?;
-        let vec = match Arc::try_unwrap(buf) {
-            Ok(mutex) => mutex.into_inner().unwrap_or_default(),
-            Err(arc) => arc.lock().unwrap_or_else(|e| e.into_inner()).clone(),
-        };
-        Ok(vec)
-    }
-}
-
-// ── SharedBufWriter ───────────────────────────────────────────────────
-
-/// Writer that appends to a shared buffer. Used internally by download_range_to_vec.
-struct SharedBufWriter(Arc<Mutex<Vec<u8>>>);
-
-impl std::io::Write for SharedBufWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(buf);
-        Ok(buf.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
     }
 }
 

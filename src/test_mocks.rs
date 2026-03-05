@@ -1,7 +1,6 @@
 //! Mock implementations for unit testing VirtualFs.
 
 use std::collections::HashMap;
-use std::ops::Range;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -314,6 +313,20 @@ impl XetOps for MockXet {
     }
 
     fn download_stream_boxed(&self, file_info: &XetFileInfo, offset: u64) -> Result<Box<dyn DownloadStreamOps>> {
+        let prev_fail = self.range_fail_count.load(Ordering::SeqCst);
+        if prev_fail > 0 {
+            self.range_fail_count.fetch_sub(1, Ordering::SeqCst);
+            return Err(Error::Xet("mock stream open failure".into()));
+        }
+        let prev_empty = self.range_empty_count.load(Ordering::SeqCst);
+        if prev_empty > 0 {
+            self.range_empty_count.fetch_sub(1, Ordering::SeqCst);
+            return Ok(Box::new(MockDownloadStream {
+                data: Vec::new(),
+                offset: 0,
+                chunk_size: 4096,
+            }));
+        }
         let files = self.files.lock().unwrap();
         let content = files.get(file_info.hash()).cloned().unwrap_or_default();
         Ok(Box::new(MockDownloadStream {
@@ -321,27 +334,6 @@ impl XetOps for MockXet {
             offset: offset as usize,
             chunk_size: 4096,
         }))
-    }
-
-    async fn download_range_to_vec(&self, file_info: &XetFileInfo, range: Range<u64>) -> Result<Vec<u8>> {
-        let prev_fail = self.range_fail_count.load(Ordering::SeqCst);
-        if prev_fail > 0 {
-            self.range_fail_count.fetch_sub(1, Ordering::SeqCst);
-            return Err(Error::Xet("mock range download failure".into()));
-        }
-        let prev_empty = self.range_empty_count.load(Ordering::SeqCst);
-        if prev_empty > 0 {
-            self.range_empty_count.fetch_sub(1, Ordering::SeqCst);
-            return Ok(Vec::new());
-        }
-        let files = self.files.lock().unwrap();
-        let content = files.get(file_info.hash()).cloned().unwrap_or_default();
-        let start = range.start as usize;
-        let end = (range.end as usize).min(content.len());
-        if start >= content.len() {
-            return Ok(Vec::new());
-        }
-        Ok(content[start..end].to_vec())
     }
 }
 

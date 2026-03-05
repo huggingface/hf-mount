@@ -1667,7 +1667,7 @@ fn read_past_eof() {
     });
 }
 
-/// Range read (seek backward) falls back to download_range_to_vec.
+/// Range read (seek backward) falls back to a temporary stream.
 #[test]
 fn read_seek_backward() {
     let hub = MockHub::new();

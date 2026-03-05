@@ -1204,155 +1204,120 @@ impl VirtualFs {
         Ok(file_handle)
     }
 
-    /// Try to read data from the stream. Handles (re)start and error recovery.
-    /// Returns `Some((chunks, total_bytes))` on success, `None` if no data was produced.
-    async fn read_from_stream(
+    /// Fetch data for the prefetch buffer. Uses the persistent stream for sequential
+    /// reads (with automatic (re)start), or opens a temporary stream with retries
+    /// for range/seek access. Returns EIO if all attempts fail.
+    async fn fetch_data(
         &self,
         prefetch_state: &mut PrefetchState,
         cursor: u64,
         plan: &FetchPlan,
         file_size: u64,
-    ) -> Option<(VecDeque<Bytes>, usize)> {
-        // (Re)start stream if needed: initial start or recovery after mid-stream errors.
-        if prefetch_state.stream.is_none() {
-            let xet_file_info = XetFileInfo::new(prefetch_state.xet_hash.clone(), prefetch_state.file_size);
-            match self.xet_sessions.download_stream_boxed(&xet_file_info, cursor) {
-                Ok(stream) => {
-                    debug!("prefetch: started stream at offset={}", cursor);
+    ) -> std::result::Result<(VecDeque<Bytes>, usize), i32> {
+        const MAX_ATTEMPTS: u32 = 3;
+        let file_info = XetFileInfo::new(prefetch_state.xet_hash.clone(), prefetch_state.file_size);
+
+        // Take the persistent stream before the loop (sequential reads).
+        // first_stream.take() only returns Some on the first iteration.
+        let mut first_stream = if plan.strategy.is_stream() {
+            prefetch_state.stream.take()
+        } else {
+            None
+        };
+
+        for attempt in 0..MAX_ATTEMPTS {
+            let stream = match first_stream.take() {
+                Some(s) => Some(s),
+                None => match self.xet_sessions.download_stream_boxed(&file_info, cursor) {
+                    Ok(s) => Some(s),
+                    Err(e) => {
+                        warn!(
+                            "prefetch: stream open failed: cursor={}, attempt={}/{}: {}",
+                            cursor,
+                            attempt + 1,
+                            MAX_ATTEMPTS,
+                            e,
+                        );
+                        None
+                    }
+                },
+            };
+
+            if let Some(mut stream) = stream {
+                // Read chunks until fetch_size bytes
+                let mut chunks = VecDeque::new();
+                let mut total = 0usize;
+                let mut failed = false;
+                let mut stream_eof = false;
+                while (total as u64) < plan.fetch_size {
+                    match stream.next().await {
+                        Ok(Some(chunk)) => {
+                            total += chunk.len();
+                            chunks.push_back(chunk);
+                        }
+                        Ok(None) => {
+                            stream_eof = true;
+                            break;
+                        }
+                        Err(e) => {
+                            warn!(
+                                "prefetch: stream read error at cursor={}, got={}/{}, attempt={}/{}: {}",
+                                cursor,
+                                total,
+                                plan.fetch_size,
+                                attempt + 1,
+                                MAX_ATTEMPTS,
+                                e,
+                            );
+                            failed = true;
+                            break;
+                        }
+                    }
+                }
+
+                // Early EOF sanity check: only meaningful when we got some data
+                // (zero-data EOF is just a failed attempt, handled by retry below)
+                if stream_eof && total > 0 {
+                    let stream_total = cursor + total as u64;
+                    if stream_total < file_size {
+                        error!(
+                            "prefetch: stream EOF at cursor={} after {} bytes (file_size={}, \
+                             shortfall={}, hash={})",
+                            cursor,
+                            total,
+                            file_size,
+                            file_size - stream_total,
+                            prefetch_state.xet_hash,
+                        );
+                        debug_assert!(
+                            false,
+                            "stream EOF before file_size: got {stream_total}, expected {file_size}"
+                        );
+                    }
+                } else if plan.strategy.is_stream() && !failed {
+                    // Keep stream alive for future sequential reads
                     prefetch_state.stream = Some(stream);
                 }
-                Err(e) => {
-                    // Not fatal: caller falls through to range download
-                    warn!("prefetch: stream start failed at offset={}: {}", cursor, e);
-                    return None;
-                }
-            }
-        }
 
-        let mut stream = prefetch_state.stream.take()?;
-        let mut chunks = VecDeque::new();
-        let mut total = 0usize;
-        let mut stream_eof = false;
-
-        while (total as u64) < plan.fetch_size {
-            match stream.next().await {
-                Ok(Some(chunk)) => {
-                    total += chunk.len();
-                    chunks.push_back(chunk);
-                }
-                Ok(None) => {
-                    stream_eof = true;
-                    break;
-                }
-                Err(e) => {
-                    error!(
-                        "prefetch: stream error at cursor={}, got={}/{}: {}",
-                        cursor, total, plan.fetch_size, e
+                if total > 0 {
+                    debug!(
+                        "prefetch fetch: cursor={}, got={}, window={}",
+                        cursor, total, prefetch_state.window_size,
                     );
-                    break;
+                    return Ok((chunks, total));
                 }
             }
-        }
 
-        if stream_eof {
-            let stream_total = cursor + total as u64;
-            if stream_total < file_size {
-                warn!(
-                    "prefetch: stream EOF at cursor={} after {} bytes (file_size={}, \
-                     shortfall={}, hash={})",
-                    cursor,
-                    total,
-                    file_size,
-                    file_size - stream_total,
-                    prefetch_state.xet_hash,
-                );
-            }
-        } else {
-            prefetch_state.stream = Some(stream);
-        }
-
-        if total > 0 {
-            debug!(
-                "prefetch stream: cursor={}, got={}, window={}",
-                cursor, total, prefetch_state.window_size
-            );
-            Some((chunks, total))
-        } else {
-            warn!(
-                "prefetch: stream returned 0 bytes at cursor={}, strategy={:?}",
-                cursor, plan.strategy,
-            );
-            None
-        }
-    }
-
-    /// Fetch a byte range via CAS with retries. Returns EIO on exhausted retries.
-    async fn fetch_range(
-        &self,
-        xet_hash: &str,
-        file_size: u64,
-        cursor: u64,
-        fetch_size: u64,
-    ) -> std::result::Result<(VecDeque<Bytes>, usize), i32> {
-        let fetch_end = cursor + fetch_size;
-        let file_info = XetFileInfo::new(xet_hash.to_string(), file_size);
-
-        debug!("prefetch range: cursor={}, size={}", cursor, fetch_size);
-
-        const MAX_RANGE_ATTEMPTS: u32 = 3;
-        let mut fetch_result = None;
-        for attempt in 0..MAX_RANGE_ATTEMPTS {
-            match self
-                .xet_sessions
-                .download_range_to_vec(&file_info, cursor..fetch_end)
-                .await
-            {
-                Ok(vec) if vec.is_empty() => {
-                    warn!(
-                        "range download returned empty: cursor={}, range={}..{}, attempt={}/{}",
-                        cursor,
-                        cursor,
-                        fetch_end,
-                        attempt + 1,
-                        MAX_RANGE_ATTEMPTS,
-                    );
-                }
-                Ok(vec) => {
-                    let len = vec.len();
-                    let expected = (fetch_end - cursor) as usize;
-                    if len < expected {
-                        debug!("range download partial: got={}/{} at cursor={}", len, expected, cursor,);
-                    }
-                    let chunk = Bytes::from(vec);
-                    fetch_result = Some((VecDeque::from([chunk]), len));
-                    break;
-                }
-                Err(e) => {
-                    warn!(
-                        "range download failed: cursor={}, range={}..{}, attempt={}/{}: {}",
-                        cursor,
-                        cursor,
-                        fetch_end,
-                        attempt + 1,
-                        MAX_RANGE_ATTEMPTS,
-                        e,
-                    );
-                }
-            }
-            if attempt + 1 < MAX_RANGE_ATTEMPTS {
+            if attempt + 1 < MAX_ATTEMPTS {
                 tokio::time::sleep(Duration::from_millis(100 * (attempt as u64 + 1))).await;
             }
         }
-        match fetch_result {
-            Some(result) => Ok(result),
-            None => {
-                error!(
-                    "range download failed after {} attempts: cursor={}, range={}..{}, hash={}",
-                    MAX_RANGE_ATTEMPTS, cursor, cursor, fetch_end, xet_hash,
-                );
-                Err(libc::EIO)
-            }
-        }
+
+        error!(
+            "prefetch: all {} fetch attempts failed: cursor={}, hash={}",
+            MAX_ATTEMPTS, cursor, prefetch_state.xet_hash,
+        );
+        Err(libc::EIO)
     }
 
     /// Read data from an open file. Returns `(data, eof)`.
@@ -1455,48 +1420,9 @@ impl VirtualFs {
                         prefetch_state.stream.is_some(),
                     );
 
-                    // Stream or range download
-                    let (chunks, total) = if plan.strategy.is_stream() {
-                        match self
-                            .read_from_stream(&mut prefetch_state, cursor, &plan, file_size)
-                            .await
-                        {
-                            Some(fetched) => fetched,
-                            None => {
-                                self.fetch_range(
-                                    &prefetch_state.xet_hash,
-                                    prefetch_state.file_size,
-                                    cursor,
-                                    plan.fetch_size,
-                                )
-                                .await?
-                            }
-                        }
-                    } else {
-                        self.fetch_range(
-                            &prefetch_state.xet_hash,
-                            prefetch_state.file_size,
-                            cursor,
-                            plan.fetch_size,
-                        )
-                        .await?
-                    };
+                    let (chunks, total) = self.fetch_data(&mut prefetch_state, cursor, &plan, file_size).await?;
 
                     prefetch_state.store_fetched(cursor, chunks, total);
-
-                    // No-progress guard: return EIO rather than a short read
-                    if total == 0 {
-                        error!(
-                            "prefetch: fetch returned 0 bytes at cursor={}, need={} more, \
-                             offset={}, file_size={}, hash={}",
-                            cursor,
-                            to_read - response.len(),
-                            offset,
-                            file_size,
-                            prefetch_state.xet_hash,
-                        );
-                        return Err(libc::EIO);
-                    }
 
                     // Drain freshly filled buffer into response
                     let remaining = (to_read - response.len()) as u32;
@@ -1506,7 +1432,7 @@ impl VirtualFs {
                     }
                 }
 
-                let eof = cursor >= file_size;
+                let eof = cursor == file_size;
                 Ok((response.freeze(), eof))
             }
         }
