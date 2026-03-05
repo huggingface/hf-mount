@@ -10,6 +10,10 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+  pull-requests: write
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -101,30 +105,47 @@ jobs:
       - name: Build release binaries
         run: cargo build --release --features nfs
 
+      - name: Install fio
+        run: sudo apt-get install -y fio
+
       - name: Run benchmarks
-        run: cargo test --release --test bench -- --nocapture 2>&1 | tee bench_output.txt
+        timeout-minutes: 10
+        run: cargo test --release --test bench --test fio_bench -- --nocapture 2>&1 | tee bench_output.txt
 
       - name: Post benchmark results
         if: github.event_name == 'pull_request'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Extract the benchmark table from output
-          TABLE=$(sed -n '/^  =====/,/^  =====/p' bench_output.txt)
-          if [ -z "$TABLE" ]; then
+          # Strip ANSI codes, then extract only ==== delimited blocks
+          CLEAN=$(sed 's/\x1b\[[0-9;]*m//g' bench_output.txt)
+          TABLES=$(echo "$CLEAN" | awk '
+            /^=====*$/ { inside=!inside; print; next }
+            inside { print }
+          ')
+          if [ -z "$TABLES" ]; then
             echo "No benchmark table found in output"
             exit 0
           fi
 
-          # Build markdown comment
-          BODY=$(cat <<'HEADER'
+          PR="${{ github.event.pull_request.number }}"
+          MARKER="<!-- bench-results -->"
+          BODY="${MARKER}
           ## Benchmark Results
 
-          ```
-          HEADER
-          )
-          BODY="${BODY}
-          ${TABLE}
+          \`\`\`
+          ${TABLES}
           \`\`\`"
 
-          gh pr comment "${{ github.event.pull_request.number }}" --body "$BODY"
+          # Find existing comment with our marker
+          COMMENT_ID=$(gh api "repos/${{ github.repository }}/issues/${PR}/comments" \
+            --jq ".[] | select(.body | startswith(\"${MARKER}\")) | .id" | head -1)
+
+          if [ -n "$COMMENT_ID" ]; then
+            gh api "repos/${{ github.repository }}/issues/comments/${COMMENT_ID}" \
+              -X PATCH -f body="$BODY"
+            echo "Updated existing comment $COMMENT_ID"
+          else
+            gh pr comment "$PR" --body "$BODY"
+            echo "Created new comment"
+          fi

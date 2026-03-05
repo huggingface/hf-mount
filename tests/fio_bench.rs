@@ -3,102 +3,164 @@ mod common;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-fn run_fio_suite(mount_point: &str) {
-    run_fio(
+struct FioResult {
+    name: String,
+    bw_mbps: f64,
+    iops: f64,
+    lat_avg_us: f64,
+}
+
+struct FioJob {
+    name: &'static str,
+    filename: &'static str,
+    rw: &'static str,
+    bs: &'static str,
+    time_based: bool,
+}
+
+const FIO_JOBS: &[FioJob] = &[
+    FioJob {
+        name: "seq-read-100M",
+        filename: "large_0.bin",
+        rw: "read",
+        bs: "128k",
+        time_based: false,
+    },
+    FioJob {
+        name: "seq-reread-100M",
+        filename: "large_0.bin",
+        rw: "read",
+        bs: "128k",
+        time_based: false,
+    },
+    FioJob {
+        name: "rand-read-4k-100M",
+        filename: "large_0.bin",
+        rw: "randread",
+        bs: "4k",
+        time_based: true,
+    },
+    FioJob {
+        name: "seq-read-5x10M",
+        filename: "medium_0.bin:medium_1.bin:medium_2.bin:medium_3.bin:medium_4.bin",
+        rw: "read",
+        bs: "128k",
+        time_based: false,
+    },
+    FioJob {
+        name: "rand-read-10x1M",
+        filename: "small_0.bin:small_1.bin:small_2.bin:small_3.bin:small_4.bin:small_5.bin:small_6.bin:small_7.bin:small_8.bin:small_9.bin",
+        rw: "randread",
+        bs: "4k",
+        time_based: true,
+    },
+];
+
+fn run_fio_suite(mount_point: &str) -> Vec<FioResult> {
+    FIO_JOBS.iter().map(|job| run_fio(mount_point, job)).collect()
+}
+
+fn run_fio(mount_point: &str, job: &FioJob) -> FioResult {
+    eprintln!("  fio: {}", job.name);
+
+    let mut args = vec![
+        "--name",
+        job.name,
+        "--directory",
         mount_point,
-        "seq-read-100M",
-        &[
-            "--filename",
-            "large_0.bin",
-            "--rw",
-            "read",
-            "--bs",
-            "128k",
-            "--ioengine",
-            "sync",
-            "--output-format",
-            "normal",
-        ],
+        "--readonly",
+        "--filename",
+        job.filename,
+        "--rw",
+        job.rw,
+        "--bs",
+        job.bs,
+        "--ioengine",
+        "sync",
+        "--output-format",
+        "json",
+    ];
+    if job.time_based {
+        args.extend_from_slice(&["--runtime", "5", "--time_based"]);
+    }
+
+    let output = Command::new("fio").args(&args).output().expect("Failed to run fio");
+
+    assert!(
+        output.status.success(),
+        "fio {} failed: {}",
+        job.name,
+        String::from_utf8_lossy(&output.stderr)
     );
 
-    run_fio(
-        mount_point,
-        "seq-reread-100M",
-        &[
-            "--filename",
-            "large_0.bin",
-            "--rw",
-            "read",
-            "--bs",
-            "128k",
-            "--ioengine",
-            "sync",
-            "--output-format",
-            "normal",
-        ],
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("fio JSON parse failed");
+
+    let read = &json["jobs"][0]["read"];
+    let bw_bytes = read["bw"].as_f64().unwrap_or(0.0); // KiB/s
+    let iops = read["iops"].as_f64().unwrap_or(0.0);
+    let lat_avg_ns = read["lat_ns"]["mean"].as_f64().unwrap_or(0.0);
+
+    FioResult {
+        name: job.name.to_string(),
+        bw_mbps: bw_bytes / 1024.0, // KiB/s -> MiB/s
+        iops,
+        lat_avg_us: lat_avg_ns / 1000.0,
+    }
+}
+
+fn print_table(fuse_results: &[FioResult], nfs_results: &[FioResult]) {
+    eprintln!("\n============================================================");
+    eprintln!("  fio Benchmark Results");
+    eprintln!("------------------------------------------------------------");
+    eprintln!(
+        "  {:25} {:>10} {:>10} {:>10} {:>10}",
+        "Job", "FUSE MB/s", "NFS MB/s", "FUSE IOPS", "NFS IOPS"
+    );
+    eprintln!(
+        "  {:25} {:>10} {:>10} {:>10} {:>10}",
+        "-------------------------", "----------", "----------", "----------", "----------"
     );
 
-    run_fio(
-        mount_point,
-        "rand-read-4k",
-        &[
-            "--filename",
-            "large_0.bin",
-            "--rw",
-            "randread",
-            "--bs",
-            "4k",
-            "--ioengine",
-            "sync",
-            "--runtime",
-            "10",
-            "--time_based",
-            "--output-format",
-            "normal",
-        ],
-    );
+    for (f, n) in fuse_results.iter().zip(nfs_results.iter()) {
+        let fuse_bw = format!("{:.1}", f.bw_mbps);
+        let nfs_bw = format!("{:.1}", n.bw_mbps);
 
-    run_fio(
-        mount_point,
-        "seq-read-5x10M",
-        &[
-            "--filename",
-            "medium_0.bin:medium_1.bin:medium_2.bin:medium_3.bin:medium_4.bin",
-            "--rw",
-            "read",
-            "--bs",
-            "128k",
-            "--ioengine",
-            "sync",
-            "--output-format",
-            "normal",
-        ],
-    );
+        if f.name.contains("rand") {
+            // For random reads, IOPS and latency are more interesting
+            let fuse_iops = format!("{:.0}", f.iops);
+            let nfs_iops = format!("{:.0}", n.iops);
+            eprintln!(
+                "  {:25} {:>10} {:>10} {:>10} {:>10}",
+                f.name, fuse_bw, nfs_bw, fuse_iops, nfs_iops
+            );
+        } else {
+            eprintln!("  {:25} {:>10} {:>10} {:>10} {:>10}", f.name, fuse_bw, nfs_bw, "", "");
+        }
+    }
 
-    run_fio(
-        mount_point,
-        "rand-read-small",
-        &[
-            "--filename",
-            "small_0.bin:small_1.bin:small_2.bin:small_3.bin:small_4.bin:small_5.bin:small_6.bin:small_7.bin:small_8.bin:small_9.bin",
-            "--rw",
-            "randread",
-            "--bs",
-            "4k",
-            "--ioengine",
-            "sync",
-            "--runtime",
-            "10",
-            "--time_based",
-            "--output-format",
-            "normal",
-        ],
-    );
+    // Latency sub-table for random reads
+    let randoms: Vec<_> = fuse_results
+        .iter()
+        .zip(nfs_results.iter())
+        .filter(|(f, _)| f.name.contains("rand"))
+        .collect();
+
+    if !randoms.is_empty() {
+        eprintln!("  {:25} {:>12} {:>12}", "Random Read Latency", "FUSE avg", "NFS avg");
+        eprintln!(
+            "  {:25} {:>12} {:>12}",
+            "-------------------------", "------------", "------------"
+        );
+        for (f, n) in &randoms {
+            eprintln!("  {:25} {:>9.1} us {:>9.1} us", f.name, f.lat_avg_us, n.lat_avg_us);
+        }
+    }
+
+    eprintln!("============================================================");
 }
 
 #[tokio::test]
 async fn test_fio_compare() {
-    // Check fio is installed
     if Command::new("fio").arg("--version").output().is_err() {
         eprintln!("Skipping: fio not installed");
         return;
@@ -111,7 +173,6 @@ async fn test_fio_compare() {
 
     let write_config = common::build_write_config(&hub).await;
 
-    // Upload files: 10x 1MB, 5x 10MB, 1x 100MB
     let pid = std::process::id();
     let tmp_dir = std::env::temp_dir().join(format!("hf-fio-cmp-setup-{}", pid));
     std::fs::create_dir_all(&tmp_dir).ok();
@@ -155,21 +216,18 @@ async fn test_fio_compare() {
 
     hub.batch_operations(&batch_ops).await.expect("batch add failed");
     eprintln!("All files committed to bucket");
-
     std::fs::remove_dir_all(&tmp_dir).ok();
 
     // --- FUSE fio ---
     let fuse_mount = format!("/tmp/hf-fio-cmp-fuse-{}", pid);
     let fuse_cache = format!("/tmp/hf-fio-cmp-fuse-cache-{}", pid);
 
-    eprintln!("\n============================================================");
-    eprintln!("  FUSE — fio benchmarks");
-    eprintln!("============================================================");
-
+    eprintln!("\nRunning fio suite on FUSE...");
     let fuse_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let child = common::mount_bucket(&bucket_id, &fuse_mount, &fuse_cache, &["--read-only"]);
-        run_fio_suite(&fuse_mount);
+        let results = run_fio_suite(&fuse_mount);
         common::unmount(&fuse_mount, child, 5);
+        results
     }));
 
     std::fs::remove_dir_all(&fuse_mount).ok();
@@ -179,14 +237,12 @@ async fn test_fio_compare() {
     let nfs_mount = format!("/tmp/hf-fio-cmp-nfs-{}", pid);
     let nfs_cache = format!("/tmp/hf-fio-cmp-nfs-cache-{}", pid);
 
-    eprintln!("\n============================================================");
-    eprintln!("  NFS — fio benchmarks");
-    eprintln!("============================================================");
-
+    eprintln!("\nRunning fio suite on NFS...");
     let nfs_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let child = common::mount_bucket_nfs(&bucket_id, &nfs_mount, &nfs_cache, &["--read-only"]);
-        run_fio_suite(&nfs_mount);
+        let results = run_fio_suite(&nfs_mount);
         common::unmount_nfs(&nfs_mount, child, 5);
+        results
     }));
 
     std::fs::remove_dir_all(&nfs_mount).ok();
@@ -195,32 +251,14 @@ async fn test_fio_compare() {
     // Cleanup
     common::delete_bucket(&common::endpoint(), &token, &bucket_id).await;
 
-    if let Err(e) = fuse_result {
-        std::panic::resume_unwind(e);
-    }
-    if let Err(e) = nfs_result {
-        std::panic::resume_unwind(e);
-    }
+    let fuse_results = match fuse_result {
+        Ok(r) => r,
+        Err(e) => std::panic::resume_unwind(e),
+    };
+    let nfs_results = match nfs_result {
+        Ok(r) => r,
+        Err(e) => std::panic::resume_unwind(e),
+    };
 
-    eprintln!("\n============================================================");
-    eprintln!("  fio comparison complete");
-    eprintln!("============================================================");
-}
-
-fn run_fio(mount_point: &str, job_name: &str, extra_args: &[&str]) {
-    eprintln!("\n--- fio: {} ---", job_name);
-    let output = Command::new("fio")
-        .args(["--name", job_name, "--directory", mount_point, "--readonly"])
-        .args(extra_args)
-        .output()
-        .expect("Failed to run fio");
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    if !stderr.is_empty() {
-        eprintln!("{}", stderr);
-    }
-    if !stdout.is_empty() {
-        eprintln!("{}", stdout);
-    }
+    print_table(&fuse_results, &nfs_results);
 }
