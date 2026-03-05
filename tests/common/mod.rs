@@ -224,7 +224,7 @@ pub fn mount_bucket(bucket_id: &str, mount_point: &str, cache_dir: &str, extra_a
 
 /// Spawn hf-mount-fuse to mount a repo as read-only, wait until the mountpoint is live.
 pub fn mount_repo(repo_id: &str, mount_point: &str, cache_dir: &str, extra_args: &[&str]) -> Child {
-    let token = std::env::var("HF_TOKEN").unwrap();
+    let token = std::env::var("HF_TOKEN").ok();
 
     let binary = std::env::current_exe()
         .unwrap()
@@ -240,10 +240,12 @@ pub fn mount_repo(repo_id: &str, mount_point: &str, cache_dir: &str, extra_args:
     std::fs::create_dir_all(cache_dir).ok();
 
     let ep = endpoint();
-    let child = Command::new(binary)
+    let mut cmd = Command::new(binary);
+    if let Some(ref t) = token {
+        cmd.args(["--hf-token", t]);
+    }
+    let child = cmd
         .args([
-            "--hf-token",
-            &token,
             "--hub-endpoint",
             &ep,
             "--cache-dir",

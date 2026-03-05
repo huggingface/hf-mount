@@ -4,11 +4,6 @@ mod common;
 /// both xet-backed and plain git/LFS files.
 #[tokio::test]
 async fn test_repo_fuse_read() {
-    if std::env::var("HF_TOKEN").is_err() {
-        eprintln!("Skipping repo test (HF_TOKEN not set)");
-        return;
-    }
-
     let pid = std::process::id();
     let mount_point = format!("/tmp/hf-mount-repo-fuse-{}", pid);
     let cache_dir = format!("/tmp/hf-mount-repo-fuse-cache-{}", pid);
