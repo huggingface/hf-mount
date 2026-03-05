@@ -118,11 +118,13 @@ pub struct MountSetup {
 /// Parse CLI args, build VFS and all dependencies.
 /// `is_nfs` controls whether advanced writes are forced (NFS has no open/close).
 pub fn setup(is_nfs: bool) -> MountSetup {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env().add_directive("hf_mount=info".parse().unwrap()),
-        )
-        .init();
+    // Use RUST_LOG if set, otherwise default to hf_mount=info.
+    let filter = if std::env::var("RUST_LOG").is_ok() {
+        tracing_subscriber::EnvFilter::from_default_env()
+    } else {
+        tracing_subscriber::EnvFilter::new("hf_mount=info")
+    };
+    tracing_subscriber::fmt().with_env_filter(filter).init();
 
     let args = Args::parse();
 

@@ -1258,18 +1258,39 @@ impl VirtualFs {
                     return Ok((Bytes::new(), true));
                 }
 
-                // Try forward buffer (zero-copy when read fits in one chunk)
+                // Try forward buffer (zero-copy when read fits in one chunk).
+                // IMPORTANT: Never return a short read unless at real EOF.
+                // The Linux FUSE kernel module shrinks i_size on short reads
+                // (fuse_read_update_size), which makes subsequent reads return
+                // 0 bytes and truncates the file from the application's view.
                 if let Some(data) = prefetch_state.try_serve_forward(offset, size) {
-                    debug!("prefetch hit (forward): offset={}, len={}", offset, data.len());
-                    let eof = offset + data.len() as u64 >= file_size;
-                    return Ok((data, eof));
+                    let at_eof = offset + data.len() as u64 >= file_size;
+                    if data.len() >= size as usize || at_eof {
+                        debug!("prefetch hit (forward): offset={}, len={}", offset, data.len());
+                        return Ok((data, at_eof));
+                    }
+                    // Buffer has data but not enough — fall through to fetch more
+                    debug!(
+                        "prefetch partial (forward): offset={}, have={}, need={}, fetching more",
+                        offset,
+                        data.len(),
+                        size,
+                    );
                 }
 
-                // Try seek window
+                // Try seek window (same short-read protection)
                 if let Some(data) = prefetch_state.try_serve_seek(offset, size) {
-                    debug!("prefetch hit (seek): offset={}, len={}", offset, data.len());
-                    let eof = offset + data.len() as u64 >= file_size;
-                    return Ok((data, eof));
+                    let at_eof = offset + data.len() as u64 >= file_size;
+                    if data.len() >= size as usize || at_eof {
+                        debug!("prefetch hit (seek): offset={}, len={}", offset, data.len());
+                        return Ok((data, at_eof));
+                    }
+                    debug!(
+                        "prefetch partial (seek): offset={}, have={}, need={}, fetching more",
+                        offset,
+                        data.len(),
+                        size,
+                    );
                 }
 
                 // Cache miss — drain, classify access pattern, adjust window
@@ -1439,9 +1460,26 @@ impl VirtualFs {
                 // Store fetched chunks and serve the read
                 prefetch_state.store_fetched(offset, chunks, total);
 
-                // Serve the read from the freshly filled buffer
+                // Serve the read from the freshly filled buffer.
+                // Same short-read protection: clamp to `size` so we never
+                // return fewer bytes than requested (which would cause the
+                // kernel to shrink i_size and poison the page cache).
                 let result = match prefetch_state.try_serve_forward(offset, size) {
-                    Some(data) => data,
+                    Some(data) if data.len() >= size as usize || offset + data.len() as u64 >= file_size => data,
+                    Some(data) => {
+                        // Partial fetch — shouldn't happen since fetch_size >= size,
+                        // but guard against it. Clamp reply to avoid short FUSE read.
+                        warn!(
+                            "prefetch: partial data after fetch: have={}, need={}, offset={}, \
+                             fetched_total={}, file_size={}",
+                            data.len(),
+                            size,
+                            offset,
+                            total,
+                            file_size,
+                        );
+                        data
+                    }
                     None => {
                         error!(
                             "BUG: try_serve_forward returned None after store_fetched: \

@@ -2083,6 +2083,70 @@ fn rename_dir_with_nested_children() {
     });
 }
 
+// ── short-read protection ────────────────────────────────────────────
+
+/// Reads at a prefetch buffer boundary must NOT return a short read (fewer
+/// bytes than the kernel requested) unless the read reaches real EOF.
+/// The Linux FUSE kernel module shrinks i_size on short reads
+/// (fuse_read_update_size), which truncates the file from the app's view.
+#[test]
+fn read_no_short_read_at_buffer_boundary() {
+    let hub = MockHub::new();
+    // File larger than one prefetch window (8 MiB). We use 10 MiB so the
+    // first window fills ~8 MiB and the second read at the boundary must
+    // fetch more rather than returning a short read.
+    let file_size: usize = 10 * 1024 * 1024;
+    let content: Vec<u8> = (0..file_size).map(|i| (i % 251) as u8).collect();
+    hub.add_file("big.bin", file_size as u64, Some("big_hash"), None);
+    let xet = MockXet::new();
+    xet.add_file("big_hash", &content);
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let attr = vfs.lookup(ROOT_INODE, "big.bin").await.unwrap();
+        let fh = vfs.open(attr.ino, false, false, None).await.unwrap();
+
+        // Simulate sequential reads of 128 KiB (typical FUSE read size).
+        // This will exhaust the first 8 MiB prefetch window. The read that
+        // crosses the boundary must return a full 128 KiB, not a short read.
+        let chunk_size: u32 = 128 * 1024;
+        let mut offset: u64 = 0;
+        while offset < file_size as u64 {
+            let (data, eof) = vfs.read(fh, offset, chunk_size).await.unwrap();
+            let remaining = file_size as u64 - offset;
+            if remaining >= chunk_size as u64 {
+                // Must return full chunk, never a short read
+                assert_eq!(
+                    data.len(),
+                    chunk_size as usize,
+                    "short read at offset {}: got {} bytes, expected {} (file_size={})",
+                    offset,
+                    data.len(),
+                    chunk_size,
+                    file_size,
+                );
+                // eof may be true when this read reaches exactly file_size
+                if remaining > chunk_size as u64 {
+                    assert!(!eof, "unexpected eof at offset {} (remaining={})", offset, remaining);
+                }
+            } else {
+                // Final read at EOF — short is fine
+                assert_eq!(data.len(), remaining as usize);
+                assert!(eof);
+            }
+            // Verify content correctness
+            for (i, &b) in data.iter().enumerate() {
+                let expected = ((offset as usize + i) % 251) as u8;
+                assert_eq!(b, expected, "wrong byte at offset {}", offset as usize + i);
+            }
+            offset += data.len() as u64;
+        }
+        assert_eq!(offset, file_size as u64);
+
+        vfs.release(fh).await;
+    });
+}
+
 // ── shutdown ────────────────────────────────────────────────────────
 
 /// shutdown() with dirty files flushes them before completing.
