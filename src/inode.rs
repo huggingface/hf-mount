@@ -1,6 +1,9 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+use crate::dirty_tracker::DirtyTracker;
 
 pub const ROOT_INODE: u64 = 1;
 
@@ -8,6 +11,16 @@ pub const ROOT_INODE: u64 = 1;
 pub enum InodeKind {
     File,
     Directory,
+}
+
+/// Delta upload metadata for a file opened in sparse mode.
+/// Tracks the old CAS hash and dirty byte ranges so flush can
+/// upload only the changed regions instead of the full file.
+#[derive(Debug, Clone)]
+pub struct DeltaInfo {
+    pub old_xet_hash: String,
+    pub old_size: u64,
+    pub dirty_tracker: Arc<Mutex<DirtyTracker>>,
 }
 
 #[derive(Debug, Clone)]
@@ -30,6 +43,8 @@ pub struct InodeEntry {
     /// When this inode's metadata was last validated against the remote (via HEAD).
     /// Used to avoid redundant HEAD requests within the revalidation TTL.
     pub last_revalidated: Option<Instant>,
+    /// Delta upload info set when file is opened in sparse mode. Cleared after flush.
+    pub delta_info: Option<DeltaInfo>,
 }
 
 pub struct InodeTable {
@@ -68,6 +83,7 @@ impl InodeTable {
             children: Vec::new(),
             pending_deletes: Vec::new(),
             last_revalidated: None,
+            delta_info: None,
         };
         table.inodes.insert(ROOT_INODE, root);
         table.path_to_inode.insert(String::new(), ROOT_INODE);
@@ -149,6 +165,7 @@ impl InodeTable {
             children: Vec::new(),
             pending_deletes: Vec::new(),
             last_revalidated: Some(Instant::now()),
+            delta_info: None,
         };
 
         self.inodes.insert(inode, entry);

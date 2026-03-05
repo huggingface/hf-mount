@@ -29,6 +29,17 @@ pub trait XetOps: Send + Sync {
     async fn download_to_file(&self, xet_hash: &str, file_size: u64, dest: &Path) -> Result<()>;
     async fn upload_files(&self, files: &[UploadFile<'_>]) -> Result<Vec<XetFileInfo>>;
     fn download_stream_boxed(&self, file_info: &XetFileInfo, offset: u64) -> Result<Box<dyn DownloadStreamOps>>;
+
+    /// Delta upload: upload only the changed regions of a file.
+    /// Returns `Ok(Some(info))` on success, `Ok(None)` if delta upload is not supported
+    /// or not applicable (caller should fall back to full upload).
+    async fn upload_file_delta(
+        &self,
+        old_xet_hash: &str,
+        new_file_size: u64,
+        dirty_ranges: &[(u64, u64)],
+        staging_path: &Path,
+    ) -> Result<Option<XetFileInfo>>;
 }
 
 /// Append-only streaming writer trait (abstracts StreamingWriter for testing).
@@ -139,6 +150,18 @@ impl XetOps for XetSessions {
     fn download_stream_boxed(&self, file_info: &XetFileInfo, offset: u64) -> Result<Box<dyn DownloadStreamOps>> {
         let stream = self.download_stream(file_info, offset)?;
         Ok(Box::new(DownloadStreamWrapper(stream)))
+    }
+
+    async fn upload_file_delta(
+        &self,
+        _old_xet_hash: &str,
+        _new_file_size: u64,
+        _dirty_ranges: &[(u64, u64)],
+        _staging_path: &Path,
+    ) -> Result<Option<XetFileInfo>> {
+        // TODO(delta-upload): Implement delta upload via xet-core's FileUploadSession.
+        // For now, return None to signal the caller should fall back to full upload.
+        Ok(None)
     }
 }
 

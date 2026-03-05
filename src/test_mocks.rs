@@ -339,6 +339,17 @@ impl XetOps for MockXet {
             chunk_size: 4096,
         }))
     }
+
+    async fn upload_file_delta(
+        &self,
+        _old_xet_hash: &str,
+        _new_file_size: u64,
+        _dirty_ranges: &[(u64, u64)],
+        _staging_path: &Path,
+    ) -> Result<Option<XetFileInfo>> {
+        // Mock: delta upload not supported, fall back to full upload
+        Ok(None)
+    }
 }
 
 // ── MockStreamingWriter ───────────────────────────────────────────────

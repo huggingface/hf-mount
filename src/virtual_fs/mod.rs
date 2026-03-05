@@ -1065,6 +1065,64 @@ impl VirtualFs {
             && staging_path.exists()
             && (is_dirty || std::fs::metadata(&staging_path).is_ok_and(|m| m.len() == size));
 
+        // Sparse open: skip download for existing CAS files when not truncating.
+        // Create a sparse staging file and track dirty ranges for delta upload at flush.
+        let use_sparse = !truncate && !is_dirty && !can_reuse_staging && !xet_hash.is_empty() && size > 0;
+
+        if use_sparse {
+            let file = File::create(&staging_path).map_err(|e| {
+                error!("Failed to create sparse staging file: {}", e);
+                libc::EIO
+            })?;
+            // Set the file size without writing data (creates a sparse file)
+            file.set_len(size).map_err(|e| {
+                error!("Failed to set sparse file size: {}", e);
+                libc::EIO
+            })?;
+            drop(file);
+
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&staging_path)
+                .map_err(|e| {
+                    error!("Failed to open sparse staging file: {}", e);
+                    libc::EIO
+                })?;
+
+            let dirty_tracker = Arc::new(Mutex::new(crate::dirty_tracker::DirtyTracker::new(size)));
+
+            // Mark inode dirty and store delta info
+            {
+                let mut inodes = self.inode_table.write().expect("inodes poisoned");
+                let entry = inodes.get_mut(ino).ok_or(libc::ENOENT)?;
+                entry.dirty = true;
+                entry.delta_info = Some(crate::inode::DeltaInfo {
+                    old_xet_hash: xet_hash.to_string(),
+                    old_size: size,
+                    dirty_tracker: dirty_tracker.clone(),
+                });
+            }
+
+            info!(
+                "open_advanced_write: sparse open for ino={} (size={}, xet_hash={})",
+                ino, size, xet_hash
+            );
+
+            let file_handle = self.alloc_file_handle();
+            self.open_files.write().expect("open_files poisoned").insert(
+                file_handle,
+                OpenFile::Sparse {
+                    ino,
+                    file: Arc::new(file),
+                    dirty: dirty_tracker,
+                    old_xet_hash: xet_hash.to_string(),
+                    old_size: size,
+                },
+            );
+            return Ok(file_handle);
+        }
+
         if !can_reuse_staging {
             if !truncate && !xet_hash.is_empty() && size > 0 {
                 // Download remote content for read-modify-write
@@ -1353,6 +1411,18 @@ impl VirtualFs {
                 Some(OpenFile::Lazy { prefetch, .. }) => ReadTarget::Remote {
                     prefetch: prefetch.clone(),
                 },
+                Some(OpenFile::Sparse {
+                    file,
+                    dirty,
+                    old_xet_hash,
+                    old_size,
+                    ..
+                }) => ReadTarget::Sparse {
+                    file: file.clone(),
+                    dirty: dirty.clone(),
+                    old_xet_hash: old_xet_hash.clone(),
+                    old_size: *old_size,
+                },
                 // write-only, not readable
                 Some(OpenFile::Streaming { .. }) => return Err(libc::EBADF), // write-only, not readable
                 None => return Err(libc::EBADF), // handle already closed (race with release)
@@ -1455,6 +1525,128 @@ impl VirtualFs {
                 let eof = cursor == file_size;
                 Ok((response.freeze(), eof))
             }
+            ReadTarget::Sparse {
+                file,
+                dirty,
+                old_xet_hash,
+                old_size,
+            } => {
+                // For sparse files: dirty bytes come from staging, clean bytes from CAS.
+                // Optimized for the common case: appends (reads below old_size are clean,
+                // reads at/above old_size are dirty) and small edits.
+
+                let (is_fully_dirty, has_any_dirty) = {
+                    let tracker = dirty.lock().expect("dirty_tracker poisoned");
+                    (
+                        tracker.is_fully_dirty(offset, size as u64),
+                        tracker.is_dirty(offset, size as u64),
+                    )
+                };
+
+                if is_fully_dirty {
+                    // Fast path: all bytes dirty — just pread from staging
+                    let file_descriptor = file.as_raw_fd();
+                    let mut buf = BytesMut::zeroed(size as usize);
+                    let n = unsafe {
+                        libc::pread(
+                            file_descriptor,
+                            buf.as_mut_ptr() as *mut libc::c_void,
+                            size as usize,
+                            offset as i64,
+                        )
+                    };
+                    if n < 0 {
+                        return Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO));
+                    }
+                    buf.truncate(n as usize);
+                    let eof = (n as u32) < size;
+                    Ok((buf.freeze(), eof))
+                } else if !has_any_dirty && offset + (size as u64) <= old_size {
+                    // Fast path: all bytes clean and within original file — stream from CAS
+                    let file_info = XetFileInfo::new(old_xet_hash, old_size);
+                    let mut stream = self
+                        .xet_sessions
+                        .download_stream_boxed(&file_info, offset)
+                        .map_err(|e| {
+                            error!("Failed to open CAS stream for sparse read: {}", e);
+                            libc::EIO
+                        })?;
+                    let to_read = (size as u64).min(old_size - offset) as usize;
+                    let mut response = BytesMut::with_capacity(to_read);
+                    while response.len() < to_read {
+                        match stream.next().await {
+                            Ok(Some(chunk)) => response.extend_from_slice(&chunk),
+                            Ok(None) => break,
+                            Err(e) => {
+                                error!("CAS stream error during sparse read: {}", e);
+                                return Err(libc::EIO);
+                            }
+                        }
+                    }
+                    response.truncate(to_read);
+                    let eof = offset + response.len() as u64 >= old_size;
+                    Ok((response.freeze(), eof))
+                } else {
+                    // Mixed path: some dirty, some clean within the read range.
+                    // Start with the staging file (dirty bytes are correct, clean
+                    // regions within old_size are zeros) then overlay clean bytes
+                    // from CAS.
+                    let file_descriptor = file.as_raw_fd();
+                    let mut buf = BytesMut::zeroed(size as usize);
+                    let n = unsafe {
+                        libc::pread(
+                            file_descriptor,
+                            buf.as_mut_ptr() as *mut libc::c_void,
+                            size as usize,
+                            offset as i64,
+                        )
+                    };
+                    if n < 0 {
+                        return Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO));
+                    }
+
+                    // Fill clean regions within old_size from CAS
+                    let cas_read_end = (offset + n as u64).min(old_size);
+                    if offset < old_size
+                        && cas_read_end > offset
+                        && let Ok(mut stream) = self
+                            .xet_sessions
+                            .download_stream_boxed(&XetFileInfo::new(old_xet_hash, old_size), offset)
+                    {
+                        // Snapshot dirty tracker before entering the async loop
+                        let dirty_snapshot = dirty.lock().expect("dirty_tracker poisoned").clone();
+                        let mut cas_offset = offset;
+                        while cas_offset < cas_read_end {
+                            match stream.next().await {
+                                Ok(Some(chunk)) => {
+                                    for (i, &byte) in chunk.iter().enumerate() {
+                                        let byte_offset = cas_offset + i as u64;
+                                        if byte_offset >= cas_read_end {
+                                            break;
+                                        }
+                                        if !dirty_snapshot.is_dirty(byte_offset, 1) {
+                                            let buf_idx = (byte_offset - offset) as usize;
+                                            if buf_idx < buf.len() {
+                                                buf[buf_idx] = byte;
+                                            }
+                                        }
+                                    }
+                                    cas_offset += chunk.len() as u64;
+                                }
+                                Ok(None) => break,
+                                Err(e) => {
+                                    warn!("CAS stream error during mixed sparse read: {}", e);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    buf.truncate(n as usize);
+                    let eof = (n as u32) < size;
+                    Ok((buf.freeze(), eof))
+                }
+            }
         }
     }
 
@@ -1472,11 +1664,23 @@ impl VirtualFs {
         }
 
         // Resolve write target: Local = staging file on disk (--advanced-writes),
+        // Sparse = sparse staging with dirty tracking (delta upload),
         // Streaming = append-only channel to CAS (default mode).
         // Clone out of the map so we release the RwLock before doing I/O.
         enum WriteTarget {
-            Local { file: Arc<File>, ino: u64 },
-            Streaming { ino: u64, channel: Arc<StreamingChannel> },
+            Local {
+                file: Arc<File>,
+                ino: u64,
+            },
+            Sparse {
+                file: Arc<File>,
+                ino: u64,
+                dirty: Arc<Mutex<crate::dirty_tracker::DirtyTracker>>,
+            },
+            Streaming {
+                ino: u64,
+                channel: Arc<StreamingChannel>,
+            },
         }
 
         let target = {
@@ -1490,6 +1694,11 @@ impl VirtualFs {
                     file: file.clone(),
                     ino: *ino,
                 },
+                Some(OpenFile::Sparse { ino, file, dirty, .. }) => WriteTarget::Sparse {
+                    file: file.clone(),
+                    ino: *ino,
+                    dirty: dirty.clone(),
+                },
                 Some(OpenFile::Streaming { ino, channel }) => WriteTarget::Streaming {
                     ino: *ino,
                     channel: channel.clone(),
@@ -1499,68 +1708,87 @@ impl VirtualFs {
             }
         };
 
-        match target {
-            WriteTarget::Local { file, ino: handle_ino } => {
-                let file_descriptor = file.as_raw_fd();
-                let n = unsafe {
-                    libc::pwrite(
-                        file_descriptor,
-                        data.as_ptr() as *const libc::c_void,
-                        data.len(),
-                        offset as i64,
-                    )
-                };
+        // Extract file + ino + optional dirty tracker from the target
+        let (staging_file, staging_ino, dirty_tracker) = match &target {
+            WriteTarget::Local { file, ino } => (Some(file.clone()), Some(*ino), None),
+            WriteTarget::Sparse { file, ino, dirty } => (Some(file.clone()), Some(*ino), Some(dirty.clone())),
+            _ => (None, None, None),
+        };
 
-                if n < 0 {
-                    Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO))
-                } else {
-                    let written = n as u32;
-                    let new_end = offset + written as u64;
-                    let mut inodes = self.inode_table.write().expect("inodes poisoned");
-                    if let Some(entry) = inodes.get_mut(handle_ino)
-                        && new_end > entry.size
-                    {
-                        entry.size = new_end;
-                    }
-                    Ok(written)
-                }
-            }
-            WriteTarget::Streaming {
-                ino: handle_ino,
-                channel,
-            } => {
-                // Check for previous worker error
-                if channel.error.lock().unwrap().is_some() {
-                    return Err(libc::EIO);
+        if let (Some(file), Some(handle_ino)) = (staging_file, staging_ino) {
+            let file_descriptor = file.as_raw_fd();
+            let n = unsafe {
+                libc::pwrite(
+                    file_descriptor,
+                    data.as_ptr() as *const libc::c_void,
+                    data.len(),
+                    offset as i64,
+                )
+            };
+
+            return if n < 0 {
+                Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO))
+            } else {
+                let written = n as u32;
+
+                // Track dirty range for delta upload
+                if let Some(tracker) = dirty_tracker {
+                    tracker
+                        .lock()
+                        .expect("dirty_tracker poisoned")
+                        .mark_dirty(offset, written as u64);
                 }
 
-                // Enforce append-only: offset must match bytes written so far
-                let expected = channel.bytes_written.load(Ordering::Relaxed);
-                if offset != expected {
-                    debug!(
-                        "streaming write: non-sequential offset={} (expected {}), ino={}",
-                        offset, expected, handle_ino
-                    );
-                    return Err(libc::EINVAL);
-                }
-
-                // Enqueue data to the background worker (blocks if channel buffer is full = backpressure)
-                let len = data.len();
-                channel.tx.blocking_send(WriteMsg::Data(data.to_vec())).map_err(|_| {
-                    error!("streaming channel closed for ino={}", handle_ino);
-                    libc::EIO
-                })?;
-                channel.bytes_written.fetch_add(len as u64, Ordering::Relaxed);
-
-                let new_size = offset + len as u64;
+                let new_end = offset + written as u64;
                 let mut inodes = self.inode_table.write().expect("inodes poisoned");
-                if let Some(entry) = inodes.get_mut(handle_ino) {
-                    entry.size = new_size;
+                if let Some(entry) = inodes.get_mut(handle_ino)
+                    && new_end > entry.size
+                {
+                    entry.size = new_end;
                 }
-
-                Ok(len as u32)
-            }
+                Ok(written)
+            };
         }
+
+        // Remaining case: streaming writes (Local and Sparse handled above)
+        let WriteTarget::Streaming {
+            ino: handle_ino,
+            channel,
+        } = target
+        else {
+            unreachable!("Local and Sparse handled above");
+        };
+
+        // Check for previous worker error
+        if channel.error.lock().unwrap().is_some() {
+            return Err(libc::EIO);
+        }
+
+        // Enforce append-only: offset must match bytes written so far
+        let expected = channel.bytes_written.load(Ordering::Relaxed);
+        if offset != expected {
+            debug!(
+                "streaming write: non-sequential offset={} (expected {}), ino={}",
+                offset, expected, handle_ino
+            );
+            return Err(libc::EINVAL);
+        }
+
+        // Enqueue data to the background worker (blocks if channel buffer is full = backpressure)
+        let len = data.len();
+        channel.tx.blocking_send(WriteMsg::Data(data.to_vec())).map_err(|_| {
+            error!("streaming channel closed for ino={}", handle_ino);
+            libc::EIO
+        })?;
+        channel.bytes_written.fetch_add(len as u64, Ordering::Relaxed);
+
+        let new_size = offset + len as u64;
+        let mut inodes = self.inode_table.write().expect("inodes poisoned");
+        if let Some(entry) = inodes.get_mut(handle_ino) {
+            entry.size = new_size;
+        }
+
+        Ok(len as u32)
     }
 
     pub async fn flush(&self, ino: u64, file_handle: u64, pid: Option<u32>) -> VirtualFsResult<()> {
@@ -1658,8 +1886,9 @@ impl VirtualFs {
         match removed {
             Some(OpenFile::Local {
                 ino, writable: true, ..
-            }) => {
-                // Advanced writes: enqueue for async flush
+            })
+            | Some(OpenFile::Sparse { ino, .. }) => {
+                // Advanced writes / sparse: enqueue for async flush
                 if let Some(fm) = &self.flush_manager {
                     fm.enqueue(ino);
                 }
@@ -2580,6 +2809,15 @@ enum OpenFile {
     },
     /// Streaming append-only writer (default write mode).
     Streaming { ino: u64, channel: Arc<StreamingChannel> },
+    /// Sparse staging file — no upfront download. Dirty ranges tracked for delta upload.
+    /// Clean reads fall through to CAS; dirty reads served from the staging file.
+    Sparse {
+        ino: u64,
+        file: Arc<File>,
+        dirty: Arc<Mutex<crate::dirty_tracker::DirtyTracker>>,
+        old_xet_hash: String,
+        old_size: u64,
+    },
 }
 
 /// Check whether two PIDs belong to the same process.
@@ -2652,6 +2890,13 @@ enum ReadTarget {
     LocalFd(Arc<File>),
     Remote {
         prefetch: Arc<tokio::sync::Mutex<PrefetchState>>,
+    },
+    /// Sparse staging: dirty bytes from staging file, clean bytes from CAS.
+    Sparse {
+        file: Arc<File>,
+        dirty: Arc<Mutex<crate::dirty_tracker::DirtyTracker>>,
+        old_xet_hash: String,
+        old_size: u64,
     },
 }
 

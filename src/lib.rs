@@ -1,4 +1,5 @@
 pub mod cached_xet_client;
+pub mod dirty_tracker;
 pub mod error;
 mod flush;
 pub mod fuse;

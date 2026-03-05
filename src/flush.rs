@@ -3,11 +3,12 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use data::XetFileInfo;
 use tokio::sync::mpsc;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::hub_api::{BatchOp, HubOps};
-use crate::inode::InodeTable;
+use crate::inode::{DeltaInfo, InodeTable};
 use crate::xet::{StagingDir, UploadFile, XetOps};
 
 type FlushRequest = u64;
@@ -168,8 +169,9 @@ async fn flush_batch(
 
     // Resolve paths from inode table, skip deleted/non-dirty inodes.
     // Capture old_xet_hash (the CAS hash of the previous version) for delta dedup.
+    // Also capture DeltaInfo for files opened in sparse mode.
     #[allow(clippy::type_complexity)]
-    let to_flush: Vec<(u64, String, PathBuf, Vec<String>, Option<String>)> = {
+    let to_flush: Vec<(u64, String, PathBuf, Vec<String>, Option<String>, Option<DeltaInfo>)> = {
         let inode_table = inodes.read().expect("inodes poisoned");
         deduped
             .into_iter()
@@ -198,6 +200,7 @@ async fn flush_batch(
                     staging_path,
                     entry.pending_deletes.clone(),
                     entry.xet_hash.clone(),
+                    entry.delta_info.clone(),
                 ))
             })
             .collect()
@@ -207,26 +210,92 @@ async fn flush_batch(
         return;
     }
 
-    // Upload all files through a single upload session
-    let upload_files: Vec<UploadFile<'_>> = to_flush
-        .iter()
-        .map(|(_, _, p, _, old_hash)| UploadFile {
-            path: p.as_path(),
-            old_xet_hash: old_hash.as_deref(),
-        })
-        .collect();
-    let upload_results = match xet_sessions.upload_files(&upload_files).await {
-        Ok(results) => results,
-        Err(e) => {
-            error!("Batch upload failed: {}", e);
-            let msg = format!("upload failed: {e}");
-            let mut errs = flush_errors.lock().expect("flush_errors poisoned");
-            for (ino, _, _, _, _) in &to_flush {
-                errs.insert(*ino, msg.clone());
+    // Try delta upload for files with DeltaInfo, collect results.
+    // Files that succeed delta upload get their XetFileInfo directly.
+    // Files that fail or don't have DeltaInfo fall through to full upload.
+    let mut upload_results: Vec<Option<XetFileInfo>> = vec![None; to_flush.len()];
+
+    for (idx, (ino, full_path, staging_path, _, _, delta_info)) in to_flush.iter().enumerate() {
+        if let Some(di) = delta_info {
+            let dirty_ranges = di.dirty_tracker.lock().expect("dirty_tracker poisoned").dirty_ranges();
+            let new_file_size = std::fs::metadata(staging_path).map(|m| m.len()).unwrap_or(0);
+            info!(
+                "Attempting delta upload for ino={} path={} old_hash={} dirty_ranges={}",
+                ino,
+                full_path,
+                di.old_xet_hash,
+                dirty_ranges.len()
+            );
+            match xet_sessions
+                .upload_file_delta(&di.old_xet_hash, new_file_size, &dirty_ranges, staging_path)
+                .await
+            {
+                Ok(Some(file_info)) => {
+                    info!(
+                        "Delta upload succeeded for ino={} path={} xet_hash={} size={}",
+                        ino,
+                        full_path,
+                        file_info.hash(),
+                        file_info.file_size()
+                    );
+                    upload_results[idx] = Some(file_info);
+                }
+                Ok(None) => {
+                    debug!(
+                        "Delta upload not supported for ino={}, falling back to full upload",
+                        ino
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        "Delta upload failed for ino={} path={}: {}, falling back to full upload",
+                        ino, full_path, e
+                    );
+                }
             }
-            return;
         }
-    };
+    }
+
+    // Collect files that still need full upload (delta upload returned None or failed)
+    let full_upload_indices: Vec<usize> = upload_results
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.is_none())
+        .map(|(i, _)| i)
+        .collect();
+
+    if !full_upload_indices.is_empty() {
+        let upload_files: Vec<UploadFile<'_>> = full_upload_indices
+            .iter()
+            .map(|&i| {
+                let (_, _, ref p, _, ref old_hash, _) = to_flush[i];
+                UploadFile {
+                    path: p.as_path(),
+                    old_xet_hash: old_hash.as_deref(),
+                }
+            })
+            .collect();
+
+        match xet_sessions.upload_files(&upload_files).await {
+            Ok(results) => {
+                for (file_info, &idx) in results.into_iter().zip(full_upload_indices.iter()) {
+                    upload_results[idx] = Some(file_info);
+                }
+            }
+            Err(e) => {
+                error!("Batch upload failed: {}", e);
+                let msg = format!("upload failed: {e}");
+                let mut errs = flush_errors.lock().expect("flush_errors poisoned");
+                for &idx in &full_upload_indices {
+                    errs.insert(to_flush[idx].0, msg.clone());
+                }
+                // If any delta uploads succeeded, we still commit those
+                if upload_results.iter().all(|r| r.is_none()) {
+                    return;
+                }
+            }
+        }
+    }
 
     let mtime_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -238,7 +307,12 @@ async fn flush_batch(
     let mut delete_ops = Vec::new();
     let mut successes: Vec<(u64, String, u64)> = Vec::new();
 
-    for ((ino, full_path, _, pending_deletes, _), file_info) in to_flush.iter().zip(upload_results.iter()) {
+    for ((ino, full_path, _, pending_deletes, _, _), file_info) in to_flush.iter().zip(upload_results.iter()) {
+        let file_info = match file_info {
+            Some(fi) => fi,
+            None => continue, // upload failed for this file
+        };
+
         info!(
             "Uploaded file ino={} path={} xet_hash={} size={}",
             ino,
@@ -262,6 +336,10 @@ async fn flush_batch(
         successes.push((*ino, file_info.hash().to_string(), file_info.file_size()));
     }
 
+    if successes.is_empty() {
+        return;
+    }
+
     ops.append(&mut delete_ops);
 
     // Single batch commit
@@ -269,7 +347,7 @@ async fn flush_batch(
         error!("Batch commit failed: {}", e);
         let msg = format!("commit failed: {e}");
         let mut errs = flush_errors.lock().expect("flush_errors poisoned");
-        for (ino, _, _, _, _) in &to_flush {
+        for (ino, _, _, _, _, _) in &to_flush {
             errs.insert(*ino, msg.clone());
         }
         return;
@@ -285,6 +363,7 @@ async fn flush_batch(
             entry.dirty = false;
             entry.mtime = now;
             entry.pending_deletes.clear();
+            entry.delta_info = None; // Clear delta info after successful flush
         }
     }
 
