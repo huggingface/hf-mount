@@ -138,6 +138,7 @@ jobs:
           echo "MOUNT_POINT=$MOUNT_POINT" >> "$GITHUB_ENV"
 
           sudo -E ./target/release/hf-mount-fuse \
+            --hf-token "$HF_TOKEN" --hub-endpoint "$HF_ENDPOINT" \
             --poll-interval-secs 0 --advanced-writes \
             bucket "$BUCKET_ID" "$MOUNT_POINT" &
           echo "MOUNT_PID=$!" >> "$GITHUB_ENV"
