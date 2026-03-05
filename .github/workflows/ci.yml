@@ -105,8 +105,11 @@ jobs:
       - name: Build release binaries
         run: cargo build --release --features nfs
 
+      - name: Install fio
+        run: sudo apt-get install -y fio
+
       - name: Run benchmarks
-        run: cargo test --release --test bench -- --nocapture 2>&1 | tee bench_output.txt
+        run: cargo test --release --test bench --test fio_bench -- --nocapture 2>&1 | tee bench_output.txt
 
       - name: Post benchmark results
         if: github.event_name == 'pull_request'
