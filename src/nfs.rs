@@ -4,7 +4,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use nfsserve::nfs::{fattr3, fileid3, filename3, ftype3, nfspath3, nfsstat3, nfstime3, sattr3, set_size3, specdata3};
+use nfsserve::nfs::{
+    fattr3, fileid3, filename3, ftype3, nfspath3, nfsstat3, nfsstring, nfstime3, sattr3, set_atime, set_gid3,
+    set_mode3, set_mtime, set_size3, set_uid3, specdata3,
+};
 use nfsserve::tcp::{NFSTcp, NFSTcpListener};
 use nfsserve::vfs::{DirEntry, NFSFileSystem, ReadDirResult, VFSCapabilities};
 use tracing::info;
@@ -70,9 +73,18 @@ impl NFSAdapter {
     }
 
     /// Create a file and insert the handle into the pool.
-    async fn create_file(&self, dirid: fileid3, filename: &filename3) -> Result<(fileid3, fattr3), nfsstat3> {
+    async fn create_file(
+        &self,
+        dirid: fileid3,
+        filename: &filename3,
+        mode: u16,
+    ) -> Result<(fileid3, fattr3), nfsstat3> {
         let name = nfs_name(filename)?;
-        let (attr, file_handle) = self.virtual_fs.create(dirid, name, None).await.map_err(errno_to_nfs)?;
+        let (attr, file_handle) = self
+            .virtual_fs
+            .create(dirid, name, mode, None)
+            .await
+            .map_err(errno_to_nfs)?;
         let ino = attr.ino;
         let fattr = vfs_attr_to_nfs(&attr);
         self.insert_handle(ino, file_handle).await;
@@ -173,8 +185,30 @@ impl NFSFileSystem for NFSAdapter {
             set_size3::size(s) => Some(s),
             set_size3::Void => None,
         };
+        let mode = match setattr.mode {
+            set_mode3::mode(m) => Some((m & 0o7777) as u16),
+            set_mode3::Void => None,
+        };
+        let uid = match setattr.uid {
+            set_uid3::uid(u) => Some(u),
+            set_uid3::Void => None,
+        };
+        let gid = match setattr.gid {
+            set_gid3::gid(g) => Some(g),
+            set_gid3::Void => None,
+        };
+        let atime = match setattr.atime {
+            set_atime::SET_TO_CLIENT_TIME(t) => Some(nfstime_to_system_time(t)),
+            set_atime::SET_TO_SERVER_TIME => Some(SystemTime::now()),
+            set_atime::DONT_CHANGE => None,
+        };
+        let mtime = match setattr.mtime {
+            set_mtime::SET_TO_CLIENT_TIME(t) => Some(nfstime_to_system_time(t)),
+            set_mtime::SET_TO_SERVER_TIME => Some(SystemTime::now()),
+            set_mtime::DONT_CHANGE => None,
+        };
         self.virtual_fs
-            .setattr(id, size)
+            .setattr(id, size, mode, uid, gid, atime, mtime)
             .await
             .map(|a| vfs_attr_to_nfs(&a))
             .map_err(errno_to_nfs)
@@ -199,19 +233,23 @@ impl NFSFileSystem for NFSAdapter {
             .map_err(errno_to_nfs)
     }
 
-    async fn create(&self, dirid: fileid3, filename: &filename3, _attr: sattr3) -> Result<(fileid3, fattr3), nfsstat3> {
-        let (ino, fattr) = self.create_file(dirid, filename).await?;
+    async fn create(&self, dirid: fileid3, filename: &filename3, attr: sattr3) -> Result<(fileid3, fattr3), nfsstat3> {
+        let mode = match attr.mode {
+            set_mode3::mode(m) => (m & 0o7777) as u16,
+            set_mode3::Void => 0o644,
+        };
+        let (ino, fattr) = self.create_file(dirid, filename, mode).await?;
         Ok((ino, fattr))
     }
 
     async fn create_exclusive(&self, dirid: fileid3, filename: &filename3) -> Result<fileid3, nfsstat3> {
-        let (ino, _) = self.create_file(dirid, filename).await?;
+        let (ino, _) = self.create_file(dirid, filename, 0o644).await?;
         Ok(ino)
     }
 
     async fn mkdir(&self, dirid: fileid3, dirname: &filename3) -> Result<(fileid3, fattr3), nfsstat3> {
         let name = nfs_name(dirname)?;
-        let attr = self.virtual_fs.mkdir(dirid, name).await.map_err(errno_to_nfs)?;
+        let attr = self.virtual_fs.mkdir(dirid, name, 0o755).await.map_err(errno_to_nfs)?;
         Ok((attr.ino, vfs_attr_to_nfs(&attr)))
     }
 
@@ -221,8 +259,8 @@ impl NFSFileSystem for NFSAdapter {
         let child_ino = self.virtual_fs.lookup(dirid, name).await.map_err(errno_to_nfs)?.ino;
         let attr = self.virtual_fs.getattr(child_ino).map_err(errno_to_nfs)?;
         match attr.kind {
-            InodeKind::File => self.virtual_fs.unlink(dirid, name).await.map_err(errno_to_nfs),
             InodeKind::Directory => self.virtual_fs.rmdir(dirid, name).await.map_err(errno_to_nfs),
+            _ => self.virtual_fs.unlink(dirid, name).await.map_err(errno_to_nfs),
         }
     }
 
@@ -243,16 +281,28 @@ impl NFSFileSystem for NFSAdapter {
 
     async fn symlink(
         &self,
-        _dirid: fileid3,
-        _linkname: &filename3,
-        _symlink: &nfspath3,
-        _attr: &sattr3,
+        dirid: fileid3,
+        linkname: &filename3,
+        symlink: &nfspath3,
+        attr: &sattr3,
     ) -> Result<(fileid3, fattr3), nfsstat3> {
-        Err(nfsstat3::NFS3ERR_NOTSUPP)
+        let name = nfs_name(linkname)?;
+        let target = std::str::from_utf8(&symlink.0).map_err(|_| nfsstat3::NFS3ERR_INVAL)?;
+        let mode = match attr.mode {
+            set_mode3::mode(m) => (m & 0o7777) as u16,
+            set_mode3::Void => 0o777,
+        };
+        let vfs_attr = self
+            .virtual_fs
+            .symlink(dirid, name, target, mode)
+            .await
+            .map_err(errno_to_nfs)?;
+        Ok((vfs_attr.ino, vfs_attr_to_nfs(&vfs_attr)))
     }
 
-    async fn readlink(&self, _id: fileid3) -> Result<nfspath3, nfsstat3> {
-        Err(nfsstat3::NFS3ERR_NOTSUPP)
+    async fn readlink(&self, id: fileid3) -> Result<nfspath3, nfsstat3> {
+        let target = self.virtual_fs.readlink(id).map_err(errno_to_nfs)?;
+        Ok(nfsstring(target.into_bytes()))
     }
 }
 
@@ -535,8 +585,8 @@ fn vfs_attr_to_nfs(attr: &VirtualFsAttr) -> fattr3 {
     let ftype = match attr.kind {
         InodeKind::File => ftype3::NF3REG,
         InodeKind::Directory => ftype3::NF3DIR,
+        InodeKind::Symlink => ftype3::NF3LNK,
     };
-    let mtime = system_time_to_nfstime(attr.mtime);
     fattr3 {
         ftype,
         mode: attr.perm as u32,
@@ -551,8 +601,12 @@ fn vfs_attr_to_nfs(attr: &VirtualFsAttr) -> fattr3 {
         },
         fsid: 0,
         fileid: attr.ino,
-        atime: mtime,
-        mtime,
-        ctime: mtime,
+        atime: system_time_to_nfstime(attr.atime),
+        mtime: system_time_to_nfstime(attr.mtime),
+        ctime: system_time_to_nfstime(attr.ctime),
     }
+}
+
+fn nfstime_to_system_time(t: nfstime3) -> SystemTime {
+    UNIX_EPOCH + std::time::Duration::new(t.seconds as u64, t.nseconds)
 }

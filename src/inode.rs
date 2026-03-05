@@ -8,6 +8,15 @@ pub const ROOT_INODE: u64 = 1;
 pub enum InodeKind {
     File,
     Directory,
+    Symlink,
+}
+
+/// A directory child entry: stores the name on the edge (needed for hard links,
+/// where the same inode can appear under different names in different directories).
+#[derive(Debug, Clone)]
+pub struct DirChild {
+    pub ino: u64,
+    pub name: String,
 }
 
 #[derive(Debug, Clone)]
@@ -19,12 +28,19 @@ pub struct InodeEntry {
     pub kind: InodeKind,
     pub size: u64,
     pub mtime: SystemTime,
+    pub mode: u16,
+    pub uid: u32,
+    pub gid: u32,
+    pub atime: SystemTime,
+    pub ctime: SystemTime,
+    pub nlink: u32,
+    pub symlink_target: Option<String>,
     pub xet_hash: Option<String>,
     /// ETag from the last HEAD revalidation (used for non-xet plain git/LFS files).
     pub etag: Option<String>,
     pub dirty: bool,
     pub children_loaded: bool,
-    pub children: Vec<u64>,
+    pub children: Vec<DirChild>,
     /// Old remote paths that should be deleted on next flush (set by rename of dirty files).
     pub pending_deletes: Vec<String>,
     /// When this inode's metadata was last validated against the remote (via HEAD).
@@ -61,6 +77,13 @@ impl InodeTable {
             kind: InodeKind::Directory,
             size: 0,
             mtime: UNIX_EPOCH,
+            mode: 0o755,
+            uid: 0,
+            gid: 0,
+            atime: UNIX_EPOCH,
+            ctime: UNIX_EPOCH,
+            nlink: 2,
+            symlink_target: None,
             xet_hash: None,
             etag: None,
             dirty: false,
@@ -90,11 +113,9 @@ impl InodeTable {
     /// Find a child of `parent` by name.
     pub fn lookup_child(&self, parent: u64, name: &str) -> Option<&InodeEntry> {
         let parent_entry = self.inodes.get(&parent)?;
-        for &child_ino in &parent_entry.children {
-            if let Some(child) = self.inodes.get(&child_ino)
-                && child.name == name
-            {
-                return Some(child);
+        for child in &parent_entry.children {
+            if child.name == name {
+                return self.inodes.get(&child.ino);
             }
         }
         None
@@ -111,6 +132,9 @@ impl InodeTable {
         size: u64,
         mtime: SystemTime,
         xet_hash: Option<String>,
+        mode: u16,
+        uid: u32,
+        gid: u32,
     ) -> u64 {
         // Check if already exists
         if let Some(&existing_ino) = self.path_to_inode.get(&full_path) {
@@ -133,7 +157,14 @@ impl InodeTable {
             full_path
         );
 
+        let now = SystemTime::now();
+        let nlink = match kind {
+            InodeKind::Directory => 2,
+            _ => 1,
+        };
+
         let inode = self.next_inode.fetch_add(1, Ordering::Relaxed);
+        let child_name = name.clone();
         let entry = InodeEntry {
             inode,
             parent,
@@ -142,10 +173,17 @@ impl InodeTable {
             kind,
             size,
             mtime,
+            mode,
+            uid,
+            gid,
+            atime: mtime,
+            ctime: now,
+            nlink,
+            symlink_target: None,
             xet_hash,
             etag: None,
             dirty: false,
-            children_loaded: kind == InodeKind::File, // files don't have children to load
+            children_loaded: kind != InodeKind::Directory, // only dirs have children to load
             children: Vec::new(),
             pending_deletes: Vec::new(),
             last_revalidated: Some(Instant::now()),
@@ -156,7 +194,10 @@ impl InodeTable {
 
         // Add to parent's children
         if let Some(parent_entry) = self.inodes.get_mut(&parent) {
-            parent_entry.children.push(inode);
+            parent_entry.children.push(DirChild {
+                ino: inode,
+                name: child_name,
+            });
         }
 
         inode
@@ -172,7 +213,7 @@ impl InodeTable {
         self.path_to_inode.insert(path, inode);
     }
 
-    /// Return inodes of all dirty files.
+    /// Return inodes of all dirty files (excludes symlinks — they have no content to flush).
     pub fn dirty_inos(&self) -> Vec<u64> {
         self.inodes
             .values()
@@ -258,18 +299,14 @@ impl InodeTable {
             return;
         };
 
-        // Recursively update children
-        for child_ino in children {
-            let child_name = match self.inodes.get(&child_ino) {
-                Some(c) => c.name.clone(),
-                None => continue,
-            };
+        // Recursively update children (DirChild carries the name directly)
+        for child in children {
             let child_path = if new_full_path.is_empty() {
-                child_name
+                child.name
             } else {
-                format!("{}/{}", new_full_path, child_name)
+                format!("{}/{}", new_full_path, child.name)
             };
-            self.update_subtree_paths(child_ino, child_path);
+            self.update_subtree_paths(child.ino, child_path);
         }
     }
 
@@ -282,19 +319,86 @@ impl InodeTable {
 
         // Remove from parent's children
         if let Some(parent) = self.inodes.get_mut(&entry.parent) {
-            parent.children.retain(|&c| c != inode);
+            parent.children.retain(|c| c.ino != inode);
         }
 
         // Recursively remove all descendants to avoid orphans
-        let mut stack = entry.children.clone();
+        let mut stack: Vec<u64> = entry.children.iter().map(|c| c.ino).collect();
         while let Some(child_ino) = stack.pop() {
             if let Some(child) = self.inodes.remove(&child_ino) {
                 self.path_to_inode.remove(&child.full_path);
-                stack.extend(child.children.iter());
+                stack.extend(child.children.iter().map(|c| c.ino));
             }
         }
 
         Some(entry)
+    }
+
+    /// Create a hard link: add a DirChild entry in `new_parent` pointing to `ino`,
+    /// register the new path, and increment nlink. Does NOT validate (caller must check).
+    pub fn link(&mut self, ino: u64, new_parent: u64, new_name: String, new_full_path: String) {
+        // Add DirChild to parent
+        if let Some(parent_entry) = self.inodes.get_mut(&new_parent) {
+            parent_entry.children.push(DirChild { ino, name: new_name });
+        }
+
+        // Register path mapping
+        self.path_to_inode.insert(new_full_path, ino);
+
+        // Increment nlink and update ctime
+        if let Some(entry) = self.inodes.get_mut(&ino) {
+            entry.nlink += 1;
+            entry.ctime = SystemTime::now();
+        }
+    }
+
+    /// Remove one directory entry by name from `parent`. Decrements nlink.
+    /// Returns `(inode_removed, entry_snapshot)` where `inode_removed` is true
+    /// if nlink reached 0 and the inode was fully removed.
+    pub fn unlink_one(&mut self, parent: u64, name: &str) -> Option<(bool, InodeEntry)> {
+        // Find the child ino by name in parent's children
+        let child_ino = {
+            let parent_entry = self.inodes.get(&parent)?;
+            parent_entry.children.iter().find(|c| c.name == name).map(|c| c.ino)?
+        };
+
+        // Build full_path for path_to_inode removal
+        let full_path = {
+            let parent_entry = self.inodes.get(&parent)?;
+            if parent_entry.full_path.is_empty() {
+                name.to_string()
+            } else {
+                format!("{}/{}", parent_entry.full_path, name)
+            }
+        };
+
+        // Remove the DirChild from parent
+        if let Some(parent_entry) = self.inodes.get_mut(&parent) {
+            // Remove only the first matching entry (there might be other links with different names)
+            if let Some(pos) = parent_entry.children.iter().position(|c| c.name == name) {
+                parent_entry.children.remove(pos);
+            }
+        }
+
+        // Remove path mapping
+        self.path_to_inode.remove(&full_path);
+
+        // Decrement nlink
+        let (nlink, entry_snapshot) = {
+            let entry = self.inodes.get_mut(&child_ino)?;
+            entry.nlink = entry.nlink.saturating_sub(1);
+            entry.ctime = SystemTime::now();
+            (entry.nlink, entry.clone())
+        };
+
+        if nlink == 0 {
+            // Fully remove the inode (but don't touch parent again, already cleaned)
+            self.inodes.remove(&child_ino);
+            // Descendants cleaned up if it was a dir (shouldn't happen for unlink, but be safe)
+            Some((true, entry_snapshot))
+        } else {
+            Some((false, entry_snapshot))
+        }
     }
 }
 
@@ -314,6 +418,9 @@ mod tests {
             42,
             UNIX_EPOCH,
             Some("abc123".to_string()),
+            0o644,
+            0,
+            0,
         );
 
         // Lookup by child name from root
@@ -348,6 +455,9 @@ mod tests {
             0,
             UNIX_EPOCH,
             None,
+            0o644,
+            0,
+            0,
         );
 
         // Newly inserted inodes are not dirty
@@ -374,11 +484,14 @@ mod tests {
             100,
             UNIX_EPOCH,
             None,
+            0o644,
+            0,
+            0,
         );
 
         // Verify it exists in parent's children
         let root = table.get(ROOT_INODE).unwrap();
-        assert!(root.children.contains(&ino));
+        assert!(root.children.iter().any(|c| c.ino == ino));
 
         // Verify path mapping exists
         assert!(table.get_by_path("remove_me.txt").is_some());
@@ -392,7 +505,7 @@ mod tests {
 
         // Parent's children no longer contains the inode
         let root = table.get(ROOT_INODE).unwrap();
-        assert!(!root.children.contains(&ino));
+        assert!(!root.children.iter().any(|c| c.ino == ino));
 
         // Path mapping is gone
         assert!(table.get_by_path("remove_me.txt").is_none());
@@ -416,6 +529,9 @@ mod tests {
             50,
             UNIX_EPOCH,
             None,
+            0o644,
+            0,
+            0,
         );
 
         // Verify original path works
@@ -444,6 +560,9 @@ mod tests {
             10,
             UNIX_EPOCH,
             None,
+            0o644,
+            0,
+            0,
         );
 
         // Inserting the same full_path again should return the existing inode
@@ -455,6 +574,9 @@ mod tests {
             20,
             UNIX_EPOCH,
             None,
+            0o644,
+            0,
+            0,
         );
 
         assert_eq!(ino1, ino2, "duplicate path insert should return existing inode");
@@ -465,7 +587,7 @@ mod tests {
         // Root should only have one child (not two)
         let root = table.get(ROOT_INODE).unwrap();
         assert_eq!(
-            root.children.iter().filter(|&&c| c == ino1).count(),
+            root.children.iter().filter(|c| c.ino == ino1).count(),
             1,
             "parent should have exactly one child reference"
         );
@@ -485,6 +607,9 @@ mod tests {
             0,
             UNIX_EPOCH,
             None,
+            0o755,
+            0,
+            0,
         );
 
         let child_ino = table.insert(
@@ -495,6 +620,9 @@ mod tests {
             10,
             UNIX_EPOCH,
             None,
+            0o644,
+            0,
+            0,
         );
 
         let subdir_ino = table.insert(
@@ -505,6 +633,9 @@ mod tests {
             0,
             UNIX_EPOCH,
             None,
+            0o755,
+            0,
+            0,
         );
 
         let deep_ino = table.insert(
@@ -515,6 +646,9 @@ mod tests {
             5,
             UNIX_EPOCH,
             None,
+            0o644,
+            0,
+            0,
         );
 
         // Rename old_dir → new_dir
@@ -552,6 +686,9 @@ mod tests {
             10,
             UNIX_EPOCH,
             None,
+            0o644,
+            0,
+            0,
         );
         assert!(table.get_dir_ino("file.txt").is_none());
 
@@ -564,6 +701,9 @@ mod tests {
             0,
             UNIX_EPOCH,
             None,
+            0o755,
+            0,
+            0,
         );
         assert_eq!(table.get_dir_ino("mydir"), Some(dir_ino));
 
@@ -585,6 +725,9 @@ mod tests {
             100,
             UNIX_EPOCH,
             Some("hash_a".to_string()),
+            0o644,
+            0,
+            0,
         );
         table.get_mut(ino1).unwrap().dirty = true;
 
@@ -596,6 +739,9 @@ mod tests {
             200,
             UNIX_EPOCH,
             Some("hash_b".to_string()),
+            0o644,
+            0,
+            0,
         );
 
         // Insert a directory — should NOT appear in file_snapshot
@@ -607,6 +753,9 @@ mod tests {
             0,
             UNIX_EPOCH,
             None,
+            0o755,
+            0,
+            0,
         );
 
         let snapshot = table.file_snapshot();
@@ -636,6 +785,9 @@ mod tests {
             100,
             UNIX_EPOCH,
             Some("old_hash".to_string()),
+            0o644,
+            0,
+            0,
         );
 
         let new_mtime = UNIX_EPOCH + std::time::Duration::from_secs(1000);
@@ -668,6 +820,9 @@ mod tests {
             0,
             UNIX_EPOCH,
             None,
+            0o755,
+            0,
+            0,
         );
 
         // Mark as loaded
@@ -694,6 +849,9 @@ mod tests {
             10,
             UNIX_EPOCH,
             Some("hash".to_string()),
+            0o644,
+            0,
+            0,
         );
 
         // Initially empty
@@ -727,6 +885,9 @@ mod tests {
             0,
             UNIX_EPOCH,
             None,
+            0o755,
+            0,
+            0,
         );
         let child_ino = table.insert(
             dir_ino,
@@ -736,6 +897,9 @@ mod tests {
             10,
             UNIX_EPOCH,
             None,
+            0o644,
+            0,
+            0,
         );
         let subdir_ino = table.insert(
             dir_ino,
@@ -745,6 +909,9 @@ mod tests {
             0,
             UNIX_EPOCH,
             None,
+            0o755,
+            0,
+            0,
         );
         let deep_ino = table.insert(
             subdir_ino,
@@ -754,6 +921,9 @@ mod tests {
             5,
             UNIX_EPOCH,
             None,
+            0o644,
+            0,
+            0,
         );
 
         // Remove the top-level dir
@@ -771,7 +941,7 @@ mod tests {
         assert!(table.get_by_path("dir/subdir/deep.txt").is_none());
 
         // Root no longer references the removed dir
-        assert!(!table.get(ROOT_INODE).unwrap().children.contains(&dir_ino));
+        assert!(!table.get(ROOT_INODE).unwrap().children.iter().any(|c| c.ino == dir_ino));
     }
 
     #[test]
@@ -788,6 +958,9 @@ mod tests {
             10,
             UNIX_EPOCH,
             None,
+            0o644,
+            0,
+            0,
         );
     }
 
@@ -804,6 +977,9 @@ mod tests {
             10,
             UNIX_EPOCH,
             None,
+            0o644,
+            0,
+            0,
         );
         // Same path but Directory kind — should panic in debug
         table.insert(
@@ -814,6 +990,9 @@ mod tests {
             0,
             UNIX_EPOCH,
             None,
+            0o755,
+            0,
+            0,
         );
     }
 
@@ -828,6 +1007,9 @@ mod tests {
             1,
             UNIX_EPOCH,
             None,
+            0o644,
+            0,
+            0,
         );
         let dir_ino = table.insert(
             ROOT_INODE,
@@ -837,6 +1019,9 @@ mod tests {
             0,
             UNIX_EPOCH,
             None,
+            0o755,
+            0,
+            0,
         );
         table.get_mut(file_ino).unwrap().dirty = true;
         table.get_mut(dir_ino).unwrap().dirty = true;
@@ -856,6 +1041,9 @@ mod tests {
             10,
             UNIX_EPOCH,
             None,
+            0o644,
+            0,
+            0,
         );
 
         let before = table.file_snapshot();
@@ -877,6 +1065,9 @@ mod tests {
             0,
             UNIX_EPOCH,
             None,
+            0o755,
+            0,
+            0,
         );
         let child_ino = table.insert(
             dir_ino,
@@ -886,6 +1077,9 @@ mod tests {
             1,
             UNIX_EPOCH,
             None,
+            0o644,
+            0,
+            0,
         );
 
         // Simulate a stale children list entry in parent by removing child first.

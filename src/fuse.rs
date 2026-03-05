@@ -48,14 +48,15 @@ fn vfs_attr_to_fuse(attr: &VirtualFsAttr) -> FileAttr {
     let kind = match attr.kind {
         InodeKind::File => FileType::RegularFile,
         InodeKind::Directory => FileType::Directory,
+        InodeKind::Symlink => FileType::Symlink,
     };
     FileAttr {
         ino: INodeNo(attr.ino),
         size: attr.size,
         blocks: attr.blocks,
-        atime: attr.mtime,
+        atime: attr.atime,
         mtime: attr.mtime,
-        ctime: attr.mtime,
+        ctime: attr.ctime,
         crtime: attr.mtime,
         kind,
         perm: attr.perm,
@@ -138,6 +139,7 @@ impl Filesystem for FuseAdapter {
                     let file_type = match entry.kind {
                         InodeKind::File => FileType::RegularFile,
                         InodeKind::Directory => FileType::Directory,
+                        InodeKind::Symlink => FileType::Symlink,
                     };
                     // (i + 1) is the offset cookie the kernel will pass back on the next call.
                     if reply.add(INodeNo(entry.ino), (i + 1) as u64, file_type, entry.name) {
@@ -239,16 +241,16 @@ impl Filesystem for FuseAdapter {
         req: &Request,
         parent: INodeNo,
         name: &OsStr,
-        _mode: u32,
+        mode: u32,
         _umask: u32,
         _flags: i32,
         reply: fuser::ReplyCreate,
     ) {
         let name = os_to_str!(name, reply);
-        match self
-            .runtime
-            .block_on(self.virtual_fs.create(parent.0, name, Some(req.pid())))
-        {
+        match self.runtime.block_on(
+            self.virtual_fs
+                .create(parent.0, name, (mode & 0o7777) as u16, Some(req.pid())),
+        ) {
             Ok((attr, file_handle)) => {
                 reply.created(
                     &self.metadata_ttl,
@@ -263,9 +265,12 @@ impl Filesystem for FuseAdapter {
     }
 
     /// Create a new directory.
-    fn mkdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, _mode: u32, _umask: u32, reply: ReplyEntry) {
+    fn mkdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, mode: u32, _umask: u32, reply: ReplyEntry) {
         let name = os_to_str!(name, reply);
-        match self.runtime.block_on(self.virtual_fs.mkdir(parent.0, name)) {
+        match self
+            .runtime
+            .block_on(self.virtual_fs.mkdir(parent.0, name, (mode & 0o7777) as u16))
+        {
             Ok(attr) => reply.entry(&self.metadata_ttl, &vfs_attr_to_fuse(&attr), GENERATION),
             Err(e) => reply.error(Errno::from_i32(e)),
         }
@@ -276,6 +281,42 @@ impl Filesystem for FuseAdapter {
         let name = os_to_str!(name, reply);
         match self.runtime.block_on(self.virtual_fs.unlink(parent.0, name)) {
             Ok(()) => reply.ok(),
+            Err(e) => reply.error(Errno::from_i32(e)),
+        }
+    }
+
+    /// Create a symbolic link.
+    fn symlink(&self, _req: &Request, parent: INodeNo, link_name: &OsStr, target: &std::path::Path, reply: ReplyEntry) {
+        let link_name = os_to_str!(link_name, reply);
+        let target = match target.to_str() {
+            Some(t) => t,
+            None => {
+                reply.error(Errno::EINVAL);
+                return;
+            }
+        };
+        match self
+            .runtime
+            .block_on(self.virtual_fs.symlink(parent.0, link_name, target, 0o777))
+        {
+            Ok(attr) => reply.entry(&self.metadata_ttl, &vfs_attr_to_fuse(&attr), GENERATION),
+            Err(e) => reply.error(Errno::from_i32(e)),
+        }
+    }
+
+    /// Read the target of a symbolic link.
+    fn readlink(&self, _req: &Request, ino: INodeNo, reply: ReplyData) {
+        match self.virtual_fs.readlink(ino.0) {
+            Ok(target) => reply.data(target.as_bytes()),
+            Err(e) => reply.error(Errno::from_i32(e)),
+        }
+    }
+
+    /// Create a hard link.
+    fn link(&self, _req: &Request, ino: INodeNo, newparent: INodeNo, newname: &OsStr, reply: ReplyEntry) {
+        let newname = os_to_str!(newname, reply);
+        match self.runtime.block_on(self.virtual_fs.link(ino.0, newparent.0, newname)) {
+            Ok(attr) => reply.entry(&self.metadata_ttl, &vfs_attr_to_fuse(&attr), GENERATION),
             Err(e) => reply.error(Errno::from_i32(e)),
         }
     }
@@ -326,17 +367,17 @@ impl Filesystem for FuseAdapter {
         }
     }
 
-    /// Set file attributes. Only size (truncate) is supported.
+    /// Set file attributes (size, mode, uid, gid, timestamps).
     fn setattr(
         &self,
         _req: &Request,
         ino: INodeNo,
-        _mode: Option<u32>,
-        _uid: Option<u32>,
-        _gid: Option<u32>,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
         size: Option<u64>,
-        _atime: Option<TimeOrNow>,
-        _mtime: Option<TimeOrNow>,
+        atime: Option<TimeOrNow>,
+        mtime: Option<TimeOrNow>,
         _ctime: Option<SystemTime>,
         _fh: Option<FileHandle>,
         _crtime: Option<SystemTime>,
@@ -345,7 +386,19 @@ impl Filesystem for FuseAdapter {
         _flags: Option<fuser::BsdFileFlags>,
         reply: ReplyAttr,
     ) {
-        match self.runtime.block_on(self.virtual_fs.setattr(ino.0, size)) {
+        let resolve_time = |t: TimeOrNow| match t {
+            TimeOrNow::SpecificTime(st) => st,
+            TimeOrNow::Now => SystemTime::now(),
+        };
+        match self.runtime.block_on(self.virtual_fs.setattr(
+            ino.0,
+            size,
+            mode.map(|m| (m & 0o7777) as u16),
+            uid,
+            gid,
+            atime.map(resolve_time),
+            mtime.map(resolve_time),
+        )) {
             Ok(attr) => reply.attr(&self.metadata_ttl, &vfs_attr_to_fuse(&attr)),
             Err(e) => reply.error(Errno::from_i32(e)),
         }
