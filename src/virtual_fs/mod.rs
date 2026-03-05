@@ -1265,7 +1265,7 @@ impl VirtualFs {
                 // (fuse_read_update_size), which makes subsequent reads return
                 // 0 bytes and truncates the file from the application's view.
                 if let Some(data) = prefetch_state.try_serve_forward(offset, size)
-                    && data.len() >= to_read
+                    && data.len() == to_read
                 {
                     debug!("prefetch hit (forward): offset={}, len={}", offset, data.len());
                     let eof = offset + data.len() as u64 >= file_size;
@@ -1274,7 +1274,7 @@ impl VirtualFs {
 
                 // Seek window fast path (also zero-copy)
                 if let Some(data) = prefetch_state.try_serve_seek(offset, size)
-                    && data.len() >= to_read
+                    && data.len() == to_read
                 {
                     debug!("prefetch hit (seek): offset={}, len={}", offset, data.len());
                     let eof = offset + data.len() as u64 >= file_size;
@@ -1292,7 +1292,7 @@ impl VirtualFs {
                     if let Some(data) = prefetch_state.try_serve_forward(cursor, remaining) {
                         cursor += data.len() as u64;
                         response.extend_from_slice(&data);
-                        if response.len() >= to_read {
+                        if response.len() == to_read {
                             break;
                         }
                     }
@@ -1304,7 +1304,7 @@ impl VirtualFs {
                         if let Some(data) = prefetch_state.try_serve_seek(cursor, remaining) {
                             cursor += data.len() as u64;
                             response.extend_from_slice(&data);
-                            if response.len() >= to_read {
+                            if response.len() == to_read {
                                 break;
                             }
                             continue;
