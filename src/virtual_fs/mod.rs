@@ -1058,8 +1058,14 @@ impl VirtualFs {
             .ok_or(libc::ENOENT)?
             .dirty;
 
-        // Reuse existing dirty staging file (unless truncating)
-        if !(is_dirty && staging_path.exists() && !truncate) {
+        // Reuse existing staging file if it matches the current remote version.
+        // This avoids re-downloading after a flush (dirty cleared but staging still valid)
+        // or after a previous read that already populated the staging file.
+        let can_reuse_staging = !truncate
+            && staging_path.exists()
+            && (is_dirty || std::fs::metadata(&staging_path).is_ok_and(|m| m.len() == size));
+
+        if !can_reuse_staging {
             if !truncate && !xet_hash.is_empty() && size > 0 {
                 // Download remote content for read-modify-write
                 self.xet_sessions
@@ -1076,6 +1082,8 @@ impl VirtualFs {
                     libc::EIO
                 })?;
             }
+        } else if !is_dirty {
+            debug!("open_advanced_write: reusing cached staging file for ino={}", ino);
         }
 
         let file = OpenOptions::new()

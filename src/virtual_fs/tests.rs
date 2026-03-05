@@ -2210,3 +2210,46 @@ fn shutdown_flushes_dirty() {
     let logs = hub.take_batch_log();
     assert!(!logs.is_empty());
 }
+
+// ── Staging file reuse after flush ──────────────────────────────────
+
+/// After flush clears dirty, re-opening the file for write should reuse the
+/// existing staging file instead of re-downloading from CAS.
+#[test]
+fn open_advanced_write_reuse_staging_after_flush() {
+    let hub = MockHub::new();
+    hub.add_file("file.txt", 8, Some("hash1"), None);
+    let xet = MockXet::new();
+    xet.add_file("hash1", b"original");
+    let (rt, vfs) = vfs_advanced(&hub, &xet);
+
+    rt.block_on(async {
+        let attr = vfs.lookup(ROOT_INODE, "file.txt").await.unwrap();
+        let ino = attr.ino;
+
+        // First open (no truncate): downloads content to staging
+        let fh1 = vfs.open(ino, true, false, None).await.unwrap();
+        write_blocking(&vfs, ino, fh1, 0, b"modified").await.unwrap();
+        vfs.release(fh1).await;
+
+        // Simulate what flush_batch does after successful upload:
+        // clear dirty, set new xet_hash, update size.
+        {
+            let mut inodes = vfs.inode_table.write().unwrap();
+            let entry = inodes.get_mut(ino).unwrap();
+            assert!(entry.dirty);
+            entry.dirty = false;
+            entry.xet_hash = Some("hash2".to_string());
+            entry.size = 8; // "modified" is 8 bytes
+        }
+
+        // Make downloads fail — if the second open tries to download, it will error
+        xet.fail_download();
+
+        // Second open (no truncate): should reuse staging without downloading
+        let fh2 = vfs.open(ino, true, false, None).await.unwrap();
+        let (data, _) = vfs.read(fh2, 0, 100).await.unwrap();
+        assert_eq!(&data[..], b"modified");
+        vfs.release(fh2).await;
+    });
+}

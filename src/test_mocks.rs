@@ -242,6 +242,10 @@ impl MockXet {
         self.files.lock().unwrap().insert(hash.to_string(), content.to_vec());
     }
 
+    pub fn fail_download(&self) {
+        self.download_fail.store(true, Ordering::SeqCst);
+    }
+
     pub fn fail_next_writer_create(&self) {
         self.writer_create_fail.store(true, Ordering::SeqCst);
     }
