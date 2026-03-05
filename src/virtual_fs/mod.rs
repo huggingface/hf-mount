@@ -457,8 +457,7 @@ impl VirtualFs {
                 };
                 let mut inodes = self.inode_table.write().expect("inodes poisoned");
                 if changed {
-                    let current_size = inodes.get(ino).map_or(0, |e| e.size);
-                    let remote_size = head_info.size.unwrap_or(current_size);
+                    let remote_size = head_info.size.expect("HEAD missing x-linked-size");
                     let remote_mtime = head_info
                         .last_modified
                         .as_deref()
