@@ -728,6 +728,18 @@ impl VirtualFs {
         self.next_file_handle.fetch_add(1, Ordering::Relaxed)
     }
 
+    /// Check if any open file handle references the given inode.
+    fn has_open_handles(&self, ino: u64) -> bool {
+        self.open_files
+            .read()
+            .expect("open_files poisoned")
+            .values()
+            .any(|of| match of {
+                OpenFile::Local { ino: i, .. } | OpenFile::Streaming { ino: i, .. } => *i == ino,
+                _ => false,
+            })
+    }
+
     /// Get or create a per-inode lock for staging file preparation.
     fn staging_lock(&self, ino: u64) -> Arc<tokio::sync::Mutex<()>> {
         self.staging_locks
@@ -1726,20 +1738,11 @@ impl VirtualFs {
         }
 
         // Clean up orphan inodes (nlink == 0) when no more handles reference them.
-        if let Some(ino) = released_ino {
-            let has_other_handles = self
-                .open_files
-                .read()
-                .expect("open_files poisoned")
-                .values()
-                .any(|of| match of {
-                    OpenFile::Local { ino: i, .. } | OpenFile::Streaming { ino: i, .. } => *i == ino,
-                    _ => false,
-                });
-            if !has_other_handles {
-                let mut inodes = self.inode_table.write().expect("inodes poisoned");
-                inodes.remove_orphan(ino);
-            }
+        if let Some(ino) = released_ino
+            && !self.has_open_handles(ino)
+        {
+            let mut inodes = self.inode_table.write().expect("inodes poisoned");
+            inodes.remove_orphan(ino);
         }
 
         // staging_locks entries are intentionally not cleaned up here: removing
@@ -2097,19 +2100,8 @@ impl VirtualFs {
                 p.ctime = now;
             }
             // If last link gone and no open handles, remove the orphan immediately
-            if last_link {
-                let has_handles = self
-                    .open_files
-                    .read()
-                    .expect("open_files poisoned")
-                    .values()
-                    .any(|of| match of {
-                        OpenFile::Local { ino: i, .. } | OpenFile::Streaming { ino: i, .. } => *i == ino,
-                        _ => false,
-                    });
-                if !has_handles {
-                    inodes.remove_orphan(ino);
-                }
+            if last_link && !self.has_open_handles(ino) {
+                inodes.remove_orphan(ino);
             }
             last_link
         };
@@ -2547,17 +2539,7 @@ impl VirtualFs {
                 inodes.remove(existing_ino);
             } else {
                 inodes.unlink_one(newparent, newname);
-                // Clean up orphan if no open handles reference the replaced file
-                let has_handles = self
-                    .open_files
-                    .read()
-                    .expect("open_files poisoned")
-                    .values()
-                    .any(|of| match of {
-                        OpenFile::Local { ino, .. } | OpenFile::Streaming { ino, .. } => *ino == existing_ino,
-                        _ => false,
-                    });
-                if !has_handles {
+                if !self.has_open_handles(existing_ino) {
                     inodes.remove_orphan(existing_ino);
                 }
             }
