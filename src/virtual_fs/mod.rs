@@ -2162,6 +2162,12 @@ impl VirtualFs {
                         full_path, e
                     );
                     // Non-fatal: pending_deletes will clean up on next flush
+                } else {
+                    // Remote rename succeeded — clear pending_deletes to avoid double-delete
+                    let mut inodes = self.inode_table.write().expect("inodes poisoned");
+                    if let Some(entry) = inodes.get_mut(ino) {
+                        entry.pending_deletes.retain(|p| p != &full_path);
+                    }
                 }
             }
         }
@@ -2618,6 +2624,12 @@ impl VirtualFs {
                 inodes.remove(existing_ino);
             } else {
                 inodes.unlink_one(newparent, newname);
+                // unlink_one may promote a surviving hard link and add the old canonical path
+                // to pending_deletes. That path is about to be taken by the source file,
+                // so clear it to prevent a spurious delete on the next flush.
+                if let Some(entry) = inodes.get_mut(existing_ino) {
+                    entry.pending_deletes.retain(|p| *p != info.new_full_path);
+                }
                 if !self.has_open_handles(existing_ino) {
                     inodes.remove_orphan(existing_ino);
                 }
