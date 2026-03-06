@@ -991,6 +991,14 @@ impl VirtualFs {
         }
     }
 
+    pub fn default_uid(&self) -> u32 {
+        self.uid
+    }
+
+    pub fn default_gid(&self) -> u32 {
+        self.gid
+    }
+
     pub fn getattr(&self, ino: u64) -> VirtualFsResult<VirtualFsAttr> {
         debug!("getattr: ino={}", ino);
 
@@ -1773,6 +1781,18 @@ impl VirtualFs {
 
     /// Finalize a streaming write: send Finish to the worker, await CAS upload, commit to Hub.
     async fn streaming_commit(&self, ino: u64, channel: &StreamingChannel) -> Result<(), i32> {
+        // POSIX: unlinked files (nlink=0) must not be re-committed on close
+        if self
+            .inode_table
+            .read()
+            .expect("inodes poisoned")
+            .get(ino)
+            .is_some_and(|e| e.nlink == 0)
+        {
+            debug!("streaming_commit: skipping unlinked ino={}", ino);
+            return Ok(());
+        }
+
         let file_info = {
             let pending = channel.pending_info.lock().unwrap().take();
             if let Some(info) = pending {
@@ -2398,8 +2418,8 @@ impl VirtualFs {
                 return Err(libc::EEXIST);
             }
             match (src.kind, existing.kind) {
-                (InodeKind::File, InodeKind::Directory) => return Err(libc::EISDIR),
-                (InodeKind::Directory, InodeKind::File) => return Err(libc::ENOTDIR),
+                (InodeKind::File | InodeKind::Symlink, InodeKind::Directory) => return Err(libc::EISDIR),
+                (InodeKind::Directory, InodeKind::File | InodeKind::Symlink) => return Err(libc::ENOTDIR),
                 (InodeKind::Directory, InodeKind::Directory) if !existing.children.is_empty() => {
                     return Err(libc::ENOTEMPTY);
                 }
@@ -2524,8 +2544,10 @@ impl VirtualFs {
                 return Err(libc::EEXIST);
             }
             match (info.kind, existing.kind) {
-                (InodeKind::File, InodeKind::Directory) => return Err(libc::EISDIR),
-                (InodeKind::Directory, InodeKind::File) => return Err(libc::ENOTDIR),
+                // POSIX: non-directory cannot replace directory
+                (InodeKind::File | InodeKind::Symlink, InodeKind::Directory) => return Err(libc::EISDIR),
+                // POSIX: directory cannot replace non-directory
+                (InodeKind::Directory, InodeKind::File | InodeKind::Symlink) => return Err(libc::ENOTDIR),
                 (InodeKind::Directory, InodeKind::Directory) if !existing.children.is_empty() => {
                     return Err(libc::ENOTEMPTY);
                 }
@@ -2539,6 +2561,10 @@ impl VirtualFs {
             if existing_kind == InodeKind::Directory {
                 // Directories can't be hard-linked, so remove() is correct
                 inodes.remove(existing_ino);
+                // POSIX: removed directory's ".." no longer links to newparent
+                if let Some(p) = inodes.get_mut(newparent) {
+                    p.nlink = p.nlink.saturating_sub(1);
+                }
             } else {
                 inodes.unlink_one(newparent, newname);
                 if !self.has_open_handles(existing_ino) {
@@ -2622,19 +2648,20 @@ impl VirtualFs {
         if let Some(p) = inodes.get_mut(parent) {
             p.mtime = now;
             p.ctime = now;
-            // POSIX: moving a directory out decrements old parent's nlink (the ".." link moves)
-            if info.kind == InodeKind::Directory {
-                p.nlink = p.nlink.saturating_sub(1);
-            }
         }
-        if parent != newparent
-            && let Some(p) = inodes.get_mut(newparent)
-        {
-            p.mtime = now;
-            p.ctime = now;
-            // POSIX: moving a directory in increments new parent's nlink (gains a ".." link)
+        if parent != newparent {
+            if let Some(p) = inodes.get_mut(newparent) {
+                p.mtime = now;
+                p.ctime = now;
+            }
+            // POSIX: moving a directory across parents updates nlink (the ".." link moves)
             if info.kind == InodeKind::Directory {
-                p.nlink += 1;
+                if let Some(p) = inodes.get_mut(parent) {
+                    p.nlink = p.nlink.saturating_sub(1);
+                }
+                if let Some(p) = inodes.get_mut(newparent) {
+                    p.nlink += 1;
+                }
             }
         }
         // Update source ctime (POSIX: inode metadata changed)

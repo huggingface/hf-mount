@@ -391,9 +391,44 @@ impl InodeTable {
             (entry.nlink, entry.clone())
         };
 
+        // If links remain and the removed entry was the canonical path,
+        // update the inode to point at another surviving link.
+        if nlink > 0 && entry_snapshot.parent == parent && entry_snapshot.name == name {
+            // Find any surviving DirChild referencing this inode
+            if let Some((new_parent_ino, new_name, new_full_path)) = self.find_link(child_ino)
+                && let Some(entry) = self.inodes.get_mut(&child_ino)
+            {
+                entry.parent = new_parent_ino;
+                entry.name = new_name;
+                entry.full_path = new_full_path.clone();
+                self.path_to_inode.insert(new_full_path, child_ino);
+            }
+        }
+
         // Return true when last link is gone (inode stays in table for open file handles;
         // callers clean it up via remove_orphan() after the last handle is released).
         Some((nlink == 0, entry_snapshot))
+    }
+
+    /// Find any surviving directory entry referencing `ino`.
+    /// Returns `(parent_ino, child_name, full_path)` if found.
+    fn find_link(&self, ino: u64) -> Option<(u64, String, String)> {
+        for entry in self.inodes.values() {
+            if entry.kind != InodeKind::Directory {
+                continue;
+            }
+            for child in &entry.children {
+                if child.ino == ino {
+                    let full_path = if entry.full_path.is_empty() {
+                        child.name.clone()
+                    } else {
+                        format!("{}/{}", entry.full_path, child.name)
+                    };
+                    return Some((entry.inode, child.name.clone(), full_path));
+                }
+            }
+        }
+        None
     }
 
     /// Remove an orphan inode (nlink == 0, no remaining file handles).
