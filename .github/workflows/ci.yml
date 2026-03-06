@@ -107,7 +107,43 @@ jobs:
 
       - name: Run pjdfstest
         timeout-minutes: 10
-        run: cargo test --release --test pjdfstest -- --nocapture
+        run: cargo test --release --test pjdfstest -- --nocapture 2>&1 | tee pjdfstest_output.txt
+
+      - name: Post pjdfstest results
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          CLEAN=$(sed 's/\x1b\[[0-9;]*m//g' pjdfstest_output.txt)
+          TABLES=$(echo "$CLEAN" | awk '
+            /^=====*$/ { inside=!inside; print; next }
+            inside { print }
+          ')
+          if [ -z "$TABLES" ]; then
+            echo "No pjdfstest table found in output"
+            exit 0
+          fi
+
+          PR="${{ github.event.pull_request.number }}"
+          MARKER="<!-- pjdfstest-results -->"
+          BODY="${MARKER}
+          ## POSIX Compliance (pjdfstest)
+
+          \`\`\`
+          ${TABLES}
+          \`\`\`"
+
+          COMMENT_ID=$(gh api "repos/${{ github.repository }}/issues/${PR}/comments" \
+            --jq ".[] | select(.body | startswith(\"${MARKER}\")) | .id" | head -1)
+
+          if [ -n "$COMMENT_ID" ]; then
+            gh api "repos/${{ github.repository }}/issues/comments/${COMMENT_ID}" \
+              -X PATCH -f body="$BODY"
+            echo "Updated existing comment $COMMENT_ID"
+          else
+            gh pr comment "$PR" --body "$BODY"
+            echo "Created new comment"
+          fi
 
   bench:
     name: Benchmarks
