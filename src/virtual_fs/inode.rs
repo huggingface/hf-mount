@@ -349,6 +349,18 @@ impl InodeTable {
             }
         }
 
+        // Remove any alias DirChild entries and path mappings from other parents
+        // (hard links can create entries in directories other than entry.parent).
+        if entry.nlink > 1 {
+            let parents: Vec<u64> = self.inodes.keys().copied().collect();
+            for p in parents {
+                if let Some(dir) = self.inodes.get_mut(&p) {
+                    dir.children.retain(|c| c.ino != inode);
+                }
+            }
+            self.path_to_inode.retain(|_, ino| *ino != inode);
+        }
+
         // Recursively remove all descendants to avoid orphans
         let mut stack: Vec<u64> = entry.children.iter().map(|c| c.ino).collect();
         while let Some(child_ino) = stack.pop() {
@@ -415,9 +427,8 @@ impl InodeTable {
         };
 
         // If links remain and the removed entry was the canonical path,
-        // update the inode's parent/name to point at a surviving link (for stat correctness).
-        // Keep full_path unchanged for remote-backed files (xet_hash set) since it drives
-        // remote operations (HEAD revalidation, flush, commit).
+        // promote a surviving link to canonical so that future renames and
+        // flushes target the correct path.
         if nlink > 0
             && entry_snapshot.parent == parent
             && entry_snapshot.name == name
@@ -426,11 +437,8 @@ impl InodeTable {
         {
             entry.parent = new_parent_ino;
             entry.name = new_name;
-            if entry.xet_hash.is_none() {
-                // Locally-created file: update full_path since there's no remote path to preserve
-                entry.full_path = new_full_path.clone();
-                self.path_to_inode.insert(new_full_path, child_ino);
-            }
+            entry.full_path = new_full_path.clone();
+            self.path_to_inode.insert(new_full_path, child_ino);
         }
 
         // Return true when last link is gone (inode stays in table for open file handles;

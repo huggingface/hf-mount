@@ -2154,7 +2154,7 @@ impl VirtualFs {
         self.ensure_children_loaded(parent).await?;
 
         let now = SystemTime::now();
-        let ino = {
+        let (ino, full_path) = {
             let mut inodes = self.inode_table.write().expect("inodes poisoned");
             let parent_entry = match inodes.get(parent) {
                 Some(e) if e.kind == InodeKind::Directory => e,
@@ -2172,7 +2172,7 @@ impl VirtualFs {
             let ino = inodes.insert(
                 parent,
                 name.to_string(),
-                full_path,
+                full_path.clone(),
                 InodeKind::Symlink,
                 target.len() as u64,
                 now,
@@ -2185,9 +2185,10 @@ impl VirtualFs {
                 entry.symlink_target = Some(target.to_string());
             }
             inodes.touch_parent(parent, now);
-            ino
+            (ino, full_path)
         };
 
+        self.negative_cache_remove(&full_path);
         let inodes = self.inode_table.read().expect("inodes poisoned");
         Ok(self.make_vfs_attr(inodes.get(ino).ok_or(libc::ENOENT)?))
     }
@@ -2233,7 +2234,7 @@ impl VirtualFs {
             }
         };
 
-        inodes.link(ino, new_parent, new_name.to_string(), new_full_path);
+        inodes.link(ino, new_parent, new_name.to_string(), new_full_path.clone());
 
         // Update parent mtime/ctime and target ctime (POSIX: directory modified, link count changed)
         let now = SystemTime::now();
@@ -2243,7 +2244,13 @@ impl VirtualFs {
         }
 
         let entry = inodes.get(ino).ok_or(libc::ENOENT)?;
-        Ok(self.make_vfs_attr(entry))
+        let attr = self.make_vfs_attr(entry);
+        drop(inodes);
+
+        // Clear negative cache so the new name is discoverable
+        self.negative_cache_remove(&new_full_path);
+
+        Ok(attr)
     }
 
     pub async fn rmdir(&self, parent: u64, name: &str) -> VirtualFsResult<()> {
