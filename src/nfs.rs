@@ -311,7 +311,14 @@ impl NFSFileSystem for NFSAdapter {
         };
         let vfs_attr = self
             .virtual_fs
-            .symlink(dirid, name, target, mode, 0, 0)
+            .symlink(
+                dirid,
+                name,
+                target,
+                mode,
+                self.virtual_fs.default_uid(),
+                self.virtual_fs.default_gid(),
+            )
             .await
             .map_err(errno_to_nfs)?;
         Ok((vfs_attr.ino, vfs_attr_to_nfs(&vfs_attr)))

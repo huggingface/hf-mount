@@ -2436,7 +2436,12 @@ impl VirtualFs {
                         if let Some(child) = inodes.get(child_ref.ino) {
                             match child.kind {
                                 InodeKind::File if !child.dirty && child.xet_hash.is_some() => {
-                                    files.push((child.full_path.clone(), child.xet_hash.clone().unwrap()));
+                                    // Skip hard-linked files whose canonical path isn't under the
+                                    // source directory (they belong elsewhere, not to this subtree).
+                                    let prefix = format!("{}/", src.full_path);
+                                    if child.full_path.starts_with(&prefix) || child.full_path == src.full_path {
+                                        files.push((child.full_path.clone(), child.xet_hash.clone().unwrap()));
+                                    }
                                 }
                                 InodeKind::Directory => stack.push(child_ref.ino),
                                 _ => {}
@@ -2592,9 +2597,14 @@ impl VirtualFs {
                     if let Some(child) = inodes.get(child_ref.ino) {
                         match child.kind {
                             InodeKind::File if child.dirty && child.xet_hash.is_some() => {
-                                let old_path = child.full_path.clone();
-                                if let Some(child_mut) = inodes.get_mut(child_ref.ino) {
-                                    child_mut.pending_deletes.push(old_path);
+                                // Skip hard-linked files whose canonical path isn't under the
+                                // source directory (they belong elsewhere, not to this subtree).
+                                let prefix = format!("{}/", info.old_path);
+                                if child.full_path.starts_with(&prefix) || child.full_path == info.old_path {
+                                    let old_path = child.full_path.clone();
+                                    if let Some(child_mut) = inodes.get_mut(child_ref.ino) {
+                                        child_mut.pending_deletes.push(old_path);
+                                    }
                                 }
                             }
                             InodeKind::Directory => stack.push(child_ref.ino),
