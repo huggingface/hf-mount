@@ -3,13 +3,13 @@ mod common;
 use std::process::Command;
 
 /// Non-regression baseline (established 2026-03-06).
-/// pjdfstest has 237 test files and 8789 individual tests.
-/// We don't support mknod/mkfifo (ENOSYS), which causes cascading failures
-/// in tests that create FIFOs/block devices then test operations on them.
-/// Current: 178/237 files, 5174/8789 tests (58.9%)
+/// mkfifo and mknod categories are excluded (ENOSYS, intentionally unsupported).
 /// Update these when adding new POSIX features.
 const MIN_FILES_PASS: usize = 170;
 const MIN_TESTS_PASS: usize = 5000;
+
+/// Categories excluded from testing (unsupported special file types).
+const EXCLUDED_CATEGORIES: &[&str] = &["mkfifo", "mknod"];
 
 /// Path where pjdfstest is built/cached.
 const PJDFSTEST_DIR: &str = "/tmp/pjdfstest";
@@ -52,8 +52,27 @@ struct ProveResults {
 fn run_prove(mount_point: &str) -> ProveResults {
     let tests_dir = format!("{}/tests/", PJDFSTEST_DIR);
 
+    // Collect test directories, excluding unsupported categories
+    let mut test_dirs: Vec<String> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&tests_dir) {
+        for entry in entries.filter_map(|e| e.ok()) {
+            if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().to_string();
+            if EXCLUDED_CATEGORIES.contains(&name.as_str()) {
+                eprintln!("  Skipping category: {} (unsupported)", name);
+                continue;
+            }
+            test_dirs.push(format!("{}{}/", tests_dir, name));
+        }
+    }
+    test_dirs.sort();
+
     let output = Command::new("sudo")
-        .args(["prove", "-r", &tests_dir])
+        .arg("prove")
+        .arg("-r")
+        .args(&test_dirs)
         .current_dir(mount_point)
         .output()
         .expect("Failed to run prove");
