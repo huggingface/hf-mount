@@ -275,6 +275,7 @@ async fn flush_batch(
             entry.size = size;
             entry.dirty = false;
             entry.mtime = now;
+            entry.ctime = now;
             entry.pending_deletes.clear();
         }
     }

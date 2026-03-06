@@ -1859,7 +1859,9 @@ impl VirtualFs {
             entry.xet_hash = Some(file_info.hash().to_string());
             entry.size = file_info.file_size();
             entry.dirty = false;
-            entry.mtime = SystemTime::now();
+            let now = SystemTime::now();
+            entry.mtime = now;
+            entry.ctime = now;
             entry.pending_deletes.clear();
         }
 
