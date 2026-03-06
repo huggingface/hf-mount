@@ -64,6 +64,7 @@ struct ProveResults {
     failed_tests: usize,
     result: String,
     per_category: Vec<(String, usize, usize)>, // (category, passed_files, total_files)
+    raw_output: String,
 }
 
 fn run_prove(mount_point: &str) -> ProveResults {
@@ -177,6 +178,7 @@ fn run_prove(mount_point: &str) -> ProveResults {
         failed_tests,
         result,
         per_category,
+        raw_output: combined,
     }
 }
 
@@ -209,6 +211,20 @@ fn print_results(results: &ProveResults) {
         eprintln!("  {:20} {:>8} {:>8} {:>8}", cat, passed, total, status);
     }
     eprintln!("============================================================");
+
+    // Print Test Summary Report (failed test details) if present
+    let in_summary: Vec<&str> = results
+        .raw_output
+        .lines()
+        .skip_while(|l| !l.contains("Test Summary Report"))
+        .take_while(|l| !l.starts_with("Files="))
+        .collect::<Vec<_>>();
+    if !in_summary.is_empty() {
+        eprintln!();
+        for line in in_summary {
+            eprintln!("  {}", line);
+        }
+    }
 }
 
 #[tokio::test]
