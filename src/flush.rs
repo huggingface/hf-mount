@@ -207,26 +207,88 @@ async fn flush_batch(
         return;
     }
 
-    // Upload all files through a single upload session
-    let upload_files: Vec<UploadFile<'_>> = to_flush
-        .iter()
-        .map(|(_, _, p, _, old_hash)| UploadFile {
-            path: p.as_path(),
-            old_xet_hash: old_hash.as_deref(),
-        })
-        .collect();
-    let upload_results = match xet_sessions.upload_files(&upload_files).await {
-        Ok(results) => results,
-        Err(e) => {
-            error!("Batch upload failed: {}", e);
-            let msg = format!("upload failed: {e}");
-            let mut errs = flush_errors.lock().expect("flush_errors poisoned");
-            for (ino, _, _, _, _) in &to_flush {
-                errs.insert(*ino, msg.clone());
+    // Upload files: try delta upload for files with a previous CAS version,
+    // fall back to full batch upload for the rest.
+    let mut upload_results: Vec<Option<data::XetFileInfo>> = vec![None; to_flush.len()];
+
+    // First pass: attempt delta upload for files that have old_xet_hash
+    for (idx, (ino, full_path, staging_path, _, old_hash)) in to_flush.iter().enumerate() {
+        let old_hash = match old_hash {
+            Some(h) => h,
+            None => continue,
+        };
+        let new_file_size = match std::fs::metadata(staging_path) {
+            Ok(m) => m.len(),
+            Err(_) => continue,
+        };
+        // Without fine-grained dirty tracking, treat the entire file as dirty.
+        // The dedup pipeline still runs and can recognize unchanged chunks.
+        let dirty_ranges = vec![(0u64, new_file_size)];
+        info!(
+            "Attempting delta upload for ino={} path={} dirty_ranges={}",
+            ino,
+            full_path,
+            dirty_ranges.len()
+        );
+        match xet_sessions
+            .upload_file_delta(old_hash, new_file_size, new_file_size, &dirty_ranges, staging_path)
+            .await
+        {
+            Ok(Some(xfi)) => {
+                info!("Delta upload succeeded for ino={} path={}", ino, full_path);
+                upload_results[idx] = Some(xfi);
             }
-            return;
+            Ok(None) => {
+                debug!(
+                    "Delta upload not supported for ino={}, falling back to full upload",
+                    ino
+                );
+            }
+            Err(e) => {
+                debug!(
+                    "Delta upload failed for ino={}: {}, falling back to full upload",
+                    ino, e
+                );
+            }
         }
-    };
+    }
+
+    // Second pass: batch upload files that weren't handled by delta upload
+    let fallback_indices: Vec<usize> = upload_results
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.is_none())
+        .map(|(i, _)| i)
+        .collect();
+
+    if !fallback_indices.is_empty() {
+        let fallback_files: Vec<UploadFile<'_>> = fallback_indices
+            .iter()
+            .map(|&i| UploadFile {
+                path: to_flush[i].2.as_path(),
+                old_xet_hash: to_flush[i].4.as_deref(),
+            })
+            .collect();
+        match xet_sessions.upload_files(&fallback_files).await {
+            Ok(results) => {
+                for (result, &idx) in results.into_iter().zip(fallback_indices.iter()) {
+                    upload_results[idx] = Some(result);
+                }
+            }
+            Err(e) => {
+                error!("Batch upload failed: {}", e);
+                let msg = format!("upload failed: {e}");
+                let mut errs = flush_errors.lock().expect("flush_errors poisoned");
+                for (ino, _, _, _, _) in &to_flush {
+                    errs.insert(*ino, msg.clone());
+                }
+                return;
+            }
+        }
+    }
+
+    // Unwrap results (all should be Some at this point)
+    let upload_results: Vec<data::XetFileInfo> = upload_results.into_iter().map(|r| r.unwrap()).collect();
 
     let mtime_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
