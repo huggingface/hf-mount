@@ -1,8 +1,8 @@
 use std::time::Duration;
 
+use super::inode::ROOT_INODE;
 use super::*;
 use crate::hub_api::HeadFileInfo;
-use crate::inode::ROOT_INODE;
 use crate::test_mocks::{MockHub, MockXet, TestOpts, make_test_vfs};
 
 fn new_runtime() -> tokio::runtime::Runtime {
@@ -217,7 +217,10 @@ fn revert_inode_new_file_removed() {
     let (rt, vfs) = vfs_simple(&hub, &xet);
 
     rt.block_on(async {
-        let (attr, fh) = vfs.create(ROOT_INODE, "new_file.txt", Some(42)).await.unwrap();
+        let (attr, fh) = vfs
+            .create(ROOT_INODE, "new_file.txt", 0o644, 1000, 1000, Some(42))
+            .await
+            .unwrap();
         let ino = attr.ino;
         write_blocking(&vfs, ino, fh, 0, b"data").await.unwrap();
 
@@ -543,7 +546,10 @@ fn unlink_locally_created_file() {
     let (rt, vfs) = vfs_simple(&hub, &xet);
 
     rt.block_on(async {
-        let (attr, fh) = vfs.create(ROOT_INODE, "local.txt", Some(42)).await.unwrap();
+        let (attr, fh) = vfs
+            .create(ROOT_INODE, "local.txt", 0o644, 1000, 1000, Some(42))
+            .await
+            .unwrap();
         let ino = attr.ino;
         write_blocking(&vfs, ino, fh, 0, b"data").await.unwrap();
         vfs.release(fh).await;
@@ -591,7 +597,7 @@ fn rmdir_empty_succeeds() {
     let (rt, vfs) = vfs_simple(&hub, &xet);
 
     rt.block_on(async {
-        let attr = vfs.mkdir(ROOT_INODE, "empty_dir").await.unwrap();
+        let attr = vfs.mkdir(ROOT_INODE, "empty_dir", 0o755, 1000, 1000).await.unwrap();
         let ino = attr.ino;
         vfs.rmdir(ROOT_INODE, "empty_dir").await.unwrap();
 
@@ -609,7 +615,7 @@ fn create_rollback_streaming_writer_fail() {
     let (rt, vfs) = vfs_simple(&hub, &xet);
 
     rt.block_on(async {
-        let result = vfs.create(ROOT_INODE, "fail.txt", Some(42)).await;
+        let result = vfs.create(ROOT_INODE, "fail.txt", 0o644, 1000, 1000, Some(42)).await;
         assert_eq!(result.unwrap_err(), libc::EIO);
 
         let inodes = vfs.inode_table.read().unwrap();
@@ -627,7 +633,7 @@ fn create_eexist_duplicate() {
 
     rt.block_on(async {
         let _ = vfs.lookup(ROOT_INODE, "exist.txt").await.unwrap();
-        let result = vfs.create(ROOT_INODE, "exist.txt", Some(42)).await;
+        let result = vfs.create(ROOT_INODE, "exist.txt", 0o644, 1000, 1000, Some(42)).await;
         assert_eq!(result.unwrap_err(), libc::EEXIST);
     });
 }
@@ -640,8 +646,11 @@ fn concurrent_create_eexist() {
     let (rt, vfs) = vfs_simple(&hub, &xet);
 
     rt.block_on(async {
-        let (_, fh1) = vfs.create(ROOT_INODE, "race.txt", Some(42)).await.unwrap();
-        let result = vfs.create(ROOT_INODE, "race.txt", Some(43)).await;
+        let (_, fh1) = vfs
+            .create(ROOT_INODE, "race.txt", 0o644, 1000, 1000, Some(42))
+            .await
+            .unwrap();
+        let result = vfs.create(ROOT_INODE, "race.txt", 0o644, 1000, 1000, Some(43)).await;
         assert_eq!(result.unwrap_err(), libc::EEXIST);
         vfs.release(fh1).await;
     });
@@ -660,12 +669,14 @@ fn os_junk_files_rejected() {
     rt.block_on(async {
         for name in [".DS_Store", "._metadata", "Thumbs.db", "desktop.ini", "__MACOSX"] {
             assert_eq!(
-                vfs.create(ROOT_INODE, name, Some(1)).await.unwrap_err(),
+                vfs.create(ROOT_INODE, name, 0o644, 1000, 1000, Some(1))
+                    .await
+                    .unwrap_err(),
                 libc::EACCES,
                 "create({name})"
             );
             assert_eq!(
-                vfs.mkdir(ROOT_INODE, name).await.unwrap_err(),
+                vfs.mkdir(ROOT_INODE, name, 0o755, 1000, 1000).await.unwrap_err(),
                 libc::EACCES,
                 "mkdir({name})"
             );
@@ -923,7 +934,7 @@ fn setattr_simple_mode_eperm() {
 
     rt.block_on(async {
         let attr = vfs.lookup(ROOT_INODE, "file.txt").await.unwrap();
-        let result = vfs.setattr(attr.ino, Some(50)).await;
+        let result = vfs.setattr(attr.ino, Some(50), None, None, None, None, None).await;
         assert_eq!(result.unwrap_err(), libc::EPERM);
     });
 }
@@ -938,7 +949,7 @@ fn setattr_directory_eisdir() {
 
     rt.block_on(async {
         let attr = vfs.lookup(ROOT_INODE, "mydir").await.unwrap();
-        let result = vfs.setattr(attr.ino, Some(0)).await;
+        let result = vfs.setattr(attr.ino, Some(0), None, None, None, None, None).await;
         assert_eq!(result.unwrap_err(), libc::EISDIR);
     });
 }
@@ -955,7 +966,7 @@ fn setattr_advanced_truncate_zero() {
         let attr = vfs.lookup(ROOT_INODE, "file.txt").await.unwrap();
         let ino = attr.ino;
 
-        let result = vfs.setattr(ino, Some(0)).await.unwrap();
+        let result = vfs.setattr(ino, Some(0), None, None, None, None, None).await.unwrap();
         assert_eq!(result.size, 0);
 
         let inodes = vfs.inode_table.read().unwrap();
@@ -975,7 +986,7 @@ fn setattr_readonly_erofs() {
 
     rt.block_on(async {
         let attr = vfs.lookup(ROOT_INODE, "file.txt").await.unwrap();
-        let result = vfs.setattr(attr.ino, Some(0)).await;
+        let result = vfs.setattr(attr.ino, Some(0), None, None, None, None, None).await;
         assert_eq!(result.unwrap_err(), libc::EROFS);
     });
 }
@@ -1077,7 +1088,7 @@ fn mkdir_eexist_and_erofs() {
         let (rt, vfs) = vfs_simple(&hub, &xet);
         rt.block_on(async {
             let _ = vfs.lookup(ROOT_INODE, "existing").await.unwrap();
-            let result = vfs.mkdir(ROOT_INODE, "existing").await;
+            let result = vfs.mkdir(ROOT_INODE, "existing", 0o755, 1000, 1000).await;
             assert_eq!(result.unwrap_err(), libc::EEXIST);
         });
     }
@@ -1085,7 +1096,7 @@ fn mkdir_eexist_and_erofs() {
     {
         let (rt, vfs) = vfs_readonly(&hub, &xet);
         rt.block_on(async {
-            let result = vfs.mkdir(ROOT_INODE, "newdir").await;
+            let result = vfs.mkdir(ROOT_INODE, "newdir", 0o755, 1000, 1000).await;
             assert_eq!(result.unwrap_err(), libc::EROFS);
         });
     }
@@ -1135,7 +1146,10 @@ fn create_and_write_advanced_mode() {
     let (rt, vfs) = vfs_advanced(&hub, &xet);
 
     rt.block_on(async {
-        let (attr, fh) = vfs.create(ROOT_INODE, "new.txt", Some(42)).await.unwrap();
+        let (attr, fh) = vfs
+            .create(ROOT_INODE, "new.txt", 0o644, 1000, 1000, Some(42))
+            .await
+            .unwrap();
         let ino = attr.ino;
         assert_eq!(attr.size, 0);
 
@@ -1561,7 +1575,7 @@ fn setattr_truncate_nonzero() {
         let attr = vfs.lookup(ROOT_INODE, "file.txt").await.unwrap();
         let ino = attr.ino;
 
-        let new_attr = vfs.setattr(ino, Some(50)).await.unwrap();
+        let new_attr = vfs.setattr(ino, Some(50), None, None, None, None, None).await.unwrap();
         assert_eq!(new_attr.size, 50);
 
         let inodes = vfs.inode_table.read().unwrap();
@@ -1578,7 +1592,7 @@ fn setattr_nonexistent_enoent() {
     let (rt, vfs) = vfs_advanced(&hub, &xet);
 
     rt.block_on(async {
-        let result = vfs.setattr(99999, Some(0)).await;
+        let result = vfs.setattr(99999, Some(0), None, None, None, None, None).await;
         assert_eq!(result.unwrap_err(), libc::ENOENT);
     });
 }
@@ -1996,7 +2010,10 @@ fn negative_cache_cleared_on_create() {
         let _ = vfs.lookup(ROOT_INODE, "new.txt").await;
 
         // Create the file
-        let (attr, fh) = vfs.create(ROOT_INODE, "new.txt", Some(1)).await.unwrap();
+        let (attr, fh) = vfs
+            .create(ROOT_INODE, "new.txt", 0o644, 1000, 1000, Some(1))
+            .await
+            .unwrap();
 
         // Lookup should now succeed (negative cache was cleared)
         let found = vfs.lookup(ROOT_INODE, "new.txt").await.unwrap();
@@ -2051,7 +2068,7 @@ fn mkdir_children_loaded() {
     let (rt, vfs) = vfs_simple(&hub, &xet);
 
     rt.block_on(async {
-        let attr = vfs.mkdir(ROOT_INODE, "newdir").await.unwrap();
+        let attr = vfs.mkdir(ROOT_INODE, "newdir", 0o755, 1000, 1000).await.unwrap();
         assert_eq!(attr.kind, InodeKind::Directory);
 
         // Should be able to readdir immediately (children_loaded = true)
@@ -2069,7 +2086,7 @@ fn mkdir_parent_enoent() {
     let (rt, vfs) = vfs_simple(&hub, &xet);
 
     rt.block_on(async {
-        let result = vfs.mkdir(99999, "newdir").await;
+        let result = vfs.mkdir(99999, "newdir", 0o755, 1000, 1000).await;
         assert_eq!(result.unwrap_err(), libc::ENOENT);
     });
 }
@@ -2191,7 +2208,10 @@ fn shutdown_flushes_dirty() {
     let (rt, vfs) = vfs_advanced(&hub, &xet);
 
     rt.block_on(async {
-        let (attr, fh) = vfs.create(ROOT_INODE, "dirty.txt", None).await.unwrap();
+        let (attr, fh) = vfs
+            .create(ROOT_INODE, "dirty.txt", 0o644, 1000, 1000, None)
+            .await
+            .unwrap();
         write_blocking(&vfs, attr.ino, fh, 0, b"unflushed data").await.unwrap();
         vfs.release(fh).await;
     });

@@ -4,10 +4,27 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 pub const ROOT_INODE: u64 = 1;
 
+/// Build a child's full path given the parent's full_path and child name.
+pub fn child_path(parent_path: &str, name: &str) -> String {
+    if parent_path.is_empty() {
+        name.to_string()
+    } else {
+        format!("{}/{}", parent_path, name)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InodeKind {
     File,
     Directory,
+    Symlink,
+}
+
+/// A directory child entry: stores the name on the parent→child edge.
+#[derive(Debug, Clone)]
+pub struct DirChild {
+    pub ino: u64,
+    pub name: String,
 }
 
 #[derive(Debug, Clone)]
@@ -19,12 +36,19 @@ pub struct InodeEntry {
     pub kind: InodeKind,
     pub size: u64,
     pub mtime: SystemTime,
+    pub mode: u16,
+    pub uid: u32,
+    pub gid: u32,
+    pub atime: SystemTime,
+    pub ctime: SystemTime,
+    pub nlink: u32,
+    pub symlink_target: Option<String>,
     pub xet_hash: Option<String>,
     /// ETag from the last HEAD revalidation (used for non-xet plain git/LFS files).
     pub etag: Option<String>,
     pub dirty: bool,
     pub children_loaded: bool,
-    pub children: Vec<u64>,
+    pub children: Vec<DirChild>,
     /// Old remote paths that should be deleted on next flush (set by rename of dirty files).
     pub pending_deletes: Vec<String>,
     /// When this inode's metadata was last validated against the remote (via HEAD).
@@ -61,6 +85,13 @@ impl InodeTable {
             kind: InodeKind::Directory,
             size: 0,
             mtime: UNIX_EPOCH,
+            mode: 0o755,
+            uid: 0,
+            gid: 0,
+            atime: UNIX_EPOCH,
+            ctime: UNIX_EPOCH,
+            nlink: 2,
+            symlink_target: None,
             xet_hash: None,
             etag: None,
             dirty: false,
@@ -88,13 +119,14 @@ impl InodeTable {
     }
 
     /// Find a child of `parent` by name.
+    /// Skips stale DirChild entries whose inode has been removed.
     pub fn lookup_child(&self, parent: u64, name: &str) -> Option<&InodeEntry> {
         let parent_entry = self.inodes.get(&parent)?;
-        for &child_ino in &parent_entry.children {
-            if let Some(child) = self.inodes.get(&child_ino)
-                && child.name == name
+        for child in &parent_entry.children {
+            if child.name == name
+                && let Some(entry) = self.inodes.get(&child.ino)
             {
-                return Some(child);
+                return Some(entry);
             }
         }
         None
@@ -111,6 +143,9 @@ impl InodeTable {
         size: u64,
         mtime: SystemTime,
         xet_hash: Option<String>,
+        mode: u16,
+        uid: u32,
+        gid: u32,
     ) -> u64 {
         // Check if already exists
         if let Some(&existing_ino) = self.path_to_inode.get(&full_path) {
@@ -133,7 +168,14 @@ impl InodeTable {
             full_path
         );
 
+        let now = SystemTime::now();
+        let nlink = match kind {
+            InodeKind::Directory => 2,
+            _ => 1,
+        };
+
         let inode = self.next_inode.fetch_add(1, Ordering::Relaxed);
+        let child_name = name.clone();
         let entry = InodeEntry {
             inode,
             parent,
@@ -142,10 +184,17 @@ impl InodeTable {
             kind,
             size,
             mtime,
+            mode,
+            uid,
+            gid,
+            atime: mtime,
+            ctime: now,
+            nlink,
+            symlink_target: None,
             xet_hash,
             etag: None,
             dirty: false,
-            children_loaded: kind == InodeKind::File, // files don't have children to load
+            children_loaded: kind != InodeKind::Directory, // only dirs have children to load
             children: Vec::new(),
             pending_deletes: Vec::new(),
             last_revalidated: Some(Instant::now()),
@@ -156,7 +205,14 @@ impl InodeTable {
 
         // Add to parent's children
         if let Some(parent_entry) = self.inodes.get_mut(&parent) {
-            parent_entry.children.push(inode);
+            parent_entry.children.push(DirChild {
+                ino: inode,
+                name: child_name,
+            });
+            // POSIX: new subdirectory's ".." links to parent
+            if kind == InodeKind::Directory {
+                parent_entry.nlink += 1;
+            }
         }
 
         inode
@@ -172,11 +228,11 @@ impl InodeTable {
         self.path_to_inode.insert(path, inode);
     }
 
-    /// Return inodes of all dirty files.
+    /// Return inodes of all dirty files (excludes symlinks — they have no content to flush).
     pub fn dirty_inos(&self) -> Vec<u64> {
         self.inodes
             .values()
-            .filter(|e| e.kind == InodeKind::File && e.dirty)
+            .filter(|e| e.kind == InodeKind::File && e.dirty && e.nlink > 0)
             .map(|e| e.inode)
             .collect()
     }
@@ -242,6 +298,8 @@ impl InodeTable {
 
     /// Recursively update full_path and path_to_inode for an inode and all its descendants.
     /// Used after a rename to keep the path mappings consistent.
+    /// Hard-linked inodes whose full_path doesn't match their expected position in the tree
+    /// are skipped (they belong elsewhere and their canonical path must not be rewritten).
     pub fn update_subtree_paths(&mut self, inode: u64, new_full_path: String) {
         // Remove old path mapping
         if let Some(entry) = self.inodes.get(&inode) {
@@ -259,17 +317,9 @@ impl InodeTable {
         };
 
         // Recursively update children
-        for child_ino in children {
-            let child_name = match self.inodes.get(&child_ino) {
-                Some(c) => c.name.clone(),
-                None => continue,
-            };
-            let child_path = if new_full_path.is_empty() {
-                child_name
-            } else {
-                format!("{}/{}", new_full_path, child_name)
-            };
-            self.update_subtree_paths(child_ino, child_path);
+        for child in children {
+            let child_path = child_path(&new_full_path, &child.name);
+            self.update_subtree_paths(child.ino, child_path);
         }
     }
 
@@ -282,19 +332,111 @@ impl InodeTable {
 
         // Remove from parent's children
         if let Some(parent) = self.inodes.get_mut(&entry.parent) {
-            parent.children.retain(|&c| c != inode);
+            parent.children.retain(|c| c.ino != inode);
+            // POSIX: removing a directory removes its ".." link to the parent
+            if entry.kind == InodeKind::Directory {
+                parent.nlink = parent.nlink.saturating_sub(1);
+            }
         }
 
         // Recursively remove all descendants to avoid orphans
-        let mut stack = entry.children.clone();
+        let mut stack: Vec<u64> = entry.children.iter().map(|c| c.ino).collect();
         while let Some(child_ino) = stack.pop() {
             if let Some(child) = self.inodes.remove(&child_ino) {
                 self.path_to_inode.remove(&child.full_path);
-                stack.extend(child.children.iter());
+                stack.extend(child.children.iter().map(|c| c.ino));
             }
         }
 
         Some(entry)
+    }
+
+    /// Remove one directory entry by name from `parent`. Decrements nlink.
+    /// Returns `(inode_removed, entry_snapshot)` where `inode_removed` is true
+    /// if nlink reached 0 and the inode was fully removed.
+    pub fn unlink_one(&mut self, parent: u64, name: &str) -> Option<(bool, InodeEntry)> {
+        // Find child ino and build full_path in a single parent lookup
+        let (child_ino, full_path) = {
+            let parent_entry = self.inodes.get(&parent)?;
+            let ino = parent_entry.children.iter().find(|c| c.name == name).map(|c| c.ino)?;
+            let path = child_path(&parent_entry.full_path, name);
+            (ino, path)
+        };
+
+        // Remove the DirChild from parent
+        if let Some(parent_entry) = self.inodes.get_mut(&parent)
+            && let Some(pos) = parent_entry.children.iter().position(|c| c.name == name)
+        {
+            parent_entry.children.remove(pos);
+        }
+
+        // Remove path mapping
+        self.path_to_inode.remove(&full_path);
+
+        // Decrement nlink
+        let entry_snapshot = {
+            let entry = self.inodes.get_mut(&child_ino)?;
+            entry.nlink = entry.nlink.saturating_sub(1);
+            entry.ctime = SystemTime::now();
+            entry.clone()
+        };
+
+        Some((entry_snapshot.nlink == 0, entry_snapshot))
+    }
+
+    /// Move a child entry from one parent to another (or rename within the same parent).
+    /// Detaches from old parent's children, attaches to new parent's children, updates the
+    /// child's `parent`/`name`, and adjusts nlink for cross-parent directory moves.
+    /// Does NOT update path mappings (caller should use `update_subtree_paths` separately).
+    pub fn move_child(&mut self, ino: u64, old_parent: u64, old_name: &str, new_parent: u64, new_name: &str) {
+        let is_dir = self.inodes.get(&ino).is_some_and(|e| e.kind == InodeKind::Directory);
+
+        // Detach from old parent
+        if let Some(old_p) = self.inodes.get_mut(&old_parent)
+            && let Some(pos) = old_p.children.iter().position(|c| c.ino == ino && c.name == old_name)
+        {
+            old_p.children.remove(pos);
+        }
+
+        // Attach to new parent
+        if let Some(new_p) = self.inodes.get_mut(&new_parent) {
+            new_p.children.push(DirChild {
+                ino,
+                name: new_name.to_string(),
+            });
+        }
+
+        // Adjust parent nlink for cross-parent directory moves
+        if is_dir && old_parent != new_parent {
+            if let Some(old_p) = self.inodes.get_mut(&old_parent) {
+                old_p.nlink = old_p.nlink.saturating_sub(1);
+            }
+            if let Some(new_p) = self.inodes.get_mut(&new_parent) {
+                new_p.nlink += 1;
+            }
+        }
+
+        // Update child's parent/name
+        if let Some(entry) = self.inodes.get_mut(&ino) {
+            entry.parent = new_parent;
+            entry.name = new_name.to_string();
+        }
+    }
+
+    /// Update mtime and ctime on a parent directory (POSIX: directory modified).
+    pub fn touch_parent(&mut self, parent: u64, now: SystemTime) {
+        if let Some(p) = self.inodes.get_mut(&parent) {
+            p.mtime = now;
+            p.ctime = now;
+        }
+    }
+
+    /// Remove an orphan inode (nlink == 0, no remaining file handles).
+    /// Called from release() after the last open handle is closed.
+    pub fn remove_orphan(&mut self, ino: u64) {
+        if self.inodes.get(&ino).is_some_and(|e| e.nlink == 0) {
+            self.inodes.remove(&ino);
+        }
     }
 }
 
@@ -314,6 +456,9 @@ mod tests {
             42,
             UNIX_EPOCH,
             Some("abc123".to_string()),
+            0o644,
+            0,
+            0,
         );
 
         // Lookup by child name from root
@@ -348,6 +493,9 @@ mod tests {
             0,
             UNIX_EPOCH,
             None,
+            0o644,
+            0,
+            0,
         );
 
         // Newly inserted inodes are not dirty
@@ -374,11 +522,14 @@ mod tests {
             100,
             UNIX_EPOCH,
             None,
+            0o644,
+            0,
+            0,
         );
 
         // Verify it exists in parent's children
         let root = table.get(ROOT_INODE).unwrap();
-        assert!(root.children.contains(&ino));
+        assert!(root.children.iter().any(|c| c.ino == ino));
 
         // Verify path mapping exists
         assert!(table.get_by_path("remove_me.txt").is_some());
@@ -392,7 +543,7 @@ mod tests {
 
         // Parent's children no longer contains the inode
         let root = table.get(ROOT_INODE).unwrap();
-        assert!(!root.children.contains(&ino));
+        assert!(!root.children.iter().any(|c| c.ino == ino));
 
         // Path mapping is gone
         assert!(table.get_by_path("remove_me.txt").is_none());
@@ -416,6 +567,9 @@ mod tests {
             50,
             UNIX_EPOCH,
             None,
+            0o644,
+            0,
+            0,
         );
 
         // Verify original path works
@@ -444,6 +598,9 @@ mod tests {
             10,
             UNIX_EPOCH,
             None,
+            0o644,
+            0,
+            0,
         );
 
         // Inserting the same full_path again should return the existing inode
@@ -455,6 +612,9 @@ mod tests {
             20,
             UNIX_EPOCH,
             None,
+            0o644,
+            0,
+            0,
         );
 
         assert_eq!(ino1, ino2, "duplicate path insert should return existing inode");
@@ -465,7 +625,7 @@ mod tests {
         // Root should only have one child (not two)
         let root = table.get(ROOT_INODE).unwrap();
         assert_eq!(
-            root.children.iter().filter(|&&c| c == ino1).count(),
+            root.children.iter().filter(|c| c.ino == ino1).count(),
             1,
             "parent should have exactly one child reference"
         );
@@ -485,6 +645,9 @@ mod tests {
             0,
             UNIX_EPOCH,
             None,
+            0o755,
+            0,
+            0,
         );
 
         let child_ino = table.insert(
@@ -495,6 +658,9 @@ mod tests {
             10,
             UNIX_EPOCH,
             None,
+            0o644,
+            0,
+            0,
         );
 
         let subdir_ino = table.insert(
@@ -505,6 +671,9 @@ mod tests {
             0,
             UNIX_EPOCH,
             None,
+            0o755,
+            0,
+            0,
         );
 
         let deep_ino = table.insert(
@@ -515,6 +684,9 @@ mod tests {
             5,
             UNIX_EPOCH,
             None,
+            0o644,
+            0,
+            0,
         );
 
         // Rename old_dir → new_dir
@@ -552,6 +724,9 @@ mod tests {
             10,
             UNIX_EPOCH,
             None,
+            0o644,
+            0,
+            0,
         );
         assert!(table.get_dir_ino("file.txt").is_none());
 
@@ -564,6 +739,9 @@ mod tests {
             0,
             UNIX_EPOCH,
             None,
+            0o755,
+            0,
+            0,
         );
         assert_eq!(table.get_dir_ino("mydir"), Some(dir_ino));
 
@@ -585,6 +763,9 @@ mod tests {
             100,
             UNIX_EPOCH,
             Some("hash_a".to_string()),
+            0o644,
+            0,
+            0,
         );
         table.get_mut(ino1).unwrap().dirty = true;
 
@@ -596,6 +777,9 @@ mod tests {
             200,
             UNIX_EPOCH,
             Some("hash_b".to_string()),
+            0o644,
+            0,
+            0,
         );
 
         // Insert a directory — should NOT appear in file_snapshot
@@ -607,6 +791,9 @@ mod tests {
             0,
             UNIX_EPOCH,
             None,
+            0o755,
+            0,
+            0,
         );
 
         let snapshot = table.file_snapshot();
@@ -636,6 +823,9 @@ mod tests {
             100,
             UNIX_EPOCH,
             Some("old_hash".to_string()),
+            0o644,
+            0,
+            0,
         );
 
         let new_mtime = UNIX_EPOCH + std::time::Duration::from_secs(1000);
@@ -668,6 +858,9 @@ mod tests {
             0,
             UNIX_EPOCH,
             None,
+            0o755,
+            0,
+            0,
         );
 
         // Mark as loaded
@@ -694,6 +887,9 @@ mod tests {
             10,
             UNIX_EPOCH,
             Some("hash".to_string()),
+            0o644,
+            0,
+            0,
         );
 
         // Initially empty
@@ -727,6 +923,9 @@ mod tests {
             0,
             UNIX_EPOCH,
             None,
+            0o755,
+            0,
+            0,
         );
         let child_ino = table.insert(
             dir_ino,
@@ -736,6 +935,9 @@ mod tests {
             10,
             UNIX_EPOCH,
             None,
+            0o644,
+            0,
+            0,
         );
         let subdir_ino = table.insert(
             dir_ino,
@@ -745,6 +947,9 @@ mod tests {
             0,
             UNIX_EPOCH,
             None,
+            0o755,
+            0,
+            0,
         );
         let deep_ino = table.insert(
             subdir_ino,
@@ -754,6 +959,9 @@ mod tests {
             5,
             UNIX_EPOCH,
             None,
+            0o644,
+            0,
+            0,
         );
 
         // Remove the top-level dir
@@ -771,7 +979,7 @@ mod tests {
         assert!(table.get_by_path("dir/subdir/deep.txt").is_none());
 
         // Root no longer references the removed dir
-        assert!(!table.get(ROOT_INODE).unwrap().children.contains(&dir_ino));
+        assert!(!table.get(ROOT_INODE).unwrap().children.iter().any(|c| c.ino == dir_ino));
     }
 
     #[test]
@@ -788,6 +996,9 @@ mod tests {
             10,
             UNIX_EPOCH,
             None,
+            0o644,
+            0,
+            0,
         );
     }
 
@@ -804,6 +1015,9 @@ mod tests {
             10,
             UNIX_EPOCH,
             None,
+            0o644,
+            0,
+            0,
         );
         // Same path but Directory kind — should panic in debug
         table.insert(
@@ -814,6 +1028,9 @@ mod tests {
             0,
             UNIX_EPOCH,
             None,
+            0o755,
+            0,
+            0,
         );
     }
 
@@ -828,6 +1045,9 @@ mod tests {
             1,
             UNIX_EPOCH,
             None,
+            0o644,
+            0,
+            0,
         );
         let dir_ino = table.insert(
             ROOT_INODE,
@@ -837,6 +1057,9 @@ mod tests {
             0,
             UNIX_EPOCH,
             None,
+            0o755,
+            0,
+            0,
         );
         table.get_mut(file_ino).unwrap().dirty = true;
         table.get_mut(dir_ino).unwrap().dirty = true;
@@ -856,6 +1079,9 @@ mod tests {
             10,
             UNIX_EPOCH,
             None,
+            0o644,
+            0,
+            0,
         );
 
         let before = table.file_snapshot();
@@ -877,6 +1103,9 @@ mod tests {
             0,
             UNIX_EPOCH,
             None,
+            0o755,
+            0,
+            0,
         );
         let child_ino = table.insert(
             dir_ino,
@@ -886,6 +1115,9 @@ mod tests {
             1,
             UNIX_EPOCH,
             None,
+            0o644,
+            0,
+            0,
         );
 
         // Simulate a stale children list entry in parent by removing child first.
@@ -896,5 +1128,249 @@ mod tests {
         table.remove(dir_ino).unwrap();
         assert!(table.get(dir_ino).is_none());
         assert!(table.get_by_path("dir").is_none());
+    }
+
+    #[test]
+    fn test_remove_directory_adjusts_parent_nlink() {
+        let mut table = InodeTable::new();
+        let nlink_before = table.get(ROOT_INODE).unwrap().nlink;
+
+        let dir_ino = table.insert(
+            ROOT_INODE,
+            "sub".to_string(),
+            "sub".to_string(),
+            InodeKind::Directory,
+            0,
+            UNIX_EPOCH,
+            None,
+            0o755,
+            0,
+            0,
+        );
+
+        // insert() increments parent nlink for new subdirectory
+        assert_eq!(table.get(ROOT_INODE).unwrap().nlink, nlink_before + 1);
+
+        // remove() should decrement it back
+        table.remove(dir_ino);
+        assert_eq!(table.get(ROOT_INODE).unwrap().nlink, nlink_before);
+    }
+
+    #[test]
+    fn test_move_child_same_parent() {
+        let mut table = InodeTable::new();
+
+        let file_ino = table.insert(
+            ROOT_INODE,
+            "old.txt".to_string(),
+            "old.txt".to_string(),
+            InodeKind::File,
+            10,
+            UNIX_EPOCH,
+            None,
+            0o644,
+            0,
+            0,
+        );
+
+        let nlink_before = table.get(ROOT_INODE).unwrap().nlink;
+
+        table.move_child(file_ino, ROOT_INODE, "old.txt", ROOT_INODE, "new.txt");
+
+        // Child removed under old name, added under new name
+        assert!(table.lookup_child(ROOT_INODE, "old.txt").is_none());
+        assert_eq!(table.lookup_child(ROOT_INODE, "new.txt").unwrap().inode, file_ino);
+
+        // name/parent updated on the inode
+        let entry = table.get(file_ino).unwrap();
+        assert_eq!(entry.name, "new.txt");
+        assert_eq!(entry.parent, ROOT_INODE);
+
+        // nlink unchanged (same parent, file not directory)
+        assert_eq!(table.get(ROOT_INODE).unwrap().nlink, nlink_before);
+    }
+
+    #[test]
+    fn test_move_child_cross_parent_file() {
+        let mut table = InodeTable::new();
+
+        let dir_a = table.insert(
+            ROOT_INODE,
+            "a".to_string(),
+            "a".to_string(),
+            InodeKind::Directory,
+            0,
+            UNIX_EPOCH,
+            None,
+            0o755,
+            0,
+            0,
+        );
+        let dir_b = table.insert(
+            ROOT_INODE,
+            "b".to_string(),
+            "b".to_string(),
+            InodeKind::Directory,
+            0,
+            UNIX_EPOCH,
+            None,
+            0o755,
+            0,
+            0,
+        );
+        let file_ino = table.insert(
+            dir_a,
+            "f.txt".to_string(),
+            "a/f.txt".to_string(),
+            InodeKind::File,
+            10,
+            UNIX_EPOCH,
+            None,
+            0o644,
+            0,
+            0,
+        );
+
+        let nlink_a = table.get(dir_a).unwrap().nlink;
+        let nlink_b = table.get(dir_b).unwrap().nlink;
+
+        table.move_child(file_ino, dir_a, "f.txt", dir_b, "g.txt");
+
+        // Detached from dir_a, attached to dir_b
+        assert!(table.lookup_child(dir_a, "f.txt").is_none());
+        assert_eq!(table.lookup_child(dir_b, "g.txt").unwrap().inode, file_ino);
+
+        // name/parent updated
+        let entry = table.get(file_ino).unwrap();
+        assert_eq!(entry.name, "g.txt");
+        assert_eq!(entry.parent, dir_b);
+
+        // nlink unchanged on both parents (file move, not directory)
+        assert_eq!(table.get(dir_a).unwrap().nlink, nlink_a);
+        assert_eq!(table.get(dir_b).unwrap().nlink, nlink_b);
+    }
+
+    #[test]
+    fn test_move_child_cross_parent_directory() {
+        let mut table = InodeTable::new();
+
+        let dir_a = table.insert(
+            ROOT_INODE,
+            "a".to_string(),
+            "a".to_string(),
+            InodeKind::Directory,
+            0,
+            UNIX_EPOCH,
+            None,
+            0o755,
+            0,
+            0,
+        );
+        let dir_b = table.insert(
+            ROOT_INODE,
+            "b".to_string(),
+            "b".to_string(),
+            InodeKind::Directory,
+            0,
+            UNIX_EPOCH,
+            None,
+            0o755,
+            0,
+            0,
+        );
+        let sub = table.insert(
+            dir_a,
+            "sub".to_string(),
+            "a/sub".to_string(),
+            InodeKind::Directory,
+            0,
+            UNIX_EPOCH,
+            None,
+            0o755,
+            0,
+            0,
+        );
+
+        let nlink_a = table.get(dir_a).unwrap().nlink;
+        let nlink_b = table.get(dir_b).unwrap().nlink;
+
+        table.move_child(sub, dir_a, "sub", dir_b, "sub");
+
+        // nlink: old parent --, new parent ++
+        assert_eq!(table.get(dir_a).unwrap().nlink, nlink_a - 1);
+        assert_eq!(table.get(dir_b).unwrap().nlink, nlink_b + 1);
+    }
+
+    #[test]
+    fn test_touch_parent() {
+        let mut table = InodeTable::new();
+        let before = table.get(ROOT_INODE).unwrap().mtime;
+
+        let now = UNIX_EPOCH + std::time::Duration::from_secs(12345);
+        table.touch_parent(ROOT_INODE, now);
+
+        let root = table.get(ROOT_INODE).unwrap();
+        assert_eq!(root.mtime, now);
+        assert_eq!(root.ctime, now);
+        assert_ne!(root.mtime, before);
+    }
+
+    #[test]
+    fn test_unlink_one_basic() {
+        let mut table = InodeTable::new();
+
+        let file_ino = table.insert(
+            ROOT_INODE,
+            "f.txt".to_string(),
+            "f.txt".to_string(),
+            InodeKind::File,
+            10,
+            UNIX_EPOCH,
+            None,
+            0o644,
+            0,
+            0,
+        );
+
+        let result = table.unlink_one(ROOT_INODE, "f.txt");
+        assert!(result.is_some());
+        let (last_link, snapshot) = result.unwrap();
+        assert!(last_link, "should be last link");
+        assert_eq!(snapshot.inode, file_ino);
+        assert_eq!(snapshot.nlink, 0);
+
+        // Child removed from parent
+        assert!(table.lookup_child(ROOT_INODE, "f.txt").is_none());
+        // Path mapping removed
+        assert!(table.get_by_path("f.txt").is_none());
+    }
+
+    #[test]
+    fn test_unlink_one_last_link() {
+        let mut table = InodeTable::new();
+
+        let file_ino = table.insert(
+            ROOT_INODE,
+            "doomed.txt".to_string(),
+            "doomed.txt".to_string(),
+            InodeKind::File,
+            10,
+            UNIX_EPOCH,
+            None,
+            0o644,
+            0,
+            0,
+        );
+
+        let (last_link, _) = table.unlink_one(ROOT_INODE, "doomed.txt").unwrap();
+        assert!(last_link);
+
+        // Inode still in table (for open file handles), but nlink == 0
+        let entry = table.get(file_ino).unwrap();
+        assert_eq!(entry.nlink, 0);
+
+        // remove_orphan should clean it up
+        table.remove_orphan(file_ino);
+        assert!(table.get(file_ino).is_none());
     }
 }

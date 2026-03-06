@@ -7,7 +7,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info};
 
 use crate::hub_api::{BatchOp, HubOps};
-use crate::inode::InodeTable;
+use crate::virtual_fs::inode::InodeTable;
 use crate::xet::{StagingDir, XetOps};
 
 type FlushRequest = u64;
@@ -275,6 +275,7 @@ async fn flush_batch(
             entry.size = size;
             entry.dirty = false;
             entry.mtime = now;
+            entry.ctime = now;
             entry.pending_deletes.clear();
         }
     }

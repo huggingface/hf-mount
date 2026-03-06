@@ -3,7 +3,6 @@ pub mod error;
 mod flush;
 pub mod fuse;
 pub mod hub_api;
-pub mod inode;
 pub mod nfs;
 mod prefetch;
 pub mod setup;
