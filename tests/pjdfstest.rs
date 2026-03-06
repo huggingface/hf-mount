@@ -239,13 +239,20 @@ fn print_results(results: &ProveResults) {
 
 #[tokio::test]
 async fn test_pjdfstest() {
+    let is_ci = std::env::var("CI").is_ok();
     if !ensure_pjdfstest() {
+        if is_ci {
+            panic!("pjdfstest build failed in CI -- setup error");
+        }
         eprintln!("Skipping: pjdfstest not available");
         return;
     }
 
     // prove requires perl
     if Command::new("prove").arg("--version").output().is_err() {
+        if is_ci {
+            panic!("prove (perl TAP harness) not found in CI");
+        }
         eprintln!("Skipping: prove (perl TAP harness) not installed");
         return;
     }

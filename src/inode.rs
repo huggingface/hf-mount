@@ -312,17 +312,20 @@ impl InodeTable {
             } else {
                 format!("{}/{}", old_full_path, child.name)
             };
-            // Skip hard-linked inodes whose canonical path is elsewhere
-            if let Some(child_entry) = self.inodes.get(&child.ino)
-                && child_entry.full_path != expected_old
-            {
-                continue;
-            }
             let child_path = if new_full_path.is_empty() {
                 child.name
             } else {
                 format!("{}/{}", new_full_path, child.name)
             };
+            // Hard-linked inodes whose canonical path is elsewhere: update the alias
+            // mapping in path_to_inode but don't rewrite the inode's canonical full_path.
+            if let Some(child_entry) = self.inodes.get(&child.ino)
+                && child_entry.full_path != expected_old
+            {
+                self.path_to_inode.remove(&expected_old);
+                self.path_to_inode.insert(child_path, child.ino);
+                continue;
+            }
             self.update_subtree_paths(child.ino, child_path);
         }
     }
