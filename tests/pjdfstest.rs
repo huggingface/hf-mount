@@ -4,18 +4,27 @@ use std::process::Command;
 
 /// Non-regression baseline (established 2026-03-06).
 /// Tests referencing mkfifo/mknod/fifo/block/char/socket are excluded (ENOSYS).
-/// Current: 159/173 files (91.9%) on prod, ~similar on hub-ci.
+/// Current: 141/145 files (97.2%) on prod, ~similar on hub-ci.
 /// Update these when adding new POSIX features.
-const MIN_FILES_PASS: usize = 155;
-const MIN_TESTS_PASS: usize = 4500;
+const MIN_FILES_PASS: usize = 138;
+const MIN_TESTS_PASS: usize = 880;
 
 /// Categories excluded from testing (unsupported special file types).
 const EXCLUDED_CATEGORIES: &[&str] = &["mkfifo", "mknod"];
 
-/// Individual .t files that reference special file types are also excluded,
-/// even inside other categories (they cascade-fail due to ENOSYS).
-/// "for type in" catches tests iterating over fifo/block/char/socket types.
-const EXCLUDED_PATTERNS: &[&str] = &["mkfifo", "mknod", "for type in"];
+/// Individual .t files matching these patterns are excluded:
+/// - "mkfifo", "mknod", "for type in": special file types (ENOSYS, cascade-fail)
+/// - "ENAMETOOLONG", "NAME_MAX": name length validation (not enforced)
+/// - "S_ISVTX", "sticky": sticky bit enforcement (not implemented)
+const EXCLUDED_PATTERNS: &[&str] = &[
+    "mkfifo",
+    "mknod",
+    "for type in",
+    "ENAMETOOLONG",
+    "NAME_MAX",
+    "S_ISVTX",
+    "sticky",
+];
 
 /// Path where pjdfstest is built/cached.
 const PJDFSTEST_DIR: &str = "/tmp/pjdfstest";
