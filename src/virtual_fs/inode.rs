@@ -380,20 +380,16 @@ impl InodeTable {
     /// Returns `(inode_removed, entry_snapshot)` where `inode_removed` is true
     /// if nlink reached 0 and the inode was fully removed.
     pub fn unlink_one(&mut self, parent: u64, name: &str) -> Option<(bool, InodeEntry)> {
-        // Find the child ino by name in parent's children
-        let child_ino = {
+        // Find child ino and build full_path in a single parent lookup
+        let (child_ino, full_path) = {
             let parent_entry = self.inodes.get(&parent)?;
-            parent_entry.children.iter().find(|c| c.name == name).map(|c| c.ino)?
-        };
-
-        // Build full_path for path_to_inode removal
-        let full_path = {
-            let parent_entry = self.inodes.get(&parent)?;
-            if parent_entry.full_path.is_empty() {
+            let ino = parent_entry.children.iter().find(|c| c.name == name).map(|c| c.ino)?;
+            let path = if parent_entry.full_path.is_empty() {
                 name.to_string()
             } else {
                 format!("{}/{}", parent_entry.full_path, name)
-            }
+            };
+            (ino, path)
         };
 
         // Remove the DirChild from parent
@@ -1204,5 +1200,298 @@ mod tests {
         table.remove(dir_ino).unwrap();
         assert!(table.get(dir_ino).is_none());
         assert!(table.get_by_path("dir").is_none());
+    }
+
+    #[test]
+    fn test_remove_directory_adjusts_parent_nlink() {
+        let mut table = InodeTable::new();
+        let nlink_before = table.get(ROOT_INODE).unwrap().nlink;
+
+        let dir_ino = table.insert(
+            ROOT_INODE,
+            "sub".to_string(),
+            "sub".to_string(),
+            InodeKind::Directory,
+            0,
+            UNIX_EPOCH,
+            None,
+            0o755,
+            0,
+            0,
+        );
+
+        // insert() increments parent nlink for new subdirectory
+        assert_eq!(table.get(ROOT_INODE).unwrap().nlink, nlink_before + 1);
+
+        // remove() should decrement it back
+        table.remove(dir_ino);
+        assert_eq!(table.get(ROOT_INODE).unwrap().nlink, nlink_before);
+    }
+
+    #[test]
+    fn test_move_child_same_parent() {
+        let mut table = InodeTable::new();
+
+        let file_ino = table.insert(
+            ROOT_INODE,
+            "old.txt".to_string(),
+            "old.txt".to_string(),
+            InodeKind::File,
+            10,
+            UNIX_EPOCH,
+            None,
+            0o644,
+            0,
+            0,
+        );
+
+        let nlink_before = table.get(ROOT_INODE).unwrap().nlink;
+
+        table.move_child(file_ino, ROOT_INODE, "old.txt", ROOT_INODE, "new.txt");
+
+        // Child removed under old name, added under new name
+        assert!(table.lookup_child(ROOT_INODE, "old.txt").is_none());
+        assert_eq!(table.lookup_child(ROOT_INODE, "new.txt").unwrap().inode, file_ino);
+
+        // name/parent updated on the inode
+        let entry = table.get(file_ino).unwrap();
+        assert_eq!(entry.name, "new.txt");
+        assert_eq!(entry.parent, ROOT_INODE);
+
+        // nlink unchanged (same parent, file not directory)
+        assert_eq!(table.get(ROOT_INODE).unwrap().nlink, nlink_before);
+    }
+
+    #[test]
+    fn test_move_child_cross_parent_file() {
+        let mut table = InodeTable::new();
+
+        let dir_a = table.insert(
+            ROOT_INODE,
+            "a".to_string(),
+            "a".to_string(),
+            InodeKind::Directory,
+            0,
+            UNIX_EPOCH,
+            None,
+            0o755,
+            0,
+            0,
+        );
+        let dir_b = table.insert(
+            ROOT_INODE,
+            "b".to_string(),
+            "b".to_string(),
+            InodeKind::Directory,
+            0,
+            UNIX_EPOCH,
+            None,
+            0o755,
+            0,
+            0,
+        );
+        let file_ino = table.insert(
+            dir_a,
+            "f.txt".to_string(),
+            "a/f.txt".to_string(),
+            InodeKind::File,
+            10,
+            UNIX_EPOCH,
+            None,
+            0o644,
+            0,
+            0,
+        );
+
+        let nlink_a = table.get(dir_a).unwrap().nlink;
+        let nlink_b = table.get(dir_b).unwrap().nlink;
+
+        table.move_child(file_ino, dir_a, "f.txt", dir_b, "g.txt");
+
+        // Detached from dir_a, attached to dir_b
+        assert!(table.lookup_child(dir_a, "f.txt").is_none());
+        assert_eq!(table.lookup_child(dir_b, "g.txt").unwrap().inode, file_ino);
+
+        // name/parent updated
+        let entry = table.get(file_ino).unwrap();
+        assert_eq!(entry.name, "g.txt");
+        assert_eq!(entry.parent, dir_b);
+
+        // nlink unchanged on both parents (file move, not directory)
+        assert_eq!(table.get(dir_a).unwrap().nlink, nlink_a);
+        assert_eq!(table.get(dir_b).unwrap().nlink, nlink_b);
+    }
+
+    #[test]
+    fn test_move_child_cross_parent_directory() {
+        let mut table = InodeTable::new();
+
+        let dir_a = table.insert(
+            ROOT_INODE,
+            "a".to_string(),
+            "a".to_string(),
+            InodeKind::Directory,
+            0,
+            UNIX_EPOCH,
+            None,
+            0o755,
+            0,
+            0,
+        );
+        let dir_b = table.insert(
+            ROOT_INODE,
+            "b".to_string(),
+            "b".to_string(),
+            InodeKind::Directory,
+            0,
+            UNIX_EPOCH,
+            None,
+            0o755,
+            0,
+            0,
+        );
+        let sub = table.insert(
+            dir_a,
+            "sub".to_string(),
+            "a/sub".to_string(),
+            InodeKind::Directory,
+            0,
+            UNIX_EPOCH,
+            None,
+            0o755,
+            0,
+            0,
+        );
+
+        let nlink_a = table.get(dir_a).unwrap().nlink;
+        let nlink_b = table.get(dir_b).unwrap().nlink;
+
+        table.move_child(sub, dir_a, "sub", dir_b, "sub");
+
+        // nlink: old parent --, new parent ++
+        assert_eq!(table.get(dir_a).unwrap().nlink, nlink_a - 1);
+        assert_eq!(table.get(dir_b).unwrap().nlink, nlink_b + 1);
+    }
+
+    #[test]
+    fn test_touch_parent() {
+        let mut table = InodeTable::new();
+        let before = table.get(ROOT_INODE).unwrap().mtime;
+
+        let now = UNIX_EPOCH + std::time::Duration::from_secs(12345);
+        table.touch_parent(ROOT_INODE, now);
+
+        let root = table.get(ROOT_INODE).unwrap();
+        assert_eq!(root.mtime, now);
+        assert_eq!(root.ctime, now);
+        assert_ne!(root.mtime, before);
+    }
+
+    #[test]
+    fn test_unlink_one_basic() {
+        let mut table = InodeTable::new();
+
+        let file_ino = table.insert(
+            ROOT_INODE,
+            "f.txt".to_string(),
+            "f.txt".to_string(),
+            InodeKind::File,
+            10,
+            UNIX_EPOCH,
+            None,
+            0o644,
+            0,
+            0,
+        );
+
+        let result = table.unlink_one(ROOT_INODE, "f.txt");
+        assert!(result.is_some());
+        let (last_link, snapshot) = result.unwrap();
+        assert!(last_link, "should be last link");
+        assert_eq!(snapshot.inode, file_ino);
+        assert_eq!(snapshot.nlink, 0);
+
+        // Child removed from parent
+        assert!(table.lookup_child(ROOT_INODE, "f.txt").is_none());
+        // Path mapping removed
+        assert!(table.get_by_path("f.txt").is_none());
+    }
+
+    #[test]
+    fn test_unlink_one_hard_link_survives() {
+        let mut table = InodeTable::new();
+
+        let dir_a = table.insert(
+            ROOT_INODE,
+            "a".to_string(),
+            "a".to_string(),
+            InodeKind::Directory,
+            0,
+            UNIX_EPOCH,
+            None,
+            0o755,
+            0,
+            0,
+        );
+
+        let file_ino = table.insert(
+            ROOT_INODE,
+            "orig.txt".to_string(),
+            "orig.txt".to_string(),
+            InodeKind::File,
+            10,
+            UNIX_EPOCH,
+            None,
+            0o644,
+            0,
+            0,
+        );
+
+        // Create a hard link in dir_a
+        table.link(file_ino, dir_a, "link.txt".to_string(), "a/link.txt".to_string());
+        assert_eq!(table.get(file_ino).unwrap().nlink, 2);
+
+        // Unlink the original
+        let (last_link, snapshot) = table.unlink_one(ROOT_INODE, "orig.txt").unwrap();
+        assert!(!last_link, "should NOT be last link");
+        assert_eq!(snapshot.nlink, 1);
+
+        // Inode still exists and is accessible via the surviving link
+        assert!(table.get(file_ino).is_some());
+        assert_eq!(table.lookup_child(dir_a, "link.txt").unwrap().inode, file_ino);
+
+        // Canonical parent/name updated to surviving link
+        let entry = table.get(file_ino).unwrap();
+        assert_eq!(entry.parent, dir_a);
+        assert_eq!(entry.name, "link.txt");
+    }
+
+    #[test]
+    fn test_unlink_one_last_link() {
+        let mut table = InodeTable::new();
+
+        let file_ino = table.insert(
+            ROOT_INODE,
+            "doomed.txt".to_string(),
+            "doomed.txt".to_string(),
+            InodeKind::File,
+            10,
+            UNIX_EPOCH,
+            None,
+            0o644,
+            0,
+            0,
+        );
+
+        let (last_link, _) = table.unlink_one(ROOT_INODE, "doomed.txt").unwrap();
+        assert!(last_link);
+
+        // Inode still in table (for open file handles), but nlink == 0
+        let entry = table.get(file_ino).unwrap();
+        assert_eq!(entry.nlink, 0);
+
+        // remove_orphan should clean it up
+        table.remove_orphan(file_ino);
+        assert!(table.get(file_ino).is_none());
     }
 }

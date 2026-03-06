@@ -10,7 +10,7 @@ use fuser::{
 };
 use tracing::{error, info};
 
-use crate::inode::InodeKind;
+use crate::virtual_fs::inode::InodeKind;
 use crate::virtual_fs::{VirtualFs, VirtualFsAttr};
 
 /// Always 0: we never recycle inode numbers, so generation is unnecessary.

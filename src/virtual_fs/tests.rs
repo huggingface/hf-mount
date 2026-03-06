@@ -1,8 +1,8 @@
 use std::time::Duration;
 
+use super::inode::ROOT_INODE;
 use super::*;
 use crate::hub_api::HeadFileInfo;
-use crate::inode::ROOT_INODE;
 use crate::test_mocks::{MockHub, MockXet, TestOpts, make_test_vfs};
 
 fn new_runtime() -> tokio::runtime::Runtime {

@@ -12,7 +12,7 @@ use nfsserve::tcp::{NFSTcp, NFSTcpListener};
 use nfsserve::vfs::{DirEntry, NFSFileSystem, ReadDirResult, VFSCapabilities};
 use tracing::info;
 
-use crate::inode::InodeKind;
+use crate::virtual_fs::inode::InodeKind;
 use crate::virtual_fs::{VirtualFs, VirtualFsAttr};
 
 // ── NFS Adapter ────────────────────────────────────────────────────────
@@ -78,18 +78,13 @@ impl NFSAdapter {
         dirid: fileid3,
         filename: &filename3,
         mode: u16,
+        uid: u32,
+        gid: u32,
     ) -> Result<(fileid3, fattr3), nfsstat3> {
         let name = nfs_name(filename)?;
         let (attr, file_handle) = self
             .virtual_fs
-            .create(
-                dirid,
-                name,
-                mode,
-                self.virtual_fs.default_uid(),
-                self.virtual_fs.default_gid(),
-                None,
-            )
+            .create(dirid, name, mode, uid, gid, None)
             .await
             .map_err(errno_to_nfs)?;
         let ino = attr.ino;
@@ -245,12 +240,28 @@ impl NFSFileSystem for NFSAdapter {
             set_mode3::mode(m) => (m & 0o7777) as u16,
             set_mode3::Void => 0o644,
         };
-        let (ino, fattr) = self.create_file(dirid, filename, mode).await?;
+        let uid = match attr.uid {
+            set_uid3::uid(u) => u,
+            set_uid3::Void => self.virtual_fs.default_uid(),
+        };
+        let gid = match attr.gid {
+            set_gid3::gid(g) => g,
+            set_gid3::Void => self.virtual_fs.default_gid(),
+        };
+        let (ino, fattr) = self.create_file(dirid, filename, mode, uid, gid).await?;
         Ok((ino, fattr))
     }
 
     async fn create_exclusive(&self, dirid: fileid3, filename: &filename3) -> Result<fileid3, nfsstat3> {
-        let (ino, _) = self.create_file(dirid, filename, 0o644).await?;
+        let (ino, _) = self
+            .create_file(
+                dirid,
+                filename,
+                0o644,
+                self.virtual_fs.default_uid(),
+                self.virtual_fs.default_gid(),
+            )
+            .await?;
         Ok(ino)
     }
 

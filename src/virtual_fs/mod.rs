@@ -11,9 +11,11 @@ use data::XetFileInfo;
 use tracing::{debug, error, info, warn};
 
 use crate::hub_api::{BatchOp, HubOps};
-use crate::inode::{InodeEntry, InodeKind, InodeTable};
+
+pub mod inode;
 use crate::prefetch::{FetchPlan, PrefetchState};
 use crate::xet::{StagingDir, StreamingWriterOps, XetOps};
+use inode::{InodeEntry, InodeKind, InodeTable};
 
 // ── Constants ──────────────────────────────────────────────────────────
 
@@ -163,7 +165,7 @@ impl VirtualFs {
         // Set root inode mtime and ownership (repos use the last commit date).
         {
             let mut inodes = vfs.inode_table.write().expect("inodes poisoned");
-            if let Some(root) = inodes.get_mut(crate::inode::ROOT_INODE) {
+            if let Some(root) = inodes.get_mut(inode::ROOT_INODE) {
                 root.mtime = vfs.hub_client.default_mtime();
                 root.atime = root.mtime;
                 root.uid = uid;
@@ -178,10 +180,7 @@ impl VirtualFs {
             if let Err(e) = vfs.runtime.block_on(vfs.preload_tree_recursive()) {
                 error!("Failed to preload repo tree: errno={}", e);
             }
-        } else if let Err(e) = vfs
-            .runtime
-            .block_on(vfs.ensure_children_loaded(crate::inode::ROOT_INODE))
-        {
+        } else if let Err(e) = vfs.runtime.block_on(vfs.ensure_children_loaded(inode::ROOT_INODE)) {
             error!("Failed to pre-load root directory: errno={}", e);
         }
 
@@ -341,7 +340,7 @@ impl VirtualFs {
                             }
                             if ancestor.is_empty() {
                                 // Root always exists; invalidate it
-                                if dirs_to_invalidate.insert(crate::inode::ROOT_INODE) {
+                                if dirs_to_invalidate.insert(inode::ROOT_INODE) {
                                     dir_paths_to_invalidate.push(String::new());
                                 }
                                 break;
@@ -626,12 +625,12 @@ impl VirtualFs {
         let mut inodes = self.inode_table.write().expect("inodes poisoned");
         // Track which directories we've seen so we can mark them children_loaded.
         let mut dirs_seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
-        dirs_seen.insert(crate::inode::ROOT_INODE);
+        dirs_seen.insert(inode::ROOT_INODE);
 
         for entry in entries {
             // Walk the path components, creating intermediate directories as needed.
             let parts: Vec<&str> = entry.path.split('/').collect();
-            let mut current_parent = crate::inode::ROOT_INODE;
+            let mut current_parent = inode::ROOT_INODE;
 
             // Create/find intermediate directories (all but last component).
             for (i, part) in parts.iter().enumerate() {
@@ -1696,8 +1695,14 @@ impl VirtualFs {
             Some(OpenFile::Local {
                 ino, writable: true, ..
             }) => {
-                // Advanced writes: enqueue for async flush
-                if let Some(fm) = &self.flush_manager {
+                // Advanced writes: enqueue for async flush (skip unlinked files)
+                let is_unlinked = self
+                    .inode_table
+                    .read()
+                    .expect("inodes poisoned")
+                    .get(ino)
+                    .is_some_and(|e| e.nlink == 0);
+                if !is_unlinked && let Some(fm) = &self.flush_manager {
                     fm.enqueue(ino);
                 }
             }
@@ -2349,8 +2354,11 @@ impl VirtualFs {
             }
         }
 
-        // Phase 2: sync to remote (add + delete ops)
-        self.rename_remote(&info).await?;
+        // Phase 2: sync to remote (add + delete ops). Skip for hard link aliases
+        // (alias paths don't exist remotely, only the canonical path does).
+        if !info.is_alias {
+            self.rename_remote(&info).await?;
+        }
 
         // Phase 3: apply to local inode table under write lock
         self.rename_apply_local(info, parent, name, newparent, newname, no_replace)
@@ -2368,6 +2376,16 @@ impl VirtualFs {
         let inodes = self.inode_table.read().expect("inodes poisoned");
 
         let src = inodes.lookup_child(parent, name).ok_or(libc::ENOENT)?;
+
+        // Compute the actual directory-entry path (may differ from src.full_path for hard link aliases)
+        let parent_path = inodes.get(parent).map(|e| e.full_path.as_str()).unwrap_or("");
+        let old_link_path = if parent_path.is_empty() {
+            name.to_string()
+        } else {
+            format!("{}/{}", parent_path, name)
+        };
+        // Hard link alias: this entry doesn't correspond to the remote canonical path
+        let is_alias = old_link_path != src.full_path;
 
         // Destination parent must exist
         let new_parent_entry = inodes.get(newparent).ok_or(libc::ENOENT)?;
@@ -2437,10 +2455,11 @@ impl VirtualFs {
 
         Ok(RenameInfo {
             ino: src.inode,
-            old_path: src.full_path.clone(),
+            old_path: old_link_path,
             kind: src.kind,
             xet_hash: src.xet_hash.clone(),
             is_dirty: src.dirty,
+            is_alias,
             new_full_path,
             descendant_files,
         })
@@ -2554,8 +2573,10 @@ impl VirtualFs {
             }
         }
 
-        // Dirty file with a remote presence: record old path for deletion at flush time
-        if info.is_dirty
+        // Dirty file with a remote presence: record old path for deletion at flush time.
+        // Skip for alias renames (alias paths aren't remote paths).
+        if !info.is_alias
+            && info.is_dirty
             && info.kind == InodeKind::File
             && info.xet_hash.is_some()
             && let Some(entry) = inodes.get_mut(info.ino)
@@ -2568,7 +2589,7 @@ impl VirtualFs {
         if info.kind == InodeKind::Directory {
             let mut stack = vec![info.ino];
             while let Some(dir_ino) = stack.pop() {
-                let children: Vec<crate::inode::DirChild> =
+                let children: Vec<inode::DirChild> =
                     inodes.get(dir_ino).map(|e| e.children.clone()).unwrap_or_default();
                 for child_ref in children {
                     if let Some(child) = inodes.get(child_ref.ino) {
@@ -2592,21 +2613,32 @@ impl VirtualFs {
             }
         }
 
-        // Remove old path mapping for the renamed entry (may differ from entry.full_path
-        // when renaming a hard-link alias). update_subtree_paths handles the canonical path.
-        {
-            let old_parent_path = inodes.get(parent).map(|e| e.full_path.clone()).unwrap_or_default();
-            let old_link_path = if old_parent_path.is_empty() {
-                oldname.to_string()
-            } else {
-                format!("{}/{}", old_parent_path, oldname)
-            };
-            inodes.remove_path(&old_link_path);
-        }
+        // Remove old path mapping for the renamed entry
+        inodes.remove_path(&info.old_path);
 
-        // Move child: detach from old parent, attach to new, update name/parent, adjust nlink
-        inodes.move_child(info.ino, parent, oldname, newparent, newname);
-        inodes.update_subtree_paths(info.ino, info.new_full_path);
+        if info.is_alias {
+            // Hard link alias: only update directory entries and path mapping.
+            // Don't touch the inode's canonical parent/name/full_path.
+            if let Some(old_p) = inodes.get_mut(parent)
+                && let Some(pos) = old_p
+                    .children
+                    .iter()
+                    .position(|c| c.ino == info.ino && c.name == oldname)
+            {
+                old_p.children.remove(pos);
+            }
+            if let Some(new_p) = inodes.get_mut(newparent) {
+                new_p.children.push(inode::DirChild {
+                    ino: info.ino,
+                    name: newname.to_string(),
+                });
+            }
+            inodes.insert_path(info.new_full_path, info.ino);
+        } else {
+            // Canonical entry: full move with path rewrite
+            inodes.move_child(info.ino, parent, oldname, newparent, newname);
+            inodes.update_subtree_paths(info.ino, info.new_full_path);
+        }
 
         // Update parent mtime/ctime for both old and new parents (POSIX: directories modified)
         let now = SystemTime::now();
@@ -2807,6 +2839,9 @@ struct RenameInfo {
     kind: InodeKind,
     xet_hash: Option<String>,
     is_dirty: bool,
+    /// True when renaming a hard link alias (not the canonical entry).
+    /// Alias renames are local-only: no remote ops or pending_deletes needed.
+    is_alias: bool,
     new_full_path: String,
     /// Descendant clean files to rename on the remote (dir renames only).
     descendant_files: Vec<(String, String)>,
