@@ -35,13 +35,22 @@ const PJDFSTEST_REV: &str = "03eb25706d8dbf3611c3f820b45b7a5e09a36c06";
 
 fn ensure_pjdfstest() -> bool {
     let binary = format!("{}/pjdfstest", PJDFSTEST_DIR);
+    // Verify both binary existence AND correct revision to avoid stale cache on self-hosted runners.
     if std::path::Path::new(&binary).exists() {
-        return true;
+        let rev_ok = Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(PJDFSTEST_DIR)
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim() == PJDFSTEST_REV)
+            .unwrap_or(false);
+        if rev_ok {
+            return true;
+        }
+        eprintln!("Cached pjdfstest has wrong revision, rebuilding...");
     }
 
     // Remove stale directory (e.g. from interrupted previous run on self-hosted runner)
     if std::path::Path::new(PJDFSTEST_DIR).exists() {
-        eprintln!("Removing stale pjdfstest directory...");
         std::fs::remove_dir_all(PJDFSTEST_DIR).ok();
     }
 
