@@ -2,12 +2,11 @@ mod common;
 
 use std::process::Command;
 
-/// Non-regression baseline (established 2026-03-06).
+/// Expected results (established 2026-03-06).
 /// Tests referencing mkfifo/mknod/fifo/block/char/socket are excluded (ENOSYS).
-/// Current: 144/144 files (100%) on prod after filtering unsupported features.
 /// Update these when adding new POSIX features.
-const MIN_FILES_PASS: usize = 140;
-const MIN_TESTS_PASS: usize = 880;
+const EXPECTED_FILES_PASS: usize = 144;
+const EXPECTED_TESTS_PASS: usize = 912;
 
 /// Categories excluded from testing (unsupported special file types).
 const EXCLUDED_CATEGORIES: &[&str] = &["mkfifo", "mknod"];
@@ -260,20 +259,16 @@ async fn test_pjdfstest() {
     std::fs::remove_dir_all(&mount_point).ok();
     std::fs::remove_dir_all(&cache_dir).ok();
 
-    // Non-regression assertions
+    // Exact regression assertions — all filtered tests must pass
     let passed_tests = results.total_tests.saturating_sub(results.failed_tests);
-    assert!(
-        results.passed_files >= MIN_FILES_PASS,
-        "Regression: only {}/{} test files passed (minimum: {})",
-        results.passed_files,
-        results.total_files,
-        MIN_FILES_PASS
+    assert_eq!(
+        results.passed_files, EXPECTED_FILES_PASS,
+        "Regression: {}/{} test files passed (expected {})",
+        results.passed_files, results.total_files, EXPECTED_FILES_PASS
     );
-    assert!(
-        passed_tests >= MIN_TESTS_PASS,
-        "Regression: only {}/{} tests passed (minimum: {})",
-        passed_tests,
-        results.total_tests,
-        MIN_TESTS_PASS
+    assert_eq!(
+        passed_tests, EXPECTED_TESTS_PASS,
+        "Regression: {}/{} tests passed (expected {})",
+        passed_tests, results.total_tests, EXPECTED_TESTS_PASS
     );
 }
