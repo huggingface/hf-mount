@@ -4,9 +4,9 @@ use std::process::Command;
 
 /// Non-regression baseline (established 2026-03-06).
 /// Tests referencing mkfifo/mknod/fifo/block/char/socket are excluded (ENOSYS).
-/// Current: 141/145 files (97.2%) on prod, ~similar on hub-ci.
+/// Current: 144/144 files (100%) on prod after filtering unsupported features.
 /// Update these when adding new POSIX features.
-const MIN_FILES_PASS: usize = 138;
+const MIN_FILES_PASS: usize = 140;
 const MIN_TESTS_PASS: usize = 880;
 
 /// Categories excluded from testing (unsupported special file types).
@@ -16,6 +16,7 @@ const EXCLUDED_CATEGORIES: &[&str] = &["mkfifo", "mknod"];
 /// - "mkfifo", "mknod", "for type in": special file types (ENOSYS, cascade-fail)
 /// - "ENAMETOOLONG", "NAME_MAX": name length validation (not enforced)
 /// - "S_ISVTX", "sticky": sticky bit enforcement (not implemented)
+/// - "socket": Unix domain sockets (unsupported)
 const EXCLUDED_PATTERNS: &[&str] = &[
     "mkfifo",
     "mknod",
@@ -24,6 +25,7 @@ const EXCLUDED_PATTERNS: &[&str] = &[
     "NAME_MAX",
     "S_ISVTX",
     "sticky",
+    "socket",
 ];
 
 /// Path where pjdfstest is built/cached.

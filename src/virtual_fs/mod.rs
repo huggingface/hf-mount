@@ -1110,6 +1110,10 @@ impl VirtualFs {
             entry.dirty = true;
             if truncate {
                 entry.size = 0;
+                // POSIX: O_TRUNC must update mtime and ctime
+                let now = SystemTime::now();
+                entry.mtime = now;
+                entry.ctime = now;
             }
         }
 
@@ -1663,6 +1667,11 @@ impl VirtualFs {
             .expect("open_files poisoned")
             .remove(&file_handle);
 
+        let released_ino = match &removed {
+            Some(OpenFile::Local { ino, .. }) | Some(OpenFile::Streaming { ino, .. }) => Some(*ino),
+            _ => None,
+        };
+
         match removed {
             Some(OpenFile::Local {
                 ino, writable: true, ..
@@ -1715,6 +1724,24 @@ impl VirtualFs {
             }
             _ => {}
         }
+
+        // Clean up orphan inodes (nlink == 0) when no more handles reference them.
+        if let Some(ino) = released_ino {
+            let has_other_handles = self
+                .open_files
+                .read()
+                .expect("open_files poisoned")
+                .values()
+                .any(|of| match of {
+                    OpenFile::Local { ino: i, .. } | OpenFile::Streaming { ino: i, .. } => *i == ino,
+                    _ => false,
+                });
+            if !has_other_handles {
+                let mut inodes = self.inode_table.write().expect("inodes poisoned");
+                inodes.remove_orphan(ino);
+            }
+        }
+
         // staging_locks entries are intentionally not cleaned up here: removing
         // while another open() may hold the Arc would break serialization.
         // Entries are tiny (Arc<Mutex<()>>) and bounded by unique inodes opened.
@@ -2055,10 +2082,11 @@ impl VirtualFs {
         }
 
         // Remote succeeded (or no remote needed) — now unlink locally.
-        // unlink_one decrements nlink and only removes the inode when nlink reaches 0.
+        // unlink_one decrements nlink; the inode stays in the table with nlink=0
+        // so open file handles can still fstat() it.
         let inode_removed = {
             let mut inodes = self.inode_table.write().expect("inodes poisoned");
-            let removed = inodes
+            let last_link = inodes
                 .unlink_one(parent, name)
                 .map(|(removed, _)| removed)
                 .unwrap_or(false);
@@ -2068,7 +2096,22 @@ impl VirtualFs {
                 p.mtime = now;
                 p.ctime = now;
             }
-            removed
+            // If last link gone and no open handles, remove the orphan immediately
+            if last_link {
+                let has_handles = self
+                    .open_files
+                    .read()
+                    .expect("open_files poisoned")
+                    .values()
+                    .any(|of| match of {
+                        OpenFile::Local { ino: i, .. } | OpenFile::Streaming { ino: i, .. } => *i == ino,
+                        _ => false,
+                    });
+                if !has_handles {
+                    inodes.remove_orphan(ino);
+                }
+            }
+            last_link
         };
         // Clean up staging file only if inode was fully removed (no remaining hard links)
         if inode_removed && let Some(ref staging_dir) = self.staging_dir {
@@ -2504,6 +2547,19 @@ impl VirtualFs {
                 inodes.remove(existing_ino);
             } else {
                 inodes.unlink_one(newparent, newname);
+                // Clean up orphan if no open handles reference the replaced file
+                let has_handles = self
+                    .open_files
+                    .read()
+                    .expect("open_files poisoned")
+                    .values()
+                    .any(|of| match of {
+                        OpenFile::Local { ino, .. } | OpenFile::Streaming { ino, .. } => *ino == existing_ino,
+                        _ => false,
+                    });
+                if !has_handles {
+                    inodes.remove_orphan(existing_ino);
+                }
             }
         }
 
@@ -2582,12 +2638,20 @@ impl VirtualFs {
         if let Some(p) = inodes.get_mut(parent) {
             p.mtime = now;
             p.ctime = now;
+            // POSIX: moving a directory out decrements old parent's nlink (the ".." link moves)
+            if info.kind == InodeKind::Directory {
+                p.nlink = p.nlink.saturating_sub(1);
+            }
         }
         if parent != newparent
             && let Some(p) = inodes.get_mut(newparent)
         {
             p.mtime = now;
             p.ctime = now;
+            // POSIX: moving a directory in increments new parent's nlink (gains a ".." link)
+            if info.kind == InodeKind::Directory {
+                p.nlink += 1;
+            }
         }
         // Update source ctime (POSIX: inode metadata changed)
         if let Some(e) = inodes.get_mut(info.ino) {

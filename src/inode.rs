@@ -217,7 +217,7 @@ impl InodeTable {
     pub fn dirty_inos(&self) -> Vec<u64> {
         self.inodes
             .values()
-            .filter(|e| e.kind == InodeKind::File && e.dirty)
+            .filter(|e| e.kind == InodeKind::File && e.dirty && e.nlink > 0)
             .map(|e| e.inode)
             .collect()
     }
@@ -391,13 +391,16 @@ impl InodeTable {
             (entry.nlink, entry.clone())
         };
 
-        if nlink == 0 {
-            // Fully remove the inode (but don't touch parent again, already cleaned)
-            self.inodes.remove(&child_ino);
-            // Descendants cleaned up if it was a dir (shouldn't happen for unlink, but be safe)
-            Some((true, entry_snapshot))
-        } else {
-            Some((false, entry_snapshot))
+        // Return true when last link is gone (inode stays in table for open file handles;
+        // callers clean it up via remove_orphan() after the last handle is released).
+        Some((nlink == 0, entry_snapshot))
+    }
+
+    /// Remove an orphan inode (nlink == 0, no remaining file handles).
+    /// Called from release() after the last open handle is closed.
+    pub fn remove_orphan(&mut self, ino: u64) {
+        if self.inodes.get(&ino).is_some_and(|e| e.nlink == 0) {
+            self.inodes.remove(&ino);
         }
     }
 }
