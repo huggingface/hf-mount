@@ -107,7 +107,9 @@ jobs:
 
       - name: Run pjdfstest
         timeout-minutes: 10
-        run: cargo test --release --test pjdfstest -- --nocapture 2>&1 | tee pjdfstest_output.txt
+        run: |
+          set -o pipefail
+          cargo test --release --test pjdfstest -- --nocapture 2>&1 | tee pjdfstest_output.txt
 
       - name: Post pjdfstest results
         if: github.event_name == 'pull_request'
