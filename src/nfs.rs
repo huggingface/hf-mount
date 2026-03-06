@@ -320,16 +320,17 @@ impl NFSFileSystem for NFSAdapter {
             set_mode3::mode(m) => (m & 0o7777) as u16,
             set_mode3::Void => 0o777,
         };
+        let uid = match attr.uid {
+            set_uid3::uid(u) => u,
+            set_uid3::Void => self.virtual_fs.default_uid(),
+        };
+        let gid = match attr.gid {
+            set_gid3::gid(g) => g,
+            set_gid3::Void => self.virtual_fs.default_gid(),
+        };
         let vfs_attr = self
             .virtual_fs
-            .symlink(
-                dirid,
-                name,
-                target,
-                mode,
-                self.virtual_fs.default_uid(),
-                self.virtual_fs.default_gid(),
-            )
+            .symlink(dirid, name, target, mode, uid, gid)
             .await
             .map_err(errno_to_nfs)?;
         Ok((vfs_attr.ino, vfs_attr_to_nfs(&vfs_attr)))
