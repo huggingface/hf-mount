@@ -242,15 +242,20 @@ impl Filesystem for FuseAdapter {
         parent: INodeNo,
         name: &OsStr,
         mode: u32,
-        _umask: u32,
+        umask: u32,
         _flags: i32,
         reply: fuser::ReplyCreate,
     ) {
         let name = os_to_str!(name, reply);
-        match self.runtime.block_on(
-            self.virtual_fs
-                .create(parent.0, name, (mode & 0o7777) as u16, Some(req.pid())),
-        ) {
+        let effective_mode = (mode & !umask & 0o7777) as u16;
+        match self.runtime.block_on(self.virtual_fs.create(
+            parent.0,
+            name,
+            effective_mode,
+            req.uid(),
+            req.gid(),
+            Some(req.pid()),
+        )) {
             Ok((attr, file_handle)) => {
                 reply.created(
                     &self.metadata_ttl,
@@ -265,12 +270,13 @@ impl Filesystem for FuseAdapter {
     }
 
     /// Create a new directory.
-    fn mkdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, mode: u32, _umask: u32, reply: ReplyEntry) {
+    fn mkdir(&self, req: &Request, parent: INodeNo, name: &OsStr, mode: u32, umask: u32, reply: ReplyEntry) {
         let name = os_to_str!(name, reply);
-        match self
-            .runtime
-            .block_on(self.virtual_fs.mkdir(parent.0, name, (mode & 0o7777) as u16))
-        {
+        let effective_mode = (mode & !umask & 0o7777) as u16;
+        match self.runtime.block_on(
+            self.virtual_fs
+                .mkdir(parent.0, name, effective_mode, req.uid(), req.gid()),
+        ) {
             Ok(attr) => reply.entry(&self.metadata_ttl, &vfs_attr_to_fuse(&attr), GENERATION),
             Err(e) => reply.error(Errno::from_i32(e)),
         }
@@ -286,7 +292,7 @@ impl Filesystem for FuseAdapter {
     }
 
     /// Create a symbolic link.
-    fn symlink(&self, _req: &Request, parent: INodeNo, link_name: &OsStr, target: &std::path::Path, reply: ReplyEntry) {
+    fn symlink(&self, req: &Request, parent: INodeNo, link_name: &OsStr, target: &std::path::Path, reply: ReplyEntry) {
         let link_name = os_to_str!(link_name, reply);
         let target = match target.to_str() {
             Some(t) => t,
@@ -295,10 +301,10 @@ impl Filesystem for FuseAdapter {
                 return;
             }
         };
-        match self
-            .runtime
-            .block_on(self.virtual_fs.symlink(parent.0, link_name, target, 0o777))
-        {
+        match self.runtime.block_on(
+            self.virtual_fs
+                .symlink(parent.0, link_name, target, 0o777, req.uid(), req.gid()),
+        ) {
             Ok(attr) => reply.entry(&self.metadata_ttl, &vfs_attr_to_fuse(&attr), GENERATION),
             Err(e) => reply.error(Errno::from_i32(e)),
         }

@@ -82,7 +82,7 @@ impl NFSAdapter {
         let name = nfs_name(filename)?;
         let (attr, file_handle) = self
             .virtual_fs
-            .create(dirid, name, mode, None)
+            .create(dirid, name, mode, 0, 0, None)
             .await
             .map_err(errno_to_nfs)?;
         let ino = attr.ino;
@@ -249,7 +249,11 @@ impl NFSFileSystem for NFSAdapter {
 
     async fn mkdir(&self, dirid: fileid3, dirname: &filename3) -> Result<(fileid3, fattr3), nfsstat3> {
         let name = nfs_name(dirname)?;
-        let attr = self.virtual_fs.mkdir(dirid, name, 0o755).await.map_err(errno_to_nfs)?;
+        let attr = self
+            .virtual_fs
+            .mkdir(dirid, name, 0o755, 0, 0)
+            .await
+            .map_err(errno_to_nfs)?;
         Ok((attr.ino, vfs_attr_to_nfs(&attr)))
     }
 
@@ -294,7 +298,7 @@ impl NFSFileSystem for NFSAdapter {
         };
         let vfs_attr = self
             .virtual_fs
-            .symlink(dirid, name, target, mode)
+            .symlink(dirid, name, target, mode, 0, 0)
             .await
             .map_err(errno_to_nfs)?;
         Ok((vfs_attr.ino, vfs_attr_to_nfs(&vfs_attr)))

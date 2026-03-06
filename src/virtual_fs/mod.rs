@@ -1828,6 +1828,8 @@ impl VirtualFs {
         parent: u64,
         name: &str,
         mode: u16,
+        caller_uid: u32,
+        caller_gid: u32,
         pid: Option<u32>,
     ) -> VirtualFsResult<(VirtualFsAttr, u64)> {
         if self.read_only {
@@ -1870,11 +1872,16 @@ impl VirtualFs {
                 now,
                 None,
                 mode,
-                self.uid,
-                self.gid,
+                caller_uid,
+                caller_gid,
             );
             if let Some(entry) = inodes.get_mut(ino) {
                 entry.dirty = true;
+            }
+            // Update parent mtime/ctime (POSIX: directory was modified)
+            if let Some(p) = inodes.get_mut(parent) {
+                p.mtime = now;
+                p.ctime = now;
             }
             (ino, full_path)
         };
@@ -1907,7 +1914,7 @@ impl VirtualFs {
                     );
 
                     let inodes = self.inode_table.read().expect("inodes poisoned");
-                    let attr = self.make_vfs_attr(inodes.get(ino).unwrap());
+                    let attr = self.make_vfs_attr(inodes.get(ino).ok_or(libc::ENOENT)?);
                     Ok((attr, file_handle))
                 }
                 Err(e) => {
@@ -1939,12 +1946,19 @@ impl VirtualFs {
                 .insert(file_handle, OpenFile::Streaming { ino, channel });
 
             let inodes = self.inode_table.read().expect("inodes poisoned");
-            let attr = self.make_vfs_attr(inodes.get(ino).unwrap());
+            let attr = self.make_vfs_attr(inodes.get(ino).ok_or(libc::ENOENT)?);
             Ok((attr, file_handle))
         }
     }
 
-    pub async fn mkdir(&self, parent: u64, name: &str, mode: u16) -> VirtualFsResult<VirtualFsAttr> {
+    pub async fn mkdir(
+        &self,
+        parent: u64,
+        name: &str,
+        mode: u16,
+        caller_uid: u32,
+        caller_gid: u32,
+    ) -> VirtualFsResult<VirtualFsAttr> {
         if self.read_only {
             return Err(libc::EROFS);
         }
@@ -1985,11 +1999,16 @@ impl VirtualFs {
                 now,
                 None,
                 mode,
-                self.uid,
-                self.gid,
+                caller_uid,
+                caller_gid,
             );
             if let Some(entry) = inodes.get_mut(ino) {
                 entry.children_loaded = true;
+            }
+            // Update parent mtime/ctime (POSIX: directory was modified)
+            if let Some(p) = inodes.get_mut(parent) {
+                p.mtime = now;
+                p.ctime = now;
             }
             (ino, full_path)
         };
@@ -1997,7 +2016,7 @@ impl VirtualFs {
         self.negative_cache_remove(&full_path);
 
         let inodes = self.inode_table.read().expect("inodes poisoned");
-        Ok(self.make_vfs_attr(inodes.get(ino).unwrap()))
+        Ok(self.make_vfs_attr(inodes.get(ino).ok_or(libc::ENOENT)?))
     }
 
     pub async fn unlink(&self, parent: u64, name: &str) -> VirtualFsResult<()> {
@@ -2016,8 +2035,8 @@ impl VirtualFs {
                 Some(_) => return Err(libc::EISDIR),
                 None => return Err(libc::ENOENT),
             };
-            // Remote delete needed if the file exists on the hub (has a xet_hash)
-            let needs_remote = entry.xet_hash.is_some();
+            // Remote delete only when last link is removed and file exists on the hub
+            let needs_remote = entry.xet_hash.is_some() && entry.nlink <= 1;
             (entry.inode, entry.full_path.clone(), needs_remote)
         };
 
@@ -2035,10 +2054,24 @@ impl VirtualFs {
             return Err(libc::EIO);
         }
 
-        // Remote succeeded (or no remote needed) — now remove locally.
-        self.inode_table.write().expect("inodes poisoned").remove(ino);
-        // Clean up staging file if present (advanced writes only)
-        if let Some(ref staging_dir) = self.staging_dir {
+        // Remote succeeded (or no remote needed) — now unlink locally.
+        // unlink_one decrements nlink and only removes the inode when nlink reaches 0.
+        let inode_removed = {
+            let mut inodes = self.inode_table.write().expect("inodes poisoned");
+            let removed = inodes
+                .unlink_one(parent, name)
+                .map(|(removed, _)| removed)
+                .unwrap_or(false);
+            // Update parent mtime/ctime (POSIX: directory was modified)
+            let now = SystemTime::now();
+            if let Some(p) = inodes.get_mut(parent) {
+                p.mtime = now;
+                p.ctime = now;
+            }
+            removed
+        };
+        // Clean up staging file only if inode was fully removed (no remaining hard links)
+        if inode_removed && let Some(ref staging_dir) = self.staging_dir {
             let staging_path = staging_dir.path(ino);
             if let Err(e) = std::fs::remove_file(&staging_path)
                 && e.kind() != std::io::ErrorKind::NotFound
@@ -2051,7 +2084,15 @@ impl VirtualFs {
         Ok(())
     }
 
-    pub async fn symlink(&self, parent: u64, name: &str, target: &str, mode: u16) -> VirtualFsResult<VirtualFsAttr> {
+    pub async fn symlink(
+        &self,
+        parent: u64,
+        name: &str,
+        target: &str,
+        mode: u16,
+        caller_uid: u32,
+        caller_gid: u32,
+    ) -> VirtualFsResult<VirtualFsAttr> {
         if self.read_only {
             return Err(libc::EROFS);
         }
@@ -2085,17 +2126,22 @@ impl VirtualFs {
                 now,
                 None,
                 mode,
-                self.uid,
-                self.gid,
+                caller_uid,
+                caller_gid,
             );
             if let Some(entry) = inodes.get_mut(ino) {
                 entry.symlink_target = Some(target.to_string());
+            }
+            // Update parent mtime/ctime (POSIX: directory was modified)
+            if let Some(p) = inodes.get_mut(parent) {
+                p.mtime = now;
+                p.ctime = now;
             }
             ino
         };
 
         let inodes = self.inode_table.read().expect("inodes poisoned");
-        Ok(self.make_vfs_attr(inodes.get(ino).unwrap()))
+        Ok(self.make_vfs_attr(inodes.get(ino).ok_or(libc::ENOENT)?))
     }
 
     pub fn readlink(&self, ino: u64) -> VirtualFsResult<String> {
@@ -2141,6 +2187,16 @@ impl VirtualFs {
 
         inodes.link(ino, new_parent, new_name.to_string(), new_full_path);
 
+        // Update parent mtime/ctime and target ctime (POSIX: directory modified, link count changed)
+        let now = SystemTime::now();
+        if let Some(p) = inodes.get_mut(new_parent) {
+            p.mtime = now;
+            p.ctime = now;
+        }
+        if let Some(t) = inodes.get_mut(ino) {
+            t.ctime = now;
+        }
+
         let entry = inodes.get(ino).ok_or(libc::ENOENT)?;
         Ok(self.make_vfs_attr(entry))
     }
@@ -2180,6 +2236,12 @@ impl VirtualFs {
             _ => {}
         }
         inodes.remove(ino);
+        // Update parent mtime/ctime (POSIX: directory was modified)
+        let now = SystemTime::now();
+        if let Some(p) = inodes.get_mut(parent) {
+            p.mtime = now;
+            p.ctime = now;
+        }
         Ok(())
     }
 
@@ -2239,11 +2301,23 @@ impl VirtualFs {
         // Phase 1: validate under read lock, collect everything we need
         let info = self.rename_validate(parent, name, newparent, newname, no_replace)?;
 
+        // POSIX: rename(a, b) where a and b are hard links to the same inode is a no-op.
+        // Check before remote sync to avoid spurious backend mutations.
+        {
+            let inodes = self.inode_table.read().expect("inodes poisoned");
+            if inodes
+                .lookup_child(newparent, newname)
+                .is_some_and(|e| e.inode == info.ino)
+            {
+                return Ok(());
+            }
+        }
+
         // Phase 2: sync to remote (add + delete ops)
         self.rename_remote(&info).await?;
 
         // Phase 3: apply to local inode table under write lock
-        self.rename_apply_local(info, parent, newparent, newname, no_replace)
+        self.rename_apply_local(info, parent, name, newparent, newname, no_replace)
     }
 
     /// Phase 1: validate rename under inode read lock, return all info needed for phases 2+3.
@@ -2388,6 +2462,7 @@ impl VirtualFs {
         &self,
         info: RenameInfo,
         parent: u64,
+        oldname: &str,
         newparent: u64,
         newname: &str,
         no_replace: bool,
@@ -2403,7 +2478,11 @@ impl VirtualFs {
 
         // Re-check destination under write lock (a concurrent create could have
         // inserted one between phase 1 read-lock and this write-lock).
-        if let Some(existing) = inodes.lookup_child(newparent, newname) {
+        let replace_target = if let Some(existing) = inodes.lookup_child(newparent, newname) {
+            // POSIX: rename(a, b) where a and b are hard links to the same inode is a no-op
+            if existing.inode == info.ino {
+                return Ok(());
+            }
             if no_replace {
                 return Err(libc::EEXIST);
             }
@@ -2415,8 +2494,17 @@ impl VirtualFs {
                 }
                 _ => {}
             }
-            let existing_ino = existing.inode;
-            inodes.remove(existing_ino);
+            Some((existing.inode, existing.kind))
+        } else {
+            None
+        };
+        if let Some((existing_ino, existing_kind)) = replace_target {
+            if existing_kind == InodeKind::Directory {
+                // Directories can't be hard-linked, so remove() is correct
+                inodes.remove(existing_ino);
+            } else {
+                inodes.unlink_one(newparent, newname);
+            }
         }
 
         // Dirty file with a remote presence: record old path for deletion at flush time
@@ -2452,9 +2540,26 @@ impl VirtualFs {
             }
         }
 
-        // Detach from old parent
-        if let Some(old_parent) = inodes.get_mut(parent) {
-            old_parent.children.retain(|c| c.ino != info.ino);
+        // Detach only the renamed entry from old parent (preserve other hard links)
+        if let Some(old_parent) = inodes.get_mut(parent)
+            && let Some(pos) = old_parent
+                .children
+                .iter()
+                .position(|c| c.ino == info.ino && c.name == oldname)
+        {
+            old_parent.children.remove(pos);
+        }
+
+        // Remove old path mapping for the renamed entry (may differ from entry.full_path
+        // when renaming a hard-link alias). update_subtree_paths handles the canonical path.
+        {
+            let old_parent_path = inodes.get(parent).map(|e| e.full_path.clone()).unwrap_or_default();
+            let old_link_path = if old_parent_path.is_empty() {
+                oldname.to_string()
+            } else {
+                format!("{}/{}", old_parent_path, oldname)
+            };
+            inodes.remove_path(&old_link_path);
         }
 
         // Update name/parent, then recursively fix all descendant paths
@@ -2470,6 +2575,23 @@ impl VirtualFs {
                 ino: info.ino,
                 name: newname.to_string(),
             });
+        }
+
+        // Update parent mtime/ctime for both old and new parents (POSIX: directories modified)
+        let now = SystemTime::now();
+        if let Some(p) = inodes.get_mut(parent) {
+            p.mtime = now;
+            p.ctime = now;
+        }
+        if parent != newparent
+            && let Some(p) = inodes.get_mut(newparent)
+        {
+            p.mtime = now;
+            p.ctime = now;
+        }
+        // Update source ctime (POSIX: inode metadata changed)
+        if let Some(e) = inodes.get_mut(info.ino) {
+            e.ctime = now;
         }
 
         Ok(())
@@ -2565,6 +2687,8 @@ impl VirtualFs {
             let mut inodes = self.inode_table.write().expect("inodes poisoned");
             if let Some(entry) = inodes.get_mut(ino) {
                 entry.size = new_size;
+                entry.mtime = SystemTime::now();
+                entry.ctime = entry.mtime;
                 entry.dirty = true;
                 if new_size == 0 {
                     entry.xet_hash = None;
