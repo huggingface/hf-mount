@@ -1930,11 +1930,7 @@ impl VirtualFs {
             if let Some(entry) = inodes.get_mut(ino) {
                 entry.dirty = true;
             }
-            // Update parent mtime/ctime (POSIX: directory was modified)
-            if let Some(p) = inodes.get_mut(parent) {
-                p.mtime = now;
-                p.ctime = now;
-            }
+            inodes.touch_parent(parent, now);
             (ino, full_path)
         };
 
@@ -2057,11 +2053,8 @@ impl VirtualFs {
             if let Some(entry) = inodes.get_mut(ino) {
                 entry.children_loaded = true;
             }
-            // Update parent mtime/ctime (nlink already incremented by insert())
-            if let Some(p) = inodes.get_mut(parent) {
-                p.mtime = now;
-                p.ctime = now;
-            }
+            // nlink already incremented by insert()
+            inodes.touch_parent(parent, now);
             (ino, full_path)
         };
 
@@ -2117,10 +2110,7 @@ impl VirtualFs {
                 .unwrap_or(false);
             // Update parent mtime/ctime (POSIX: directory was modified)
             let now = SystemTime::now();
-            if let Some(p) = inodes.get_mut(parent) {
-                p.mtime = now;
-                p.ctime = now;
-            }
+            inodes.touch_parent(parent, now);
             // If last link gone and no open handles, remove the orphan immediately
             if last_link && !self.has_open_handles(ino) {
                 inodes.remove_orphan(ino);
@@ -2189,11 +2179,7 @@ impl VirtualFs {
             if let Some(entry) = inodes.get_mut(ino) {
                 entry.symlink_target = Some(target.to_string());
             }
-            // Update parent mtime/ctime (POSIX: directory was modified)
-            if let Some(p) = inodes.get_mut(parent) {
-                p.mtime = now;
-                p.ctime = now;
-            }
+            inodes.touch_parent(parent, now);
             ino
         };
 
@@ -2246,10 +2232,7 @@ impl VirtualFs {
 
         // Update parent mtime/ctime and target ctime (POSIX: directory modified, link count changed)
         let now = SystemTime::now();
-        if let Some(p) = inodes.get_mut(new_parent) {
-            p.mtime = now;
-            p.ctime = now;
-        }
+        inodes.touch_parent(new_parent, now);
         if let Some(t) = inodes.get_mut(ino) {
             t.ctime = now;
         }
@@ -2293,13 +2276,8 @@ impl VirtualFs {
             _ => {}
         }
         inodes.remove(ino);
-        // Update parent mtime/ctime and nlink (POSIX: removed subdir's ".." no longer links to parent)
-        let now = SystemTime::now();
-        if let Some(p) = inodes.get_mut(parent) {
-            p.mtime = now;
-            p.ctime = now;
-            p.nlink = p.nlink.saturating_sub(1);
-        }
+        // nlink adjusted by remove()
+        inodes.touch_parent(parent, SystemTime::now());
         Ok(())
     }
 
@@ -2566,11 +2544,8 @@ impl VirtualFs {
         if let Some((existing_ino, existing_kind)) = replace_target {
             if existing_kind == InodeKind::Directory {
                 // Directories can't be hard-linked, so remove() is correct
+                // (remove() adjusts parent nlink for directories)
                 inodes.remove(existing_ino);
-                // POSIX: removed directory's ".." no longer links to newparent
-                if let Some(p) = inodes.get_mut(newparent) {
-                    p.nlink = p.nlink.saturating_sub(1);
-                }
             } else {
                 inodes.unlink_one(newparent, newname);
                 if !self.has_open_handles(existing_ino) {
@@ -2617,16 +2592,6 @@ impl VirtualFs {
             }
         }
 
-        // Detach only the renamed entry from old parent (preserve other hard links)
-        if let Some(old_parent) = inodes.get_mut(parent)
-            && let Some(pos) = old_parent
-                .children
-                .iter()
-                .position(|c| c.ino == info.ino && c.name == oldname)
-        {
-            old_parent.children.remove(pos);
-        }
-
         // Remove old path mapping for the renamed entry (may differ from entry.full_path
         // when renaming a hard-link alias). update_subtree_paths handles the canonical path.
         {
@@ -2639,41 +2604,15 @@ impl VirtualFs {
             inodes.remove_path(&old_link_path);
         }
 
-        // Update name/parent, then recursively fix all descendant paths
-        if let Some(entry) = inodes.get_mut(info.ino) {
-            entry.name = newname.to_string();
-            entry.parent = newparent;
-        }
+        // Move child: detach from old parent, attach to new, update name/parent, adjust nlink
+        inodes.move_child(info.ino, parent, oldname, newparent, newname);
         inodes.update_subtree_paths(info.ino, info.new_full_path);
-
-        // Attach to new parent
-        if let Some(new_parent) = inodes.get_mut(newparent) {
-            new_parent.children.push(crate::inode::DirChild {
-                ino: info.ino,
-                name: newname.to_string(),
-            });
-        }
 
         // Update parent mtime/ctime for both old and new parents (POSIX: directories modified)
         let now = SystemTime::now();
-        if let Some(p) = inodes.get_mut(parent) {
-            p.mtime = now;
-            p.ctime = now;
-        }
+        inodes.touch_parent(parent, now);
         if parent != newparent {
-            if let Some(p) = inodes.get_mut(newparent) {
-                p.mtime = now;
-                p.ctime = now;
-            }
-            // POSIX: moving a directory across parents updates nlink (the ".." link moves)
-            if info.kind == InodeKind::Directory {
-                if let Some(p) = inodes.get_mut(parent) {
-                    p.nlink = p.nlink.saturating_sub(1);
-                }
-                if let Some(p) = inodes.get_mut(newparent) {
-                    p.nlink += 1;
-                }
-            }
+            inodes.touch_parent(newparent, now);
         }
         // Update source ctime (POSIX: inode metadata changed)
         if let Some(e) = inodes.get_mut(info.ino) {

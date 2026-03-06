@@ -340,6 +340,10 @@ impl InodeTable {
         // Remove from parent's children
         if let Some(parent) = self.inodes.get_mut(&entry.parent) {
             parent.children.retain(|c| c.ino != inode);
+            // POSIX: removing a directory removes its ".." link to the parent
+            if entry.kind == InodeKind::Directory {
+                parent.nlink = parent.nlink.saturating_sub(1);
+            }
         }
 
         // Recursively remove all descendants to avoid orphans
@@ -454,6 +458,53 @@ impl InodeTable {
             }
         }
         None
+    }
+
+    /// Move a child entry from one parent to another (or rename within the same parent).
+    /// Detaches from old parent's children, attaches to new parent's children, updates the
+    /// child's `parent`/`name`, and adjusts nlink for cross-parent directory moves.
+    /// Does NOT update path mappings (caller should use `update_subtree_paths` separately).
+    pub fn move_child(&mut self, ino: u64, old_parent: u64, old_name: &str, new_parent: u64, new_name: &str) {
+        let is_dir = self.inodes.get(&ino).is_some_and(|e| e.kind == InodeKind::Directory);
+
+        // Detach from old parent
+        if let Some(old_p) = self.inodes.get_mut(&old_parent)
+            && let Some(pos) = old_p.children.iter().position(|c| c.ino == ino && c.name == old_name)
+        {
+            old_p.children.remove(pos);
+        }
+
+        // Attach to new parent
+        if let Some(new_p) = self.inodes.get_mut(&new_parent) {
+            new_p.children.push(DirChild {
+                ino,
+                name: new_name.to_string(),
+            });
+        }
+
+        // Adjust parent nlink for cross-parent directory moves
+        if is_dir && old_parent != new_parent {
+            if let Some(old_p) = self.inodes.get_mut(&old_parent) {
+                old_p.nlink = old_p.nlink.saturating_sub(1);
+            }
+            if let Some(new_p) = self.inodes.get_mut(&new_parent) {
+                new_p.nlink += 1;
+            }
+        }
+
+        // Update child's parent/name
+        if let Some(entry) = self.inodes.get_mut(&ino) {
+            entry.parent = new_parent;
+            entry.name = new_name.to_string();
+        }
+    }
+
+    /// Update mtime and ctime on a parent directory (POSIX: directory modified).
+    pub fn touch_parent(&mut self, parent: u64, now: SystemTime) {
+        if let Some(p) = self.inodes.get_mut(&parent) {
+            p.mtime = now;
+            p.ctime = now;
+        }
     }
 
     /// Remove an orphan inode (nlink == 0, no remaining file handles).
