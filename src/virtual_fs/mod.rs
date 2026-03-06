@@ -966,8 +966,7 @@ impl VirtualFs {
         let full_path = {
             let inodes = self.inode_table.read().expect("inodes poisoned");
             match inodes.get(parent) {
-                Some(e) if e.full_path.is_empty() => name.to_string(),
-                Some(e) => format!("{}/{}", e.full_path, name),
+                Some(e) => inode::child_path(&e.full_path, name),
                 None => return Err(libc::ENOENT),
             }
         };
@@ -1911,11 +1910,7 @@ impl VirtualFs {
                 Some(_) => return Err(libc::ENOTDIR),
                 None => return Err(libc::ENOENT),
             };
-            let full_path = if parent_entry.full_path.is_empty() {
-                name.to_string()
-            } else {
-                format!("{}/{}", parent_entry.full_path, name)
-            };
+            let full_path = inode::child_path(&parent_entry.full_path, name);
             if inodes.lookup_child(parent, name).is_some() {
                 return Err(libc::EEXIST);
             }
@@ -2034,11 +2029,7 @@ impl VirtualFs {
                 Some(_) => return Err(libc::ENOTDIR),
                 None => return Err(libc::ENOENT),
             };
-            let full_path = if parent_entry.full_path.is_empty() {
-                name.to_string()
-            } else {
-                format!("{}/{}", parent_entry.full_path, name)
-            };
+            let full_path = inode::child_path(&parent_entry.full_path, name);
             if inodes.lookup_child(parent, name).is_some() {
                 return Err(libc::EEXIST);
             }
@@ -2162,11 +2153,7 @@ impl VirtualFs {
                 Some(_) => return Err(libc::ENOTDIR),
                 None => return Err(libc::ENOENT),
             };
-            let full_path = if parent_entry.full_path.is_empty() {
-                name.to_string()
-            } else {
-                format!("{}/{}", parent_entry.full_path, name)
-            };
+            let full_path = inode::child_path(&parent_entry.full_path, name);
             if inodes.lookup_child(parent, name).is_some() {
                 return Err(libc::EEXIST);
             }
@@ -2339,11 +2326,7 @@ impl VirtualFs {
 
         // Destination parent must exist
         let new_parent_entry = inodes.get(newparent).ok_or(libc::ENOENT)?;
-        let new_full_path = if new_parent_entry.full_path.is_empty() {
-            newname.to_string()
-        } else {
-            format!("{}/{}", new_parent_entry.full_path, newname)
-        };
+        let new_full_path = inode::child_path(&new_parent_entry.full_path, newname);
 
         // Prevent moving a directory into its own subtree (would create a cycle)
         if src.kind == InodeKind::Directory {

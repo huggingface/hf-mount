@@ -4,6 +4,15 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 pub const ROOT_INODE: u64 = 1;
 
+/// Build a child's full path given the parent's full_path and child name.
+pub fn child_path(parent_path: &str, name: &str) -> String {
+    if parent_path.is_empty() {
+        name.to_string()
+    } else {
+        format!("{}/{}", parent_path, name)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InodeKind {
     File,
@@ -11,8 +20,7 @@ pub enum InodeKind {
     Symlink,
 }
 
-/// A directory child entry: stores the name on the edge (needed for hard links,
-/// where the same inode can appear under different names in different directories).
+/// A directory child entry: stores the name on the parent→child edge.
 #[derive(Debug, Clone)]
 pub struct DirChild {
     pub ino: u64,
@@ -310,11 +318,7 @@ impl InodeTable {
 
         // Recursively update children
         for child in children {
-            let child_path = if new_full_path.is_empty() {
-                child.name
-            } else {
-                format!("{}/{}", new_full_path, child.name)
-            };
+            let child_path = child_path(&new_full_path, &child.name);
             self.update_subtree_paths(child.ino, child_path);
         }
     }
@@ -355,11 +359,7 @@ impl InodeTable {
         let (child_ino, full_path) = {
             let parent_entry = self.inodes.get(&parent)?;
             let ino = parent_entry.children.iter().find(|c| c.name == name).map(|c| c.ino)?;
-            let path = if parent_entry.full_path.is_empty() {
-                name.to_string()
-            } else {
-                format!("{}/{}", parent_entry.full_path, name)
-            };
+            let path = child_path(&parent_entry.full_path, name);
             (ino, path)
         };
 
