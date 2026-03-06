@@ -300,35 +300,21 @@ impl InodeTable {
         }
 
         // Update this inode's path
-        let (old_full_path, children) = if let Some(entry) = self.inodes.get_mut(&inode) {
-            let old = std::mem::replace(&mut entry.full_path, new_full_path.clone());
+        let children = if let Some(entry) = self.inodes.get_mut(&inode) {
+            entry.full_path = new_full_path.clone();
             self.path_to_inode.insert(new_full_path.clone(), inode);
-            (old, entry.children.clone())
+            entry.children.clone()
         } else {
             return;
         };
 
-        // Recursively update children (DirChild carries the name directly)
+        // Recursively update children
         for child in children {
-            let expected_old = if old_full_path.is_empty() {
-                child.name.clone()
-            } else {
-                format!("{}/{}", old_full_path, child.name)
-            };
             let child_path = if new_full_path.is_empty() {
                 child.name
             } else {
                 format!("{}/{}", new_full_path, child.name)
             };
-            // Hard-linked inodes whose canonical path is elsewhere: update the alias
-            // mapping in path_to_inode but don't rewrite the inode's canonical full_path.
-            if let Some(child_entry) = self.inodes.get(&child.ino)
-                && child_entry.full_path != expected_old
-            {
-                self.path_to_inode.remove(&expected_old);
-                self.path_to_inode.insert(child_path, child.ino);
-                continue;
-            }
             self.update_subtree_paths(child.ino, child_path);
         }
     }
@@ -349,18 +335,6 @@ impl InodeTable {
             }
         }
 
-        // Remove any alias DirChild entries and path mappings from other parents
-        // (hard links can create entries in directories other than entry.parent).
-        if entry.nlink > 1 {
-            let parents: Vec<u64> = self.inodes.keys().copied().collect();
-            for p in parents {
-                if let Some(dir) = self.inodes.get_mut(&p) {
-                    dir.children.retain(|c| c.ino != inode);
-                }
-            }
-            self.path_to_inode.retain(|_, ino| *ino != inode);
-        }
-
         // Recursively remove all descendants to avoid orphans
         let mut stack: Vec<u64> = entry.children.iter().map(|c| c.ino).collect();
         while let Some(child_ino) = stack.pop() {
@@ -371,24 +345,6 @@ impl InodeTable {
         }
 
         Some(entry)
-    }
-
-    /// Create a hard link: add a DirChild entry in `new_parent` pointing to `ino`,
-    /// register the new path, and increment nlink. Does NOT validate (caller must check).
-    pub fn link(&mut self, ino: u64, new_parent: u64, new_name: String, new_full_path: String) {
-        // Add DirChild to parent
-        if let Some(parent_entry) = self.inodes.get_mut(&new_parent) {
-            parent_entry.children.push(DirChild { ino, name: new_name });
-        }
-
-        // Register path mapping
-        self.path_to_inode.insert(new_full_path, ino);
-
-        // Increment nlink and update ctime
-        if let Some(entry) = self.inodes.get_mut(&ino) {
-            entry.nlink += 1;
-            entry.ctime = SystemTime::now();
-        }
     }
 
     /// Remove one directory entry by name from `parent`. Decrements nlink.
@@ -408,63 +364,24 @@ impl InodeTable {
         };
 
         // Remove the DirChild from parent
-        if let Some(parent_entry) = self.inodes.get_mut(&parent) {
-            // Remove only the first matching entry (there might be other links with different names)
-            if let Some(pos) = parent_entry.children.iter().position(|c| c.name == name) {
-                parent_entry.children.remove(pos);
-            }
+        if let Some(parent_entry) = self.inodes.get_mut(&parent)
+            && let Some(pos) = parent_entry.children.iter().position(|c| c.name == name)
+        {
+            parent_entry.children.remove(pos);
         }
 
         // Remove path mapping
         self.path_to_inode.remove(&full_path);
 
         // Decrement nlink
-        let (nlink, entry_snapshot) = {
+        let entry_snapshot = {
             let entry = self.inodes.get_mut(&child_ino)?;
             entry.nlink = entry.nlink.saturating_sub(1);
             entry.ctime = SystemTime::now();
-            (entry.nlink, entry.clone())
+            entry.clone()
         };
 
-        // If links remain and the removed entry was the canonical path,
-        // promote a surviving link to canonical so that future renames and
-        // flushes target the correct path.
-        if nlink > 0
-            && entry_snapshot.parent == parent
-            && entry_snapshot.name == name
-            && let Some((new_parent_ino, new_name, new_full_path)) = self.find_link(child_ino)
-            && let Some(entry) = self.inodes.get_mut(&child_ino)
-        {
-            entry.parent = new_parent_ino;
-            entry.name = new_name;
-            entry.full_path = new_full_path.clone();
-            self.path_to_inode.insert(new_full_path, child_ino);
-        }
-
-        // Return true when last link is gone (inode stays in table for open file handles;
-        // callers clean it up via remove_orphan() after the last handle is released).
-        Some((nlink == 0, entry_snapshot))
-    }
-
-    /// Find any surviving directory entry referencing `ino`.
-    /// Returns `(parent_ino, child_name, full_path)` if found.
-    fn find_link(&self, ino: u64) -> Option<(u64, String, String)> {
-        for entry in self.inodes.values() {
-            if entry.kind != InodeKind::Directory {
-                continue;
-            }
-            for child in &entry.children {
-                if child.ino == ino {
-                    let full_path = if entry.full_path.is_empty() {
-                        child.name.clone()
-                    } else {
-                        format!("{}/{}", entry.full_path, child.name)
-                    };
-                    return Some((entry.inode, child.name.clone(), full_path));
-                }
-            }
-        }
-        None
+        Some((entry_snapshot.nlink == 0, entry_snapshot))
     }
 
     /// Move a child entry from one parent to another (or rename within the same parent).
@@ -1426,55 +1343,6 @@ mod tests {
         assert!(table.lookup_child(ROOT_INODE, "f.txt").is_none());
         // Path mapping removed
         assert!(table.get_by_path("f.txt").is_none());
-    }
-
-    #[test]
-    fn test_unlink_one_hard_link_survives() {
-        let mut table = InodeTable::new();
-
-        let dir_a = table.insert(
-            ROOT_INODE,
-            "a".to_string(),
-            "a".to_string(),
-            InodeKind::Directory,
-            0,
-            UNIX_EPOCH,
-            None,
-            0o755,
-            0,
-            0,
-        );
-
-        let file_ino = table.insert(
-            ROOT_INODE,
-            "orig.txt".to_string(),
-            "orig.txt".to_string(),
-            InodeKind::File,
-            10,
-            UNIX_EPOCH,
-            None,
-            0o644,
-            0,
-            0,
-        );
-
-        // Create a hard link in dir_a
-        table.link(file_ino, dir_a, "link.txt".to_string(), "a/link.txt".to_string());
-        assert_eq!(table.get(file_ino).unwrap().nlink, 2);
-
-        // Unlink the original
-        let (last_link, snapshot) = table.unlink_one(ROOT_INODE, "orig.txt").unwrap();
-        assert!(!last_link, "should NOT be last link");
-        assert_eq!(snapshot.nlink, 1);
-
-        // Inode still exists and is accessible via the surviving link
-        assert!(table.get(file_ino).is_some());
-        assert_eq!(table.lookup_child(dir_a, "link.txt").unwrap().inode, file_ino);
-
-        // Canonical parent/name updated to surviving link
-        let entry = table.get(file_ino).unwrap();
-        assert_eq!(entry.parent, dir_a);
-        assert_eq!(entry.name, "link.txt");
     }
 
     #[test]

@@ -25,6 +25,7 @@ const EXCLUDED_PATTERNS: &[&str] = &[
     "S_ISVTX",
     "sticky",
     "socket",
+    "link",
 ];
 
 /// Path where pjdfstest is built/cached.

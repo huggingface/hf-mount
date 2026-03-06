@@ -2203,55 +2203,10 @@ impl VirtualFs {
         }
     }
 
-    pub async fn link(&self, ino: u64, new_parent: u64, new_name: &str) -> VirtualFsResult<VirtualFsAttr> {
-        if self.read_only {
-            return Err(libc::EROFS);
-        }
-
-        debug!("link: ino={}, new_parent={}, new_name={}", ino, new_parent, new_name);
-
-        self.ensure_children_loaded(new_parent).await?;
-
-        let mut inodes = self.inode_table.write().expect("inodes poisoned");
-
-        // Target must exist and not be a directory
-        let entry = inodes.get(ino).ok_or(libc::ENOENT)?;
-        if entry.kind == InodeKind::Directory {
-            return Err(libc::EPERM);
-        }
-
-        // Destination must not exist
-        if inodes.lookup_child(new_parent, new_name).is_some() {
-            return Err(libc::EEXIST);
-        }
-
-        // Build new full path
-        let new_full_path = {
-            let parent_entry = inodes.get(new_parent).ok_or(libc::ENOENT)?;
-            if parent_entry.full_path.is_empty() {
-                new_name.to_string()
-            } else {
-                format!("{}/{}", parent_entry.full_path, new_name)
-            }
-        };
-
-        inodes.link(ino, new_parent, new_name.to_string(), new_full_path.clone());
-
-        // Update parent mtime/ctime and target ctime (POSIX: directory modified, link count changed)
-        let now = SystemTime::now();
-        inodes.touch_parent(new_parent, now);
-        if let Some(t) = inodes.get_mut(ino) {
-            t.ctime = now;
-        }
-
-        let entry = inodes.get(ino).ok_or(libc::ENOENT)?;
-        let attr = self.make_vfs_attr(entry);
-        drop(inodes);
-
-        // Clear negative cache so the new name is discoverable
-        self.negative_cache_remove(&new_full_path);
-
-        Ok(attr)
+    pub async fn link(&self, _ino: u64, _new_parent: u64, _new_name: &str) -> VirtualFsResult<VirtualFsAttr> {
+        // Hard links are not supported — they are ephemeral (in-memory only) and never
+        // persisted to the hub, which makes them a source of subtle bugs with no benefit.
+        Err(libc::ENOTSUP)
     }
 
     pub async fn rmdir(&self, parent: u64, name: &str) -> VirtualFsResult<()> {
@@ -2362,11 +2317,8 @@ impl VirtualFs {
             }
         }
 
-        // Phase 2: sync to remote (add + delete ops). Skip for hard link aliases
-        // (alias paths don't exist remotely, only the canonical path does).
-        if !info.is_alias {
-            self.rename_remote(&info).await?;
-        }
+        // Phase 2: sync to remote (add + delete ops)
+        self.rename_remote(&info).await?;
 
         // Phase 3: apply to local inode table under write lock
         self.rename_apply_local(info, parent, name, newparent, newname, no_replace)
@@ -2384,16 +2336,6 @@ impl VirtualFs {
         let inodes = self.inode_table.read().expect("inodes poisoned");
 
         let src = inodes.lookup_child(parent, name).ok_or(libc::ENOENT)?;
-
-        // Compute the actual directory-entry path (may differ from src.full_path for hard link aliases)
-        let parent_path = inodes.get(parent).map(|e| e.full_path.as_str()).unwrap_or("");
-        let old_link_path = if parent_path.is_empty() {
-            name.to_string()
-        } else {
-            format!("{}/{}", parent_path, name)
-        };
-        // Hard link alias: this entry doesn't correspond to the remote canonical path
-        let is_alias = old_link_path != src.full_path;
 
         // Destination parent must exist
         let new_parent_entry = inodes.get(newparent).ok_or(libc::ENOENT)?;
@@ -2442,12 +2384,7 @@ impl VirtualFs {
                         if let Some(child) = inodes.get(child_ref.ino) {
                             match child.kind {
                                 InodeKind::File if !child.dirty && child.xet_hash.is_some() => {
-                                    // Skip hard-linked files whose canonical path isn't under the
-                                    // source directory (they belong elsewhere, not to this subtree).
-                                    let prefix = format!("{}/", src.full_path);
-                                    if child.full_path.starts_with(&prefix) || child.full_path == src.full_path {
-                                        files.push((child.full_path.clone(), child.xet_hash.clone().unwrap()));
-                                    }
+                                    files.push((child.full_path.clone(), child.xet_hash.clone().unwrap()));
                                 }
                                 InodeKind::Directory => stack.push(child_ref.ino),
                                 _ => {}
@@ -2463,11 +2400,10 @@ impl VirtualFs {
 
         Ok(RenameInfo {
             ino: src.inode,
-            old_path: old_link_path,
+            old_path: src.full_path.clone(),
             kind: src.kind,
             xet_hash: src.xet_hash.clone(),
             is_dirty: src.dirty,
-            is_alias,
             new_full_path,
             descendant_files,
         })
@@ -2582,9 +2518,7 @@ impl VirtualFs {
         }
 
         // Dirty file with a remote presence: record old path for deletion at flush time.
-        // Skip for alias renames (alias paths aren't remote paths).
-        if !info.is_alias
-            && info.is_dirty
+        if info.is_dirty
             && info.kind == InodeKind::File
             && info.xet_hash.is_some()
             && let Some(entry) = inodes.get_mut(info.ino)
@@ -2603,14 +2537,9 @@ impl VirtualFs {
                     if let Some(child) = inodes.get(child_ref.ino) {
                         match child.kind {
                             InodeKind::File if child.dirty && child.xet_hash.is_some() => {
-                                // Skip hard-linked files whose canonical path isn't under the
-                                // source directory (they belong elsewhere, not to this subtree).
-                                let prefix = format!("{}/", info.old_path);
-                                if child.full_path.starts_with(&prefix) || child.full_path == info.old_path {
-                                    let old_path = child.full_path.clone();
-                                    if let Some(child_mut) = inodes.get_mut(child_ref.ino) {
-                                        child_mut.pending_deletes.push(old_path);
-                                    }
+                                let old_path = child.full_path.clone();
+                                if let Some(child_mut) = inodes.get_mut(child_ref.ino) {
+                                    child_mut.pending_deletes.push(old_path);
                                 }
                             }
                             InodeKind::Directory => stack.push(child_ref.ino),
@@ -2624,29 +2553,8 @@ impl VirtualFs {
         // Remove old path mapping for the renamed entry
         inodes.remove_path(&info.old_path);
 
-        if info.is_alias {
-            // Hard link alias: only update directory entries and path mapping.
-            // Don't touch the inode's canonical parent/name/full_path.
-            if let Some(old_p) = inodes.get_mut(parent)
-                && let Some(pos) = old_p
-                    .children
-                    .iter()
-                    .position(|c| c.ino == info.ino && c.name == oldname)
-            {
-                old_p.children.remove(pos);
-            }
-            if let Some(new_p) = inodes.get_mut(newparent) {
-                new_p.children.push(inode::DirChild {
-                    ino: info.ino,
-                    name: newname.to_string(),
-                });
-            }
-            inodes.insert_path(info.new_full_path, info.ino);
-        } else {
-            // Canonical entry: full move with path rewrite
-            inodes.move_child(info.ino, parent, oldname, newparent, newname);
-            inodes.update_subtree_paths(info.ino, info.new_full_path);
-        }
+        inodes.move_child(info.ino, parent, oldname, newparent, newname);
+        inodes.update_subtree_paths(info.ino, info.new_full_path);
 
         // Update parent mtime/ctime for both old and new parents (POSIX: directories modified)
         let now = SystemTime::now();
@@ -2847,9 +2755,6 @@ struct RenameInfo {
     kind: InodeKind,
     xet_hash: Option<String>,
     is_dirty: bool,
-    /// True when renaming a hard link alias (not the canonical entry).
-    /// Alias renames are local-only: no remote ops or pending_deletes needed.
-    is_alias: bool,
     new_full_path: String,
     /// Descendant clean files to rename on the remote (dir renames only).
     descendant_files: Vec<(String, String)>,

@@ -318,13 +318,8 @@ impl Filesystem for FuseAdapter {
         }
     }
 
-    /// Create a hard link.
-    fn link(&self, _req: &Request, ino: INodeNo, newparent: INodeNo, newname: &OsStr, reply: ReplyEntry) {
-        let newname = os_to_str!(newname, reply);
-        match self.runtime.block_on(self.virtual_fs.link(ino.0, newparent.0, newname)) {
-            Ok(attr) => reply.entry(&self.metadata_ttl, &vfs_attr_to_fuse(&attr), GENERATION),
-            Err(e) => reply.error(Errno::from_i32(e)),
-        }
+    fn link(&self, _req: &Request, _ino: INodeNo, _newparent: INodeNo, _newname: &OsStr, reply: ReplyEntry) {
+        reply.error(Errno::from_i32(libc::ENOTSUP));
     }
 
     /// Remove an empty directory.
