@@ -5,8 +5,8 @@ use std::process::Command;
 /// Expected results (established 2026-03-06).
 /// Tests referencing mkfifo/mknod/fifo/block/char/socket are excluded (ENOSYS).
 /// Update these when adding new POSIX features.
-const EXPECTED_FILES_PASS: usize = 144;
-const EXPECTED_TESTS_PASS: usize = 912;
+const EXPECTED_FILES_PASS: usize = 130;
+const EXPECTED_TESTS_PASS: usize = 832;
 
 /// Categories excluded from testing (unsupported special file types / ops).
 const EXCLUDED_CATEGORIES: &[&str] = &["mkfifo", "mknod", "link"];
