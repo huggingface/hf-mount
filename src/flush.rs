@@ -8,7 +8,7 @@ use tracing::{debug, error, info};
 
 use crate::hub_api::{BatchOp, HubOps};
 use crate::inode::InodeTable;
-use crate::xet::{StagingDir, UploadFile, XetOps};
+use crate::xet::{StagingDir, XetOps};
 
 type FlushRequest = u64;
 
@@ -166,10 +166,8 @@ async fn flush_batch(
 
     debug!("flush_batch: deduped inos = {:?}", deduped);
 
-    // Resolve paths from inode table, skip deleted/non-dirty inodes.
-    // Capture old_xet_hash (the CAS hash of the previous version) for delta dedup.
-    #[allow(clippy::type_complexity)]
-    let to_flush: Vec<(u64, String, PathBuf, Vec<String>, Option<String>)> = {
+    // Resolve paths from inode table, skip deleted/non-dirty inodes
+    let to_flush: Vec<(u64, String, PathBuf, Vec<String>)> = {
         let inode_table = inodes.read().expect("inodes poisoned");
         deduped
             .into_iter()
@@ -197,7 +195,6 @@ async fn flush_batch(
                     entry.full_path.clone(),
                     staging_path,
                     entry.pending_deletes.clone(),
-                    entry.xet_hash.clone(),
                 ))
             })
             .collect()
@@ -208,20 +205,14 @@ async fn flush_batch(
     }
 
     // Upload all files through a single upload session
-    let upload_files: Vec<UploadFile<'_>> = to_flush
-        .iter()
-        .map(|(_, _, p, _, old_hash)| UploadFile {
-            path: p.as_path(),
-            old_xet_hash: old_hash.as_deref(),
-        })
-        .collect();
-    let upload_results = match xet_sessions.upload_files(&upload_files).await {
+    let staging_paths: Vec<&std::path::Path> = to_flush.iter().map(|(_, _, p, _)| p.as_path()).collect();
+    let upload_results = match xet_sessions.upload_files(&staging_paths).await {
         Ok(results) => results,
         Err(e) => {
             error!("Batch upload failed: {}", e);
             let msg = format!("upload failed: {e}");
             let mut errs = flush_errors.lock().expect("flush_errors poisoned");
-            for (ino, _, _, _, _) in &to_flush {
+            for (ino, _, _, _) in &to_flush {
                 errs.insert(*ino, msg.clone());
             }
             return;
@@ -238,7 +229,7 @@ async fn flush_batch(
     let mut delete_ops = Vec::new();
     let mut successes: Vec<(u64, String, u64)> = Vec::new();
 
-    for ((ino, full_path, _, pending_deletes, _), file_info) in to_flush.iter().zip(upload_results.iter()) {
+    for ((ino, full_path, _, pending_deletes), file_info) in to_flush.iter().zip(upload_results.iter()) {
         info!(
             "Uploaded file ino={} path={} xet_hash={} size={}",
             ino,
@@ -269,7 +260,7 @@ async fn flush_batch(
         error!("Batch commit failed: {}", e);
         let msg = format!("commit failed: {e}");
         let mut errs = flush_errors.lock().expect("flush_errors poisoned");
-        for (ino, _, _, _, _) in &to_flush {
+        for (ino, _, _, _) in &to_flush {
             errs.insert(*ino, msg.clone());
         }
         return;

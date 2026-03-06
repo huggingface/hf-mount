@@ -11,7 +11,7 @@ use data::XetFileInfo;
 
 use crate::error::{Error, Result};
 use crate::hub_api::{BatchOp, HeadFileInfo, HubOps, SourceKind, TreeEntry};
-use crate::xet::{DownloadStreamOps, StagingDir, StreamingWriterOps, UploadFile, XetOps};
+use crate::xet::{DownloadStreamOps, StagingDir, StreamingWriterOps, XetOps};
 
 // ── MockHub ───────────────────────────────────────────────────────────
 
@@ -297,13 +297,13 @@ impl XetOps for MockXet {
         Ok(())
     }
 
-    async fn upload_files(&self, files: &[UploadFile<'_>]) -> Result<Vec<XetFileInfo>> {
+    async fn upload_files(&self, paths: &[&Path]) -> Result<Vec<XetFileInfo>> {
         if self.upload_fail.swap(false, Ordering::SeqCst) {
             return Err(Error::Xet("mock upload failure".into()));
         }
         let mut results = Vec::new();
-        for file in files {
-            let content = std::fs::read(file.path).map_err(Error::Io)?;
+        for path in paths {
+            let content = std::fs::read(path).map_err(Error::Io)?;
             let hash = self.next_hash_string();
             let size = content.len() as u64;
             self.files.lock().unwrap().insert(hash.clone(), content);

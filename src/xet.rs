@@ -7,19 +7,6 @@ use data::{FileDownloadSession, FileUploadSession, SingleFileCleaner, XetFileInf
 
 use crate::error::{Error, Result};
 
-// ── Types ────────────────────────────────────────────────────────────
-
-/// A file to upload via the batch upload path (advanced writes / FlushManager).
-/// Carries the staging path and, for modified files, the CAS hash of the
-/// previous version so we can preload its shard data for deduplication.
-pub struct UploadFile<'a> {
-    pub path: &'a Path,
-    /// CAS hash of the previous file version (before this write).
-    /// When set, the upload session can preload the old file's shard data
-    /// so unchanged chunks are recognized as duplicates.
-    pub old_xet_hash: Option<&'a str>,
-}
-
 // ── Traits ───────────────────────────────────────────────────────────
 
 /// Trait abstracting CAS operations used by VirtualFs and FlushManager.
@@ -27,7 +14,7 @@ pub struct UploadFile<'a> {
 pub trait XetOps: Send + Sync {
     async fn create_streaming_writer(&self) -> Result<Box<dyn StreamingWriterOps>>;
     async fn download_to_file(&self, xet_hash: &str, file_size: u64, dest: &Path) -> Result<()>;
-    async fn upload_files(&self, files: &[UploadFile<'_>]) -> Result<Vec<XetFileInfo>>;
+    async fn upload_files(&self, paths: &[&Path]) -> Result<Vec<XetFileInfo>>;
     fn download_stream_boxed(&self, file_info: &XetFileInfo, offset: u64) -> Result<Box<dyn DownloadStreamOps>>;
 }
 
@@ -97,7 +84,7 @@ impl XetOps for XetSessions {
         Ok(())
     }
 
-    async fn upload_files(&self, files: &[UploadFile<'_>]) -> Result<Vec<XetFileInfo>> {
+    async fn upload_files(&self, paths: &[&Path]) -> Result<Vec<XetFileInfo>> {
         let config = self
             .upload_config
             .as_ref()
@@ -107,27 +94,13 @@ impl XetOps for XetSessions {
             .await
             .map_err(|e| Error::Xet(e.to_string()))?;
 
-        // TODO(delta-upload): When xet-core supports shard preloading, call
-        // upload_session.preload_file_chunks(old_hash) here for files with
-        // old_xet_hash set. This will import the old file's chunk hashes into
-        // the dedup table so unchanged chunks are recognized during re-upload.
-        for file in files {
-            if let Some(old_hash) = file.old_xet_hash {
-                tracing::debug!(
-                    path = %file.path.display(),
-                    old_xet_hash = old_hash,
-                    "file has previous CAS version, delta dedup may apply"
-                );
-            }
-        }
-
-        let upload_files: Vec<_> = files
+        let files: Vec<_> = paths
             .iter()
-            .map(|f| (f.path.to_path_buf(), Some(mdb_shard::Sha256::default())))
+            .map(|p| (p.to_path_buf(), Some(mdb_shard::Sha256::default())))
             .collect();
 
         let results = upload_session
-            .upload_files(upload_files)
+            .upload_files(files)
             .await
             .map_err(|e| Error::Xet(e.to_string()))?;
 
