@@ -287,6 +287,8 @@ impl InodeTable {
 
     /// Recursively update full_path and path_to_inode for an inode and all its descendants.
     /// Used after a rename to keep the path mappings consistent.
+    /// Hard-linked inodes whose full_path doesn't match their expected position in the tree
+    /// are skipped (they belong elsewhere and their canonical path must not be rewritten).
     pub fn update_subtree_paths(&mut self, inode: u64, new_full_path: String) {
         // Remove old path mapping
         if let Some(entry) = self.inodes.get(&inode) {
@@ -295,16 +297,27 @@ impl InodeTable {
         }
 
         // Update this inode's path
-        let children = if let Some(entry) = self.inodes.get_mut(&inode) {
-            entry.full_path = new_full_path.clone();
+        let (old_full_path, children) = if let Some(entry) = self.inodes.get_mut(&inode) {
+            let old = std::mem::replace(&mut entry.full_path, new_full_path.clone());
             self.path_to_inode.insert(new_full_path.clone(), inode);
-            entry.children.clone()
+            (old, entry.children.clone())
         } else {
             return;
         };
 
         // Recursively update children (DirChild carries the name directly)
         for child in children {
+            let expected_old = if old_full_path.is_empty() {
+                child.name.clone()
+            } else {
+                format!("{}/{}", old_full_path, child.name)
+            };
+            // Skip hard-linked inodes whose canonical path is elsewhere
+            if let Some(child_entry) = self.inodes.get(&child.ino)
+                && child_entry.full_path != expected_old
+            {
+                continue;
+            }
             let child_path = if new_full_path.is_empty() {
                 child.name
             } else {

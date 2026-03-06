@@ -39,6 +39,12 @@ fn ensure_pjdfstest() -> bool {
         return true;
     }
 
+    // Remove stale directory (e.g. from interrupted previous run on self-hosted runner)
+    if std::path::Path::new(PJDFSTEST_DIR).exists() {
+        eprintln!("Removing stale pjdfstest directory...");
+        std::fs::remove_dir_all(PJDFSTEST_DIR).ok();
+    }
+
     eprintln!("Building pjdfstest...");
     let ok = Command::new("sh")
         .args([
