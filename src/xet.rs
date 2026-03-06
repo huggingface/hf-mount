@@ -28,17 +28,6 @@ pub trait XetOps: Send + Sync {
     async fn create_streaming_writer(&self) -> Result<Box<dyn StreamingWriterOps>>;
     async fn download_to_file(&self, xet_hash: &str, file_size: u64, dest: &Path) -> Result<()>;
     async fn upload_files(&self, files: &[UploadFile<'_>]) -> Result<Vec<XetFileInfo>>;
-    /// Delta upload: re-upload a modified file by interleaving clean ranges (from CAS)
-    /// with dirty ranges (from staging). Returns `Some(xfi)` on success, `None` if
-    /// delta upload is not possible (caller should fall back to full upload).
-    async fn upload_file_delta(
-        &self,
-        old_xet_hash: &str,
-        old_file_size: u64,
-        new_file_size: u64,
-        dirty_ranges: &[(u64, u64)],
-        staging_path: &Path,
-    ) -> Result<Option<XetFileInfo>>;
     fn download_stream_boxed(&self, file_info: &XetFileInfo, offset: u64) -> Result<Box<dyn DownloadStreamOps>>;
 }
 
@@ -145,41 +134,6 @@ impl XetOps for XetSessions {
         upload_session.finalize().await.map_err(|e| Error::Xet(e.to_string()))?;
 
         Ok(results)
-    }
-
-    async fn upload_file_delta(
-        &self,
-        old_xet_hash: &str,
-        old_file_size: u64,
-        new_file_size: u64,
-        dirty_ranges: &[(u64, u64)],
-        staging_path: &Path,
-    ) -> Result<Option<XetFileInfo>> {
-        let config = self
-            .upload_config
-            .as_ref()
-            .ok_or_else(|| Error::Hub("no upload config (read-only mode)".into()))?;
-
-        let upload_session = FileUploadSession::new(config.clone(), None)
-            .await
-            .map_err(|e| Error::Xet(e.to_string()))?;
-
-        let old_file_info = XetFileInfo::new(old_xet_hash.to_string(), old_file_size);
-
-        let (xfi, metrics) = upload_session
-            .upload_file_delta(&self.session, &old_file_info, new_file_size, dirty_ranges, staging_path)
-            .await
-            .map_err(|e| Error::Xet(e.to_string()))?;
-
-        tracing::info!(
-            new_bytes = metrics.new_bytes,
-            deduped_bytes = metrics.deduped_bytes,
-            total_bytes = metrics.total_bytes,
-            "Delta upload dedup metrics"
-        );
-
-        upload_session.finalize().await.map_err(|e| Error::Xet(e.to_string()))?;
-        Ok(Some(xfi))
     }
 
     fn download_stream_boxed(&self, file_info: &XetFileInfo, offset: u64) -> Result<Box<dyn DownloadStreamOps>> {

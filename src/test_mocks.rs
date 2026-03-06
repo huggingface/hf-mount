@@ -312,17 +312,6 @@ impl XetOps for MockXet {
         Ok(results)
     }
 
-    async fn upload_file_delta(
-        &self,
-        _old_xet_hash: &str,
-        _old_file_size: u64,
-        _new_file_size: u64,
-        _dirty_ranges: &[(u64, u64)],
-        _staging_path: &Path,
-    ) -> Result<Option<XetFileInfo>> {
-        Ok(None)
-    }
-
     fn download_stream_boxed(&self, file_info: &XetFileInfo, offset: u64) -> Result<Box<dyn DownloadStreamOps>> {
         let prev_fail = self.range_fail_count.load(Ordering::SeqCst);
         if prev_fail > 0 {
