@@ -70,8 +70,18 @@ For private repos or buckets, pass `--hf-token` or set the `HF_TOKEN` env var.
 - **Lazy loading** -- files are fetched on demand from CAS, not eagerly downloaded
 - **Simple writes** (FUSE default) -- append-only, in-memory streaming to CAS, synchronous upload on close
 - **Advanced writes** (`--advanced-writes`, always-on for NFS) -- staging files on disk, random writes + seek, async debounced flush
+- **POSIX metadata** -- chmod, chown, timestamps, symlinks, hard links (ephemeral, see below)
 - **Remote sync** -- background polling detects remote changes and updates the local view
 - **Read-only mode** -- `--read-only` flag for safe mounts (always on for repos)
+
+### Ephemeral POSIX metadata
+
+File permissions, ownership (uid/gid), timestamps (atime/ctime), symlinks, and hard links are
+supported in-memory. This allows tools that expect a POSIX-like environment (rsync, git,
+compilers, package managers) to work correctly on the mounted filesystem.
+
+**This metadata is ephemeral**: it is not persisted to remote storage and is lost on
+unmount/remount. Only file content and directory structure are stored remotely.
 
 ## Prerequisites
 
