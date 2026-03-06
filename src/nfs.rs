@@ -643,5 +643,6 @@ fn vfs_attr_to_nfs(attr: &VirtualFsAttr) -> fattr3 {
 }
 
 fn nfstime_to_system_time(t: nfstime3) -> SystemTime {
-    UNIX_EPOCH + std::time::Duration::new(t.seconds as u64, t.nseconds)
+    let nsec = t.nseconds.min(999_999_999);
+    UNIX_EPOCH + std::time::Duration::new(t.seconds as u64, nsec)
 }

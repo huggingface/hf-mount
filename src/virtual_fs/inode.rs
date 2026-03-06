@@ -111,11 +111,14 @@ impl InodeTable {
     }
 
     /// Find a child of `parent` by name.
+    /// Skips stale DirChild entries whose inode has been removed.
     pub fn lookup_child(&self, parent: u64, name: &str) -> Option<&InodeEntry> {
         let parent_entry = self.inodes.get(&parent)?;
         for child in &parent_entry.children {
-            if child.name == name {
-                return self.inodes.get(&child.ino);
+            if child.name == name
+                && let Some(entry) = self.inodes.get(&child.ino)
+            {
+                return Some(entry);
             }
         }
         None
