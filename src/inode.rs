@@ -198,6 +198,10 @@ impl InodeTable {
                 ino: inode,
                 name: child_name,
             });
+            // POSIX: new subdirectory's ".." links to parent
+            if kind == InodeKind::Directory {
+                parent_entry.nlink += 1;
+            }
         }
 
         inode
@@ -392,14 +396,19 @@ impl InodeTable {
         };
 
         // If links remain and the removed entry was the canonical path,
-        // update the inode to point at another surviving link.
-        if nlink > 0 && entry_snapshot.parent == parent && entry_snapshot.name == name {
-            // Find any surviving DirChild referencing this inode
-            if let Some((new_parent_ino, new_name, new_full_path)) = self.find_link(child_ino)
-                && let Some(entry) = self.inodes.get_mut(&child_ino)
-            {
-                entry.parent = new_parent_ino;
-                entry.name = new_name;
+        // update the inode's parent/name to point at a surviving link (for stat correctness).
+        // Keep full_path unchanged for remote-backed files (xet_hash set) since it drives
+        // remote operations (HEAD revalidation, flush, commit).
+        if nlink > 0
+            && entry_snapshot.parent == parent
+            && entry_snapshot.name == name
+            && let Some((new_parent_ino, new_name, new_full_path)) = self.find_link(child_ino)
+            && let Some(entry) = self.inodes.get_mut(&child_ino)
+        {
+            entry.parent = new_parent_ino;
+            entry.name = new_name;
+            if entry.xet_hash.is_none() {
+                // Locally-created file: update full_path since there's no remote path to preserve
                 entry.full_path = new_full_path.clone();
                 self.path_to_inode.insert(new_full_path, child_ino);
             }

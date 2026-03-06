@@ -2055,11 +2055,10 @@ impl VirtualFs {
             if let Some(entry) = inodes.get_mut(ino) {
                 entry.children_loaded = true;
             }
-            // Update parent mtime/ctime and nlink (POSIX: new subdir's ".." links to parent)
+            // Update parent mtime/ctime (nlink already incremented by insert())
             if let Some(p) = inodes.get_mut(parent) {
                 p.mtime = now;
                 p.ctime = now;
-                p.nlink += 1;
             }
             (ino, full_path)
         };

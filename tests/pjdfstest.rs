@@ -30,6 +30,9 @@ const EXCLUDED_PATTERNS: &[&str] = &[
 /// Path where pjdfstest is built/cached.
 const PJDFSTEST_DIR: &str = "/tmp/pjdfstest";
 
+/// Pinned commit to ensure stable test counts across CI runs.
+const PJDFSTEST_REV: &str = "03eb25706d8dbf3611c3f820b45b7a5e09a36c06";
+
 fn ensure_pjdfstest() -> bool {
     let binary = format!("{}/pjdfstest", PJDFSTEST_DIR);
     if std::path::Path::new(&binary).exists() {
@@ -41,9 +44,11 @@ fn ensure_pjdfstest() -> bool {
         .args([
             "-c",
             &format!(
-                "git clone --depth 1 https://github.com/pjd/pjdfstest.git {dir} && \
-                 cd {dir} && autoreconf -ifs && ./configure && make pjdfstest",
-                dir = PJDFSTEST_DIR
+                "git clone https://github.com/pjd/pjdfstest.git {dir} && \
+                 cd {dir} && git checkout {rev} && \
+                 autoreconf -ifs && ./configure && make pjdfstest",
+                dir = PJDFSTEST_DIR,
+                rev = PJDFSTEST_REV
             ),
         ])
         .status()
