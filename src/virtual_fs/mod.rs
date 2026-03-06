@@ -2078,7 +2078,7 @@ impl VirtualFs {
 
         self.ensure_children_loaded(parent).await?;
 
-        let (ino, full_path, xet_hash, needs_remote_delete) = {
+        let (ino, full_path, needs_remote_delete) = {
             let inodes = self.inode_table.read().expect("inodes poisoned");
             let entry = match inodes.lookup_child(parent, name) {
                 Some(entry) if entry.kind != InodeKind::Directory => entry,
@@ -2087,12 +2087,7 @@ impl VirtualFs {
             };
             // Remote delete only when last link is removed and file exists on the hub
             let needs_remote = entry.xet_hash.is_some() && entry.nlink <= 1;
-            (
-                entry.inode,
-                entry.full_path.clone(),
-                entry.xet_hash.clone(),
-                needs_remote,
-            )
+            (entry.inode, entry.full_path.clone(), needs_remote)
         };
 
         // Delete from remote first — if this fails, local state is untouched and
@@ -2127,50 +2122,6 @@ impl VirtualFs {
             }
             last_link
         };
-
-        // When unlinking the canonical entry of a remote file while other links survive,
-        // unlink_one promotes a surviving link. Sync the hub: add the new path, delete the old.
-        // This mirrors rename_remote for clean files. Dirty files will sync via pending_deletes at flush.
-        if !inode_removed && let Some(ref hash) = xet_hash {
-            let new_canonical = self
-                .inode_table
-                .read()
-                .expect("inodes poisoned")
-                .get(ino)
-                .map(|e| (e.full_path.clone(), e.dirty));
-            if let Some((new_path, false)) = new_canonical
-                && new_path != full_path
-            {
-                let mtime_ms = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as u64;
-                let ops = vec![
-                    BatchOp::AddFile {
-                        path: new_path,
-                        xet_hash: hash.clone(),
-                        mtime: mtime_ms,
-                        content_type: None,
-                    },
-                    BatchOp::DeleteFile {
-                        path: full_path.clone(),
-                    },
-                ];
-                if let Err(e) = self.hub_client.batch_operations(&ops).await {
-                    warn!(
-                        "Remote rename after canonical promotion failed for {}: {}",
-                        full_path, e
-                    );
-                    // Non-fatal: pending_deletes will clean up on next flush
-                } else {
-                    // Remote rename succeeded — clear pending_deletes to avoid double-delete
-                    let mut inodes = self.inode_table.write().expect("inodes poisoned");
-                    if let Some(entry) = inodes.get_mut(ino) {
-                        entry.pending_deletes.retain(|p| p != &full_path);
-                    }
-                }
-            }
-        }
 
         // Clean up staging file only if inode was fully removed (no remaining hard links)
         if inode_removed && let Some(ref staging_dir) = self.staging_dir {
@@ -2624,12 +2575,6 @@ impl VirtualFs {
                 inodes.remove(existing_ino);
             } else {
                 inodes.unlink_one(newparent, newname);
-                // unlink_one may promote a surviving hard link and add the old canonical path
-                // to pending_deletes. That path is about to be taken by the source file,
-                // so clear it to prevent a spurious delete on the next flush.
-                if let Some(entry) = inodes.get_mut(existing_ino) {
-                    entry.pending_deletes.retain(|p| *p != info.new_full_path);
-                }
                 if !self.has_open_handles(existing_ino) {
                     inodes.remove_orphan(existing_ino);
                 }

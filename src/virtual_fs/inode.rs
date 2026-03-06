@@ -435,10 +435,6 @@ impl InodeTable {
             && let Some((new_parent_ino, new_name, new_full_path)) = self.find_link(child_ino)
             && let Some(entry) = self.inodes.get_mut(&child_ino)
         {
-            // Record old remote path for cleanup at next flush (mirrors rename logic).
-            if entry.xet_hash.is_some() {
-                entry.pending_deletes.push(entry.full_path.clone());
-            }
             entry.parent = new_parent_ino;
             entry.name = new_name;
             entry.full_path = new_full_path.clone();
