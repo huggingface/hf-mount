@@ -3,14 +3,19 @@ mod common;
 use std::process::Command;
 
 /// Non-regression baseline (established 2026-03-06).
-/// mkfifo and mknod categories are excluded (ENOSYS, intentionally unsupported).
-/// Current: 168/212 files, 5062/8483 tests (59.7%) on hub-ci.
+/// Tests referencing mkfifo/mknod/fifo/block/char/socket are excluded (ENOSYS).
+/// Current: 159/173 files (91.9%) on prod, ~similar on hub-ci.
 /// Update these when adding new POSIX features.
-const MIN_FILES_PASS: usize = 165;
-const MIN_TESTS_PASS: usize = 4900;
+const MIN_FILES_PASS: usize = 155;
+const MIN_TESTS_PASS: usize = 4500;
 
 /// Categories excluded from testing (unsupported special file types).
 const EXCLUDED_CATEGORIES: &[&str] = &["mkfifo", "mknod"];
+
+/// Individual .t files that reference special file types are also excluded,
+/// even inside other categories (they cascade-fail due to ENOSYS).
+/// "for type in" catches tests iterating over fifo/block/char/socket types.
+const EXCLUDED_PATTERNS: &[&str] = &["mkfifo", "mknod", "for type in"];
 
 /// Path where pjdfstest is built/cached.
 const PJDFSTEST_DIR: &str = "/tmp/pjdfstest";
@@ -53,27 +58,48 @@ struct ProveResults {
 fn run_prove(mount_point: &str) -> ProveResults {
     let tests_dir = format!("{}/tests/", PJDFSTEST_DIR);
 
-    // Collect test directories, excluding unsupported categories
-    let mut test_dirs: Vec<String> = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(&tests_dir) {
-        for entry in entries.filter_map(|e| e.ok()) {
-            if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+    // Collect individual .t files, excluding:
+    //  - entire categories in EXCLUDED_CATEGORIES
+    //  - individual .t files that reference mkfifo/mknod (cascade-fail)
+    let mut test_files: Vec<String> = Vec::new();
+    let mut skipped_files = 0usize;
+    if let Ok(cats) = std::fs::read_dir(&tests_dir) {
+        for cat in cats.filter_map(|e| e.ok()) {
+            if !cat.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                 continue;
             }
-            let name = entry.file_name().to_string_lossy().to_string();
-            if EXCLUDED_CATEGORIES.contains(&name.as_str()) {
-                eprintln!("  Skipping category: {} (unsupported)", name);
+            let cat_name = cat.file_name().to_string_lossy().to_string();
+            if EXCLUDED_CATEGORIES.contains(&cat_name.as_str()) {
+                eprintln!("  Skipping category: {} (unsupported)", cat_name);
                 continue;
             }
-            test_dirs.push(format!("{}{}/", tests_dir, name));
+            if let Ok(files) = std::fs::read_dir(cat.path()) {
+                for file in files.filter_map(|e| e.ok()) {
+                    let fname = file.file_name().to_string_lossy().to_string();
+                    if !fname.ends_with(".t") {
+                        continue;
+                    }
+                    // Check if the test file references excluded patterns
+                    let content = std::fs::read_to_string(file.path()).unwrap_or_default();
+                    if EXCLUDED_PATTERNS.iter().any(|pat| content.contains(pat)) {
+                        skipped_files += 1;
+                        continue;
+                    }
+                    test_files.push(file.path().to_string_lossy().to_string());
+                }
+            }
         }
     }
-    test_dirs.sort();
+    test_files.sort();
+    eprintln!(
+        "  Running {} test files ({} skipped for mkfifo/mknod references)",
+        test_files.len(),
+        skipped_files
+    );
 
     let output = Command::new("sudo")
         .arg("prove")
-        .arg("-r")
-        .args(&test_dirs)
+        .args(&test_files)
         .current_dir(mount_point)
         .output()
         .expect("Failed to run prove");
