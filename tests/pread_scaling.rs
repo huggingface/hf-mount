@@ -59,7 +59,7 @@ async fn test_parallel_pread_scaling() {
     let filename = format!("pread_scale_{}.bin", std::process::id());
     let data = common::generate_pattern(FILE_SIZE);
 
-    let (token, bucket_id, hub) = match common::setup_bucket_with_file("pread-scale", &filename, &data).await {
+    let (token, bucket_id, _hub) = match common::setup_bucket_with_file("pread-scale", &filename, &data).await {
         Some(cfg) => cfg,
         None => return, // HF_TOKEN not set
     };
