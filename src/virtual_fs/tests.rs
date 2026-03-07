@@ -2230,3 +2230,79 @@ fn shutdown_flushes_dirty() {
     let logs = hub.take_batch_log();
     assert!(!logs.is_empty());
 }
+
+// ── Concurrent pread benchmark ──────────────────────────────────────
+
+/// Reproduce the multi-thread pread pattern without FUSE.
+/// N tokio tasks read sequentially from different regions of the same file handle,
+/// simulating N threads doing pread(fd, buf, 128K, offset) on the same fd.
+///
+/// This test prints throughput per thread count so we can see scaling behavior.
+/// It uses MockXet (in-memory, zero network) so any degradation is purely
+/// from lock contention and stream management overhead.
+#[test]
+fn concurrent_pread_scaling() {
+    const FILE_SIZE: u64 = 64 * 1024 * 1024; // 64 MB
+    const READ_SIZE: u32 = 128 * 1024; // 128 KB (typical FUSE read)
+
+    let hub = MockHub::new();
+    hub.add_file("big.safetensor", FILE_SIZE, Some("big_hash"), None);
+    let xet = MockXet::new();
+    // Fill with patterned data so we can verify correctness
+    let data: Vec<u8> = (0..FILE_SIZE as usize).map(|i| (i % 251) as u8).collect();
+    xet.add_file("big_hash", &data);
+
+    let (rt, vfs) = vfs_readonly(&hub, &xet);
+
+    rt.block_on(async {
+        let attr = vfs.lookup(ROOT_INODE, "big.safetensor").await.unwrap();
+
+        eprintln!("\n{:>8}  {:>10}  {:>10}", "Threads", "Wall (ms)", "MB/s");
+        eprintln!("{:>8}  {:>10}  {:>10}", "-------", "---------", "---------");
+
+        for num_threads in [1, 2, 4, 8] {
+            // Shared file handle (pread pattern: N threads share one fd)
+            let fh = vfs.open(attr.ino, false, false, None).await.unwrap();
+
+            // Each "thread" reads a contiguous region of the file
+            let region_size = FILE_SIZE / num_threads as u64;
+            let reads_per_thread = region_size / READ_SIZE as u64;
+
+            let start = std::time::Instant::now();
+
+            let mut handles = Vec::new();
+            for t in 0..num_threads {
+                let vfs = vfs.clone();
+                let base_offset = t as u64 * region_size;
+                handles.push(tokio::spawn(async move {
+                    let mut bytes_read = 0u64;
+                    for i in 0..reads_per_thread {
+                        let offset = base_offset + i * READ_SIZE as u64;
+                        let (chunk, _) = vfs.read(fh, offset, READ_SIZE).await.unwrap();
+                        assert_eq!(chunk.len(), READ_SIZE as usize, "short read at offset {}", offset);
+                        // Verify first byte
+                        assert_eq!(chunk[0], (offset % 251) as u8, "data mismatch at offset {}", offset);
+                        bytes_read += chunk.len() as u64;
+                    }
+                    bytes_read
+                }));
+            }
+
+            let mut total_bytes = 0u64;
+            for h in handles {
+                total_bytes += h.await.unwrap();
+            }
+
+            let elapsed = start.elapsed();
+            let mb_per_sec = total_bytes as f64 / elapsed.as_secs_f64() / 1_048_576.0;
+            eprintln!(
+                "{:>8}  {:>10.1}  {:>10.1}",
+                num_threads,
+                elapsed.as_millis(),
+                mb_per_sec,
+            );
+
+            vfs.release(fh).await;
+        }
+    });
+}
