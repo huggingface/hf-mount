@@ -16,7 +16,7 @@ cas_object = { git = "https://github.com/huggingface/xet-core.git", rev = "e85cf
 merklehash = { git = "https://github.com/huggingface/xet-core.git", rev = "e85cf9d" }
 
 # External crates
-fuser = { version = "0.17", features = ["macos-no-mount"] }
+fuser = "0.17"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
 reqwest = { version = "0.12", features = ["json", "stream"] }
 futures = "0.3"
