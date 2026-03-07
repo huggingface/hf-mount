@@ -13,7 +13,7 @@ use tracing::{debug, error, info, warn};
 use crate::hub_api::{BatchOp, HubOps};
 
 pub mod inode;
-use crate::prefetch::{FetchPlan, PrefetchState};
+use crate::prefetch::{FORWARD_SKIP, FetchPlan, N_PREFETCH_SLOTS, PrefetchState};
 use crate::xet::{StagingDir, StreamingWriterOps, XetOps};
 use inode::{InodeEntry, InodeKind, InodeTable};
 
@@ -1260,7 +1260,11 @@ impl VirtualFs {
         } else {
             None
         };
-        let prefetch = Arc::new(tokio::sync::Mutex::new(PrefetchState::new(xet_hash, size)));
+        let prefetch = Arc::new(
+            (0..N_PREFETCH_SLOTS)
+                .map(|_| tokio::sync::Mutex::new(PrefetchState::new(xet_hash.clone(), size)))
+                .collect::<Vec<_>>(),
+        );
         let file_handle = self.alloc_file_handle();
         self.open_files
             .write()
@@ -1433,7 +1437,50 @@ impl VirtualFs {
                 if let Some(ref mut rx) = warm {
                     let _ = rx.wait_for(|v| *v).await;
                 }
-                let mut prefetch_state = prefetch.lock().await;
+                // Acquire the best prefetch slot for this offset.
+                // We HOLD the guard from the successful try_lock — no TOCTOU race.
+                // Each concurrent pread (e.g. safetensors worker threads sharing one
+                // fd) lands on a different slot and downloads in parallel.
+                //
+                // Priority: cache hit → near-sequential → empty → any free → blocking.
+                let mut prefetch_state = 'slot: {
+                    // Pass 1: forward buffer already covers `offset` (cache hit)
+                    for i in 0..prefetch.len() {
+                        if let Ok(g) = prefetch[i].try_lock() {
+                            let end = g.buf_start + g.chunks_len as u64;
+                            if g.chunks_len > 0 && offset >= g.buf_start && offset < end {
+                                break 'slot g;
+                            }
+                        }
+                    }
+                    // Pass 2: stream positioned just before `offset` (near-sequential)
+                    for i in 0..prefetch.len() {
+                        if let Ok(g) = prefetch[i].try_lock() {
+                            let end = g.buf_start + g.chunks_len as u64;
+                            if offset >= end && offset <= end + FORWARD_SKIP {
+                                break 'slot g;
+                            }
+                        }
+                    }
+                    // Pass 3: empty slot — best for a fresh independent stream
+                    for i in 0..prefetch.len() {
+                        if let Ok(g) = prefetch[i].try_lock() {
+                            if g.chunks_len == 0 && g.stream.is_none() {
+                                break 'slot g;
+                            }
+                        }
+                    }
+                    // Pass 4: any unlocked slot (evict its buffered data)
+                    for i in 0..prefetch.len() {
+                        if let Ok(g) = prefetch[i].try_lock() {
+                            break 'slot g;
+                        }
+                    }
+                    // Pass 5: all slots busy — block on a deterministic slot by 8 MiB
+                    // bucket so two near-offset readers share the same slot (and its data).
+                    let idx = (offset / (8 * 1024 * 1024)) as usize % prefetch.len();
+                    prefetch[idx].lock().await
+                };
 
                 let file_size = prefetch_state.file_size;
 
@@ -2829,9 +2876,11 @@ struct StreamingChannel {
 enum OpenFile {
     /// Local file (staging for writes, or dirty reads).
     Local { ino: u64, file: Arc<File>, writable: bool },
-    /// Lazy remote — data fetched on-demand with adaptive prefetch buffer.
+    /// Lazy remote — data fetched on-demand with N independent prefetch slots.
+    /// Each concurrent reader (e.g. safetensors pread threads sharing one fd) gets
+    /// its own slot, so parallel reads at different offsets do not serialize.
     Lazy {
-        prefetch: Arc<tokio::sync::Mutex<PrefetchState>>,
+        prefetch: Arc<Vec<tokio::sync::Mutex<PrefetchState>>>,
         /// Background reconstruction cache warmup. Becomes `true` when the full-file plan
         /// is cached. `None` for empty files (no warmup needed).
         warm: Option<tokio::sync::watch::Receiver<bool>>,
@@ -2909,7 +2958,7 @@ enum ReadTarget {
     /// Hold an Arc<File> so the FD stays alive even if release() runs concurrently.
     LocalFd(Arc<File>),
     Remote {
-        prefetch: Arc<tokio::sync::Mutex<PrefetchState>>,
+        prefetch: Arc<Vec<tokio::sync::Mutex<PrefetchState>>>,
         warm: Option<tokio::sync::watch::Receiver<bool>>,
     },
 }

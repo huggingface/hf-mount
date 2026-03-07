@@ -20,6 +20,10 @@ pub(crate) const SEEK_WINDOW: usize = 1_048_576; // 1 MiB
 /// stream. Reads within this range are served by draining/discarding the
 /// gap from the current stream (cheaper than a new CAS request).
 pub(crate) const FORWARD_SKIP: u64 = 16 * 1_048_576; // 16 MiB
+/// Number of independent prefetch slots per lazy file handle.
+/// Each concurrent reader (e.g. safetensors pread threads) gets its own slot,
+/// eliminating the global-mutex serialization that collapses throughput.
+pub(crate) const N_PREFETCH_SLOTS: usize = 8;
 
 // ── FetchPlan ────────────────────────────────────────────────────────
 

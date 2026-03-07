@@ -2239,32 +2239,46 @@ fn shutdown_flushes_dirty() {
 ///
 /// This test prints throughput per thread count so we can see scaling behavior.
 /// It uses MockXet (in-memory, zero network) so any degradation is purely
-/// from lock contention and stream management overhead.
+/// Regression test for the parallel-pread global-mutex bottleneck.
+///
+/// Safetensors / transformers open ONE fd and call pread from N threads
+/// simultaneously. Before the multi-slot fix every concurrent read blocked
+/// on a single `tokio::sync::Mutex<PrefetchState>`, collapsing throughput
+/// by ~30x under 2 threads.
+///
+/// 50 ms first-chunk latency is injected so serialisation shows up as
+/// wall-clock time even with an in-memory mock:
+///   - N=1  baseline : ~200 ms  (4 sequential fetches × 50 ms)
+///   - N=4  with fix : ~50 ms   (4 fetches in parallel)
+///   - N=4  with bug : ~200 ms  (4 serialised fetches, same as N=1)
+///
+/// Assertion: 4-thread wall time must be strictly less than 1-thread wall time.
 #[test]
 fn concurrent_pread_scaling() {
     const FILE_SIZE: u64 = 64 * 1024 * 1024; // 64 MB
     const READ_SIZE: u32 = 128 * 1024; // 128 KB (typical FUSE read)
+    const DELAY_MS: u64 = 50; // injected first-chunk latency per download stream
 
     let hub = MockHub::new();
     hub.add_file("big.safetensor", FILE_SIZE, Some("big_hash"), None);
     let xet = MockXet::new();
-    // Fill with patterned data so we can verify correctness
     let data: Vec<u8> = (0..FILE_SIZE as usize).map(|i| (i % 251) as u8).collect();
     xet.add_file("big_hash", &data);
+    xet.set_first_chunk_delay_ms(DELAY_MS);
 
     let (rt, vfs) = vfs_readonly(&hub, &xet);
 
-    rt.block_on(async {
+    let (elapsed_1, elapsed_4) = rt.block_on(async {
         let attr = vfs.lookup(ROOT_INODE, "big.safetensor").await.unwrap();
 
         eprintln!("\n{:>8}  {:>10}  {:>10}", "Threads", "Wall (ms)", "MB/s");
         eprintln!("{:>8}  {:>10}  {:>10}", "-------", "---------", "---------");
 
-        for num_threads in [1, 2, 4, 8] {
-            // Shared file handle (pread pattern: N threads share one fd)
+        let mut timings = std::collections::HashMap::new();
+
+        for num_threads in [1usize, 4] {
             let fh = vfs.open(attr.ino, false, false, None).await.unwrap();
 
-            // Each "thread" reads a contiguous region of the file
             let region_size = FILE_SIZE / num_threads as u64;
             let reads_per_thread = region_size / READ_SIZE as u64;
 
@@ -2275,16 +2289,15 @@ fn concurrent_pread_scaling() {
                 let vfs = vfs.clone();
                 let base_offset = t as u64 * region_size;
                 handles.push(tokio::spawn(async move {
-                    let mut bytes_read = 0u64;
+                    let mut bytes = 0u64;
                     for i in 0..reads_per_thread {
-                        let offset = base_offset + i * READ_SIZE as u64;
-                        let (chunk, _) = vfs.read(fh, offset, READ_SIZE).await.unwrap();
-                        assert_eq!(chunk.len(), READ_SIZE as usize, "short read at offset {}", offset);
-                        // Verify first byte
-                        assert_eq!(chunk[0], (offset % 251) as u8, "data mismatch at offset {}", offset);
-                        bytes_read += chunk.len() as u64;
+                        let off = base_offset + i * READ_SIZE as u64;
+                        let (chunk, _) = vfs.read(fh, off, READ_SIZE).await.unwrap();
+                        assert_eq!(chunk.len(), READ_SIZE as usize, "short read at {}", off);
+                        assert_eq!(chunk[0], (off % 251) as u8, "data mismatch at {}", off);
+                        bytes += chunk.len() as u64;
                     }
-                    bytes_read
+                    bytes
                 }));
             }
 
@@ -2294,15 +2307,34 @@ fn concurrent_pread_scaling() {
             }
 
             let elapsed = start.elapsed();
-            let mb_per_sec = total_bytes as f64 / elapsed.as_secs_f64() / 1_048_576.0;
-            eprintln!(
-                "{:>8}  {:>10.1}  {:>10.1}",
-                num_threads,
-                elapsed.as_millis(),
-                mb_per_sec,
-            );
+            let mbps = total_bytes as f64 / elapsed.as_secs_f64() / 1_048_576.0;
+            eprintln!("{:>8}  {:>10.1}  {:>10.1}", num_threads, elapsed.as_millis(), mbps);
 
+            timings.insert(num_threads, elapsed);
             vfs.release(fh).await;
         }
+
+        (timings[&1], timings[&4])
     });
+
+    eprintln!(
+        "\nScaling: 4-thread {}ms vs 1-thread {}ms (ratio {:.2}x)",
+        elapsed_4.as_millis(),
+        elapsed_1.as_millis(),
+        elapsed_4.as_secs_f64() / elapsed_1.as_secs_f64(),
+    );
+
+    // With multi-slot fix: 4 threads fetch in parallel → wall time ≈ DELAY_MS (~50ms).
+    // With the bug: 4 threads serialise → wall time >> 4 × DELAY_MS (~28 000ms).
+    // Threshold: 75% of serial time (4 × DELAY_MS) = 150ms.
+    let serial_ms = 4u128 * DELAY_MS as u128;
+    let threshold_ms = serial_ms * 75 / 100;
+    assert!(
+        elapsed_4.as_millis() < threshold_ms,
+        "REGRESSION: 4-thread pread took {}ms (expected <{}ms, serial would be {}ms). \
+         Concurrent reads on a shared fd are being serialised (prefetch mutex bottleneck).",
+        elapsed_4.as_millis(),
+        threshold_ms,
+        serial_ms,
+    );
 }

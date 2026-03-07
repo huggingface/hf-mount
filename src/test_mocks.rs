@@ -212,7 +212,7 @@ impl HubOps for MockHub {
 // ── MockXet ───────────────────────────────────────────────────────────
 
 pub struct MockXet {
-    files: Mutex<HashMap<String, Vec<u8>>>,
+    files: Mutex<HashMap<String, Arc<Vec<u8>>>>,
     next_hash: AtomicU64,
     writer_create_fail: AtomicBool,
     upload_fail: AtomicBool,
@@ -222,6 +222,9 @@ pub struct MockXet {
     range_fail_count: AtomicU32,
     /// Number of range download calls that should return empty before succeeding.
     range_empty_count: AtomicU32,
+    /// Delay (ms) injected at the first `next()` call of every download stream.
+    /// Used in unit tests to expose mutex-serialization bottlenecks.
+    first_chunk_delay_ms: AtomicU64,
 }
 
 impl MockXet {
@@ -235,11 +238,22 @@ impl MockXet {
             writer_fail_after: AtomicU64::new(u64::MAX),
             range_fail_count: AtomicU32::new(0),
             range_empty_count: AtomicU32::new(0),
+            first_chunk_delay_ms: AtomicU64::new(0),
         })
     }
 
+    /// Inject an artificial delay (ms) on the first chunk of every download stream.
+    /// Used to expose mutex-serialization: N parallel readers with delay D should
+    /// complete in ~D ms (parallel), not ~N*D ms (serial).
+    pub fn set_first_chunk_delay_ms(&self, ms: u64) {
+        self.first_chunk_delay_ms.store(ms, Ordering::SeqCst);
+    }
+
     pub fn add_file(&self, hash: &str, content: &[u8]) {
-        self.files.lock().unwrap().insert(hash.to_string(), content.to_vec());
+        self.files
+            .lock()
+            .unwrap()
+            .insert(hash.to_string(), Arc::new(content.to_vec()));
     }
 
     pub fn fail_next_writer_create(&self) {
@@ -287,12 +301,12 @@ impl XetOps for MockXet {
         if self.download_fail.swap(false, Ordering::SeqCst) {
             return Err(Error::Xet("mock download failure".into()));
         }
-        let files = self.files.lock().unwrap();
-        if let Some(content) = files.get(xet_hash) {
+        let content = self.files.lock().unwrap().get(xet_hash).cloned();
+        if let Some(content) = content {
             if let Some(parent) = dest.parent() {
                 std::fs::create_dir_all(parent).ok();
             }
-            std::fs::write(dest, content).map_err(Error::Io)?;
+            std::fs::write(dest, content.as_slice()).map_err(Error::Io)?;
         }
         Ok(())
     }
@@ -306,7 +320,7 @@ impl XetOps for MockXet {
             let content = std::fs::read(path).map_err(Error::Io)?;
             let hash = self.next_hash_string();
             let size = content.len() as u64;
-            self.files.lock().unwrap().insert(hash.clone(), content);
+            self.files.lock().unwrap().insert(hash.clone(), Arc::new(content));
             results.push(XetFileInfo::new(hash, size));
         }
         Ok(results)
@@ -324,17 +338,27 @@ impl XetOps for MockXet {
         if prev_empty > 0 {
             self.range_empty_count.fetch_sub(1, Ordering::SeqCst);
             return Ok(Box::new(MockDownloadStream {
-                data: Vec::new(),
+                data: Arc::new(Vec::new()),
                 offset: 0,
                 chunk_size: 4096,
+                first_chunk_delay_ms: 0,
             }));
         }
-        let files = self.files.lock().unwrap();
-        let content = files.get(file_info.hash()).cloned().unwrap_or_default();
+        // Clone only the Arc (refcount bump, no data copy) so concurrent streams
+        // don't serialize on a lock + 64 MB memcpy.
+        let content = self
+            .files
+            .lock()
+            .unwrap()
+            .get(file_info.hash())
+            .cloned()
+            .unwrap_or_default();
+        let first_chunk_delay_ms = self.first_chunk_delay_ms.load(Ordering::SeqCst);
         Ok(Box::new(MockDownloadStream {
             data: content,
             offset: offset as usize,
             chunk_size: 4096,
+            first_chunk_delay_ms,
         }))
     }
 }
@@ -374,14 +398,21 @@ impl StreamingWriterOps for MockStreamingWriter {
 // ── MockDownloadStream ────────────────────────────────────────────────
 
 pub struct MockDownloadStream {
-    data: Vec<u8>,
+    /// Arc so cloning the stream descriptor is O(1) — no 64 MB memcpy per task.
+    data: Arc<Vec<u8>>,
     offset: usize,
     chunk_size: usize,
+    /// Delay injected before the first chunk (simulates network round-trip).
+    first_chunk_delay_ms: u64,
 }
 
 #[async_trait::async_trait]
 impl DownloadStreamOps for MockDownloadStream {
     async fn next(&mut self) -> Result<Option<Bytes>> {
+        if self.first_chunk_delay_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(self.first_chunk_delay_ms)).await;
+            self.first_chunk_delay_ms = 0; // only delay the first chunk
+        }
         if self.offset >= self.data.len() {
             return Ok(None);
         }
