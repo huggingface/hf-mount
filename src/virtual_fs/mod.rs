@@ -1824,7 +1824,6 @@ impl VirtualFs {
                 info
             } else {
                 let (result_tx, result_rx) = tokio::sync::oneshot::channel();
-                debug!("streaming_commit: ino={}, sending Finish to worker...", ino);
                 if channel.tx.send(WriteMsg::Finish(result_tx)).await.is_err() {
                     // Channel closed: only treat as success if already committed.
                     // If the worker died from an error, this is a real failure.
@@ -1872,23 +1871,12 @@ impl VirtualFs {
             ops.push(BatchOp::DeleteFile { path: old_path.clone() });
         }
 
-        let hub_start = std::time::Instant::now();
         if let Err(e) = self.hub_client.batch_operations(&ops).await {
-            error!(
-                "Failed to commit file {}: {} ({:.1}s)",
-                full_path,
-                e,
-                hub_start.elapsed().as_secs_f64()
-            );
+            error!("Failed to commit file {}: {}", full_path, e);
             // CAS upload succeeded — preserve file_info for retry in release()
             *channel.pending_info.lock().unwrap() = Some(file_info);
             return Err(libc::EIO);
         }
-        debug!(
-            "streaming_commit: ino={}, Hub commit done in {:.1}s",
-            ino,
-            hub_start.elapsed().as_secs_f64(),
-        );
 
         // Update inode: clean, with hash
         let mut inodes = self.inode_table.write().expect("inodes poisoned");
@@ -2891,68 +2879,22 @@ async fn streaming_worker(
     error: Arc<std::sync::Mutex<Option<String>>>,
 ) {
     let mut failed = false;
-    let mut total_bytes: u64 = 0;
-    let mut chunk_count: u64 = 0;
-    let start = std::time::Instant::now();
-    let mut last_log = start;
     while let Some(msg) = rx.recv().await {
         match msg {
             WriteMsg::Data(data) => {
                 if failed {
                     continue; // drain remaining messages
                 }
-                let len = data.len() as u64;
                 if let Err(e) = writer.write(&data).await {
                     *error.lock().unwrap() = Some(e.to_string());
                     failed = true;
-                    continue;
-                }
-                total_bytes += len;
-                chunk_count += 1;
-                let now = std::time::Instant::now();
-                if now.duration_since(last_log).as_secs() >= 5 {
-                    let elapsed = now.duration_since(start).as_secs_f64();
-                    let mb = total_bytes as f64 / (1024.0 * 1024.0);
-                    debug!(
-                        "streaming_worker: received {:.1} MiB in {} chunks ({:.1} MiB/s, {:.1}s elapsed)",
-                        mb,
-                        chunk_count,
-                        mb / elapsed,
-                        elapsed,
-                    );
-                    last_log = now;
                 }
             }
             WriteMsg::Finish(reply) => {
-                let elapsed_write = start.elapsed();
-                let mb = total_bytes as f64 / (1024.0 * 1024.0);
-                info!(
-                    "streaming_worker: write phase done: {:.1} MiB in {} chunks, {:.1}s ({:.1} MiB/s)",
-                    mb,
-                    chunk_count,
-                    elapsed_write.as_secs_f64(),
-                    mb / elapsed_write.as_secs_f64().max(0.001),
-                );
                 let result = if failed {
                     Err(crate::error::Error::Hub("streaming write failed".into()))
                 } else {
-                    let t0 = std::time::Instant::now();
-                    let res = writer.finish_boxed().await;
-                    let fin_elapsed = t0.elapsed();
-                    match &res {
-                        Ok(info) => info!(
-                            "streaming_worker: CAS finalize done in {:.1}s, hash={}, size={}",
-                            fin_elapsed.as_secs_f64(),
-                            info.hash(),
-                            info.file_size(),
-                        ),
-                        Err(e) => error!(
-                            "streaming_worker: CAS finalize failed after {:.1}s: {}",
-                            fin_elapsed.as_secs_f64(),
-                            e,
-                        ),
-                    }
-                    res
+                    writer.finish_boxed().await
                 };
                 let _ = reply.send(result);
                 return;
