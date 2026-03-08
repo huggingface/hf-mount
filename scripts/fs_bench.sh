@@ -225,6 +225,7 @@ run_benchmarks() {
 
 run_benchmarks read
 run_benchmarks write
+run_benchmarks mix
 
 echo "Throughput:" >&2
 jq -n '[inputs]' "${results_dir}"/*_parsed.json | tee "${results_dir}/output.json"
