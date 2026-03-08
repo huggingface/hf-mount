@@ -11,6 +11,9 @@
 #                             Use this on repeated runs to avoid re-uploading large files.
 #   HF_JOB_NAME_FILTER      — only run jobs whose filename matches this substring
 #                             (e.g. "small" to skip 100G jobs in CI)
+#   HF_NO_DISK_CACHE        — set to 1 to disable the on-disk xorb chunk cache.
+#                             Comparable to mountpoint-s3 without --cache (reads fetch
+#                             from CAS on each FUSE miss, OS page cache still applies).
 #   iterations              — fio iterations per job (default: 10)
 #
 # Comparable to mountpoint-s3 when run on a high-network instance (they use m5dn.24xlarge,
@@ -202,11 +205,14 @@ run_benchmarks() {
     job_name="$(basename "${job_file}" .fio)"
     cache_dir="/tmp/hf-bench-cache-$$/${job_name}"
 
-    if [[ "${category}" == "read" ]]; then
-      do_mount "${cache_dir}" --read-only
-    else
-      do_mount "${cache_dir}"
-    fi
+    # Mount read-write so fio can create and benchmark on the same mount.
+    local extra_args=()
+    [[ "${HF_NO_DISK_CACHE:-0}" == "1" ]] && extra_args+=(--no-disk-cache)
+    do_mount "${cache_dir}" "${extra_args[@]}"
+
+    # Lay out files (create if not present), then immediately run benchmark on same mount.
+    echo "Laying out files for ${job_file}" >&2
+    fio --thread --directory="${_MOUNT_DIR}" --create_only=1 --eta=never "${job_file}" &>/dev/null
 
     echo "Running ${job_file}" >&2
     run_fio_job "${job_file}" "${_MOUNT_DIR}"

@@ -73,7 +73,15 @@ bandwidth. mountpoint-s3 uses `m5dn.24xlarge` (100 Gbps, local NVMe SSD).
 | `HF_MOUNT_BIN` | Path to `hf-mount-fuse` binary |
 | `HF_BENCH_BUCKET` | Reuse a pre-existing bucket (skips file upload) |
 | `HF_JOB_NAME_FILTER` | Only run jobs matching this substring (e.g. `small`) |
+| `HF_NO_DISK_CACHE` | Set to `1` to disable the on-disk xorb chunk cache |
 | `iterations` | fio iterations per job (default: 10) |
+
+**Cache behavior:**
+
+By default, hf-mount caches xorb chunks on disk between reads (comparable to mountpoint-s3
+with `--cache`). Set `HF_NO_DISK_CACHE=1` to disable this: reads fetch chunks from the CAS
+network on each FUSE cache miss (OS page cache still applies), which is comparable to
+mountpoint-s3 without `--cache`.
 
 **Tip:** To skip re-uploading 100 GiB files on repeated runs, set `HF_BENCH_BUCKET` to a
 previously created benchmark bucket.

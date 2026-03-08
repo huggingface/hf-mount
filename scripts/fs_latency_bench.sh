@@ -8,6 +8,9 @@
 #   HF_ENDPOINT             — defaults to https://huggingface.co
 #   HF_MOUNT_BIN            — path to hf-mount-fuse (default: ./target/release/hf-mount-fuse)
 #   HF_BENCH_BUCKET         — reuse a pre-existing bucket (skips create/upload/delete)
+#   HF_NO_DISK_CACHE        — set to 1 to disable the on-disk xorb chunk cache.
+#                             Recommended for TTFB: measures real CAS download latency,
+#                             comparable to mountpoint-s3 without --cache.
 #
 # Usage:
 #   cargo build --release
@@ -130,7 +133,9 @@ run_ttfb_jobs() {
     job_name="$(basename "${job_file}" .fio)"
     cache_dir="/tmp/hf-latency-cache-$$/${job_name}"
 
-    do_mount "${cache_dir}" --read-only
+    local extra_args=(--read-only)
+    [[ "${HF_NO_DISK_CACHE:-0}" == "1" ]] && extra_args+=(--no-disk-cache)
+    do_mount "${cache_dir}" "${extra_args[@]}"
     echo "Running ${job_name}" >&2
 
     set +e
