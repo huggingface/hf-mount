@@ -1806,14 +1806,6 @@ impl VirtualFs {
 
     /// Finalize a streaming write: send Finish to the worker, await CAS upload, commit to Hub.
     async fn streaming_commit(&self, ino: u64, channel: &StreamingChannel) -> Result<(), i32> {
-        let commit_start = std::time::Instant::now();
-        let bytes_written = channel.bytes_written.load(std::sync::atomic::Ordering::Relaxed);
-        let mb = bytes_written as f64 / (1024.0 * 1024.0);
-        info!(
-            "streaming_commit: ino={}, {:.1} MiB written, starting commit...",
-            ino, mb
-        );
-
         // POSIX: unlinked files (nlink=0) must not be re-committed on close
         if self
             .inode_table
@@ -1832,7 +1824,7 @@ impl VirtualFs {
                 info
             } else {
                 let (result_tx, result_rx) = tokio::sync::oneshot::channel();
-                info!("streaming_commit: ino={}, sending Finish to worker...", ino);
+                debug!("streaming_commit: ino={}, sending Finish to worker...", ino);
                 if channel.tx.send(WriteMsg::Finish(result_tx)).await.is_err() {
                     // Channel closed: only treat as success if already committed.
                     // If the worker died from an error, this is a real failure.
@@ -1881,10 +1873,6 @@ impl VirtualFs {
         }
 
         let hub_start = std::time::Instant::now();
-        info!(
-            "streaming_commit: ino={}, calling Hub batch_operations for {}...",
-            ino, full_path
-        );
         if let Err(e) = self.hub_client.batch_operations(&ops).await {
             error!(
                 "Failed to commit file {}: {} ({:.1}s)",
@@ -1896,7 +1884,7 @@ impl VirtualFs {
             *channel.pending_info.lock().unwrap() = Some(file_info);
             return Err(libc::EIO);
         }
-        info!(
+        debug!(
             "streaming_commit: ino={}, Hub commit done in {:.1}s",
             ino,
             hub_start.elapsed().as_secs_f64(),
@@ -1915,11 +1903,10 @@ impl VirtualFs {
         }
 
         info!(
-            "Committed file: {} (hash={}, size={}, total_commit={:.1}s)",
+            "Committed file: {} (hash={}, size={})",
             full_path,
             file_info.hash(),
             file_info.file_size(),
-            commit_start.elapsed().as_secs_f64(),
         );
 
         Ok(())
@@ -2926,7 +2913,7 @@ async fn streaming_worker(
                 if now.duration_since(last_log).as_secs() >= 5 {
                     let elapsed = now.duration_since(start).as_secs_f64();
                     let mb = total_bytes as f64 / (1024.0 * 1024.0);
-                    info!(
+                    debug!(
                         "streaming_worker: received {:.1} MiB in {} chunks ({:.1} MiB/s, {:.1}s elapsed)",
                         mb,
                         chunk_count,
@@ -2950,7 +2937,6 @@ async fn streaming_worker(
                     Err(crate::error::Error::Hub("streaming write failed".into()))
                 } else {
                     let t0 = std::time::Instant::now();
-                    info!("streaming_worker: starting CAS finalize ({:.1} MiB)...", mb);
                     let res = writer.finish_boxed().await;
                     let fin_elapsed = t0.elapsed();
                     match &res {

@@ -142,6 +142,13 @@ pub fn setup(is_nfs: bool) -> MountSetup {
         ("HF_XET_RECONSTRUCTION_TARGET_BLOCK_COMPLETION_TIME", "30"),
         ("HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_SIZE", "134217728"),
         ("HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT", "268435456"),
+        // Raise read_timeout from 120s default so large shard uploads don't get killed
+        // by the global client read_timeout before the per-request timeout kicks in.
+        ("HF_XET_CLIENT_READ_TIMEOUT", "600"),
+        // Upload tuning: skip slow adaptive concurrency ramp-up
+        ("HF_XET_CLIENT_AC_INITIAL_UPLOAD_CONCURRENCY", "16"),
+        // Larger ingestion blocks = fewer CDC calls
+        ("HF_XET_DATA_INGESTION_BLOCK_SIZE", "16777216"),
     ] {
         if std::env::var(k).is_err() {
             // SAFETY: called before any threads are spawned.
