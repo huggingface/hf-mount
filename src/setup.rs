@@ -219,9 +219,9 @@ pub fn setup(is_nfs: bool) -> MountSetup {
         ))
         .expect("Failed to create CAS client");
     let cached_client = CachedXetClient::new(raw_client);
-    let download_session = FileDownloadSession::from_client(cached_client, None, Some(xorb_cache));
+    let download_session = FileDownloadSession::from_client(cached_client.clone(), None, Some(xorb_cache));
     let upload_config = if read_only { None } else { Some(cas_config) };
-    let xet_sessions = XetSessions::new(download_session, upload_config);
+    let xet_sessions = XetSessions::new(download_session, upload_config, cached_client);
 
     let advanced_writes = args.advanced_writes || (is_nfs && !read_only);
     // Repos need a staging dir for HTTP download cache (open_readonly),
