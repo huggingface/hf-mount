@@ -24,6 +24,13 @@ pub(crate) const FORWARD_SKIP: u64 = 16 * 1_048_576; // 16 MiB
 /// Each concurrent reader (e.g. safetensors pread threads) gets its own slot,
 /// eliminating the global-mutex serialization that collapses throughput.
 pub(crate) const N_PREFETCH_SLOTS: usize = 8;
+/// Minimum fetch size for range (non-sequential) downloads.
+/// Each CAS range request has ~50ms of latency overhead regardless of size.
+/// With N threads doing work-stealing on a sorted tensor file, the stride
+/// between accesses is N × avg_tensor_size (≈27 MiB for 8 threads on GPT-2).
+/// A 64 MiB minimum covers the stride, turning 7× more HTTP requests (92 vs 13)
+/// into ~18 requests, cutting per-request latency overhead from 4.6s to 0.9s.
+pub(crate) const RANGE_WINDOW: u64 = 64 * 1_048_576; // 64 MiB
 
 // ── FetchPlan ────────────────────────────────────────────────────────
 
@@ -111,9 +118,9 @@ impl PrefetchState {
             debug!("prefetch window doubled to {}", self.window_size);
             true
         } else {
-            // Far seek: reset to initial window, cancel stream
-            self.window_size = INITIAL_WINDOW;
-            debug!("prefetch window reset to {}", self.window_size);
+            // Far seek: preserve window_size rather than resetting to INITIAL_WINDOW.
+            // Window growth is driven by sequential reads; random access (e.g. slot
+            // eviction by another thread) should not undo that accumulated headroom.
             false
         };
 
@@ -134,7 +141,14 @@ impl PrefetchState {
         };
 
         let needed = (size as u64).min(self.file_size - offset);
-        let fetch_size = needed.max(self.window_size).min(self.file_size - offset);
+        // Sequential reads use the adaptive window; range downloads use at least
+        // RANGE_WINDOW to amortise HTTP request latency across many tensors.
+        let min_window = if is_sequential {
+            self.window_size
+        } else {
+            self.window_size.max(RANGE_WINDOW)
+        };
+        let fetch_size = needed.max(min_window).min(self.file_size - offset);
 
         FetchPlan { strategy, fetch_size }
     }

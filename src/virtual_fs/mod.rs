@@ -1464,10 +1464,11 @@ impl VirtualFs {
                     }
                     // Pass 3: empty slot — best for a fresh independent stream
                     for i in 0..prefetch.len() {
-                        if let Ok(g) = prefetch[i].try_lock() {
-                            if g.chunks_len == 0 && g.stream.is_none() {
-                                break 'slot g;
-                            }
+                        if let Ok(g) = prefetch[i].try_lock()
+                            && g.chunks_len == 0
+                            && g.stream.is_none()
+                        {
+                            break 'slot g;
                         }
                     }
                     // Pass 4: any unlocked slot (evict its buffered data)
