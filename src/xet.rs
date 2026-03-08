@@ -2,8 +2,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use bytes::Bytes;
+use cas_client::Client;
 use data::configurations::TranslatorConfig;
 use data::{FileDownloadSession, FileUploadSession, SingleFileCleaner, XetFileInfo};
+use merklehash::MerkleHash;
 use ulid::Ulid;
 
 use crate::error::{Error, Result};
@@ -17,6 +19,9 @@ pub trait XetOps: Send + Sync {
     async fn download_to_file(&self, xet_hash: &str, file_size: u64, dest: &Path) -> Result<()>;
     async fn upload_files(&self, paths: &[&Path]) -> Result<Vec<XetFileInfo>>;
     fn download_stream_boxed(&self, file_info: &XetFileInfo, offset: u64) -> Result<Box<dyn DownloadStreamOps>>;
+    /// Pre-warm the reconstruction cache for a file by fetching its full plan.
+    /// Errors are silently ignored — this is best-effort.
+    async fn warm_reconstruction_cache(&self, xet_hash: &str);
 }
 
 /// Append-only streaming writer trait (abstracts StreamingWriter for testing).
@@ -41,11 +46,21 @@ pub trait DownloadStreamOps: Send {
 pub struct XetSessions {
     session: Arc<FileDownloadSession>,
     upload_config: Option<Arc<TranslatorConfig>>,
+    /// Kept separately from `session` so we can call `get_reconstruction` for cache warming.
+    cas_client: Arc<dyn Client>,
 }
 
 impl XetSessions {
-    pub fn new(session: Arc<FileDownloadSession>, upload_config: Option<Arc<TranslatorConfig>>) -> Arc<Self> {
-        Arc::new(Self { session, upload_config })
+    pub fn new(
+        session: Arc<FileDownloadSession>,
+        upload_config: Option<Arc<TranslatorConfig>>,
+        cas_client: Arc<dyn Client>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            session,
+            upload_config,
+            cas_client,
+        })
     }
 
     /// Start a streaming download from a byte offset (sync, returns an iterator-like stream).
@@ -113,6 +128,12 @@ impl XetOps for XetSessions {
     fn download_stream_boxed(&self, file_info: &XetFileInfo, offset: u64) -> Result<Box<dyn DownloadStreamOps>> {
         let stream = self.download_stream(file_info, offset)?;
         Ok(Box::new(DownloadStreamWrapper(stream)))
+    }
+
+    async fn warm_reconstruction_cache(&self, xet_hash: &str) {
+        if let Ok(hash) = MerkleHash::from_hex(xet_hash) {
+            let _ = self.cas_client.get_reconstruction(&hash, None).await;
+        }
     }
 }
 

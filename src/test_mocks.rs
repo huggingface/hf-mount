@@ -312,6 +312,8 @@ impl XetOps for MockXet {
         Ok(results)
     }
 
+    async fn warm_reconstruction_cache(&self, _xet_hash: &str) {}
+
     fn download_stream_boxed(&self, file_info: &XetFileInfo, offset: u64) -> Result<Box<dyn DownloadStreamOps>> {
         let prev_fail = self.range_fail_count.load(Ordering::SeqCst);
         if prev_fail > 0 {

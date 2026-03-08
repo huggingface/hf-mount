@@ -16,7 +16,7 @@ xorb_object = { git = "https://github.com/huggingface/xet-core.git", rev = "c805
 merklehash = { git = "https://github.com/huggingface/xet-core.git", rev = "c805591" }
 
 # External crates
-fuser = "0.17"
+fuser = { version = "0.17", features = ["macos-no-mount"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
 reqwest = { version = "0.12", features = ["json", "stream"] }
 futures = "0.3"
