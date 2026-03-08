@@ -1,6 +1,5 @@
 #![allow(dead_code)]
 
-pub mod bench;
 pub mod fs_tests;
 
 use std::path::Path;
