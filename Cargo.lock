@@ -122,9 +122,9 @@ checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 
 [[package]]
 name = "aws-lc-rs"
-version = "1.16.0"
+version = "1.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d9a7b350e3bb1767102698302bc37256cbd48422809984b98d292c40e2579aa9"
+checksum = "94bffc006df10ac2a68c83692d734a465f8ee6c5b384d8545a636f81d858f4bf"
 dependencies = [
  "aws-lc-sys",
  "zeroize",
@@ -132,9 +132,9 @@ dependencies = [
 
 [[package]]
 name = "aws-lc-sys"
-version = "0.37.1"
+version = "0.38.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b092fe214090261288111db7a2b2c2118e5a7f30dc2569f1732c4069a6840549"
+checksum = "4321e568ed89bb5a7d291a7f37997c2c0df89809d7b6d12062c81ddb54aa782e"
 dependencies = [
  "cc",
  "cmake",
@@ -288,7 +288,7 @@ dependencies = [
 [[package]]
 name = "cas_client"
 version = "0.14.5"
-source = "git+https://github.com/huggingface/xet-core.git?rev=c805591#c805591d4db975139589bfbe259ac14547e5e7ba"
+source = "git+https://github.com/huggingface/xet-core.git?rev=6a716f2#6a716f231772e831409c413b73a8ba45b0ea014a"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -336,7 +336,7 @@ dependencies = [
 [[package]]
 name = "cas_types"
 version = "0.1.0"
-source = "git+https://github.com/huggingface/xet-core.git?rev=c805591#c805591d4db975139589bfbe259ac14547e5e7ba"
+source = "git+https://github.com/huggingface/xet-core.git?rev=6a716f2#6a716f231772e831409c413b73a8ba45b0ea014a"
 dependencies = [
  "merklehash",
  "serde",
@@ -396,7 +396,7 @@ dependencies = [
 [[package]]
 name = "chunk_cache"
 version = "0.1.0"
-source = "git+https://github.com/huggingface/xet-core.git?rev=c805591#c805591d4db975139589bfbe259ac14547e5e7ba"
+source = "git+https://github.com/huggingface/xet-core.git?rev=6a716f2#6a716f231772e831409c413b73a8ba45b0ea014a"
 dependencies = [
  "async-trait",
  "base64",
@@ -634,7 +634,7 @@ checksum = "52560adf09603e58c9a7ee1fe1dcb95a16927b17c127f0ac02d6e768a0e25bc1"
 [[package]]
 name = "data"
 version = "0.14.5"
-source = "git+https://github.com/huggingface/xet-core.git?rev=c805591#c805591d4db975139589bfbe259ac14547e5e7ba"
+source = "git+https://github.com/huggingface/xet-core.git?rev=6a716f2#6a716f231772e831409c413b73a8ba45b0ea014a"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -675,7 +675,7 @@ dependencies = [
 [[package]]
 name = "deduplication"
 version = "0.14.5"
-source = "git+https://github.com/huggingface/xet-core.git?rev=c805591#c805591d4db975139589bfbe259ac14547e5e7ba"
+source = "git+https://github.com/huggingface/xet-core.git?rev=6a716f2#6a716f231772e831409c413b73a8ba45b0ea014a"
 dependencies = [
  "async-trait",
  "bytes",
@@ -835,7 +835,7 @@ dependencies = [
 [[package]]
 name = "error_printer"
 version = "0.14.5"
-source = "git+https://github.com/huggingface/xet-core.git?rev=c805591#c805591d4db975139589bfbe259ac14547e5e7ba"
+source = "git+https://github.com/huggingface/xet-core.git?rev=6a716f2#6a716f231772e831409c413b73a8ba45b0ea014a"
 dependencies = [
  "tracing",
 ]
@@ -849,7 +849,7 @@ checksum = "37909eebbb50d72f9059c3b6d82c0463f2ff062c9e95845c43a6c9c0355411be"
 [[package]]
 name = "file_reconstruction"
 version = "0.14.5"
-source = "git+https://github.com/huggingface/xet-core.git?rev=c805591#c805591d4db975139589bfbe259ac14547e5e7ba"
+source = "git+https://github.com/huggingface/xet-core.git?rev=6a716f2#6a716f231772e831409c413b73a8ba45b0ea014a"
 dependencies = [
  "async-trait",
  "bytes",
@@ -871,7 +871,7 @@ dependencies = [
 [[package]]
 name = "file_utils"
 version = "0.14.2"
-source = "git+https://github.com/huggingface/xet-core.git?rev=c805591#c805591d4db975139589bfbe259ac14547e5e7ba"
+source = "git+https://github.com/huggingface/xet-core.git?rev=6a716f2#6a716f231772e831409c413b73a8ba45b0ea014a"
 dependencies = [
  "colored",
  "lazy_static",
@@ -1096,21 +1096,21 @@ dependencies = [
  "cfg-if 1.0.4",
  "js-sys",
  "libc",
- "r-efi",
+ "r-efi 5.3.0",
  "wasip2",
  "wasm-bindgen",
 ]
 
 [[package]]
 name = "getrandom"
-version = "0.4.1"
+version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "139ef39800118c7683f2fd3c98c1b23c09ae076556b435f8e9064ae108aaeeec"
+checksum = "0de51e6874e94e7bf76d726fc5d13ba782deca734ff60d5bb2fb2607c7406555"
 dependencies = [
  "cfg-if 1.0.4",
  "js-sys",
  "libc",
- "r-efi",
+ "r-efi 6.0.0",
  "wasip2",
  "wasip3",
  "wasm-bindgen",
@@ -1314,7 +1314,7 @@ checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
 [[package]]
 name = "hub_client"
 version = "0.1.0"
-source = "git+https://github.com/huggingface/xet-core.git?rev=c805591#c805591d4db975139589bfbe259ac14547e5e7ba"
+source = "git+https://github.com/huggingface/xet-core.git?rev=6a716f2#6a716f231772e831409c413b73a8ba45b0ea014a"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1553,9 +1553,9 @@ dependencies = [
 
 [[package]]
 name = "ipnet"
-version = "2.11.0"
+version = "2.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "469fb0b9cefa57e3ef31275ee7cacb78f2fdca44e4765491884a2b119d4eb130"
+checksum = "d98f6fed1fde3f8c21bc40a1abb88dd75e67924f9cffc3ef95607bad8017f8e2"
 
 [[package]]
 name = "iri-string"
@@ -1661,9 +1661,9 @@ checksum = "09edd9e8b54e49e587e4f6295a7d29c3ea94d469cb40ab8ca70b288248a81db2"
 
 [[package]]
 name = "libc"
-version = "0.2.182"
+version = "0.2.183"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6800badb6cb2082ffd7b6a67e6125bb39f18782f793520caee8cb8846be06112"
+checksum = "b5b646652bf6661599e1da8901b3b9522896f01e736bad5f723fe7a3a27f899d"
 
 [[package]]
 name = "libm"
@@ -1673,12 +1673,13 @@ checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
 name = "libredox"
-version = "0.1.12"
+version = "0.1.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3d0b95e02c851351f877147b7deea7b1afb1df71b63aa5f8270716e0c5720616"
+checksum = "1744e39d1d6a9948f4f388969627434e31128196de472883b39f148769bfe30a"
 dependencies = [
  "bitflags",
  "libc",
+ "plain",
  "redox_syscall 0.7.3",
 ]
 
@@ -1763,7 +1764,7 @@ dependencies = [
 [[package]]
 name = "mdb_shard"
 version = "0.14.5"
-source = "git+https://github.com/huggingface/xet-core.git?rev=c805591#c805591d4db975139589bfbe259ac14547e5e7ba"
+source = "git+https://github.com/huggingface/xet-core.git?rev=6a716f2#6a716f231772e831409c413b73a8ba45b0ea014a"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1808,12 +1809,12 @@ dependencies = [
 [[package]]
 name = "merklehash"
 version = "0.14.5"
-source = "git+https://github.com/huggingface/xet-core.git?rev=c805591#c805591d4db975139589bfbe259ac14547e5e7ba"
+source = "git+https://github.com/huggingface/xet-core.git?rev=6a716f2#6a716f231772e831409c413b73a8ba45b0ea014a"
 dependencies = [
  "base64",
  "blake3",
  "bytemuck",
- "getrandom 0.4.1",
+ "getrandom 0.4.2",
  "heed",
  "rand 0.9.2",
  "safe-transmute",
@@ -2274,6 +2275,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7edddbd0b52d732b21ad9a5fab5c704c14cd949e5e9a1ec5929a24fded1b904c"
 
 [[package]]
+name = "plain"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
+
+[[package]]
 name = "potential_utf"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2335,9 +2342,9 @@ dependencies = [
 
 [[package]]
 name = "proc-macro-crate"
-version = "3.4.0"
+version = "3.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "219cb19e96be00ab2e37d6e299658a0cfa83e52429179969b0f0121b4ac46983"
+checksum = "e67ba7e9b2b56446f1d419b1d807906278ffa1a658a8a5d8a39dcb1f5a78614f"
 dependencies = [
  "toml_edit",
 ]
@@ -2354,7 +2361,7 @@ dependencies = [
 [[package]]
 name = "progress_tracking"
 version = "0.1.0"
-source = "git+https://github.com/huggingface/xet-core.git?rev=c805591#c805591d4db975139589bfbe259ac14547e5e7ba"
+source = "git+https://github.com/huggingface/xet-core.git?rev=6a716f2#6a716f231772e831409c413b73a8ba45b0ea014a"
 dependencies = [
  "async-trait",
  "merklehash",
@@ -2457,9 +2464,9 @@ dependencies = [
 
 [[package]]
 name = "quote"
-version = "1.0.44"
+version = "1.0.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "21b2ebcf727b7760c461f091f9f0f539b77b8e87f2fd88131e7f1b433b3cece4"
+checksum = "41f2619966050689382d2b44f664f4bc593e129785a36d6ee376ddf37259b924"
 dependencies = [
  "proc-macro2",
 ]
@@ -2469,6 +2476,12 @@ name = "r-efi"
 version = "5.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "69cdb34c158ceb288df11e18b4bd39de994f6657d83847bdffdbd7f346754b0f"
+
+[[package]]
+name = "r-efi"
+version = "6.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "rand"
@@ -3132,12 +3145,12 @@ checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
 
 [[package]]
 name = "socket2"
-version = "0.6.2"
+version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "86f4aa3ad99f2088c990dfa82d367e19cb29268ed67c574d10d0a4bfe71f07e0"
+checksum = "3a766e1110788c36f4fa1c2b71b387a7815aa65f88ce0229841826633d93723e"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3229,9 +3242,9 @@ dependencies = [
 
 [[package]]
 name = "sysinfo"
-version = "0.38.2"
+version = "0.38.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1efc19935b4b66baa6f654ac7924c192f55b175c00a7ab72410fc24284dacda8"
+checksum = "d03c61d2a49c649a15c407338afe7accafde9dac869995dccb73e5f7ef7d9034"
 dependencies = [
  "libc",
  "memchr",
@@ -3269,7 +3282,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "82a72c767771b47409d2345987fda8628641887d5466101319899796367354a0"
 dependencies = [
  "fastrand",
- "getrandom 0.4.1",
+ "getrandom 0.4.2",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -3375,9 +3388,9 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "tokio"
-version = "1.49.0"
+version = "1.50.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "72a2903cd7736441aac9df9d7688bd0ce48edccaadf181c3b90be801e81d3d86"
+checksum = "27ad5e34374e03cfffefc301becb44e9dc3c17584f414349ebe29ed26661822d"
 dependencies = [
  "bytes",
  "libc",
@@ -3391,9 +3404,9 @@ dependencies = [
 
 [[package]]
 name = "tokio-macros"
-version = "2.6.0"
+version = "2.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "af407857209536a95c8e56f8231ef2c2e2aff839b22e07a1ffcbc617e9db9fa5"
+checksum = "5c55a2eff8b69ce66c84f85e1da1c233edc36ceb85a2058d11b0d6a3c7e7569c"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -3446,18 +3459,18 @@ dependencies = [
 
 [[package]]
 name = "toml_datetime"
-version = "0.7.5+spec-1.1.0"
+version = "1.0.0+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "92e1cfed4a3038bc5a127e35a2d360f145e1f4b971b551a2ba5fd7aedf7e1347"
+checksum = "32c2555c699578a4f59f0cc68e5116c8d7cabbd45e1409b989d4be085b53f13e"
 dependencies = [
  "serde_core",
 ]
 
 [[package]]
 name = "toml_edit"
-version = "0.23.10+spec-1.0.0"
+version = "0.25.4+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "84c8b9f757e028cee9fa244aea147aab2a9ec09d5325a9b01e0a49730c2b5269"
+checksum = "7193cbd0ce53dc966037f54351dbbcf0d5a642c7f0038c382ef9e677ce8c13f2"
 dependencies = [
  "indexmap",
  "toml_datetime",
@@ -3686,7 +3699,7 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 [[package]]
 name = "utils"
 version = "0.14.5"
-source = "git+https://github.com/huggingface/xet-core.git?rev=c805591#c805591d4db975139589bfbe259ac14547e5e7ba"
+source = "git+https://github.com/huggingface/xet-core.git?rev=6a716f2#6a716f231772e831409c413b73a8ba45b0ea014a"
 dependencies = [
  "async-trait",
  "bincode",
@@ -3715,11 +3728,11 @@ dependencies = [
 
 [[package]]
 name = "uuid"
-version = "1.21.0"
+version = "1.22.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b672338555252d43fd2240c714dc444b8c6fb0a5c5335e65a07bba7742735ddb"
+checksum = "a68d3c8f01c0cfa54a75291d83601161799e4a89a39e0929f4b0354d88757a37"
 dependencies = [
- "getrandom 0.4.1",
+ "getrandom 0.4.2",
  "js-sys",
  "wasm-bindgen",
 ]
@@ -4391,9 +4404,9 @@ checksum = "d6bbff5f0aada427a1e5a6da5f1f98158182f26556f345ac9e04d36d0ebed650"
 
 [[package]]
 name = "winnow"
-version = "0.7.14"
+version = "0.7.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5a5364e9d77fcdeeaa6062ced926ee3381faa2ee02d3eb83a5c27a8825540829"
+checksum = "df79d97927682d2fd8adb29682d1140b343be4ac0f08fd68b7765d9c059d3945"
 dependencies = [
  "memchr",
 ]
@@ -4495,7 +4508,7 @@ checksum = "9edde0db4769d2dc68579893f2306b26c6ecfbe0ef499b013d731b7b9247e0b9"
 [[package]]
 name = "xet_config"
 version = "0.14.5"
-source = "git+https://github.com/huggingface/xet-core.git?rev=c805591#c805591d4db975139589bfbe259ac14547e5e7ba"
+source = "git+https://github.com/huggingface/xet-core.git?rev=6a716f2#6a716f231772e831409c413b73a8ba45b0ea014a"
 dependencies = [
  "const-str",
  "konst",
@@ -4505,7 +4518,7 @@ dependencies = [
 [[package]]
 name = "xet_runtime"
 version = "0.1.0"
-source = "git+https://github.com/huggingface/xet-core.git?rev=c805591#c805591d4db975139589bfbe259ac14547e5e7ba"
+source = "git+https://github.com/huggingface/xet-core.git?rev=6a716f2#6a716f231772e831409c413b73a8ba45b0ea014a"
 dependencies = [
  "dirs",
  "error_printer",
@@ -4522,7 +4535,7 @@ dependencies = [
 [[package]]
 name = "xorb_object"
 version = "0.1.0"
-source = "git+https://github.com/huggingface/xet-core.git?rev=c805591#c805591d4db975139589bfbe259ac14547e5e7ba"
+source = "git+https://github.com/huggingface/xet-core.git?rev=6a716f2#6a716f231772e831409c413b73a8ba45b0ea014a"
 dependencies = [
  "anyhow",
  "blake3",
