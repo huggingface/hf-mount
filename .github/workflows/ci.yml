@@ -148,7 +148,7 @@ jobs:
           fi
 
   bench:
-    name: Benchmarks
+    name: Benchmarks (fio small)
     runs-on:
       group: hf-mount-ci
     needs: lint-test
@@ -165,45 +165,33 @@ jobs:
       - name: Install system deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y fuse3 libfuse3-dev nfs-common
+          sudo apt-get install -y fuse3 libfuse3-dev nfs-common fio jq
           echo 'user_allow_other' | sudo tee -a /etc/fuse.conf
 
       - name: Build release binaries
         run: cargo build --release
 
-      - name: Install fio
-        run: sudo apt-get install -y fio
-
       - name: Run benchmarks
-        timeout-minutes: 10
-        run: cargo test --release --test bench --test fio_bench -- --nocapture 2>&1 | tee bench_output.txt
+        timeout-minutes: 15
+        run: |
+          HF_JOB_NAME_FILTER=small iterations=3 \
+            ./scripts/fs_bench.sh 2>&1 | tee bench_output.txt
 
       - name: Post benchmark results
         if: github.event_name == 'pull_request'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Strip ANSI codes, then extract only ==== delimited blocks
-          CLEAN=$(sed 's/\x1b\[[0-9;]*m//g' bench_output.txt)
-          TABLES=$(echo "$CLEAN" | awk '
-            /^=====*$/ { inside=!inside; print; next }
-            inside { print }
-          ')
-          if [ -z "$TABLES" ]; then
-            echo "No benchmark table found in output"
-            exit 0
-          fi
-
+          RESULTS=$(jq -r '.[] | "| \(.name) | \(.value | round) \(.unit) |"' results/fuse/output.json)
           PR="${{ github.event.pull_request.number }}"
           MARKER="<!-- bench-results -->"
           BODY="${MARKER}
-          ## Benchmark Results
+          ## Benchmark Results (fio small, FUSE)
 
-          \`\`\`
-          ${TABLES}
-          \`\`\`"
+          | Job | Throughput |
+          |-----|-----------|
+          ${RESULTS}"
 
-          # Find existing comment with our marker
           COMMENT_ID=$(gh api "repos/${{ github.repository }}/issues/${PR}/comments" \
             --jq ".[] | select(.body | startswith(\"${MARKER}\")) | .id" | head -1)
 

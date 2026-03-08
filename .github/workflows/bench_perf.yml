@@ -67,14 +67,16 @@ jobs:
         run: |
           # Use small filter in CI to keep runtime reasonable (skip 100G jobs).
           # Remove HF_JOB_NAME_FILTER or set iterations=10 for full comparison runs.
-          HF_JOB_NAME_FILTER=small iterations=3 ./scripts/fs_bench.sh 2>&1 | tee bench.log
+          HF_JOB_NAME_FILTER=small iterations=3 \
+            HF_CATEGORIES=read,write,mix \
+            ./scripts/fs_bench.sh 2>&1 | tee bench.log
 
       - name: Publish throughput results to gh-pages
         uses: benchmark-action/github-action-benchmark@v1
         with:
           name: Throughput (MiB/s)
           tool: customBiggerIsBetter
-          output-file-path: results/output.json
+          output-file-path: results/fuse/output.json
           benchmark-data-dir-path: dev/bench
           github-token: ${{ secrets.GITHUB_TOKEN }}
           auto-push: ${{ needs.check-trigger.outputs.publish == 'true' }}
@@ -88,7 +90,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          RESULTS=$(jq -r '.[] | "| \(.name) | \(.value | round) \(.unit) |"' results/output.json)
+          RESULTS=$(jq -r '.[] | "| \(.name) | \(.value | round) \(.unit) |"' results/fuse/output.json)
           PR="${{ github.event.pull_request.number }}"
           MARKER="<!-- perf-bench-results -->"
           BODY="${MARKER}
@@ -143,14 +145,16 @@ jobs:
         run: cargo build --release
 
       - name: Run latency benchmarks
-        run: ./scripts/fs_latency_bench.sh 2>&1 | tee latency.log
+        run: |
+          HF_CATEGORIES=read_latency,write_latency \
+            ./scripts/fs_bench.sh 2>&1 | tee latency.log
 
       - name: Publish latency results to gh-pages
         uses: benchmark-action/github-action-benchmark@v1
         with:
           name: Latency - TTFB (ms)
           tool: customSmallerIsBetter
-          output-file-path: results/output.json
+          output-file-path: results/fuse/output.json
           benchmark-data-dir-path: dev/latency_bench
           github-token: ${{ secrets.GITHUB_TOKEN }}
           auto-push: ${{ needs.check-trigger.outputs.publish == 'true' }}
