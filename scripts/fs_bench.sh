@@ -291,7 +291,63 @@ run_fio_create_job() {
 
 # ── Category runners ──────────────────────────────────────────────────────────
 
-# Standard throughput categories (read, write, mix, write_latency).
+# Generate a temporary fio write job from a read job (for populating test files).
+# Strips time_based/runtime so fio writes the full file, changes rw to write,
+# and removes direct=1 (not useful for layout writes).
+make_write_job() {
+  local read_job="$1"
+  local write_job
+  write_job=$(mktemp /tmp/fio-write-XXXX.fio)
+  sed -e 's/rw=\(rand\)\?read/rw=write/' \
+      -e '/^time_based/d' \
+      -e '/^runtime=/d' \
+      -e '/^direct=/d' \
+      "${read_job}" > "${write_job}"
+  echo "${write_job}"
+}
+
+# Read category: write real data first, then benchmark reads on a fresh mount.
+# This ensures reads hit CAS instead of reading sparse zeros.
+run_read_category() {
+  local jobs_dir="${SCRIPT_DIR}/fio/read"
+  [[ -d "${jobs_dir}" ]] || return 0
+
+  # Collect jobs to run
+  local job_files=()
+  for job_file in "${jobs_dir}"/*.fio; do
+    should_run_job "${job_file}" || continue
+    job_files+=("${job_file}")
+  done
+  [[ ${#job_files[@]} -gt 0 ]] || return 0
+
+  # Phase 1: populate all test files on a single writable mount
+  local populate_cache="/tmp/hf-bench-populate-$$"
+  do_mount "${populate_cache}"
+  for job_file in "${job_files[@]}"; do
+    echo "Populating data for $(basename "${job_file}")" >&2
+    local write_job
+    write_job=$(make_write_job "${job_file}")
+    fio --thread --directory="${_MOUNT_DIR}" --eta=never "${write_job}" &>/dev/null
+    rm -f "${write_job}"
+  done
+  echo "Unmounting to commit writes..." >&2
+  do_unmount
+  rm -rf "${_MOUNT_DIR}" 2>/dev/null || true
+
+  # Phase 2: benchmark each job on a fresh cold-cache mount
+  for job_file in "${job_files[@]}"; do
+    local job_name cache_dir
+    job_name="$(basename "${job_file}" .fio)"
+    cache_dir="/tmp/hf-bench-read-$$/${job_name}"
+
+    do_mount "${cache_dir}"
+    run_fio_job "${job_file}" "${_MOUNT_DIR}"
+    do_unmount
+    rm -rf "${_MOUNT_DIR}" 2>/dev/null || true
+  done
+}
+
+# Standard throughput categories (write, mix).
 run_throughput_category() {
   local category="$1"
   local jobs_dir="${SCRIPT_DIR}/fio/${category}"
@@ -321,21 +377,24 @@ run_throughput_category() {
   done
 }
 
-# Read latency: lay out files, unmount, remount read-only, measure TTFB.
+# Read latency: write real data, unmount, remount read-only, measure TTFB.
 run_read_latency() {
   local jobs_dir="${SCRIPT_DIR}/fio/read_latency"
   [[ -d "${jobs_dir}" ]] || return 0
 
   local setup_cache="/tmp/hf-bench-latency-setup-$$"
 
-  # Lay out all latency test files on one mount
-  echo "Laying out read_latency files..." >&2
+  # Populate all latency test files with real data on one mount
+  echo "Populating read_latency files..." >&2
   do_mount "${setup_cache}"
   for job_file in "${jobs_dir}"/*.fio; do
     should_run_job "${job_file}" || continue
-    fio --thread --directory="${_MOUNT_DIR}" --create_only=1 --eta=never "${job_file}" &>/dev/null || true
+    local write_job
+    write_job=$(make_write_job "${job_file}")
+    fio --thread --directory="${_MOUNT_DIR}" --eta=never "${write_job}" &>/dev/null || true
+    rm -f "${write_job}"
   done
-  echo "Unmounting to flush uploads..." >&2
+  echo "Unmounting to commit writes..." >&2
   do_unmount
 
   # Benchmark each job on a fresh read-only mount
@@ -412,7 +471,9 @@ for cat in "${CATEGORIES[@]}"; do
   echo "" >&2
   echo "=== Category: ${cat} ===" >&2
   case "${cat}" in
-    read|write|mix)
+    read)
+      run_read_category ;;
+    write|mix)
       run_throughput_category "${cat}" ;;
     read_latency)
       run_read_latency ;;
