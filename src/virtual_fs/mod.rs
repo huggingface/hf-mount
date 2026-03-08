@@ -1128,6 +1128,7 @@ impl VirtualFs {
             entry.dirty = true;
             if truncate {
                 entry.size = 0;
+                entry.sparse = false;
                 // POSIX: O_TRUNC must update mtime and ctime
                 let now = SystemTime::now();
                 entry.mtime = now;
@@ -1176,6 +1177,7 @@ impl VirtualFs {
             let entry = inodes.get_mut(ino).ok_or(libc::ENOENT)?;
             entry.dirty = true;
             entry.size = 0;
+            entry.sparse = false;
             entry.xet_hash = None;
         }
 
@@ -1188,6 +1190,11 @@ impl VirtualFs {
 
     /// Open a file for reading. Dispatches based on where the content lives.
     async fn open_readonly(&self, ino: u64, fe: FileEntry, staging_path: Option<PathBuf>) -> VirtualFsResult<u64> {
+        // Sparse pre-allocated file (ftruncate on empty): reads return zeros.
+        if fe.sparse {
+            return self.open_lazy(String::new(), fe.size);
+        }
+
         match (fe.dirty, &staging_path) {
             // Advanced write in progress — read from local staging file.
             (true, Some(path)) if path.exists() => self.open_local_readonly(ino, path),
@@ -1444,6 +1451,12 @@ impl VirtualFs {
 
                 // Maximum bytes we should return (capped at file boundary).
                 let to_read = ((size as u64).min(file_size - offset)) as usize;
+
+                // Sparse file (ftruncate pre-allocation, no backing data): return zeros.
+                if prefetch_state.xet_hash.is_empty() {
+                    let eof = offset + to_read as u64 >= file_size;
+                    return Ok((Bytes::from(vec![0u8; to_read]), eof));
+                }
 
                 // IMPORTANT: Never return a short read unless at real EOF.
                 // The Linux FUSE kernel module shrinks i_size on short reads
@@ -1715,19 +1728,33 @@ impl VirtualFs {
             Some(OpenFile::Local {
                 ino, writable: true, ..
             }) => {
-                // Advanced writes: enqueue for async flush (skip unlinked files)
-                let is_unlinked = self
+                // Advanced writes: enqueue for async flush (skip unlinked and sparse files)
+                let should_flush = self
                     .inode_table
                     .read()
                     .expect("inodes poisoned")
                     .get(ino)
-                    .is_some_and(|e| e.nlink == 0);
-                if !is_unlinked && let Some(fm) = &self.flush_manager {
+                    .is_some_and(|e| e.nlink > 0 && !e.sparse);
+                if should_flush && let Some(fm) = &self.flush_manager {
                     fm.enqueue(ino);
                 }
             }
             Some(OpenFile::Streaming { ino, channel }) => {
-                let needs_commit = {
+                // Sparse pre-allocation with no actual writes: skip commit to
+                // preserve the ftruncate size. No data was written to the stream.
+                let is_sparse_noop = channel.bytes_written.load(Ordering::Relaxed) == 0
+                    && self
+                        .inode_table
+                        .read()
+                        .expect("inodes poisoned")
+                        .get(ino)
+                        .is_some_and(|e| e.sparse);
+                if is_sparse_noop {
+                    *channel.state.lock().unwrap() = CommitState::Committed;
+                    self.fulfill_commit_hook(ino, &channel, Ok(()));
+                }
+
+                let needs_commit = !is_sparse_noop && {
                     let state = channel.state.lock().unwrap();
                     matches!(&*state, CommitState::Writing | CommitState::Deferred)
                 };
@@ -2592,30 +2619,47 @@ impl VirtualFs {
             return Err(libc::EROFS);
         }
 
-        // Simple mode: truncation is not supported via setattr. O_TRUNC opens
-        // go through open() directly (FUSE_ATOMIC_O_TRUNC is negotiated).
-        // Non-zero truncation requires staging files (advanced_writes mode).
-        if size.is_some() && !self.advanced_writes {
-            return Err(libc::EPERM);
-        }
-
-        // Validate inode exists and is a file before any side effects
-        {
-            let inodes = self.inode_table.read().expect("inodes poisoned");
-            match inodes.get(ino) {
-                Some(e) if size.is_some() && e.kind != InodeKind::File => return Err(libc::EISDIR),
-                Some(_) => {}
-                None => return Err(libc::ENOENT),
-            }
-        }
-
         if let Some(new_size) = size {
-            // Serialize with open() staging preparation on the same inode
-            let staging_mutex = self.staging_lock(ino);
-            let _staging_guard = staging_mutex.lock().await;
+            // Validate inode exists and is a file before any side effects
+            {
+                let inodes = self.inode_table.read().expect("inodes poisoned");
+                match inodes.get(ino) {
+                    Some(e) if e.kind != InodeKind::File => return Err(libc::EISDIR),
+                    None => return Err(libc::ENOENT),
+                    _ => {}
+                }
+            }
 
-            if self.advanced_writes {
+            // Sparse pre-allocation: ftruncate on an empty/sparse file just updates
+            // the reported size without writing data. Reads return zeros.
+            // This handles fio --create_only=1 which calls ftruncate(fd, 100G) to
+            // pre-allocate files before the actual benchmark run.
+            let is_sparse_prealloc = {
+                let inodes = self.inode_table.read().expect("inodes poisoned");
+                let entry = inodes.get(ino).ok_or(libc::ENOENT)?;
+                new_size > 0
+                    && (entry.size == 0 || entry.sparse)
+                    && entry.xet_hash.as_deref().unwrap_or_default().is_empty()
+            };
+
+            if is_sparse_prealloc {
+                let mut inodes = self.inode_table.write().expect("inodes poisoned");
+                if let Some(entry) = inodes.get_mut(ino) {
+                    entry.size = new_size;
+                    entry.sparse = true;
+                    let now = SystemTime::now();
+                    entry.mtime = now;
+                    entry.ctime = now;
+                }
+            } else if !self.advanced_writes {
+                // Simple mode: truncation is not supported via setattr.
+                // O_TRUNC opens go through open() directly (FUSE_ATOMIC_O_TRUNC).
+                return Err(libc::EPERM);
+            } else {
                 // Advanced mode: truncation is applied to the staging file on disk
+                let staging_mutex = self.staging_lock(ino);
+                let _staging_guard = staging_mutex.lock().await;
+
                 let staging_path = self
                     .staging_dir
                     .as_ref()
@@ -2658,24 +2702,24 @@ impl VirtualFs {
                         return Err(libc::EIO);
                     }
                 }
-            }
-            // Advanced mode only past this point (simple mode returns EPERM above).
 
-            let mut inodes = self.inode_table.write().expect("inodes poisoned");
-            if let Some(entry) = inodes.get_mut(ino) {
-                entry.size = new_size;
-                entry.mtime = SystemTime::now();
-                entry.ctime = entry.mtime;
-                entry.dirty = true;
-                if new_size == 0 {
-                    entry.xet_hash = None;
+                let mut inodes = self.inode_table.write().expect("inodes poisoned");
+                if let Some(entry) = inodes.get_mut(ino) {
+                    entry.size = new_size;
+                    entry.mtime = SystemTime::now();
+                    entry.ctime = entry.mtime;
+                    entry.dirty = true;
+                    entry.sparse = false;
+                    if new_size == 0 {
+                        entry.xet_hash = None;
+                    }
                 }
-            }
 
-            // Schedule flush so the truncation is committed to CAS/bucket
-            drop(inodes);
-            if let Some(fm) = &self.flush_manager {
-                fm.enqueue(ino);
+                // Schedule flush so the truncation is committed to CAS/bucket
+                drop(inodes);
+                if let Some(fm) = &self.flush_manager {
+                    fm.enqueue(ino);
+                }
             }
         }
 
@@ -2720,6 +2764,7 @@ impl VirtualFs {
             xet_hash: entry.xet_hash.clone().unwrap_or_default(),
             size: entry.size,
             dirty: entry.dirty,
+            sparse: entry.sparse,
             full_path: entry.full_path.clone(),
         })
     }
@@ -2771,6 +2816,7 @@ struct FileEntry {
     xet_hash: String,
     size: u64,
     dirty: bool,
+    sparse: bool,
     full_path: String,
 }
 

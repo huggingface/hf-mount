@@ -939,6 +939,90 @@ fn setattr_simple_mode_eperm() {
     });
 }
 
+/// setattr(size) on a new empty file in simple mode is a sparse pre-allocation.
+#[test]
+fn setattr_simple_mode_empty_file_sparse() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        // Create a new empty file (size == 0 in streaming mode)
+        let (attr, _fh) = vfs
+            .create(ROOT_INODE, "new.txt", 0o644, 1000, 1000, Some(1))
+            .await
+            .unwrap();
+        // ftruncate(fd, N) on an empty file should succeed as sparse pre-allocation
+        let result = vfs.setattr(attr.ino, Some(100), None, None, None, None, None).await;
+        assert!(result.is_ok(), "ftruncate on empty file should succeed: {:?}", result);
+        let inodes = vfs.inode_table.read().unwrap();
+        let entry = inodes.get(attr.ino).unwrap();
+        assert_eq!(entry.size, 100, "inode size should reflect ftruncate size");
+        assert!(entry.sparse, "file should be marked as sparse");
+    });
+}
+
+/// Reading a sparse file returns zeros.
+#[test]
+fn sparse_file_read_returns_zeros() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let (attr, fh) = vfs
+            .create(ROOT_INODE, "big.bin", 0o644, 1000, 1000, Some(1))
+            .await
+            .unwrap();
+        // Pre-allocate 1 MiB via ftruncate
+        vfs.setattr(attr.ino, Some(1 << 20), None, None, None, None, None)
+            .await
+            .unwrap();
+        // Close the write handle, open for reading
+        vfs.release(fh).await;
+        let rfh = vfs.open(attr.ino, false, false, Some(1)).await.unwrap();
+        // Read at offset 0
+        let (data, eof) = vfs.read(rfh, 0, 4096).await.unwrap();
+        assert_eq!(data.len(), 4096);
+        assert!(data.iter().all(|&b| b == 0), "sparse read should return zeros");
+        assert!(!eof);
+        // Read near end (past EOF boundary)
+        let (data, eof) = vfs.read(rfh, (1 << 20) - 10, 4096).await.unwrap();
+        assert_eq!(data.len(), 10, "should be capped at file size");
+        assert!(eof);
+        assert!(data.iter().all(|&b| b == 0));
+    });
+}
+
+/// Sparse flag is cleared when the file is re-opened with O_TRUNC for real writes.
+#[test]
+fn sparse_cleared_on_truncate_write() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let (attr, fh) = vfs
+            .create(ROOT_INODE, "f.bin", 0o644, 1000, 1000, Some(1))
+            .await
+            .unwrap();
+        // Pre-allocate
+        vfs.setattr(attr.ino, Some(1000), None, None, None, None, None)
+            .await
+            .unwrap();
+        vfs.release(fh).await;
+
+        // Re-open with O_TRUNC for real writes
+        let wfh = vfs.open(attr.ino, true, true, Some(1)).await.unwrap();
+        let inodes = vfs.inode_table.read().unwrap();
+        let entry = inodes.get(attr.ino).unwrap();
+        assert!(!entry.sparse, "sparse should be cleared on O_TRUNC open");
+        assert_eq!(entry.size, 0, "size should be 0 after truncate");
+        drop(inodes);
+        vfs.release(wfh).await;
+    });
+}
+
 /// setattr(size) on a directory returns EISDIR.
 #[test]
 fn setattr_directory_eisdir() {
