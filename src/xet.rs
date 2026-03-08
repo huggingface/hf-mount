@@ -210,8 +210,25 @@ impl StreamingWriterOps for StreamingWriter {
     }
 
     async fn finish_boxed(self: Box<Self>) -> Result<XetFileInfo> {
+        let mb = self.bytes_written as f64 / (1024.0 * 1024.0);
+
+        let t0 = std::time::Instant::now();
+        tracing::info!("StreamingWriter::finish: cleaner.finish() starting ({:.1} MiB)...", mb);
         let (info, _metrics) = self.cleaner.finish().await.map_err(|e| Error::Xet(e.to_string()))?;
+        tracing::info!(
+            "StreamingWriter::finish: cleaner.finish() done in {:.1}s, hash={}",
+            t0.elapsed().as_secs_f64(),
+            info.hash(),
+        );
+
+        let t1 = std::time::Instant::now();
+        tracing::info!("StreamingWriter::finish: session.finalize() starting...");
         self.session.finalize().await.map_err(|e| Error::Xet(e.to_string()))?;
+        tracing::info!(
+            "StreamingWriter::finish: session.finalize() done in {:.1}s",
+            t1.elapsed().as_secs_f64(),
+        );
+
         Ok(info)
     }
 
