@@ -1,0 +1,11 @@
+[global]
+name=fs_bench
+bs=1B
+
+[time_to_first_byte_read_small_file]
+size=1B
+rw=read
+ioengine=sync
+fallocate=none
+direct=1
+loops=10

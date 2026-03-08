@@ -1,0 +1,160 @@
+name: Performance Benchmarks
+
+# Mirrors the mountpoint-s3 benchmark CI approach.
+# mountpoint-s3 runs on m5dn.24xlarge (100 Gbps, NVMe local cache).
+# For comparable results, run on a high-network instance of equivalent class.
+#
+# Triggers:
+#   - Every push to main     → publishes results to gh-pages (historical charts)
+#   - PR labeled "performance" → posts results as PR comment, no publish
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+    types: [labeled]
+
+jobs:
+  check-trigger:
+    runs-on: ubuntu-latest
+    outputs:
+      should-run: ${{ steps.check.outputs.should-run }}
+      publish: ${{ steps.check.outputs.publish }}
+    steps:
+      - id: check
+        run: |
+          if [[ "${{ github.event_name }}" == "push" ]]; then
+            echo "should-run=true" >> "$GITHUB_OUTPUT"
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          elif [[ "${{ github.event.label.name }}" == "performance" ]]; then
+            echo "should-run=true" >> "$GITHUB_OUTPUT"
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "should-run=false" >> "$GITHUB_OUTPUT"
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  bench:
+    name: Throughput
+    needs: check-trigger
+    if: needs.check-trigger.outputs.should-run == 'true'
+    runs-on:
+      group: hf-mount-ci
+    permissions:
+      contents: write
+      pull-requests: write
+    env:
+      HF_TOKEN: ${{ secrets.HF_TOKEN_HUB_CI }}
+      HF_ENDPOINT: https://hub-ci.huggingface.co
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fuse3 libfuse3-dev fio jq
+          echo 'user_allow_other' | sudo tee -a /etc/fuse.conf
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Run throughput benchmarks
+        run: |
+          # Use small filter in CI to keep runtime reasonable (skip 100G jobs).
+          # Remove HF_JOB_NAME_FILTER or set iterations=10 for full comparison runs.
+          HF_JOB_NAME_FILTER=small iterations=3 ./scripts/fs_bench.sh 2>&1 | tee bench.log
+
+      - name: Publish throughput results to gh-pages
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          name: Throughput (MiB/s)
+          tool: customBiggerIsBetter
+          output-file-path: results/output.json
+          benchmark-data-dir-path: dev/bench
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          auto-push: ${{ needs.check-trigger.outputs.publish == 'true' }}
+          comment-on-alert: true
+          alert-threshold: 150%
+          fail-on-alert: false
+          summary-always: true
+
+      - name: Post PR comment
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          RESULTS=$(jq -r '.[] | "| \(.name) | \(.value | round) \(.unit) |"' results/output.json)
+          PR="${{ github.event.pull_request.number }}"
+          MARKER="<!-- perf-bench-results -->"
+          BODY="${MARKER}
+          ## Performance Benchmark Results
+
+          | Job | Throughput |
+          |-----|-----------|
+          ${RESULTS}
+
+          <details><summary>Full log</summary>
+
+          \`\`\`
+          $(tail -50 bench.log)
+          \`\`\`
+          </details>"
+
+          COMMENT_ID=$(gh api "repos/${{ github.repository }}/issues/${PR}/comments" \
+            --jq ".[] | select(.body | startswith(\"${MARKER}\")) | .id" | head -1)
+          if [[ -n "${COMMENT_ID}" ]]; then
+            gh api "repos/${{ github.repository }}/issues/comments/${COMMENT_ID}" \
+              -X PATCH -f body="${BODY}"
+          else
+            gh pr comment "${PR}" --body "${BODY}"
+          fi
+
+  latency-bench:
+    name: Latency (TTFB)
+    needs: check-trigger
+    if: needs.check-trigger.outputs.should-run == 'true'
+    runs-on:
+      group: hf-mount-ci
+    permissions:
+      contents: write
+      pull-requests: write
+    env:
+      HF_TOKEN: ${{ secrets.HF_TOKEN_HUB_CI }}
+      HF_ENDPOINT: https://hub-ci.huggingface.co
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fuse3 libfuse3-dev fio jq
+          echo 'user_allow_other' | sudo tee -a /etc/fuse.conf
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Run latency benchmarks
+        run: ./scripts/fs_latency_bench.sh 2>&1 | tee latency.log
+
+      - name: Publish latency results to gh-pages
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          name: Latency - TTFB (ms)
+          tool: customSmallerIsBetter
+          output-file-path: results/output.json
+          benchmark-data-dir-path: dev/latency_bench
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          auto-push: ${{ needs.check-trigger.outputs.publish == 'true' }}
+          comment-on-alert: true
+          alert-threshold: 150%
+          fail-on-alert: false
+          summary-always: true
