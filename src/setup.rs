@@ -76,6 +76,13 @@ pub struct Args {
     #[arg(long, default_value_t = 10_000_000_000)]
     pub cache_size: u64,
 
+    /// Disable the on-disk xorb chunk cache. Every read fetches chunks from
+    /// the CAS network (no local disk storage between reads). Useful for
+    /// benchmarking without cache effects, comparable to mountpoint-s3
+    /// without --cache.
+    #[arg(long, default_value_t = false)]
+    pub no_disk_cache: bool,
+
     /// Kernel metadata cache TTL in milliseconds. Controls how long file
     /// attributes are trusted before re-checking via HEAD. Lower values
     /// give fresher metadata but increase latency on directory traversals
@@ -194,28 +201,21 @@ pub fn setup(is_nfs: bool) -> MountSetup {
     let refresher = hub_client.token_refresher(read_only);
     let cas_config = build_cas_config(&runtime, &refresher);
 
-    // Ensure cache directory exists and is writable.
+    // Ensure cache directory exists and is writable (needed for staging even without xorb cache).
     std::fs::create_dir_all(&args.cache_dir)
         .unwrap_or_else(|e| panic!("Failed to create cache dir {:?}: {e}", args.cache_dir));
-    let xorbs_dir = args.cache_dir.join("xorbs");
-    std::fs::create_dir_all(&xorbs_dir).unwrap_or_else(|e| panic!("Failed to create xorbs dir {:?}: {e}", xorbs_dir));
-    let probe = xorbs_dir.join(".write-check");
-    if let Err(e) = std::fs::write(&probe, b"") {
-        let user = std::env::var("USER").unwrap_or_default();
-        panic!(
-            "Cache dir {:?} is not writable: {e}\n\
-             Fix with: sudo chown -R {user} {:?}",
-            xorbs_dir, args.cache_dir
-        );
-    }
-    std::fs::remove_file(&probe).ok();
 
-    let xorb_cache = {
+    let xorb_cache = if args.no_disk_cache {
+        None
+    } else {
+        let xorbs_dir = args.cache_dir.join("xorbs");
+        std::fs::create_dir_all(&xorbs_dir)
+            .unwrap_or_else(|e| panic!("Failed to create xorbs dir {:?}: {e}", xorbs_dir));
         let config = data::CacheConfig {
-            cache_directory: args.cache_dir.join("xorbs"),
+            cache_directory: xorbs_dir,
             cache_size: args.cache_size,
         };
-        data::get_cache(&config).expect("Failed to create xorb cache")
+        Some(data::get_cache(&config).expect("Failed to create xorb cache"))
     };
 
     let raw_client = runtime
@@ -226,7 +226,7 @@ pub fn setup(is_nfs: bool) -> MountSetup {
         ))
         .expect("Failed to create CAS client");
     let cached_client = CachedXetClient::new(raw_client);
-    let download_session = FileDownloadSession::from_client(cached_client.clone(), None, Some(xorb_cache));
+    let download_session = FileDownloadSession::from_client(cached_client.clone(), None, xorb_cache);
     let upload_config = if read_only { None } else { Some(cas_config) };
     let xet_sessions = XetSessions::new(download_session, upload_config, cached_client);
 
