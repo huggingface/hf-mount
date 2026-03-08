@@ -357,7 +357,9 @@ impl XetOps for MockXet {
         Ok(Box::new(MockDownloadStream {
             data: content,
             offset: offset as usize,
-            chunk_size: 4096,
+            // 512 KiB chunks keep the fetch loop short (16 iters per 8 MiB window)
+            // so concurrent tasks don't starve the tokio scheduler on 2-core CI.
+            chunk_size: 512 * 1024,
             first_chunk_delay_ms,
         }))
     }
