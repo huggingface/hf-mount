@@ -7,21 +7,27 @@
 # Optional env vars:
 #   HF_ENDPOINT             — defaults to https://huggingface.co
 #   HF_MOUNT_BIN            — path to hf-mount-fuse (default: ./target/release/hf-mount-fuse)
-#   HF_BENCH_BUCKET         — reuse a pre-existing bucket (skips create/upload/delete).
-#                             Use this on repeated runs to avoid re-uploading large files.
+#   HF_MOUNT_BACKEND        — "fuse" (default) or "nfs"
+#   HF_ADVANCED_WRITES      — set to 1 to enable --advanced-writes
+#   HF_NO_DISK_CACHE        — set to 1 to disable the on-disk xorb chunk cache
+#   HF_BENCH_BUCKET         — reuse a pre-existing bucket (skips create/delete)
 #   HF_JOB_NAME_FILTER      — only run jobs whose filename matches this substring
-#                             (e.g. "small" to skip 100G jobs in CI)
-#   HF_NO_DISK_CACHE        — set to 1 to disable the on-disk xorb chunk cache.
-#                             Comparable to mountpoint-s3 without --cache (reads fetch
-#                             from CAS on each FUSE miss, OS page cache still applies).
+#   HF_CATEGORIES           — comma-separated list of categories to run
+#                             (default: read,write,mix,read_latency,write_latency,create)
 #   iterations              — fio iterations per job (default: 10)
-#
-# Comparable to mountpoint-s3 when run on a high-network instance (they use m5dn.24xlarge,
-# 100 Gbps). Set HF_JOB_NAME_FILTER=small for quick CI runs on smaller instances.
 #
 # Usage:
 #   cargo build --release
+#   # FUSE with cache (default)
 #   ./scripts/fs_bench.sh
+#   # FUSE without cache
+#   HF_NO_DISK_CACHE=1 ./scripts/fs_bench.sh
+#   # FUSE with advanced writes
+#   HF_ADVANCED_WRITES=1 ./scripts/fs_bench.sh
+#   # NFS
+#   HF_MOUNT_BACKEND=nfs ./scripts/fs_bench.sh
+#   # Quick run (small files only)
+#   HF_JOB_NAME_FILTER=small ./scripts/fs_bench.sh
 set -euo pipefail
 
 if ! command -v fio &>/dev/null; then
@@ -37,17 +43,35 @@ fi
 HF_ENDPOINT="${HF_ENDPOINT:-https://huggingface.co}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
-HF_MOUNT_BIN="${HF_MOUNT_BIN:-${PROJECT_DIR}/target/release/hf-mount-fuse}"
+BACKEND="${HF_MOUNT_BACKEND:-fuse}"
 : "${iterations:=10}"
 
-results_dir="${PROJECT_DIR}/results"
+# Build the mode label for results directory
+MODE="${BACKEND}"
+[[ "${HF_NO_DISK_CACHE:-0}" == "1" ]] && MODE="${MODE}_nocache"
+[[ "${HF_ADVANCED_WRITES:-0}" == "1" ]] && MODE="${MODE}_advwr"
+
+# Resolve binary
+if [[ "${BACKEND}" == "nfs" ]]; then
+  HF_MOUNT_BIN="${HF_MOUNT_BIN:-${PROJECT_DIR}/target/release/hf-mount-nfs}"
+else
+  HF_MOUNT_BIN="${HF_MOUNT_BIN:-${PROJECT_DIR}/target/release/hf-mount-fuse}"
+fi
+
+if [[ ! -x "${HF_MOUNT_BIN}" ]]; then
+  echo "Binary not found at ${HF_MOUNT_BIN}. Run: cargo build --release" >&2; exit 1
+fi
+
+# Categories to run
+IFS=',' read -ra CATEGORIES <<< "${HF_CATEGORIES:-read,write,mix,read_latency,write_latency,create}"
+
+results_dir="${PROJECT_DIR}/results/${MODE}"
 rm -rf "${results_dir}"
 mkdir -p "${results_dir}"
 
-if [[ ! -x "${HF_MOUNT_BIN}" ]]; then
-  echo "hf-mount-fuse not found at ${HF_MOUNT_BIN}. Run: cargo build --release" >&2; exit 1
-fi
-
+echo "=== Benchmark mode: ${MODE} ===" >&2
+echo "Binary: ${HF_MOUNT_BIN}" >&2
+echo "Categories: ${CATEGORIES[*]}" >&2
 [[ -n "${HF_JOB_NAME_FILTER:-}" ]] && echo "Job filter: ${HF_JOB_NAME_FILTER}" >&2
 
 # ── Bucket lifecycle ──────────────────────────────────────────────────────────
@@ -69,7 +93,11 @@ _MOUNT_DIR=""
 
 cleanup() {
   if [[ -n "${_MOUNT_DIR}" ]] && mountpoint -q "${_MOUNT_DIR}" 2>/dev/null; then
-    fusermount -u "${_MOUNT_DIR}" 2>/dev/null || true
+    if [[ "${BACKEND}" == "nfs" ]]; then
+      sudo umount "${_MOUNT_DIR}" 2>/dev/null || true
+    else
+      fusermount -u "${_MOUNT_DIR}" 2>/dev/null || true
+    fi
   fi
   if [[ -n "${_CHILD_PID}" ]]; then
     kill "${_CHILD_PID}" 2>/dev/null || true
@@ -91,14 +119,19 @@ do_mount() {
   shift
   _MOUNT_DIR="$(mktemp -d /tmp/hf-bench-XXXXXXXXXX)"
   mkdir -p "${cache_dir}"
-  "${HF_MOUNT_BIN}" \
-    --hf-token "${HF_TOKEN}" \
-    --hub-endpoint "${HF_ENDPOINT}" \
-    --cache-dir "${cache_dir}" \
-    --poll-interval-secs 0 \
-    "$@" \
-    bucket "${HF_BENCH_BUCKET}" "${_MOUNT_DIR}" \
-    &>/dev/null &
+
+  local mount_args=(
+    --hf-token "${HF_TOKEN}"
+    --hub-endpoint "${HF_ENDPOINT}"
+    --cache-dir "${cache_dir}"
+    --poll-interval-secs 0
+  )
+  [[ "${HF_NO_DISK_CACHE:-0}" == "1" ]] && mount_args+=(--no-disk-cache)
+  [[ "${HF_ADVANCED_WRITES:-0}" == "1" ]] && mount_args+=(--advanced-writes)
+  mount_args+=("$@")
+  mount_args+=(bucket "${HF_BENCH_BUCKET}" "${_MOUNT_DIR}")
+
+  "${HF_MOUNT_BIN}" "${mount_args[@]}" &>/dev/null &
   _CHILD_PID=$!
   for i in $(seq 1 30); do
     grep -q "${_MOUNT_DIR}" /proc/mounts 2>/dev/null && \
@@ -109,7 +142,11 @@ do_mount() {
 }
 
 do_unmount() {
-  fusermount -u "${_MOUNT_DIR}" 2>/dev/null || true
+  if [[ "${BACKEND}" == "nfs" ]]; then
+    sudo umount "${_MOUNT_DIR}" 2>/dev/null || true
+  else
+    fusermount -u "${_MOUNT_DIR}" 2>/dev/null || true
+  fi
   for _ in $(seq 1 30); do
     kill -0 "${_CHILD_PID}" 2>/dev/null || { _CHILD_PID=""; _MOUNT_DIR=""; return 0; }
     sleep 1
@@ -145,7 +182,7 @@ fi
 
 # ── fio benchmark runner ──────────────────────────────────────────────────────
 
-# Mirrors mountpoint-s3's run_fio_job() and its jq aggregation exactly.
+# Throughput aggregation (MiB/s) — same jq as mountpoint-s3, with null-safe rw check.
 run_fio_job() {
   local job_file="$1" mount_dir="$2"
   local job_name
@@ -170,13 +207,12 @@ run_fio_job() {
   done
   echo "done" >&2
 
-  # Average across iterations — same jq logic as mountpoint-s3/scripts/fs_bench.sh
   jq -s '[
     [.[].jobs] | add | group_by(.jobname)[] |
     {
       name: .[0].jobname,
       value: ((map(
-        if .["job options"].rw | test("^(rand)?read")
+        if (.["job options"].rw // "write") | test("^(rand)?read")
         then .read.bw
         else .write.bw
         end
@@ -190,7 +226,73 @@ run_fio_job() {
   }' "${results_dir}/${job_name}_iter"*.json | tee "${results_dir}/${job_name}_parsed.json"
 }
 
-run_benchmarks() {
+# Latency aggregation (milliseconds).
+run_fio_latency_job() {
+  local job_file="$1" mount_dir="$2"
+  local job_name
+  job_name="$(basename "${job_file}" .fio)"
+
+  echo -n "Running latency job ${job_name}... " >&2
+  set +e
+  timeout 300s fio \
+    --thread \
+    --output="${results_dir}/${job_name}_iter1.json" \
+    --output-format=json \
+    --directory="${mount_dir}" \
+    --eta=never \
+    "${job_file}"
+  local job_status=$?
+  set -e
+  if [[ ${job_status} -ne 0 ]]; then
+    echo "Job ${job_name} failed with exit code ${job_status}" >&2; exit 1
+  fi
+  echo "done" >&2
+
+  jq -n 'inputs.jobs[] |
+    if (.["job options"].rw // "write") | test("^(rand)?read")
+    then {name: .jobname, value: (.read.lat_ns.mean / 1000000), unit: "milliseconds"}
+    else {name: .jobname, value: (.write.lat_ns.mean / 1000000), unit: "milliseconds"}
+    end
+  ' "${results_dir}/${job_name}_iter1.json" | tee "${results_dir}/${job_name}_parsed.json"
+}
+
+# Create benchmark aggregation (files/s via IOPS).
+run_fio_create_job() {
+  local job_file="$1" mount_dir="$2"
+  local job_name
+  job_name="$(basename "${job_file}" .fio)"
+
+  echo -n "Running create job ${job_name} for ${iterations} iterations... " >&2
+  for i in $(seq 1 "${iterations}"); do
+    echo -n "${i};" >&2
+    set +e
+    timeout 300s fio \
+      --thread \
+      --output="${results_dir}/${job_name}_iter${i}.json" \
+      --output-format=json \
+      --directory="${mount_dir}" \
+      --eta=never \
+      "${job_file}"
+    local job_status=$?
+    set -e
+    if [[ ${job_status} -ne 0 ]]; then
+      echo "Job ${job_name} failed with exit code ${job_status}" >&2; exit 1
+    fi
+  done
+  echo "done" >&2
+
+  # Sum IOPS across all threads, average across iterations
+  jq -s '{
+    name: .[0].jobs[0].jobname,
+    value: ([.[].jobs | map(.write.iops) | add] | add / length),
+    unit: "files/s"
+  }' "${results_dir}/${job_name}_iter"*.json | tee "${results_dir}/${job_name}_parsed.json"
+}
+
+# ── Category runners ──────────────────────────────────────────────────────────
+
+# Standard throughput categories (read, write, mix, write_latency).
+run_throughput_category() {
   local category="$1"
   local jobs_dir="${SCRIPT_DIR}/fio/${category}"
   [[ -d "${jobs_dir}" ]] || return 0
@@ -210,12 +312,95 @@ run_benchmarks() {
     [[ "${HF_NO_DISK_CACHE:-0}" == "1" ]] && extra_args+=(--no-disk-cache)
     do_mount "${cache_dir}" "${extra_args[@]}"
 
-    # Lay out files (create if not present), then immediately run benchmark on same mount.
     echo "Laying out files for ${job_file}" >&2
     fio --thread --directory="${_MOUNT_DIR}" --create_only=1 --eta=never "${job_file}" &>/dev/null
 
-    echo "Running ${job_file}" >&2
     run_fio_job "${job_file}" "${_MOUNT_DIR}"
+    do_unmount
+    rm -rf "${_MOUNT_DIR}" 2>/dev/null || true
+  done
+}
+
+# Read latency: lay out files, unmount, remount read-only, measure TTFB.
+run_read_latency() {
+  local jobs_dir="${SCRIPT_DIR}/fio/read_latency"
+  [[ -d "${jobs_dir}" ]] || return 0
+
+  local setup_cache="/tmp/hf-bench-latency-setup-$$"
+
+  # Lay out all latency test files on one mount
+  echo "Laying out read_latency files..." >&2
+  do_mount "${setup_cache}"
+  for job_file in "${jobs_dir}"/*.fio; do
+    should_run_job "${job_file}" || continue
+    fio --thread --directory="${_MOUNT_DIR}" --create_only=1 --eta=never "${job_file}" &>/dev/null || true
+  done
+  echo "Unmounting to flush uploads..." >&2
+  do_unmount
+
+  # Benchmark each job on a fresh read-only mount
+  for job_file in "${jobs_dir}"/*.fio; do
+    if ! should_run_job "${job_file}"; then
+      echo "Skipping $(basename "${job_file}")" >&2
+      continue
+    fi
+
+    local job_name cache_dir
+    job_name="$(basename "${job_file}" .fio)"
+    cache_dir="/tmp/hf-bench-latency-$$/${job_name}"
+
+    do_mount "${cache_dir}" --read-only
+
+    run_fio_latency_job "${job_file}" "${_MOUNT_DIR}"
+
+    do_unmount
+    rm -rf "${_MOUNT_DIR}" 2>/dev/null || true
+  done
+}
+
+# Write latency.
+run_write_latency() {
+  local jobs_dir="${SCRIPT_DIR}/fio/write_latency"
+  [[ -d "${jobs_dir}" ]] || return 0
+
+  for job_file in "${jobs_dir}"/*.fio; do
+    if ! should_run_job "${job_file}"; then
+      echo "Skipping $(basename "${job_file}")" >&2
+      continue
+    fi
+
+    local job_name cache_dir
+    job_name="$(basename "${job_file}" .fio)"
+    cache_dir="/tmp/hf-bench-cache-$$/${job_name}"
+
+    do_mount "${cache_dir}"
+
+    run_fio_latency_job "${job_file}" "${_MOUNT_DIR}"
+
+    do_unmount
+    rm -rf "${_MOUNT_DIR}" 2>/dev/null || true
+  done
+}
+
+# Create benchmark (files/s).
+run_create() {
+  local jobs_dir="${SCRIPT_DIR}/fio/create"
+  [[ -d "${jobs_dir}" ]] || return 0
+
+  for job_file in "${jobs_dir}"/*.fio; do
+    if ! should_run_job "${job_file}"; then
+      echo "Skipping $(basename "${job_file}")" >&2
+      continue
+    fi
+
+    local job_name cache_dir
+    job_name="$(basename "${job_file}" .fio)"
+    cache_dir="/tmp/hf-bench-cache-$$/${job_name}"
+
+    do_mount "${cache_dir}"
+
+    run_fio_create_job "${job_file}" "${_MOUNT_DIR}"
+
     do_unmount
     rm -rf "${_MOUNT_DIR}" 2>/dev/null || true
   done
@@ -223,9 +408,23 @@ run_benchmarks() {
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-run_benchmarks read
-run_benchmarks write
-run_benchmarks mix
+for cat in "${CATEGORIES[@]}"; do
+  echo "" >&2
+  echo "=== Category: ${cat} ===" >&2
+  case "${cat}" in
+    read|write|mix)
+      run_throughput_category "${cat}" ;;
+    read_latency)
+      run_read_latency ;;
+    write_latency)
+      run_write_latency ;;
+    create)
+      run_create ;;
+    *)
+      echo "Unknown category: ${cat}" >&2 ;;
+  esac
+done
 
-echo "Throughput:" >&2
+echo "" >&2
+echo "=== Results (${MODE}) ===" >&2
 jq -n '[inputs]' "${results_dir}"/*_parsed.json | tee "${results_dir}/output.json"
