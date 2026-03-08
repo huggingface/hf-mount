@@ -248,47 +248,26 @@ fn print_results(results: &ProveResults) {
     }
 }
 
-#[tokio::test]
-async fn test_pjdfstest() {
+fn preflight() -> bool {
     let is_ci = std::env::var("CI").is_ok();
     if !ensure_pjdfstest() {
         if is_ci {
             panic!("pjdfstest build failed in CI -- setup error");
         }
         eprintln!("Skipping: pjdfstest not available");
-        return;
+        return false;
     }
-
-    // prove requires perl
     if Command::new("prove").arg("--version").output().is_err() {
         if is_ci {
             panic!("prove (perl TAP harness) not found in CI");
         }
         eprintln!("Skipping: prove (perl TAP harness) not installed");
-        return;
+        return false;
     }
+    true
+}
 
-    let (token, bucket_id, _hub) = match common::setup_bucket("pjdfs").await {
-        Some(cfg) => cfg,
-        None => return,
-    };
-
-    let pid = std::process::id();
-    let mount_point = format!("/tmp/hf-pjdfs-{}", pid);
-    let cache_dir = format!("/tmp/hf-pjdfs-cache-{}", pid);
-
-    let child = common::mount_bucket(&bucket_id, &mount_point, &cache_dir, &["--advanced-writes"]);
-
-    let results = run_prove(&mount_point);
-
-    print_results(&results);
-
-    common::unmount(&mount_point, child, 5);
-    common::delete_bucket(&common::endpoint(), &token, &bucket_id).await;
-    std::fs::remove_dir_all(&mount_point).ok();
-    std::fs::remove_dir_all(&cache_dir).ok();
-
-    // Exact regression assertions — all filtered tests must pass
+fn assert_results(results: &ProveResults) {
     let passed_tests = results.total_tests.saturating_sub(results.failed_tests);
     assert!(
         results.passed_files >= EXPECTED_FILES_PASS,
@@ -304,4 +283,60 @@ async fn test_pjdfstest() {
         results.total_tests,
         EXPECTED_TESTS_PASS
     );
+}
+
+#[tokio::test]
+async fn test_pjdfstest_fuse() {
+    if !preflight() {
+        return;
+    }
+
+    let (token, bucket_id, _hub) = match common::setup_bucket("pjdfs-fuse").await {
+        Some(cfg) => cfg,
+        None => return,
+    };
+
+    let pid = std::process::id();
+    let mount_point = format!("/tmp/hf-pjdfs-fuse-{}", pid);
+    let cache_dir = format!("/tmp/hf-pjdfs-fuse-cache-{}", pid);
+
+    let child = common::mount_bucket(&bucket_id, &mount_point, &cache_dir, &["--advanced-writes"]);
+
+    let results = run_prove(&mount_point);
+    print_results(&results);
+
+    common::unmount(&mount_point, child, 5);
+    common::delete_bucket(&common::endpoint(), &token, &bucket_id).await;
+    std::fs::remove_dir_all(&mount_point).ok();
+    std::fs::remove_dir_all(&cache_dir).ok();
+
+    assert_results(&results);
+}
+
+#[tokio::test]
+async fn test_pjdfstest_nfs() {
+    if !preflight() {
+        return;
+    }
+
+    let (token, bucket_id, _hub) = match common::setup_bucket("pjdfs-nfs").await {
+        Some(cfg) => cfg,
+        None => return,
+    };
+
+    let pid = std::process::id();
+    let mount_point = format!("/tmp/hf-pjdfs-nfs-{}", pid);
+    let cache_dir = format!("/tmp/hf-pjdfs-nfs-cache-{}", pid);
+
+    let child = common::mount_bucket_nfs(&bucket_id, &mount_point, &cache_dir, &["--advanced-writes"]);
+
+    let results = run_prove(&mount_point);
+    print_results(&results);
+
+    common::unmount_nfs(&mount_point, child, 5);
+    common::delete_bucket(&common::endpoint(), &token, &bucket_id).await;
+    std::fs::remove_dir_all(&mount_point).ok();
+    std::fs::remove_dir_all(&cache_dir).ok();
+
+    assert_results(&results);
 }
