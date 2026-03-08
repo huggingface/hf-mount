@@ -163,7 +163,7 @@ pub async fn upload_file(
         .await
         .expect("FileUploadSession::new failed");
 
-    let files = vec![(staged_path.to_path_buf(), None::<mdb_shard::Sha256>)];
+    let files = vec![(staged_path.to_path_buf(), None::<mdb_shard::Sha256>, ulid::Ulid::new())];
     let mut results = upload_session.upload_files(files).await.expect("upload_files failed");
 
     let file_info = results.pop().expect("upload returned no file info");

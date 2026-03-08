@@ -4,6 +4,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use data::configurations::TranslatorConfig;
 use data::{FileDownloadSession, FileUploadSession, SingleFileCleaner, XetFileInfo};
+use ulid::Ulid;
 
 use crate::error::{Error, Result};
 
@@ -50,7 +51,7 @@ impl XetSessions {
     /// Start a streaming download from a byte offset (sync, returns an iterator-like stream).
     pub fn download_stream(&self, file_info: &XetFileInfo, offset: u64) -> Result<data::DownloadStream> {
         self.session
-            .download_stream_from_offset(file_info, offset, None)
+            .download_stream_from_offset(file_info, offset, Ulid::new())
             .map_err(|e| Error::Xet(e.to_string()))
     }
 }
@@ -66,7 +67,7 @@ impl XetOps for XetSessions {
             .await
             .map_err(|e| Error::Xet(e.to_string()))?;
         let cleaner = session
-            .start_clean(None, None, Some(mdb_shard::Sha256::default()))
+            .start_clean(None, 0, Some(mdb_shard::Sha256::default()), Ulid::new())
             .await;
         Ok(Box::new(StreamingWriter {
             cleaner,
@@ -78,7 +79,7 @@ impl XetOps for XetSessions {
     async fn download_to_file(&self, xet_hash: &str, file_size: u64, dest: &Path) -> Result<()> {
         let file_info = XetFileInfo::new(xet_hash.to_string(), file_size);
         self.session
-            .download_file(&file_info, dest, None)
+            .download_file(&file_info, dest, Ulid::new())
             .await
             .map_err(|e| Error::Xet(e.to_string()))?;
         Ok(())
@@ -96,7 +97,7 @@ impl XetOps for XetSessions {
 
         let files: Vec<_> = paths
             .iter()
-            .map(|p| (p.to_path_buf(), Some(mdb_shard::Sha256::default())))
+            .map(|p| (p.to_path_buf(), Some(mdb_shard::Sha256::default()), Ulid::new()))
             .collect();
 
         let results = upload_session

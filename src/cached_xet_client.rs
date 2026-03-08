@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use bytes::Bytes;
 use cas_client::adaptive_concurrency::ConnectionPermit;
 use cas_client::{Client, ProgressCallback, URLProvider};
-use cas_object::SerializedCasObject;
+use xorb_object::SerializedXorbObject;
 use cas_types::{BatchQueryReconstructionResponse, FileRange, QueryReconstructionResponse};
 use mdb_shard::file_structs::MDBFileInfo;
 use merklehash::MerkleHash;
@@ -103,7 +103,7 @@ impl Client for CachedXetClient {
     async fn upload_xorb(
         &self,
         prefix: &str,
-        serialized_cas_object: SerializedCasObject,
+        serialized_cas_object: SerializedXorbObject,
         progress_callback: Option<ProgressCallback>,
         upload_permit: ConnectionPermit,
     ) -> Result<u64> {
@@ -244,7 +244,7 @@ mod tests {
         async fn upload_xorb(
             &self,
             _prefix: &str,
-            _serialized_cas_object: SerializedCasObject,
+            _serialized_cas_object: SerializedXorbObject,
             _progress_callback: Option<ProgressCallback>,
             _upload_permit: ConnectionPermit,
         ) -> Result<u64> {
