@@ -2230,3 +2230,86 @@ fn shutdown_flushes_dirty() {
     let logs = hub.take_batch_log();
     assert!(!logs.is_empty());
 }
+
+// ── Reconstruction cache warm-up tests ──────────────────────────────
+
+/// `open()` must trigger exactly one `warm_reconstruction_cache` call per file handle,
+/// and that call must complete before the first `read()` is served.
+///
+/// We inject a 50 ms delay into the warm call to ensure the warm task is still
+/// running when `read()` is called.  If `read()` did NOT wait for the watch, the
+/// first read would race with the warm task and the assertion on `warm_call_count`
+/// at read time might pass trivially — so we also verify timing:
+///   - with the warm delay the first read takes ≥ 50 ms (waited for warm)
+///   - subsequent reads on the same handle take < 10 ms (watch already true)
+///   - a second `open()` on the same inode triggers a second warm call.
+#[test]
+fn warm_cache_triggered_on_open_sequential_read() {
+    const WARM_DELAY_MS: u64 = 50;
+    const FILE_SIZE: u64 = 1024 * 1024; // 1 MiB — small so data fetch is trivial
+
+    let hub = MockHub::new();
+    hub.add_file("file.bin", FILE_SIZE, Some("hash_abc"), None);
+    let xet = MockXet::new();
+    let data: Vec<u8> = (0..FILE_SIZE as usize).map(|i| (i % 251) as u8).collect();
+    xet.add_file("hash_abc", &data);
+    xet.set_warm_delay_ms(WARM_DELAY_MS);
+
+    let (rt, vfs) = vfs_readonly(&hub, &xet);
+
+    rt.block_on(async {
+        let attr = vfs.lookup(ROOT_INODE, "file.bin").await.unwrap();
+
+        // ── open #1 ──────────────────────────────────────────────────
+        // Warm task starts in background with 50 ms delay.
+        // We yield briefly so the task is definitely running before read().
+        let fh1 = vfs.open(attr.ino, false, false, None).await.unwrap();
+        tokio::task::yield_now().await;
+
+        // First read must wait for warm to complete — expect ≥ WARM_DELAY_MS.
+        let t0 = std::time::Instant::now();
+        let (chunk, _) = vfs.read(fh1, 0, 4096).await.unwrap();
+        let elapsed_first = t0.elapsed();
+
+        assert_eq!(chunk.len(), 4096);
+        assert_eq!(chunk[0], 0u8); // pattern byte at offset 0
+        assert!(
+            elapsed_first.as_millis() >= WARM_DELAY_MS as u128,
+            "first read finished in {}ms — should have waited for warm ({} ms)",
+            elapsed_first.as_millis(),
+            WARM_DELAY_MS,
+        );
+
+        // Warm was called exactly once so far.
+        assert_eq!(xet.warm_call_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // Subsequent reads on the same handle are immediate (watch already true).
+        let t1 = std::time::Instant::now();
+        let (chunk2, _) = vfs.read(fh1, 4096, 4096).await.unwrap();
+        let elapsed_second = t1.elapsed();
+        assert_eq!(chunk2.len(), 4096);
+        assert_eq!(chunk2[0], (4096 % 251) as u8);
+        assert!(
+            elapsed_second.as_millis() < 10,
+            "second read took {}ms — should be near-instant (no warm wait)",
+            elapsed_second.as_millis(),
+        );
+
+        vfs.release(fh1).await;
+
+        // ── open #2 ──────────────────────────────────────────────────
+        // Each open() is an independent handle with its own warm task.
+        let fh2 = vfs.open(attr.ino, false, false, None).await.unwrap();
+        tokio::task::yield_now().await;
+
+        vfs.read(fh2, 0, 4096).await.unwrap();
+
+        assert_eq!(
+            xet.warm_call_count.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "second open should trigger a second warm call"
+        );
+
+        vfs.release(fh2).await;
+    });
+}

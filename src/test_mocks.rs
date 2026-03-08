@@ -222,6 +222,10 @@ pub struct MockXet {
     range_fail_count: AtomicU32,
     /// Number of range download calls that should return empty before succeeding.
     range_empty_count: AtomicU32,
+    /// How many times warm_reconstruction_cache was called.
+    pub warm_call_count: AtomicU32,
+    /// Optional delay injected into warm_reconstruction_cache (simulates CAS round-trip).
+    warm_delay_ms: AtomicU64,
 }
 
 impl MockXet {
@@ -235,7 +239,13 @@ impl MockXet {
             writer_fail_after: AtomicU64::new(u64::MAX),
             range_fail_count: AtomicU32::new(0),
             range_empty_count: AtomicU32::new(0),
+            warm_call_count: AtomicU32::new(0),
+            warm_delay_ms: AtomicU64::new(0),
         })
+    }
+
+    pub fn set_warm_delay_ms(&self, ms: u64) {
+        self.warm_delay_ms.store(ms, Ordering::SeqCst);
     }
 
     pub fn add_file(&self, hash: &str, content: &[u8]) {
@@ -312,7 +322,13 @@ impl XetOps for MockXet {
         Ok(results)
     }
 
-    async fn warm_reconstruction_cache(&self, _xet_hash: &str) {}
+    async fn warm_reconstruction_cache(&self, _xet_hash: &str) {
+        self.warm_call_count.fetch_add(1, Ordering::SeqCst);
+        let delay = self.warm_delay_ms.load(Ordering::SeqCst);
+        if delay > 0 {
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+        }
+    }
 
     fn download_stream_boxed(&self, file_info: &XetFileInfo, offset: u64) -> Result<Box<dyn DownloadStreamOps>> {
         let prev_fail = self.range_fail_count.load(Ordering::SeqCst);
