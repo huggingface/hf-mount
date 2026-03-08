@@ -1244,13 +1244,28 @@ impl VirtualFs {
     }
 
     /// Allocate a lazy file handle backed by a prefetch buffer.
+    /// Starts reconstruction cache warmup in the background — open() returns immediately.
+    /// The first read() waits for the warmup only if it has not completed yet.
     fn open_lazy(&self, xet_hash: String, size: u64) -> VirtualFsResult<u64> {
+        let warm = if !xet_hash.is_empty() {
+            let (tx, rx) = tokio::sync::watch::channel(false);
+            let sessions = self.xet_sessions.clone();
+            let hash = xet_hash.clone();
+            tokio::spawn(async move {
+                sessions.warm_reconstruction_cache(&hash).await;
+                // Errors silently dropped — worst case the first read pays the CAS round-trip.
+                let _ = tx.send(true);
+            });
+            Some(rx)
+        } else {
+            None
+        };
         let prefetch = Arc::new(tokio::sync::Mutex::new(PrefetchState::new(xet_hash, size)));
         let file_handle = self.alloc_file_handle();
         self.open_files
             .write()
             .expect("open_files poisoned")
-            .insert(file_handle, OpenFile::Lazy { prefetch });
+            .insert(file_handle, OpenFile::Lazy { prefetch, warm });
         Ok(file_handle)
     }
 
@@ -1380,8 +1395,9 @@ impl VirtualFs {
             let files = self.open_files.read().expect("open_files poisoned");
             match files.get(&file_handle) {
                 Some(OpenFile::Local { file, .. }) => ReadTarget::LocalFd(file.clone()),
-                Some(OpenFile::Lazy { prefetch, .. }) => ReadTarget::Remote {
+                Some(OpenFile::Lazy { prefetch, warm }) => ReadTarget::Remote {
                     prefetch: prefetch.clone(),
+                    warm: warm.clone(),
                 },
                 // write-only, not readable
                 Some(OpenFile::Streaming { .. }) => return Err(libc::EBADF), // write-only, not readable
@@ -1411,7 +1427,12 @@ impl VirtualFs {
                     Ok((buf.freeze(), eof))
                 }
             }
-            ReadTarget::Remote { prefetch } => {
+            ReadTarget::Remote { prefetch, mut warm } => {
+                // Wait for background reconstruction cache warmup, if not already done.
+                // Returns immediately on subsequent reads (watch value stays true).
+                if let Some(ref mut rx) = warm {
+                    let _ = rx.wait_for(|v| *v).await;
+                }
                 let mut prefetch_state = prefetch.lock().await;
 
                 let file_size = prefetch_state.file_size;
@@ -2811,6 +2832,9 @@ enum OpenFile {
     /// Lazy remote — data fetched on-demand with adaptive prefetch buffer.
     Lazy {
         prefetch: Arc<tokio::sync::Mutex<PrefetchState>>,
+        /// Background reconstruction cache warmup. Becomes `true` when the full-file plan
+        /// is cached. `None` for empty files (no warmup needed).
+        warm: Option<tokio::sync::watch::Receiver<bool>>,
     },
     /// Streaming append-only writer (default write mode).
     Streaming { ino: u64, channel: Arc<StreamingChannel> },
@@ -2886,6 +2910,7 @@ enum ReadTarget {
     LocalFd(Arc<File>),
     Remote {
         prefetch: Arc<tokio::sync::Mutex<PrefetchState>>,
+        warm: Option<tokio::sync::watch::Receiver<bool>>,
     },
 }
 

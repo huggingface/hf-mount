@@ -462,17 +462,8 @@ pub fn mount_fuse(
         config.mount_options.push(fuser::MountOption::RO);
     }
     config.acl = fuser::SessionACL::All;
-    #[cfg(not(target_os = "macos"))]
-    {
-        config.clone_fd = true;
-        config.n_threads = Some(max_threads);
-    }
-    #[cfg(target_os = "macos")]
-    {
-        // macFUSE only supports single-threaded session (fuser limitation).
-        let _ = max_threads;
-        config.n_threads = Some(1);
-    }
+    config.clone_fd = true;
+    config.n_threads = Some(max_threads);
 
     let session = match fuser::Session::new(adapter, mount_point, &config) {
         Ok(s) => s,
