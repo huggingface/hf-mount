@@ -262,7 +262,7 @@ impl Filesystem for FuseAdapter {
         name: &OsStr,
         mode: u32,
         umask: u32,
-        _flags: i32,
+        flags: i32,
         reply: fuser::ReplyCreate,
     ) {
         let name = os_to_str!(name, reply);
@@ -276,12 +276,20 @@ impl Filesystem for FuseAdapter {
             Some(req.pid()),
         )) {
             Ok((attr, file_handle)) => {
+                // Same guard as open(): skip DIRECT_IO for O_RDWR in simple
+                // streaming mode (handle is write-only, reads would EBADF).
+                let rdwr = (flags & libc::O_ACCMODE) == libc::O_RDWR;
+                let oflags = if rdwr && !self.advanced_writes {
+                    FopenFlags::empty()
+                } else {
+                    self.open_flags()
+                };
                 reply.created(
                     &self.metadata_ttl,
                     &vfs_attr_to_fuse(&attr),
                     GENERATION,
                     FileHandle(file_handle),
-                    self.open_flags(),
+                    oflags,
                 );
             }
             Err(e) => reply.error(Errno::from_i32(e)),
