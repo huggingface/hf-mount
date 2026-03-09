@@ -107,9 +107,12 @@ impl Filesystem for FuseAdapter {
 
         // Allow mmap on DIRECT_IO files (Linux 6.6+). Without this, mmap()
         // returns EINVAL when FOPEN_DIRECT_IO is set, breaking safetensors and
-        // other memory-mapped readers. Silently ignored on older kernels/macOS.
-        if self.direct_io {
-            let _ = config.add_capabilities(InitFlags::FUSE_DIRECT_IO_ALLOW_MMAP);
+        // other memory-mapped readers.
+        if self.direct_io && config.add_capabilities(InitFlags::FUSE_DIRECT_IO_ALLOW_MMAP).is_err() {
+            info!(
+                "--direct-io: kernel does not support FUSE_DIRECT_IO_ALLOW_MMAP; \
+                 mmap-based readers (e.g. safetensors) may fail with EINVAL"
+            );
         }
 
         // Receive O_TRUNC in open() flags instead of a separate setattr(size=0) call.
