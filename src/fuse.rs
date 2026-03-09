@@ -175,7 +175,15 @@ impl Filesystem for FuseAdapter {
             .block_on(self.virtual_fs.open(ino.0, writable, truncate, Some(req.pid())))
         {
             Ok(file_handle) => {
-                reply.opened(FileHandle(file_handle), self.open_flags());
+                // Only bypass page cache for read-only opens; writable (streaming)
+                // handles don't support read() so DIRECT_IO would surface EBADF
+                // on any read-after-write attempt.
+                let flags = if writable {
+                    FopenFlags::empty()
+                } else {
+                    self.open_flags()
+                };
+                reply.opened(FileHandle(file_handle), flags);
             }
             Err(e) => reply.error(Errno::from_i32(e)),
         }
@@ -266,12 +274,14 @@ impl Filesystem for FuseAdapter {
             Some(req.pid()),
         )) {
             Ok((attr, file_handle)) => {
+                // create() always produces a writable handle; skip DIRECT_IO
+                // (same rationale as open() above).
                 reply.created(
                     &self.metadata_ttl,
                     &vfs_attr_to_fuse(&attr),
                     GENERATION,
                     FileHandle(file_handle),
-                    self.open_flags(),
+                    FopenFlags::empty(),
                 );
             }
             Err(e) => reply.error(Errno::from_i32(e)),

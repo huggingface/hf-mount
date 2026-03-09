@@ -281,7 +281,7 @@ pub fn setup(is_nfs: bool) -> MountSetup {
         metadata_ttl,
         !args.metadata_ttl_minimal,
         !args.no_filter_os_files,
-        args.direct_io,
+        args.direct_io && !is_nfs,
         std::time::Duration::from_millis(args.flush_debounce_ms),
         std::time::Duration::from_millis(args.flush_max_batch_window_ms),
     );
