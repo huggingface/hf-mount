@@ -257,6 +257,10 @@ pub fn setup(is_nfs: bool) -> MountSetup {
         panic!("Failed to create mount point {:?}: {e}", mount_point);
     }
 
+    if is_nfs && args.direct_io {
+        info!("--direct-io is ignored for NFS mounts (no NFS equivalent)");
+    }
+
     let backend_name = if is_nfs { "nfs" } else { "fuse" };
     info!(
         "Mounting {} at {:?} ({}, backend={})",

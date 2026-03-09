@@ -175,10 +175,10 @@ impl Filesystem for FuseAdapter {
             .block_on(self.virtual_fs.open(ino.0, writable, truncate, Some(req.pid())))
         {
             Ok(file_handle) => {
-                // Only bypass page cache for read-only opens; writable (streaming)
-                // handles don't support read() so DIRECT_IO would surface EBADF
-                // on any read-after-write attempt.
-                let flags = if writable {
+                // Skip DIRECT_IO for simple streaming write handles (they don't
+                // support read()). Advanced-write handles are local files and
+                // can safely use DIRECT_IO even when opened O_RDWR.
+                let flags = if writable && !self.advanced_writes {
                     FopenFlags::empty()
                 } else {
                     self.open_flags()
@@ -274,14 +274,20 @@ impl Filesystem for FuseAdapter {
             Some(req.pid()),
         )) {
             Ok((attr, file_handle)) => {
-                // create() always produces a writable handle; skip DIRECT_IO
-                // (same rationale as open() above).
+                // create() produces a writable handle. In advanced-writes mode
+                // it's a local file (readable), so DIRECT_IO is safe. In simple
+                // streaming mode, skip it (no read support).
+                let oflags = if self.advanced_writes {
+                    self.open_flags()
+                } else {
+                    FopenFlags::empty()
+                };
                 reply.created(
                     &self.metadata_ttl,
                     &vfs_attr_to_fuse(&attr),
                     GENERATION,
                     FileHandle(file_handle),
-                    FopenFlags::empty(),
+                    oflags,
                 );
             }
             Err(e) => reply.error(Errno::from_i32(e)),
