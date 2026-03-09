@@ -1725,19 +1725,15 @@ impl VirtualFs {
             Some(OpenFile::Local {
                 ino, writable: true, ..
             }) => {
-                // Advanced writes: enqueue for async flush (skip unlinked files)
-                let (is_unlinked, is_dirty) = {
-                    let inodes = self.inode_table.read().expect("inodes poisoned");
-                    let entry = inodes.get(ino);
-                    (entry.is_some_and(|e| e.nlink == 0), entry.is_some_and(|e| e.dirty))
-                };
-                if is_unlinked && is_dirty {
-                    warn!(
-                        "release: skipping flush for unlinked dirty file ino={}: \
-                         data written before unlink will not be committed",
-                        ino
-                    );
-                } else if !is_unlinked && let Some(fm) = &self.flush_manager {
+                // Advanced writes: enqueue for async flush (skip unlinked files —
+                // user deleted the file, no point uploading it to remote).
+                let is_unlinked = self
+                    .inode_table
+                    .read()
+                    .expect("inodes poisoned")
+                    .get(ino)
+                    .is_some_and(|e| e.nlink == 0);
+                if !is_unlinked && let Some(fm) = &self.flush_manager {
                     fm.enqueue(ino);
                 }
             }
@@ -1827,24 +1823,17 @@ impl VirtualFs {
 
     /// Finalize a streaming write: send Finish to the worker, await CAS upload, commit to Hub.
     async fn streaming_commit(&self, ino: u64, channel: &StreamingChannel) -> Result<(), i32> {
-        // POSIX: unlinked files (nlink=0) must not be re-committed on close.
-        // Warn if the file was dirty so operators know data was not persisted.
+        // Unlinked files (nlink=0) must not be re-committed on close —
+        // user deleted the file, uploading would resurrect it.
+        if self
+            .inode_table
+            .read()
+            .expect("inodes poisoned")
+            .get(ino)
+            .is_some_and(|e| e.nlink == 0)
         {
-            let inodes = self.inode_table.read().expect("inodes poisoned");
-            if let Some(entry) = inodes.get(ino)
-                && entry.nlink == 0
-            {
-                if entry.dirty {
-                    warn!(
-                        "streaming_commit: skipping unlinked dirty file ino={} path={}: \
-                         data will not be committed",
-                        ino, entry.full_path
-                    );
-                } else {
-                    debug!("streaming_commit: skipping unlinked ino={}", ino);
-                }
-                return Ok(());
-            }
+            debug!("streaming_commit: skipping unlinked ino={}", ino);
+            return Ok(());
         }
 
         let file_info = {
