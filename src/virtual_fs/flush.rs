@@ -277,7 +277,11 @@ async fn flush_batch(
         info!("Batch commit retry succeeded");
     }
 
-    // Update inodes
+    // Update inodes.
+    // BUG: setting dirty=false unconditionally can lose writes from a concurrent
+    // writable handle on the same inode. If handle A flushes and clears dirty,
+    // handle B's subsequent release sees !dirty and skips the flush. Fix requires
+    // a dirty generation counter instead of a bool.
     let mut inode_table = inodes.write().expect("inodes poisoned");
     let now = SystemTime::now();
     for (ino, xet_hash, size) in successes {
