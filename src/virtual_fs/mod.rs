@@ -1165,6 +1165,8 @@ impl VirtualFs {
                 size: entry.size,
                 mtime: entry.mtime,
                 pending_deletes: entry.pending_deletes.clone(),
+                dirty: entry.dirty,
+                sparse: entry.sparse,
                 existed_before: true,
             }
         };
@@ -1831,7 +1833,8 @@ impl VirtualFs {
             entry.size = snapshot.size;
             entry.mtime = snapshot.mtime;
             entry.pending_deletes = snapshot.pending_deletes.clone();
-            entry.dirty = false;
+            entry.dirty = snapshot.dirty;
+            entry.sparse = snapshot.sparse;
             info!(
                 "Reverted ino={}: restored (hash={:?}, size={})",
                 ino, snapshot.xet_hash, snapshot.size
@@ -2035,6 +2038,8 @@ impl VirtualFs {
                 size: 0,
                 mtime: now,
                 pending_deletes: Vec::new(),
+                dirty: false,
+                sparse: false,
                 existed_before: false,
             };
             let (file_handle, channel) = match self.setup_streaming_writer(ino, pid, snapshot).await {
@@ -2848,6 +2853,8 @@ struct InodeSnapshot {
     size: u64,
     mtime: SystemTime,
     pending_deletes: Vec<String>,
+    dirty: bool,
+    sparse: bool,
     /// false for create() (new file), true for open(O_TRUNC) (overwrite).
     existed_before: bool,
 }
