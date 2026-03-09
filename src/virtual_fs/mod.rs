@@ -2648,6 +2648,7 @@ impl VirtualFs {
                 let inodes = self.inode_table.read().expect("inodes poisoned");
                 let entry = inodes.get(ino).ok_or(libc::ENOENT)?;
                 new_size > 0
+                    && !self.advanced_writes
                     && (entry.size == 0 || entry.sparse)
                     && entry.xet_hash.as_deref().unwrap_or_default().is_empty()
             };
