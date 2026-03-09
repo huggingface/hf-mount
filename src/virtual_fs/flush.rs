@@ -214,17 +214,13 @@ async fn flush_batch(
         return;
     }
 
-    // Sync staging files to disk before uploading. Ensures pwrite() data
-    // still in the kernel page cache is persisted before CAS reads the files.
+    // fdatasync staging files. This only guards against kernel/machine crash
+    // between pwrite() and upload — the page cache is coherent within the same
+    // host, so a process crash alone won't cause stale reads by upload_files().
     for (ino, path, staging_path, _) in &to_flush {
-        match std::fs::File::open(staging_path) {
-            Ok(file) => {
-                if let Err(e) = file.sync_data() {
-                    error!("flush: fdatasync failed for ino={} path={}: {}", ino, path, e);
-                }
-            }
-            Err(e) => {
-                error!("flush: failed to open staging file for sync ino={}: {}", ino, e);
+        if let Ok(file) = std::fs::File::open(staging_path) {
+            if let Err(e) = file.sync_data() {
+                error!("flush: fdatasync failed for ino={} path={}: {}", ino, path, e);
             }
         }
     }
