@@ -2604,7 +2604,7 @@ impl VirtualFs {
             }
 
             if !self.advanced_writes {
-                // Simple mode: ftruncate via setattr is silently ignored (like mountpoint-s3).
+                // Simple mode: ftruncate via setattr is silently ignored.
                 // Real truncation goes through open(O_TRUNC) which is handled separately.
             } else {
                 // Advanced mode: truncation is applied to the staging file on disk

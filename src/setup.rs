@@ -78,8 +78,7 @@ pub struct Args {
 
     /// Disable the on-disk xorb chunk cache. Every read fetches chunks from
     /// the CAS network (no local disk storage between reads). Useful for
-    /// benchmarking without cache effects, comparable to mountpoint-s3
-    /// without --cache.
+    /// benchmarking without cache effects.
     #[arg(long, default_value_t = false)]
     pub no_disk_cache: bool,
 

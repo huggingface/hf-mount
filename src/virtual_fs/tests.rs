@@ -942,7 +942,7 @@ fn setattr_simple_mode_noop() {
     });
 }
 
-/// setattr(size) on an empty file in simple mode is a silent noop (like mountpoint-s3).
+/// setattr(size) on an empty file in simple mode is a silent noop.
 #[test]
 fn setattr_simple_mode_empty_file_noop() {
     let hub = MockHub::new();
