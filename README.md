@@ -161,6 +161,7 @@ sudo umount /mnt/data
 | `--metadata-ttl-minimal` | `false` | HEAD on every lookup (skip TTL cache) |
 | `--flush-debounce-ms` | `2000` | Advanced writes only. Flush debounce delay (ms) |
 | `--flush-max-batch-window-ms` | `30000` | Advanced writes only. Max flush batch window (ms) |
+| `--no-disk-cache` | `false` | Disable xorb chunk cache (every read fetches from CAS) |
 | `--no-filter-os-files` | `false` | Disable filtering of OS junk files (.DS_Store, Thumbs.db, etc.) |
 | `--uid` / `--gid` | current user | Override UID/GID for mounted files |
 
