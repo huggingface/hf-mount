@@ -1003,6 +1003,15 @@ impl VirtualFs {
         self.gid
     }
 
+    /// Schedule a debounced flush for a dirty inode.
+    /// Used by NFS (which has no close/flush RPC) to ensure writes
+    /// eventually get committed to the Hub.
+    pub fn schedule_flush(&self, ino: u64) {
+        if let Some(fm) = &self.flush_manager {
+            fm.enqueue(ino);
+        }
+    }
+
     pub fn getattr(&self, ino: u64) -> VirtualFsResult<VirtualFsAttr> {
         debug!("getattr: ino={}", ino);
 

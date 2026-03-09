@@ -232,6 +232,9 @@ impl NFSFileSystem for NFSAdapter {
         self.virtual_fs
             .write(id, file_handle, offset, data)
             .map_err(errno_to_nfs)?;
+        // NFS has no close/flush RPC, so schedule a debounced flush after
+        // each write to ensure data eventually gets committed to the Hub.
+        self.virtual_fs.schedule_flush(id);
         self.virtual_fs
             .getattr(id)
             .map(|a| vfs_attr_to_nfs(&a))
