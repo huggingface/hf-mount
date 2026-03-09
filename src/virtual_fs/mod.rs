@@ -1445,12 +1445,6 @@ impl VirtualFs {
                 // Maximum bytes we should return (capped at file boundary).
                 let to_read = ((size as u64).min(file_size - offset)) as usize;
 
-                // Sparse file (ftruncate pre-allocation, no backing data): return zeros.
-                if prefetch_state.xet_hash.is_empty() {
-                    let eof = offset + to_read as u64 >= file_size;
-                    return Ok((Bytes::from(vec![0u8; to_read]), eof));
-                }
-
                 // IMPORTANT: Never return a short read unless at real EOF.
                 // The Linux FUSE kernel module shrinks i_size on short reads
                 // (fuse_read_update_size), which makes subsequent reads return
@@ -1721,7 +1715,7 @@ impl VirtualFs {
             Some(OpenFile::Local {
                 ino, writable: true, ..
             }) => {
-                // Advanced writes: enqueue for async flush (skip unlinked and sparse files)
+                // Advanced writes: enqueue for async flush (skip unlinked files)
                 let should_flush = self
                     .inode_table
                     .read()
