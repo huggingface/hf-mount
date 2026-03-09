@@ -2657,6 +2657,7 @@ impl VirtualFs {
                 if let Some(entry) = inodes.get_mut(ino) {
                     entry.size = new_size;
                     entry.sparse = true;
+                    entry.dirty = true;
                     let now = SystemTime::now();
                     entry.mtime = now;
                     entry.ctime = now;

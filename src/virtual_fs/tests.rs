@@ -959,6 +959,7 @@ fn setattr_simple_mode_empty_file_sparse() {
         let entry = inodes.get(attr.ino).unwrap();
         assert_eq!(entry.size, 100, "inode size should reflect ftruncate size");
         assert!(entry.sparse, "file should be marked as sparse");
+        assert!(entry.dirty, "sparse file should be dirty to prevent poll clobbering");
     });
 }
 
