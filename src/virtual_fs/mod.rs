@@ -1911,6 +1911,7 @@ impl VirtualFs {
             entry.xet_hash = Some(file_info.hash().to_string());
             entry.size = file_info.file_size();
             entry.dirty = false;
+            entry.sparse = false;
             let now = SystemTime::now();
             entry.mtime = now;
             entry.ctime = now;
@@ -2634,6 +2635,9 @@ impl VirtualFs {
             // the reported size without writing data. Reads return zeros.
             // This handles fio --create_only=1 which calls ftruncate(fd, 100G) to
             // pre-allocate files before the actual benchmark run.
+            // Note: sparse is local-only metadata, not persisted remotely. If real
+            // data is written later, open_streaming_write/open_advanced_write clears
+            // the flag, and streaming_commit also clears it after upload.
             let is_sparse_prealloc = {
                 let inodes = self.inode_table.read().expect("inodes poisoned");
                 let entry = inodes.get(ino).ok_or(libc::ENOENT)?;
