@@ -1716,13 +1716,13 @@ impl VirtualFs {
                 ino, writable: true, ..
             }) => {
                 // Advanced writes: enqueue for async flush (skip unlinked files)
-                let should_flush = self
+                let is_unlinked = self
                     .inode_table
                     .read()
                     .expect("inodes poisoned")
                     .get(ino)
-                    .is_some_and(|e| e.nlink > 0);
-                if should_flush && let Some(fm) = &self.flush_manager {
+                    .is_some_and(|e| e.nlink == 0);
+                if !is_unlinked && let Some(fm) = &self.flush_manager {
                     fm.enqueue(ino);
                 }
             }
