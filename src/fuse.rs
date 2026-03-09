@@ -105,6 +105,13 @@ impl Filesystem for FuseAdapter {
         let _ = config.set_max_readahead(16 * 1_048_576); // 16 MiB
         let _ = config.set_max_write(16 * 1_048_576); // 16 MiB — fewer round-trips for large sequential writes
 
+        // Allow mmap on DIRECT_IO files (Linux 6.6+). Without this, mmap()
+        // returns EINVAL when FOPEN_DIRECT_IO is set, breaking safetensors and
+        // other memory-mapped readers. Silently ignored on older kernels/macOS.
+        if self.direct_io {
+            let _ = config.add_capabilities(InitFlags::FUSE_DIRECT_IO_ALLOW_MMAP);
+        }
+
         // Receive O_TRUNC in open() flags instead of a separate setattr(size=0) call.
         if !self.read_only {
             let trunc_ok = config.add_capabilities(InitFlags::FUSE_ATOMIC_O_TRUNC).is_ok();
