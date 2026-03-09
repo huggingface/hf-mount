@@ -166,6 +166,9 @@ impl PrefetchState {
         let avail = self.chunks_len - logical_off;
         let to_read = (size as usize).min(avail);
         let data = read_chunk_range(&self.chunks, self.chunks_front_offset, logical_off, to_read);
+        // In forward-only mode (--direct-io), evict consumed bytes so the
+        // prefetch buffer cannot serve re-reads — forces a CAS refetch,
+        // giving honest benchmark numbers without buffer-as-cache effects.
         if self.forward_only && to_read > 0 {
             let consumed = logical_off + to_read;
             self.drain_to_seek(consumed);
