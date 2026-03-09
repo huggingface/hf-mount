@@ -36,7 +36,9 @@ impl NFSAdapter {
     async fn evict_handle(&self, ino: u64, file_handle: u64) {
         // Flush commits any buffered writes to CAS+Hub before releasing.
         let _ = self.virtual_fs.flush(ino, file_handle, None).await;
-        self.virtual_fs.release(file_handle).await;
+        if let Err(e) = self.virtual_fs.release(file_handle).await {
+            tracing::error!("NFS evict_handle: release failed for ino={}: errno={}", ino, e);
+        }
     }
 
     /// Get or open a file handle from the pool.
@@ -61,9 +63,10 @@ impl NFSAdapter {
                 (pool.insert(ino, file_handle), None)
             }
         };
-        // Release duplicate handle outside the lock (release is async)
+        // Release duplicate handle outside the lock (release is async).
+        // This is a freshly-opened read-only handle, so errors are non-critical.
         if let Some((existing, dup)) = dup_handle {
-            self.virtual_fs.release(dup).await;
+            let _ = self.virtual_fs.release(dup).await;
             return Ok(existing);
         }
         if let Some((evicted_ino, evicted_handle)) = evicted {

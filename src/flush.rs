@@ -166,7 +166,7 @@ async fn flush_batch(
 
     debug!("flush_batch: deduped inos = {:?}", deduped);
 
-    // Resolve paths from inode table, skip deleted/non-dirty inodes
+    // Resolve paths from inode table, skip deleted/non-dirty/unlinked inodes
     let to_flush: Vec<(u64, String, PathBuf, Vec<String>)> = {
         let inode_table = inodes.read().expect("inodes poisoned");
         deduped
@@ -181,6 +181,15 @@ async fn flush_batch(
                 };
                 if !entry.dirty {
                     debug!("flush: ino={} path={} not dirty, skipping", ino, entry.full_path);
+                    return None;
+                }
+                // Guard against resurrecting deleted files: if nlink dropped to 0
+                // between enqueue and flush execution, skip the upload.
+                if entry.nlink == 0 {
+                    info!(
+                        "flush: ino={} path={} was unlinked since enqueue, skipping",
+                        ino, entry.full_path
+                    );
                     return None;
                 }
                 let staging_path = staging_dir.path(ino);
@@ -202,6 +211,21 @@ async fn flush_batch(
 
     if to_flush.is_empty() {
         return;
+    }
+
+    // Sync staging files to disk before uploading. Ensures pwrite() data
+    // still in the kernel page cache is persisted before CAS reads the files.
+    for (ino, path, staging_path, _) in &to_flush {
+        match std::fs::File::open(staging_path) {
+            Ok(file) => {
+                if let Err(e) = file.sync_data() {
+                    error!("flush: fdatasync failed for ino={} path={}: {}", ino, path, e);
+                }
+            }
+            Err(e) => {
+                error!("flush: failed to open staging file for sync ino={}: {}", ino, e);
+            }
+        }
     }
 
     // Upload all files through a single upload session
@@ -255,15 +279,22 @@ async fn flush_batch(
 
     ops.append(&mut delete_ops);
 
-    // Single batch commit
+    // Single batch commit (retry once on transient failure since CAS upload already succeeded)
     if let Err(e) = hub_client.batch_operations(&ops).await {
-        error!("Batch commit failed: {}", e);
-        let msg = format!("commit failed: {e}");
-        let mut errs = flush_errors.lock().expect("flush_errors poisoned");
-        for (ino, _, _, _) in &to_flush {
-            errs.insert(*ino, msg.clone());
+        error!("Batch commit failed, retrying in 2s: {}", e);
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        if let Err(e2) = hub_client.batch_operations(&ops).await {
+            error!("Batch commit retry failed: {}", e2);
+            let msg = format!("commit failed after retry: {e2}");
+            let mut errs = flush_errors.lock().expect("flush_errors poisoned");
+            for (ino, _, _, _) in &to_flush {
+                errs.insert(*ino, msg.clone());
+            }
+            // Files remain dirty -- will be re-uploaded on next flush or shutdown
+            return;
         }
-        return;
+        info!("Batch commit retry succeeded");
     }
 
     // Update inodes

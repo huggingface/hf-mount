@@ -1705,7 +1705,7 @@ impl VirtualFs {
         Ok(())
     }
 
-    pub async fn release(&self, file_handle: u64) {
+    pub async fn release(&self, file_handle: u64) -> VirtualFsResult<()> {
         debug!("release: fh={}", file_handle);
 
         let removed = self
@@ -1719,18 +1719,25 @@ impl VirtualFs {
             _ => None,
         };
 
+        let mut release_error: Option<i32> = None;
+
         match removed {
             Some(OpenFile::Local {
                 ino, writable: true, ..
             }) => {
                 // Advanced writes: enqueue for async flush (skip unlinked files)
-                let is_unlinked = self
-                    .inode_table
-                    .read()
-                    .expect("inodes poisoned")
-                    .get(ino)
-                    .is_some_and(|e| e.nlink == 0);
-                if !is_unlinked && let Some(fm) = &self.flush_manager {
+                let (is_unlinked, is_dirty) = {
+                    let inodes = self.inode_table.read().expect("inodes poisoned");
+                    let entry = inodes.get(ino);
+                    (entry.is_some_and(|e| e.nlink == 0), entry.is_some_and(|e| e.dirty))
+                };
+                if is_unlinked && is_dirty {
+                    warn!(
+                        "release: skipping flush for unlinked dirty file ino={}: \
+                         data written before unlink will not be committed",
+                        ino
+                    );
+                } else if !is_unlinked && let Some(fm) = &self.flush_manager {
                     fm.enqueue(ino);
                 }
             }
@@ -1751,7 +1758,7 @@ impl VirtualFs {
                         Err(e) => {
                             // Retry only if CAS upload succeeded but Hub commit failed
                             // (pending_info is preserved). If the worker itself died,
-                            // there's nothing to retry — the data is gone.
+                            // there's nothing to retry -- the data is gone.
                             if channel.pending_info.lock().unwrap().is_some() {
                                 tokio::time::sleep(Duration::from_secs(1)).await;
                                 self.streaming_commit(ino, &channel).await
@@ -1766,9 +1773,10 @@ impl VirtualFs {
                             *channel.state.lock().unwrap() = CommitState::Committed;
                         }
                         Err(e) => {
-                            error!("data loss: streaming commit failed for ino={}: errno={}", ino, e);
+                            error!("DATA LOSS: streaming commit failed for ino={}: errno={}", ino, e);
                             self.revert_inode(ino, &channel.snapshot);
                             *channel.state.lock().unwrap() = CommitState::Failed("commit failed".into());
+                            release_error = Some(*e);
                         }
                     }
 
@@ -1789,6 +1797,11 @@ impl VirtualFs {
         // staging_locks entries are intentionally not cleaned up here: removing
         // while another open() may hold the Arc would break serialization.
         // Entries are tiny (Arc<Mutex<()>>) and bounded by unique inodes opened.
+
+        match release_error {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
     /// Revert an inode to its pre-write state after a failed streaming commit.
@@ -1814,16 +1827,24 @@ impl VirtualFs {
 
     /// Finalize a streaming write: send Finish to the worker, await CAS upload, commit to Hub.
     async fn streaming_commit(&self, ino: u64, channel: &StreamingChannel) -> Result<(), i32> {
-        // POSIX: unlinked files (nlink=0) must not be re-committed on close
-        if self
-            .inode_table
-            .read()
-            .expect("inodes poisoned")
-            .get(ino)
-            .is_some_and(|e| e.nlink == 0)
+        // POSIX: unlinked files (nlink=0) must not be re-committed on close.
+        // Warn if the file was dirty so operators know data was not persisted.
         {
-            debug!("streaming_commit: skipping unlinked ino={}", ino);
-            return Ok(());
+            let inodes = self.inode_table.read().expect("inodes poisoned");
+            if let Some(entry) = inodes.get(ino)
+                && entry.nlink == 0
+            {
+                if entry.dirty {
+                    warn!(
+                        "streaming_commit: skipping unlinked dirty file ino={} path={}: \
+                         data will not be committed",
+                        ino, entry.full_path
+                    );
+                } else {
+                    debug!("streaming_commit: skipping unlinked ino={}", ino);
+                }
+                return Ok(());
+            }
         }
 
         let file_info = {

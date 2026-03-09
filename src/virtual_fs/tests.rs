@@ -93,7 +93,7 @@ fn streaming_write_happy_path() {
         assert_eq!(written, 11);
 
         vfs.flush(ino, fh, Some(42)).await.unwrap();
-        vfs.release(fh).await;
+        vfs.release(fh).await.unwrap();
 
         let inodes = vfs.inode_table.read().unwrap();
         let entry = inodes.get(ino).unwrap();
@@ -124,7 +124,7 @@ fn flush_deferred_pid_mismatch() {
         assert!(hub.take_batch_log().is_empty());
 
         // Release commits
-        vfs.release(fh).await;
+        vfs.release(fh).await.unwrap();
         let logs = hub.take_batch_log();
         assert_eq!(logs.len(), 1);
     });
@@ -146,7 +146,7 @@ fn flush_deferred_zero_bytes() {
         vfs.flush(ino, fh, Some(42)).await.unwrap();
         assert!(hub.take_batch_log().is_empty());
 
-        vfs.release(fh).await;
+        vfs.release(fh).await.unwrap();
         let logs = hub.take_batch_log();
         assert_eq!(logs.len(), 1);
     });
@@ -174,7 +174,8 @@ fn worker_error_propagates_eio() {
         let result = write_blocking(&vfs, ino, fh, 18, b"more").await;
         assert_eq!(result.unwrap_err(), libc::EIO);
 
-        vfs.release(fh).await;
+        // release returns EIO because the streaming worker died
+        assert_eq!(vfs.release(fh).await.unwrap_err(), libc::EIO);
     });
 }
 
@@ -197,7 +198,7 @@ fn hub_commit_fail_retry_in_release() {
         assert_eq!(result.unwrap_err(), libc::EIO);
 
         // release() retries and succeeds
-        vfs.release(fh).await;
+        vfs.release(fh).await.unwrap();
 
         let logs = hub.take_batch_log();
         assert_eq!(logs.len(), 1);
@@ -227,7 +228,8 @@ fn revert_inode_new_file_removed() {
         // flush(1) + release attempt(1) + release retry(1) = 3 failures
         hub.fail_next_batch(3);
         let _ = vfs.flush(ino, fh, Some(42)).await;
-        vfs.release(fh).await;
+        // release returns EIO because all commit attempts failed
+        assert_eq!(vfs.release(fh).await.unwrap_err(), libc::EIO);
 
         let inodes = vfs.inode_table.read().unwrap();
         assert!(inodes.get(ino).is_none());
@@ -250,7 +252,8 @@ fn revert_inode_overwrite_restored() {
 
         hub.fail_next_batch(3);
         let _ = vfs.flush(ino, fh, Some(42)).await;
-        vfs.release(fh).await;
+        // release returns EIO because all commit attempts failed
+        assert_eq!(vfs.release(fh).await.unwrap_err(), libc::EIO);
 
         let inodes = vfs.inode_table.read().unwrap();
         let entry = inodes.get(ino).unwrap();
@@ -283,10 +286,10 @@ fn commit_hook_notifies_waiting_open() {
         assert!(!open_task.is_finished(), "open should be blocked waiting for commit");
 
         // Release fulfills the commit hook, unblocking the second open
-        vfs.release(fh1).await;
+        vfs.release(fh1).await.unwrap();
 
         let fh2 = open_task.await.unwrap().unwrap();
-        vfs.release(fh2).await;
+        vfs.release(fh2).await.unwrap();
     });
 }
 
@@ -310,7 +313,7 @@ fn flush_idempotent_on_committed() {
         let logs = hub.take_batch_log();
         assert_eq!(logs.len(), 1); // only one batch
 
-        vfs.release(fh).await;
+        vfs.release(fh).await.unwrap();
     });
 }
 
@@ -328,7 +331,7 @@ fn release_commits_without_flush() {
         let fh = vfs.open(ino, true, true, Some(42)).await.unwrap();
         write_blocking(&vfs, ino, fh, 0, b"data").await.unwrap();
 
-        vfs.release(fh).await;
+        vfs.release(fh).await.unwrap();
 
         let logs = hub.take_batch_log();
         assert_eq!(logs.len(), 1);
@@ -423,7 +426,7 @@ fn rename_dirty_file_pending_deletes() {
 
         assert!(hub.take_batch_log().is_empty());
 
-        vfs.release(fh).await;
+        vfs.release(fh).await.unwrap();
     });
 }
 
@@ -552,7 +555,7 @@ fn unlink_locally_created_file() {
             .unwrap();
         let ino = attr.ino;
         write_blocking(&vfs, ino, fh, 0, b"data").await.unwrap();
-        vfs.release(fh).await;
+        vfs.release(fh).await.unwrap();
 
         hub.take_batch_log(); // clear commit log
 
@@ -652,7 +655,7 @@ fn concurrent_create_eexist() {
             .unwrap();
         let result = vfs.create(ROOT_INODE, "race.txt", 0o644, 1000, 1000, Some(43)).await;
         assert_eq!(result.unwrap_err(), libc::EEXIST);
-        vfs.release(fh1).await;
+        vfs.release(fh1).await.unwrap();
     });
 }
 
@@ -811,7 +814,7 @@ fn write_streaming_nonsequential_einval() {
         let result = write_blocking(&vfs, attr.ino, fh, 10, b"data").await;
         assert_eq!(result.unwrap_err(), libc::EINVAL);
 
-        vfs.release(fh).await;
+        vfs.release(fh).await.unwrap();
     });
 }
 
@@ -831,7 +834,7 @@ fn write_readonly_handle_ebadf() {
         let result = write_blocking(&vfs, attr.ino, fh, 0, b"data").await;
         assert_eq!(result.unwrap_err(), libc::EBADF);
 
-        vfs.release(fh).await;
+        vfs.release(fh).await.unwrap();
     });
 }
 
@@ -850,7 +853,7 @@ fn read_streaming_handle_ebadf() {
         let result = vfs.read(fh, 0, 10).await;
         assert_eq!(result.unwrap_err(), libc::EBADF);
 
-        vfs.release(fh).await;
+        vfs.release(fh).await.unwrap();
     });
 }
 
@@ -888,7 +891,7 @@ fn read_remote_file_range() {
         assert_eq!(&data[..], content);
         assert!(eof);
 
-        vfs.release(fh).await;
+        vfs.release(fh).await.unwrap();
     });
 }
 
@@ -1031,7 +1034,7 @@ fn flush_manager_check_error_surfaces() {
         write_blocking(&vfs, ino, fh, 0, b"data").await.unwrap();
 
         xet.fail_upload();
-        vfs.release(fh).await;
+        vfs.release(fh).await.unwrap();
 
         // Wait for flush debounce (100ms in test config) + processing
         tokio::time::sleep(Duration::from_secs(3)).await;
@@ -1158,7 +1161,7 @@ fn flush_batch_ordering_adds_before_deletes() {
         assert!(matches!(ops.first().unwrap(), BatchOp::AddFile { .. }));
         assert!(matches!(ops.last().unwrap(), BatchOp::DeleteFile { .. }));
 
-        vfs.release(fh).await;
+        vfs.release(fh).await.unwrap();
     });
 }
 
@@ -1183,7 +1186,7 @@ fn create_and_write_advanced_mode() {
         let (data, _eof) = vfs.read(fh, 0, 100).await.unwrap();
         assert_eq!(&data[..], b"hello staging");
 
-        vfs.release(fh).await;
+        vfs.release(fh).await.unwrap();
 
         let inodes = vfs.inode_table.read().unwrap();
         let entry = inodes.get(ino).unwrap();
@@ -1452,7 +1455,7 @@ fn open_readonly_empty_file() {
         let (data, eof) = vfs.read(fh, 0, 100).await.unwrap();
         assert!(data.is_empty());
         assert!(eof);
-        vfs.release(fh).await;
+        vfs.release(fh).await.unwrap();
     });
 }
 
@@ -1471,13 +1474,13 @@ fn open_readonly_dirty_staging() {
         // Open for write + truncate to create staging file
         let wfh = vfs.open(ino, true, true, None).await.unwrap();
         write_blocking(&vfs, ino, wfh, 0, b"local content").await.unwrap();
-        vfs.release(wfh).await;
+        vfs.release(wfh).await.unwrap();
 
         // Now open read-only — should read from staging file
         let rfh = vfs.open(ino, false, false, None).await.unwrap();
         let (data, _) = vfs.read(rfh, 0, 100).await.unwrap();
         assert_eq!(&data[..], b"local content");
-        vfs.release(rfh).await;
+        vfs.release(rfh).await.unwrap();
     });
 }
 
@@ -1505,7 +1508,7 @@ fn open_readonly_http_download() {
         // (download_file_http is a no-op in MockHub), but the file will be empty.
         // The point is that the HTTP download path is exercised without error.
         let fh = vfs.open(attr.ino, false, false, None).await.unwrap();
-        vfs.release(fh).await;
+        vfs.release(fh).await.unwrap();
     });
 }
 
@@ -1555,7 +1558,7 @@ fn open_advanced_write_truncate() {
             assert_eq!(inodes.get(ino).unwrap().size, 0);
             assert!(inodes.get(ino).unwrap().dirty);
         }
-        vfs.release(fh).await;
+        vfs.release(fh).await.unwrap();
     });
 }
 
@@ -1574,13 +1577,13 @@ fn open_advanced_write_reuse_dirty_staging() {
         // First open: truncate + write
         let fh1 = vfs.open(ino, true, true, None).await.unwrap();
         write_blocking(&vfs, ino, fh1, 0, b"modified").await.unwrap();
-        vfs.release(fh1).await;
+        vfs.release(fh1).await.unwrap();
 
         // Second open without truncate: should reuse the existing staging file
         let fh2 = vfs.open(ino, true, false, None).await.unwrap();
         let (data, _) = vfs.read(fh2, 0, 100).await.unwrap();
         assert_eq!(&data[..], b"modified");
-        vfs.release(fh2).await;
+        vfs.release(fh2).await.unwrap();
     });
 }
 
@@ -1714,7 +1717,7 @@ fn read_sequential_xet_file() {
         let (data2, _) = vfs.read(fh, 4096, 4096).await.unwrap();
         assert_eq!(data2.len(), 4096);
 
-        vfs.release(fh).await;
+        vfs.release(fh).await.unwrap();
     });
 }
 
@@ -1735,7 +1738,7 @@ fn read_past_eof() {
         assert!(data.is_empty());
         assert!(eof);
 
-        vfs.release(fh).await;
+        vfs.release(fh).await.unwrap();
     });
 }
 
@@ -1762,7 +1765,7 @@ fn read_seek_backward() {
         assert_eq!(data2[0], 0);
         assert_eq!(data2.len(), 32);
 
-        vfs.release(fh).await;
+        vfs.release(fh).await.unwrap();
     });
 }
 
@@ -1787,7 +1790,7 @@ fn read_range_retry_on_error() {
         assert_eq!(data[0], 64);
         assert_eq!(data.len(), 32);
 
-        vfs.release(fh).await;
+        vfs.release(fh).await.unwrap();
     });
 }
 
@@ -1811,7 +1814,7 @@ fn read_range_retry_on_empty() {
         assert_eq!(data[0], 64);
         assert_eq!(data.len(), 32);
 
-        vfs.release(fh).await;
+        vfs.release(fh).await.unwrap();
     });
 }
 
@@ -1834,7 +1837,7 @@ fn read_range_all_retries_exhausted() {
         let result = vfs.read(fh, 64, 32).await;
         assert_eq!(result.unwrap_err(), libc::EIO);
 
-        vfs.release(fh).await;
+        vfs.release(fh).await.unwrap();
     });
 }
 
@@ -1863,7 +1866,7 @@ fn advanced_write_random_offset() {
         let (data, _) = vfs.read(fh, 0, 20).await.unwrap();
         assert_eq!(&data[..], b"01234ABC89");
 
-        vfs.release(fh).await;
+        vfs.release(fh).await.unwrap();
     });
 }
 
@@ -1893,7 +1896,7 @@ fn unlink_cleans_staging() {
         // Create a staging file by opening for write
         let fh = vfs.open(ino, true, true, None).await.unwrap();
         write_blocking(&vfs, ino, fh, 0, b"data").await.unwrap();
-        vfs.release(fh).await;
+        vfs.release(fh).await.unwrap();
 
         // Unlink — should also clean up staging
         vfs.unlink(ROOT_INODE, "file.txt").await.unwrap();
@@ -1974,7 +1977,7 @@ fn revalidation_skips_dirty_files() {
         // Make the file dirty via advanced write (truncate)
         let fh = vfs.open(ino, true, true, None).await.unwrap();
         write_blocking(&vfs, ino, fh, 0, b"local").await.unwrap();
-        vfs.release(fh).await;
+        vfs.release(fh).await.unwrap();
 
         // Change remote HEAD response
         hub.set_head(
@@ -2043,7 +2046,7 @@ fn negative_cache_cleared_on_create() {
         let found = vfs.lookup(ROOT_INODE, "new.txt").await.unwrap();
         assert_eq!(found.ino, attr.ino);
 
-        vfs.release(fh).await;
+        vfs.release(fh).await.unwrap();
     });
 }
 
@@ -2218,7 +2221,7 @@ fn read_no_short_read_at_buffer_boundary() {
         }
         assert_eq!(offset, file_size as u64);
 
-        vfs.release(fh).await;
+        vfs.release(fh).await.unwrap();
     });
 }
 
@@ -2237,7 +2240,7 @@ fn shutdown_flushes_dirty() {
             .await
             .unwrap();
         write_blocking(&vfs, attr.ino, fh, 0, b"unflushed data").await.unwrap();
-        vfs.release(fh).await;
+        vfs.release(fh).await.unwrap();
     });
 
     // File should be dirty
@@ -2319,7 +2322,7 @@ fn warm_cache_triggered_on_open_sequential_read() {
             elapsed_second.as_millis(),
         );
 
-        vfs.release(fh1).await;
+        vfs.release(fh1).await.unwrap();
 
         // ── open #2 ──────────────────────────────────────────────────
         // Each open() is an independent handle with its own warm task.
@@ -2334,6 +2337,6 @@ fn warm_cache_triggered_on_open_sequential_read() {
             "second open should trigger a second warm call"
         );
 
-        vfs.release(fh2).await;
+        vfs.release(fh2).await.unwrap();
     });
 }

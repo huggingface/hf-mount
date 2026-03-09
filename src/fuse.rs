@@ -260,8 +260,10 @@ impl Filesystem for FuseAdapter {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        self.runtime.block_on(self.virtual_fs.release(fh.0));
-        reply.ok();
+        match self.runtime.block_on(self.virtual_fs.release(fh.0)) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(Errno::from_i32(e)),
+        }
     }
 
     /// Create and open a new file in one call (O_CREAT).
@@ -534,16 +536,24 @@ pub fn mount_fuse(
         }
     };
 
-    // Catch SIGINT/SIGTERM and trigger a clean unmount instead of letting
-    // the default handler kill the process (which leaves a stale mount).
+    // Catch SIGINT/SIGTERM: flush all dirty data, then unmount.
+    // shutdown() MUST run before unmount so that pending writes are committed
+    // even if unmount_fuse() fails and falls through to process::exit().
+    let vfs_for_signal = virtual_fs.clone();
     let mp = mount_point.to_path_buf();
     runtime.spawn(async move {
         wait_for_signal().await;
-        info!("Received signal, unmounting...");
+        info!("Received signal, flushing dirty files before unmount...");
+        vfs_for_signal.shutdown();
+        info!("Flush complete, unmounting...");
         unmount_fuse(&mp);
     });
 
     let _ = bg.join();
+    // Safety net: flush again after FUSE session ends. Covers external unmount
+    // (e.g. `fusermount -u`) where our signal handler never fires. Idempotent
+    // because shutdown() takes handles from Mutex<Option<...>>.
+    virtual_fs.shutdown();
 }
 
 /// Wait for SIGINT or SIGTERM.
