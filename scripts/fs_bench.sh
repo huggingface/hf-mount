@@ -128,6 +128,11 @@ do_mount() {
   )
   [[ "${HF_NO_DISK_CACHE:-0}" == "1" ]] && mount_args+=(--no-disk-cache)
   [[ "${HF_ADVANCED_WRITES:-0}" == "1" ]] && mount_args+=(--advanced-writes)
+  # When running as root (sudo), set file ownership to the calling user
+  # so fio and other tools can access mounted files without permission issues.
+  if [[ "$(id -u)" == "0" && -n "${SUDO_UID:-}" ]]; then
+    mount_args+=(--uid "${SUDO_UID}" --gid "${SUDO_GID:-${SUDO_UID}}")
+  fi
   mount_args+=("$@")
   mount_args+=(bucket "${HF_BENCH_BUCKET}" "${_MOUNT_DIR}")
 
@@ -138,7 +143,7 @@ do_mount() {
       { echo "Mount ready after $((i*500))ms" >&2; return 0; }
     sleep 0.5
   done
-  echo "Warning: mount not ready after 15s" >&2
+  echo "ERROR: mount not ready after 15s" >&2; exit 1
 }
 
 do_unmount() {
@@ -154,6 +159,10 @@ do_unmount() {
   kill "${_CHILD_PID}" 2>/dev/null || true
   wait "${_CHILD_PID}" 2>/dev/null || true
   _CHILD_PID=""; _MOUNT_DIR=""
+}
+
+should_run_job() {
+  [[ -z "${HF_JOB_NAME_FILTER:-}" ]] || [[ "$1" == *"${HF_JOB_NAME_FILTER}"* ]]
 }
 
 # ── File setup (one-time) ─────────────────────────────────────────────────────
@@ -298,11 +307,16 @@ make_write_job() {
   local read_job="$1"
   local write_job
   write_job=$(mktemp /tmp/fio-write-XXXX.fio)
+  # create_on_open=1: skip the layout step (create+ftruncate) and create at open time,
+  # so fio opens with O_CREAT|O_TRUNC which streaming write mode supports.
+  # Remove numjobs so populate writes a single copy of each file.
   sed -e 's/rw=\(rand\)\?read/rw=write/' \
       -e '/^time_based/d' \
       -e '/^runtime=/d' \
       -e '/^direct=/d' \
+      -e '/^numjobs=/d' \
       "${read_job}" > "${write_job}"
+  echo "create_on_open=1" >> "${write_job}"
   echo "${write_job}"
 }
 
