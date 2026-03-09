@@ -166,7 +166,7 @@ impl PrefetchState {
         let avail = self.chunks_len - logical_off;
         let to_read = (size as usize).min(avail);
         let data = read_chunk_range(&self.chunks, self.chunks_front_offset, logical_off, to_read);
-        if self.forward_only {
+        if self.forward_only && to_read > 0 {
             let consumed = logical_off + to_read;
             self.drain_to_seek(consumed);
         }
@@ -174,8 +174,9 @@ impl PrefetchState {
     }
 
     /// Try to serve a read from the backward seek window.
+    /// Disabled in forward-only mode (no backward cache).
     pub(crate) fn try_serve_seek(&mut self, offset: u64, size: u32) -> Option<Bytes> {
-        if self.seek_data.is_empty() {
+        if self.forward_only || self.seek_data.is_empty() {
             return None;
         }
         let seek_end = self.seek_start + self.seek_data.len() as u64;
@@ -198,23 +199,24 @@ impl PrefetchState {
         }
         let to_move = consumed.min(self.chunks_len);
 
-        let seek_end = self.seek_start + self.seek_data.len() as u64;
-        let contiguous = self.seek_data.is_empty() || seek_end == self.buf_start;
+        // In forward-only mode, skip seek window population (just discard).
+        if !self.forward_only {
+            let seek_end = self.seek_start + self.seek_data.len() as u64;
+            let contiguous = self.seek_data.is_empty() || seek_end == self.buf_start;
 
-        if contiguous && to_move <= SEEK_WINDOW {
-            // Append consumed bytes, trim excess from front if needed
-            self.copy_chunks_to_seek(0, to_move);
-            if self.seek_data.len() > SEEK_WINDOW {
-                let excess = self.seek_data.len() - SEEK_WINDOW;
-                drop(self.seek_data.drain(..excess));
-                self.seek_start += excess as u64;
+            if contiguous && to_move <= SEEK_WINDOW {
+                self.copy_chunks_to_seek(0, to_move);
+                if self.seek_data.len() > SEEK_WINDOW {
+                    let excess = self.seek_data.len() - SEEK_WINDOW;
+                    drop(self.seek_data.drain(..excess));
+                    self.seek_start += excess as u64;
+                }
+            } else {
+                let keep = to_move.min(SEEK_WINDOW);
+                self.seek_data.clear();
+                self.seek_start = self.buf_start + (to_move - keep) as u64;
+                self.copy_chunks_to_seek(to_move - keep, keep);
             }
-        } else {
-            // Non-contiguous or overflow: reset and keep last SEEK_WINDOW bytes
-            let keep = to_move.min(SEEK_WINDOW);
-            self.seek_data.clear();
-            self.seek_start = self.buf_start + (to_move - keep) as u64;
-            self.copy_chunks_to_seek(to_move - keep, keep);
         }
 
         // Pop consumed chunks from front
