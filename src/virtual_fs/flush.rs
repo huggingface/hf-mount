@@ -184,15 +184,6 @@ async fn flush_batch(
                     debug!("flush: ino={} path={} not dirty, skipping", ino, entry.full_path);
                     return None;
                 }
-                // Guard against resurrecting deleted files: if nlink dropped to 0
-                // between enqueue and flush execution, skip the upload.
-                if entry.nlink == 0 {
-                    info!(
-                        "flush: ino={} path={} was unlinked since enqueue, skipping",
-                        ino, entry.full_path
-                    );
-                    return None;
-                }
                 let staging_path = staging_dir.path(ino);
                 if !staging_path.exists() {
                     let msg = format!("staging file missing for {}", entry.full_path);
