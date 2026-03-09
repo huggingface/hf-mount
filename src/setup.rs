@@ -82,6 +82,13 @@ pub struct Args {
     #[arg(long, default_value_t = false)]
     pub no_disk_cache: bool,
 
+    /// Bypass the kernel page cache (FOPEN_DIRECT_IO). Every read goes
+    /// through the FUSE handler instead of being served from cached pages.
+    /// Useful for benchmarking; not recommended for production (disables
+    /// efficient mmap caching).
+    #[arg(long, default_value_t = false)]
+    pub direct_io: bool,
+
     /// Kernel metadata cache TTL in milliseconds. Controls how long file
     /// attributes are trusted before re-checking via HEAD. Lower values
     /// give fresher metadata but increase latency on directory traversals
@@ -121,6 +128,7 @@ pub struct MountSetup {
     pub mount_point: PathBuf,
     pub read_only: bool,
     pub advanced_writes: bool,
+    pub direct_io: bool,
     pub metadata_ttl: std::time::Duration,
     pub max_threads: usize,
     pub metadata_ttl_ms: u64,
@@ -283,6 +291,7 @@ pub fn setup(is_nfs: bool) -> MountSetup {
         mount_point,
         read_only,
         advanced_writes,
+        direct_io: args.direct_io,
         metadata_ttl,
         max_threads: args.max_threads,
         metadata_ttl_ms: args.metadata_ttl_ms,

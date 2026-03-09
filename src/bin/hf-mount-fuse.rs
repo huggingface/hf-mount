@@ -12,6 +12,7 @@ fn main() {
         s.metadata_ttl,
         s.read_only,
         s.advanced_writes,
+        s.direct_io,
         s.max_threads,
         &s.runtime,
     );

@@ -24,6 +24,8 @@ pub struct FuseAdapter {
     metadata_ttl: Duration,
     read_only: bool,
     advanced_writes: bool,
+    /// FOPEN_DIRECT_IO flag on open/create, bypassing kernel page cache.
+    direct_io: bool,
 }
 
 impl FuseAdapter {
@@ -33,6 +35,7 @@ impl FuseAdapter {
         metadata_ttl: Duration,
         read_only: bool,
         advanced_writes: bool,
+        direct_io: bool,
     ) -> Self {
         Self {
             runtime,
@@ -40,6 +43,15 @@ impl FuseAdapter {
             metadata_ttl,
             read_only,
             advanced_writes,
+            direct_io,
+        }
+    }
+
+    fn open_flags(&self) -> FopenFlags {
+        if self.direct_io {
+            FopenFlags::FOPEN_DIRECT_IO
+        } else {
+            FopenFlags::empty()
         }
     }
 }
@@ -163,11 +175,7 @@ impl Filesystem for FuseAdapter {
             .block_on(self.virtual_fs.open(ino.0, writable, truncate, Some(req.pid())))
         {
             Ok(file_handle) => {
-                // No FOPEN_KEEP_CACHE: the kernel invalidates the page cache on
-                // each open(), ensuring fresh data from the remote. Remote changes
-                // are also proactively invalidated via notify_inval_inode in the
-                // poll loop.
-                reply.opened(FileHandle(file_handle), FopenFlags::empty());
+                reply.opened(FileHandle(file_handle), self.open_flags());
             }
             Err(e) => reply.error(Errno::from_i32(e)),
         }
@@ -263,7 +271,7 @@ impl Filesystem for FuseAdapter {
                     &vfs_attr_to_fuse(&attr),
                     GENERATION,
                     FileHandle(file_handle),
-                    FopenFlags::empty(),
+                    self.open_flags(),
                 );
             }
             Err(e) => reply.error(Errno::from_i32(e)),
@@ -437,12 +445,14 @@ impl Filesystem for FuseAdapter {
 }
 
 /// Mount the VFS as a FUSE filesystem and block until unmount.
+#[allow(clippy::too_many_arguments)]
 pub fn mount_fuse(
     virtual_fs: Arc<VirtualFs>,
     mount_point: &Path,
     metadata_ttl: Duration,
     read_only: bool,
     advanced_writes: bool,
+    direct_io: bool,
     max_threads: usize,
     runtime: &tokio::runtime::Runtime,
 ) {
@@ -452,6 +462,7 @@ pub fn mount_fuse(
         metadata_ttl,
         read_only,
         advanced_writes,
+        direct_io,
     );
 
     let mut config = fuser::Config::default();
