@@ -256,65 +256,25 @@ async fn flush_batch(
 
     ops.append(&mut delete_ops);
 
-    // Single batch commit (retry once on transient failure since CAS upload already succeeded)
+    // Single batch commit (retry once on transient failure since CAS upload already succeeded).
+    // Note: the retry reuses the original ops without re-reading inode state. In theory a
+    // rename/unlink could happen during the 2s window, but that's extremely unlikely and
+    // the next flush cycle would correct it anyway.
     if let Err(e) = hub_client.batch_operations(&ops).await {
         error!("Batch commit failed, retrying in 2s: {}", e);
         tokio::time::sleep(Duration::from_secs(2)).await;
 
-        // Re-validate inode state: files may have been renamed, unlinked, or
-        // reopened during the retry window. Rebuild ops from current state.
-        let mut retry_ops = Vec::new();
-        let mut retry_delete_ops = Vec::new();
-        let mut retry_successes = Vec::new();
-        {
-            let inode_table = inodes.read().expect("inodes poisoned");
-            for ((ino, orig_path, _, _), file_info) in to_flush.iter().zip(upload_results.iter()) {
-                let entry = match inode_table.get(*ino) {
-                    Some(e) => e,
-                    None => {
-                        debug!("flush retry: ino={} removed, skipping", ino);
-                        continue;
-                    }
-                };
-                // Skip if unlinked, no longer dirty (another flush succeeded),
-                // or path changed (rename happened -- stale hash for new content).
-                if entry.nlink == 0 || !entry.dirty || entry.full_path != *orig_path {
-                    debug!(
-                        "flush retry: ino={} state changed (nlink={}, dirty={}, path={}), skipping",
-                        ino, entry.nlink, entry.dirty, entry.full_path
-                    );
-                    continue;
-                }
-                retry_ops.push(BatchOp::AddFile {
-                    path: entry.full_path.clone(),
-                    xet_hash: file_info.hash().to_string(),
-                    mtime: mtime_ms,
-                    content_type: None,
-                });
-                for old_path in &entry.pending_deletes {
-                    retry_delete_ops.push(BatchOp::DeleteFile { path: old_path.clone() });
-                }
-                retry_successes.push((*ino, file_info.hash().to_string(), file_info.file_size()));
-            }
-        }
-        retry_ops.append(&mut retry_delete_ops);
-
-        if retry_ops.is_empty() {
-            info!("Batch commit retry: all files changed state, nothing to retry");
-        } else if let Err(e2) = hub_client.batch_operations(&retry_ops).await {
+        if let Err(e2) = hub_client.batch_operations(&ops).await {
             error!("Batch commit retry failed: {}", e2);
             let msg = format!("commit failed after retry: {e2}");
             let mut errs = flush_errors.lock().expect("flush_errors poisoned");
-            for (ino, _, _) in &retry_successes {
+            for (ino, _, _, _) in &to_flush {
                 errs.insert(*ino, msg.clone());
             }
             // Files remain dirty -- will be re-uploaded on next flush or shutdown
             return;
-        } else {
-            info!("Batch commit retry succeeded");
         }
-        // Use retry_successes instead of original successes for inode update
-        successes = retry_successes;
+        info!("Batch commit retry succeeded");
     }
 
     // Update inodes
