@@ -12,10 +12,12 @@ use tracing::{debug, error, info, warn};
 
 use crate::hub_api::{BatchOp, HubOps};
 
+mod flush;
 pub mod inode;
-use crate::prefetch::{FetchPlan, PrefetchState};
+mod prefetch;
 use crate::xet::{StagingDir, StreamingWriterOps, XetOps};
 use inode::{InodeEntry, InodeKind, InodeTable};
+use prefetch::{FetchPlan, PrefetchState};
 
 // ── Constants ──────────────────────────────────────────────────────────
 
@@ -62,7 +64,7 @@ pub struct VirtualFs {
     /// open() awaits it instead of blindly blocking on staging_lock.
     pending_commits: Mutex<HashMap<u64, CommitHookRx>>,
     /// Debounced batch flush pipeline (None when read_only).
-    flush_manager: Option<crate::flush::FlushManager>,
+    flush_manager: Option<flush::FlushManager>,
     /// Background poll task handle, taken in shutdown().
     poll_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Kernel cache invalidation callback. Set via `set_invalidator()` after mount.
@@ -109,7 +111,7 @@ impl VirtualFs {
             let sd = staging_dir
                 .as_ref()
                 .expect("--advanced-writes requires a staging directory");
-            Some(crate::flush::FlushManager::new(
+            Some(flush::FlushManager::new(
                 xet_sessions.clone(),
                 sd.clone(),
                 hub_client.clone(),

@@ -7,8 +7,9 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info};
 
 use crate::hub_api::{BatchOp, HubOps};
-use crate::virtual_fs::inode::InodeTable;
 use crate::xet::{StagingDir, XetOps};
+
+use super::inode::InodeTable;
 
 type FlushRequest = u64;
 
