@@ -1581,10 +1581,13 @@ impl VirtualFs {
                     let written = n as u32;
                     let new_end = offset + written as u64;
                     let mut inodes = self.inode_table.write().expect("inodes poisoned");
-                    if let Some(entry) = inodes.get_mut(handle_ino)
-                        && new_end > entry.size
-                    {
-                        entry.size = new_end;
+                    if let Some(entry) = inodes.get_mut(handle_ino) {
+                        if new_end > entry.size {
+                            entry.size = new_end;
+                        }
+                        if entry.sparse {
+                            entry.sparse = false;
+                        }
                     }
                     Ok(written)
                 }
@@ -1620,6 +1623,9 @@ impl VirtualFs {
                 let mut inodes = self.inode_table.write().expect("inodes poisoned");
                 if let Some(entry) = inodes.get_mut(handle_ino) {
                     entry.size = new_size;
+                    if entry.sparse {
+                        entry.sparse = false;
+                    }
                 }
 
                 Ok(len as u32)
