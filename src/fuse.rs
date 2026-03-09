@@ -563,13 +563,15 @@ pub fn mount_fuse(
     virtual_fs.shutdown();
 }
 
-/// Wait for SIGINT or SIGTERM.
+/// Wait for SIGINT, SIGTERM, or SIGHUP.
 async fn wait_for_signal() {
     use tokio::signal::unix::{SignalKind, signal};
     let mut sigterm = signal(SignalKind::terminate()).expect("Failed to register SIGTERM handler");
+    let mut sighup = signal(SignalKind::hangup()).expect("Failed to register SIGHUP handler");
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {}
         _ = sigterm.recv() => {}
+        _ = sighup.recv() => {}
     }
 }
 
