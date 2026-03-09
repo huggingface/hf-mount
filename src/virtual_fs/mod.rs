@@ -1619,10 +1619,12 @@ impl VirtualFs {
                 })?;
                 channel.bytes_written.fetch_add(len as u64, Ordering::Relaxed);
 
-                let new_size = offset + len as u64;
+                let new_end = offset + len as u64;
                 let mut inodes = self.inode_table.write().expect("inodes poisoned");
                 if let Some(entry) = inodes.get_mut(handle_ino) {
-                    entry.size = new_size;
+                    if new_end > entry.size {
+                        entry.size = new_end;
+                    }
                     if entry.sparse {
                         entry.sparse = false;
                     }
