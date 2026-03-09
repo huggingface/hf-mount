@@ -214,17 +214,6 @@ async fn flush_batch(
         return;
     }
 
-    // fdatasync staging files. This only guards against kernel/machine crash
-    // between pwrite() and upload — the page cache is coherent within the same
-    // host, so a process crash alone won't cause stale reads by upload_files().
-    for (ino, path, staging_path, _) in &to_flush {
-        if let Ok(file) = std::fs::File::open(staging_path) {
-            if let Err(e) = file.sync_data() {
-                error!("flush: fdatasync failed for ino={} path={}: {}", ino, path, e);
-            }
-        }
-    }
-
     // Upload all files through a single upload session
     let staging_paths: Vec<&std::path::Path> = to_flush.iter().map(|(_, _, p, _)| p.as_path()).collect();
     let upload_results = match xet_sessions.upload_files(&staging_paths).await {
