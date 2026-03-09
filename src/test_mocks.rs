@@ -459,6 +459,7 @@ pub fn make_test_vfs(
         opts.metadata_ttl,
         opts.serve_lookup_from_cache,
         true,                       // filter_os_files
+        false,                      // direct_io
         Duration::from_millis(100), // fast debounce for tests
         Duration::from_secs(1),     // fast batch window for tests
     )

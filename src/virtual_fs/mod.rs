@@ -78,6 +78,8 @@ pub struct VirtualFs {
     serve_lookup_from_cache: bool,
     /// When true, reject creation of OS junk files (.DS_Store, Thumbs.db, etc.).
     filter_os_files: bool,
+    /// When true, prefetch buffers drain after serving (forward-only, no re-read cache).
+    direct_io: bool,
 }
 
 /// Where to read file content from when opening read-only.
@@ -96,6 +98,7 @@ impl VirtualFs {
         metadata_ttl: Duration,
         serve_lookup_from_cache: bool,
         filter_os_files: bool,
+        direct_io: bool,
         flush_debounce: Duration,
         flush_max_batch_window: Duration,
     ) -> Arc<Self> {
@@ -160,6 +163,7 @@ impl VirtualFs {
             metadata_ttl,
             serve_lookup_from_cache,
             filter_os_files,
+            direct_io,
         });
 
         // Set root inode mtime and ownership (repos use the last commit date).
@@ -1260,7 +1264,11 @@ impl VirtualFs {
         } else {
             None
         };
-        let prefetch = Arc::new(tokio::sync::Mutex::new(PrefetchState::new(xet_hash, size)));
+        let prefetch = Arc::new(tokio::sync::Mutex::new(PrefetchState::new(
+            xet_hash,
+            size,
+            self.direct_io,
+        )));
         let file_handle = self.alloc_file_handle();
         self.open_files
             .write()

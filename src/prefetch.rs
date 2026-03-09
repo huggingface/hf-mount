@@ -68,10 +68,12 @@ pub(crate) struct PrefetchState {
     pub(crate) window_size: u64,
     // Full-file stream for sequential reads (reuses one FileReconstructor)
     pub(crate) stream: Option<Box<dyn DownloadStreamOps>>,
+    /// When true, drain consumed bytes after serving (no re-read from buffer).
+    forward_only: bool,
 }
 
 impl PrefetchState {
-    pub(crate) fn new(xet_hash: String, file_size: u64) -> Self {
+    pub(crate) fn new(xet_hash: String, file_size: u64, forward_only: bool) -> Self {
         Self {
             xet_hash,
             file_size,
@@ -83,6 +85,7 @@ impl PrefetchState {
             seek_start: 0,
             window_size: INITIAL_WINDOW,
             stream: None,
+            forward_only,
         }
     }
 
@@ -150,7 +153,8 @@ impl PrefetchState {
 
     /// Try to serve a read from the forward buffer.
     /// Returns a zero-copy `Bytes` slice when the read fits in one chunk.
-    pub(crate) fn try_serve_forward(&self, offset: u64, size: u32) -> Option<Bytes> {
+    /// In forward-only mode, drains consumed bytes so re-reads must refetch.
+    pub(crate) fn try_serve_forward(&mut self, offset: u64, size: u32) -> Option<Bytes> {
         if self.chunks_len == 0 {
             return None;
         }
@@ -161,12 +165,12 @@ impl PrefetchState {
         let logical_off = (offset - self.buf_start) as usize;
         let avail = self.chunks_len - logical_off;
         let to_read = (size as usize).min(avail);
-        Some(read_chunk_range(
-            &self.chunks,
-            self.chunks_front_offset,
-            logical_off,
-            to_read,
-        ))
+        let data = read_chunk_range(&self.chunks, self.chunks_front_offset, logical_off, to_read);
+        if self.forward_only {
+            let consumed = logical_off + to_read;
+            self.drain_to_seek(consumed);
+        }
+        Some(data)
     }
 
     /// Try to serve a read from the backward seek window.
@@ -277,7 +281,7 @@ mod tests {
 
     /// Helper: create a PrefetchState pre-loaded with chunks at a given offset.
     fn ps_with_chunks(buf_start: u64, chunks: &[&[u8]]) -> PrefetchState {
-        let mut ps = PrefetchState::new("hash".into(), u64::MAX);
+        let mut ps = PrefetchState::new("hash".into(), u64::MAX, false);
         ps.buf_start = buf_start;
         for chunk in chunks {
             let b = Bytes::copy_from_slice(chunk);
@@ -292,7 +296,7 @@ mod tests {
     #[test]
     fn forward_single_chunk_zero_copy() {
         // Read [1..4) from a single chunk — should be a Bytes::slice(), no memcpy.
-        let ps = ps_with_chunks(0, &[&[10, 20, 30, 40, 50]]);
+        let mut ps = ps_with_chunks(0, &[&[10, 20, 30, 40, 50]]);
         let result = ps.try_serve_forward(1, 3).unwrap();
         assert_eq!(&result[..], &[20, 30, 40]);
     }
@@ -301,7 +305,7 @@ mod tests {
     fn forward_spans_two_chunks() {
         // Read crosses chunk boundary: last byte of chunk 0 + first 2 of chunk 1.
         // This path allocates a BytesMut and copies from both chunks.
-        let ps = ps_with_chunks(0, &[&[1, 2, 3], &[4, 5, 6]]);
+        let mut ps = ps_with_chunks(0, &[&[1, 2, 3], &[4, 5, 6]]);
         let result = ps.try_serve_forward(2, 3).unwrap();
         assert_eq!(&result[..], &[3, 4, 5]);
     }
@@ -320,7 +324,7 @@ mod tests {
     #[test]
     fn forward_out_of_range() {
         // Reads before or after the buffer should return None.
-        let ps = ps_with_chunks(100, &[&[1, 2, 3]]);
+        let mut ps = ps_with_chunks(100, &[&[1, 2, 3]]);
         assert!(ps.try_serve_forward(99, 1).is_none()); // before
         assert!(ps.try_serve_forward(103, 1).is_none()); // after
     }
@@ -328,7 +332,7 @@ mod tests {
     #[test]
     fn forward_clamps_to_available() {
         // Requesting more bytes than available should clamp to what's left.
-        let ps = ps_with_chunks(0, &[&[1, 2, 3]]);
+        let mut ps = ps_with_chunks(0, &[&[1, 2, 3]]);
         let result = ps.try_serve_forward(1, 100).unwrap();
         assert_eq!(&result[..], &[2, 3]);
     }
@@ -338,7 +342,7 @@ mod tests {
     #[test]
     fn seek_window_basic() {
         // Backward seek window serves previously consumed bytes.
-        let mut ps = PrefetchState::new("hash".into(), u64::MAX);
+        let mut ps = PrefetchState::new("hash".into(), u64::MAX, false);
         ps.seek_data.extend(&[10, 20, 30, 40, 50]);
         ps.seek_start = 100;
         let result = ps.try_serve_seek(102, 2).unwrap();
@@ -347,7 +351,7 @@ mod tests {
 
     #[test]
     fn seek_window_out_of_range() {
-        let mut ps = PrefetchState::new("hash".into(), u64::MAX);
+        let mut ps = PrefetchState::new("hash".into(), u64::MAX, false);
         ps.seek_data.extend(&[1, 2, 3]);
         ps.seek_start = 100;
         assert!(ps.try_serve_seek(99, 1).is_none());
@@ -407,7 +411,7 @@ mod tests {
 
     #[test]
     fn empty_buffer() {
-        let ps = PrefetchState::new("hash".into(), 100);
+        let mut ps = PrefetchState::new("hash".into(), 100, false);
         assert!(ps.try_serve_forward(0, 10).is_none());
     }
 
@@ -416,7 +420,7 @@ mod tests {
     #[test]
     fn forward_zero_size() {
         // A zero-size read at a valid offset should return Some(empty).
-        let ps = ps_with_chunks(0, &[&[1, 2, 3]]);
+        let mut ps = ps_with_chunks(0, &[&[1, 2, 3]]);
         let result = ps.try_serve_forward(0, 0).unwrap();
         assert!(result.is_empty());
     }
@@ -424,7 +428,7 @@ mod tests {
     #[test]
     fn seek_zero_size() {
         // A zero-size seek read at a valid offset should return Some(empty).
-        let mut ps = PrefetchState::new("hash".into(), u64::MAX);
+        let mut ps = PrefetchState::new("hash".into(), u64::MAX, false);
         ps.seek_data.extend(&[1, 2, 3]);
         ps.seek_start = 0;
         let result = ps.try_serve_seek(0, 0).unwrap();
@@ -480,5 +484,40 @@ mod tests {
         assert!(ps.chunks.is_empty());
         let seek: Vec<u8> = ps.seek_data.iter().copied().collect();
         assert_eq!(seek, vec![1, 2, 3]);
+    }
+
+    // ── Forward-only mode tests ─────────────────────────────────────
+
+    fn ps_forward_only(buf_start: u64, chunks: &[&[u8]]) -> PrefetchState {
+        let mut ps = PrefetchState::new("hash".into(), u64::MAX, true);
+        ps.buf_start = buf_start;
+        for chunk in chunks {
+            let b = Bytes::copy_from_slice(chunk);
+            ps.chunks_len += b.len();
+            ps.chunks.push_back(b);
+        }
+        ps
+    }
+
+    #[test]
+    fn forward_only_reread_misses() {
+        let mut ps = ps_forward_only(0, &[&[1, 2, 3, 4, 5]]);
+        let result = ps.try_serve_forward(0, 3).unwrap();
+        assert_eq!(&result[..], &[1, 2, 3]);
+        // Re-read at same offset misses (data was drained)
+        assert!(ps.try_serve_forward(0, 3).is_none());
+        // Remaining data still available
+        let result = ps.try_serve_forward(3, 2).unwrap();
+        assert_eq!(&result[..], &[4, 5]);
+    }
+
+    #[test]
+    fn non_forward_only_reread_hits() {
+        let mut ps = ps_with_chunks(0, &[&[1, 2, 3, 4, 5]]);
+        let result = ps.try_serve_forward(0, 3).unwrap();
+        assert_eq!(&result[..], &[1, 2, 3]);
+        // Re-read at same offset hits (data retained)
+        let result = ps.try_serve_forward(0, 3).unwrap();
+        assert_eq!(&result[..], &[1, 2, 3]);
     }
 }
