@@ -1128,7 +1128,6 @@ impl VirtualFs {
             entry.dirty = true;
             if truncate {
                 entry.size = 0;
-                entry.sparse = false;
                 // POSIX: O_TRUNC must update mtime and ctime
                 let now = SystemTime::now();
                 entry.mtime = now;
@@ -1165,8 +1164,6 @@ impl VirtualFs {
                 size: entry.size,
                 mtime: entry.mtime,
                 pending_deletes: entry.pending_deletes.clone(),
-                dirty: entry.dirty,
-                sparse: entry.sparse,
                 existed_before: true,
             }
         };
@@ -1179,7 +1176,6 @@ impl VirtualFs {
             let entry = inodes.get_mut(ino).ok_or(libc::ENOENT)?;
             entry.dirty = true;
             entry.size = 0;
-            entry.sparse = false;
             entry.xet_hash = None;
         }
 
@@ -1192,11 +1188,6 @@ impl VirtualFs {
 
     /// Open a file for reading. Dispatches based on where the content lives.
     async fn open_readonly(&self, ino: u64, fe: FileEntry, staging_path: Option<PathBuf>) -> VirtualFsResult<u64> {
-        // Sparse pre-allocated file (ftruncate on empty): reads return zeros.
-        if fe.sparse {
-            return self.open_lazy(String::new(), fe.size);
-        }
-
         match (fe.dirty, &staging_path) {
             // Advanced write in progress — read from local staging file.
             (true, Some(path)) if path.exists() => self.open_local_readonly(ino, path),
@@ -1583,13 +1574,10 @@ impl VirtualFs {
                     let written = n as u32;
                     let new_end = offset + written as u64;
                     let mut inodes = self.inode_table.write().expect("inodes poisoned");
-                    if let Some(entry) = inodes.get_mut(handle_ino) {
-                        if new_end > entry.size {
-                            entry.size = new_end;
-                        }
-                        if entry.sparse {
-                            entry.sparse = false;
-                        }
+                    if let Some(entry) = inodes.get_mut(handle_ino)
+                        && new_end > entry.size
+                    {
+                        entry.size = new_end;
                     }
                     Ok(written)
                 }
@@ -1621,15 +1609,10 @@ impl VirtualFs {
                 })?;
                 channel.bytes_written.fetch_add(len as u64, Ordering::Relaxed);
 
-                let new_end = offset + len as u64;
+                let new_size = offset + len as u64;
                 let mut inodes = self.inode_table.write().expect("inodes poisoned");
                 if let Some(entry) = inodes.get_mut(handle_ino) {
-                    if new_end > entry.size {
-                        entry.size = new_end;
-                    }
-                    if entry.sparse {
-                        entry.sparse = false;
-                    }
+                    entry.size = new_size;
                 }
 
                 Ok(len as u32)
@@ -1744,27 +1727,13 @@ impl VirtualFs {
                     .read()
                     .expect("inodes poisoned")
                     .get(ino)
-                    .is_some_and(|e| e.nlink > 0 && !e.sparse);
+                    .is_some_and(|e| e.nlink > 0);
                 if should_flush && let Some(fm) = &self.flush_manager {
                     fm.enqueue(ino);
                 }
             }
             Some(OpenFile::Streaming { ino, channel }) => {
-                // Sparse pre-allocation with no actual writes: skip commit to
-                // preserve the ftruncate size. No data was written to the stream.
-                let is_sparse_noop = channel.bytes_written.load(Ordering::Relaxed) == 0
-                    && self
-                        .inode_table
-                        .read()
-                        .expect("inodes poisoned")
-                        .get(ino)
-                        .is_some_and(|e| e.sparse);
-                if is_sparse_noop {
-                    *channel.state.lock().unwrap() = CommitState::Committed;
-                    self.fulfill_commit_hook(ino, &channel, Ok(()));
-                }
-
-                let needs_commit = !is_sparse_noop && {
+                let needs_commit = {
                     let state = channel.state.lock().unwrap();
                     matches!(&*state, CommitState::Writing | CommitState::Deferred)
                 };
@@ -1833,8 +1802,7 @@ impl VirtualFs {
             entry.size = snapshot.size;
             entry.mtime = snapshot.mtime;
             entry.pending_deletes = snapshot.pending_deletes.clone();
-            entry.dirty = snapshot.dirty;
-            entry.sparse = snapshot.sparse;
+            entry.dirty = false;
             info!(
                 "Reverted ino={}: restored (hash={:?}, size={})",
                 ino, snapshot.xet_hash, snapshot.size
@@ -1922,7 +1890,6 @@ impl VirtualFs {
             entry.xet_hash = Some(file_info.hash().to_string());
             entry.size = file_info.file_size();
             entry.dirty = false;
-            entry.sparse = false;
             let now = SystemTime::now();
             entry.mtime = now;
             entry.ctime = now;
@@ -2038,8 +2005,6 @@ impl VirtualFs {
                 size: 0,
                 mtime: now,
                 pending_deletes: Vec::new(),
-                dirty: false,
-                sparse: false,
                 existed_before: false,
             };
             let (file_handle, channel) = match self.setup_streaming_writer(ino, pid, snapshot).await {
@@ -2644,36 +2609,9 @@ impl VirtualFs {
                 }
             }
 
-            // Sparse pre-allocation: ftruncate on an empty/sparse file just updates
-            // the reported size without writing data. Reads return zeros.
-            // This handles fio --create_only=1 which calls ftruncate(fd, 100G) to
-            // pre-allocate files before the actual benchmark run.
-            // Note: sparse is local-only metadata, not persisted remotely. If real
-            // data is written later, open_streaming_write/open_advanced_write clears
-            // the flag, and streaming_commit also clears it after upload.
-            let is_sparse_prealloc = {
-                let inodes = self.inode_table.read().expect("inodes poisoned");
-                let entry = inodes.get(ino).ok_or(libc::ENOENT)?;
-                new_size > 0
-                    && !self.advanced_writes
-                    && (entry.size == 0 || entry.sparse)
-                    && entry.xet_hash.as_deref().unwrap_or_default().is_empty()
-            };
-
-            if is_sparse_prealloc {
-                let mut inodes = self.inode_table.write().expect("inodes poisoned");
-                if let Some(entry) = inodes.get_mut(ino) {
-                    entry.size = new_size;
-                    entry.sparse = true;
-                    entry.dirty = true;
-                    let now = SystemTime::now();
-                    entry.mtime = now;
-                    entry.ctime = now;
-                }
-            } else if !self.advanced_writes {
-                // Simple mode: truncation is not supported via setattr.
-                // O_TRUNC opens go through open() directly (FUSE_ATOMIC_O_TRUNC).
-                return Err(libc::EPERM);
+            if !self.advanced_writes {
+                // Simple mode: ftruncate via setattr is silently ignored (like mountpoint-s3).
+                // Real truncation goes through open(O_TRUNC) which is handled separately.
             } else {
                 // Advanced mode: truncation is applied to the staging file on disk
                 let staging_mutex = self.staging_lock(ino);
@@ -2728,7 +2666,6 @@ impl VirtualFs {
                     entry.mtime = SystemTime::now();
                     entry.ctime = entry.mtime;
                     entry.dirty = true;
-                    entry.sparse = false;
                     if new_size == 0 {
                         entry.xet_hash = None;
                     }
@@ -2783,7 +2720,6 @@ impl VirtualFs {
             xet_hash: entry.xet_hash.clone().unwrap_or_default(),
             size: entry.size,
             dirty: entry.dirty,
-            sparse: entry.sparse,
             full_path: entry.full_path.clone(),
         })
     }
@@ -2835,7 +2771,6 @@ struct FileEntry {
     xet_hash: String,
     size: u64,
     dirty: bool,
-    sparse: bool,
     full_path: String,
 }
 
@@ -2853,8 +2788,6 @@ struct InodeSnapshot {
     size: u64,
     mtime: SystemTime,
     pending_deletes: Vec<String>,
-    dirty: bool,
-    sparse: bool,
     /// false for create() (new file), true for open(O_TRUNC) (overwrite).
     existed_before: bool,
 }

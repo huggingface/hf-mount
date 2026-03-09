@@ -924,9 +924,9 @@ fn open_simple_no_truncate_eperm() {
     });
 }
 
-/// setattr(size) in simple mode returns EPERM (truncation not supported).
+/// setattr(size) in simple mode is a silent noop (size unchanged).
 #[test]
-fn setattr_simple_mode_eperm() {
+fn setattr_simple_mode_noop() {
     let hub = MockHub::new();
     hub.add_file("file.txt", 100, Some("hash1"), None);
     let xet = MockXet::new();
@@ -935,92 +935,31 @@ fn setattr_simple_mode_eperm() {
     rt.block_on(async {
         let attr = vfs.lookup(ROOT_INODE, "file.txt").await.unwrap();
         let result = vfs.setattr(attr.ino, Some(50), None, None, None, None, None).await;
-        assert_eq!(result.unwrap_err(), libc::EPERM);
+        assert!(result.is_ok(), "ftruncate should succeed (noop)");
+        let inodes = vfs.inode_table.read().unwrap();
+        let entry = inodes.get(attr.ino).unwrap();
+        assert_eq!(entry.size, 100, "size should be unchanged (noop)");
     });
 }
 
-/// setattr(size) on a new empty file in simple mode is a sparse pre-allocation.
+/// setattr(size) on an empty file in simple mode is a silent noop (like mountpoint-s3).
 #[test]
-fn setattr_simple_mode_empty_file_sparse() {
+fn setattr_simple_mode_empty_file_noop() {
     let hub = MockHub::new();
     let xet = MockXet::new();
     let (rt, vfs) = vfs_simple(&hub, &xet);
 
     rt.block_on(async {
-        // Create a new empty file (size == 0 in streaming mode)
         let (attr, _fh) = vfs
             .create(ROOT_INODE, "new.txt", 0o644, 1000, 1000, Some(1))
             .await
             .unwrap();
-        // ftruncate(fd, N) on an empty file should succeed as sparse pre-allocation
+        // ftruncate(fd, N) in simple mode succeeds but is a noop
         let result = vfs.setattr(attr.ino, Some(100), None, None, None, None, None).await;
-        assert!(result.is_ok(), "ftruncate on empty file should succeed: {:?}", result);
+        assert!(result.is_ok(), "ftruncate should succeed (noop): {:?}", result);
         let inodes = vfs.inode_table.read().unwrap();
         let entry = inodes.get(attr.ino).unwrap();
-        assert_eq!(entry.size, 100, "inode size should reflect ftruncate size");
-        assert!(entry.sparse, "file should be marked as sparse");
-        assert!(entry.dirty, "sparse file should be dirty to prevent poll clobbering");
-    });
-}
-
-/// Reading a sparse file returns zeros.
-#[test]
-fn sparse_file_read_returns_zeros() {
-    let hub = MockHub::new();
-    let xet = MockXet::new();
-    let (rt, vfs) = vfs_simple(&hub, &xet);
-
-    rt.block_on(async {
-        let (attr, fh) = vfs
-            .create(ROOT_INODE, "big.bin", 0o644, 1000, 1000, Some(1))
-            .await
-            .unwrap();
-        // Pre-allocate 1 MiB via ftruncate
-        vfs.setattr(attr.ino, Some(1 << 20), None, None, None, None, None)
-            .await
-            .unwrap();
-        // Close the write handle, open for reading
-        vfs.release(fh).await;
-        let rfh = vfs.open(attr.ino, false, false, Some(1)).await.unwrap();
-        // Read at offset 0
-        let (data, eof) = vfs.read(rfh, 0, 4096).await.unwrap();
-        assert_eq!(data.len(), 4096);
-        assert!(data.iter().all(|&b| b == 0), "sparse read should return zeros");
-        assert!(!eof);
-        // Read near end (past EOF boundary)
-        let (data, eof) = vfs.read(rfh, (1 << 20) - 10, 4096).await.unwrap();
-        assert_eq!(data.len(), 10, "should be capped at file size");
-        assert!(eof);
-        assert!(data.iter().all(|&b| b == 0));
-    });
-}
-
-/// Sparse flag is cleared when the file is re-opened with O_TRUNC for real writes.
-#[test]
-fn sparse_cleared_on_truncate_write() {
-    let hub = MockHub::new();
-    let xet = MockXet::new();
-    let (rt, vfs) = vfs_simple(&hub, &xet);
-
-    rt.block_on(async {
-        let (attr, fh) = vfs
-            .create(ROOT_INODE, "f.bin", 0o644, 1000, 1000, Some(1))
-            .await
-            .unwrap();
-        // Pre-allocate
-        vfs.setattr(attr.ino, Some(1000), None, None, None, None, None)
-            .await
-            .unwrap();
-        vfs.release(fh).await;
-
-        // Re-open with O_TRUNC for real writes
-        let wfh = vfs.open(attr.ino, true, true, Some(1)).await.unwrap();
-        let inodes = vfs.inode_table.read().unwrap();
-        let entry = inodes.get(attr.ino).unwrap();
-        assert!(!entry.sparse, "sparse should be cleared on O_TRUNC open");
-        assert_eq!(entry.size, 0, "size should be 0 after truncate");
-        drop(inodes);
-        vfs.release(wfh).await;
+        assert_eq!(entry.size, 0, "size should be unchanged (noop)");
     });
 }
 

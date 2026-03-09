@@ -51,10 +51,6 @@ pub struct InodeEntry {
     pub children: Vec<DirChild>,
     /// Old remote paths that should be deleted on next flush (set by rename of dirty files).
     pub pending_deletes: Vec<String>,
-    /// Sparse pre-allocation: file reports `size` bytes but has no backing data.
-    /// Set by ftruncate on empty files (e.g. `fio --create_only`). Reads return zeros.
-    /// Cleared when the file is opened for real writes (O_TRUNC).
-    pub sparse: bool,
     /// When this inode's metadata was last validated against the remote (via HEAD).
     /// Used to avoid redundant HEAD requests within the revalidation TTL.
     pub last_revalidated: Option<Instant>,
@@ -102,7 +98,6 @@ impl InodeTable {
             children_loaded: false,
             children: Vec::new(),
             pending_deletes: Vec::new(),
-            sparse: false,
             last_revalidated: None,
         };
         table.inodes.insert(ROOT_INODE, root);
@@ -202,7 +197,6 @@ impl InodeTable {
             children_loaded: kind != InodeKind::Directory, // only dirs have children to load
             children: Vec::new(),
             pending_deletes: Vec::new(),
-            sparse: false,
             last_revalidated: Some(Instant::now()),
         };
 
