@@ -214,7 +214,7 @@ pub fn build(source: Source, options: MountOptions, is_nfs: bool) -> MountSetup 
 
     let (mount_point, source_kind, path_prefix) = match source {
         Source::Bucket { bucket_id, mount_point } => {
-            let (id, prefix) = split_path_prefix(&bucket_id, 2);
+            let (id, prefix) = split_path_prefix(&bucket_id);
             (
                 mount_point,
                 SourceKind::Bucket {
@@ -229,7 +229,7 @@ pub fn build(source: Source, options: MountOptions, is_nfs: bool) -> MountSetup 
             revision,
         } => {
             let (repo_type, rest) = parse_repo_id(&repo_id);
-            let (id, prefix) = split_path_prefix(&rest, 2);
+            let (id, prefix) = split_path_prefix(&rest);
             (
                 mount_point,
                 SourceKind::Repo {

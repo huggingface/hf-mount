@@ -219,21 +219,21 @@ pub fn parse_repo_id(repo_id: &str) -> (RepoType, String) {
     }
 }
 
-/// Split a raw identifier into `(id, path_prefix)` after `id_segments` `/`-separated segments.
-/// E.g. `split_path_prefix("user/bucket/a/b", 2)` → `("user/bucket", "a/b")`.
-pub fn split_path_prefix(raw: &str, id_segments: usize) -> (&str, &str) {
+/// Split a raw identifier into `(id, path_prefix)` after the first 2 `/`-separated segments.
+/// E.g. `split_path_prefix("user/bucket/a/b")` → `("user/bucket", "a/b")`.
+pub fn split_path_prefix(raw: &str) -> (&str, &str) {
     let mut end = 0;
     let mut count = 0;
     for (i, ch) in raw.char_indices() {
         if ch == '/' {
             count += 1;
-            if count == id_segments {
+            if count == 2 {
                 end = i;
                 break;
             }
         }
     }
-    if count < id_segments {
+    if count < 2 {
         // Not enough segments — entire string is the ID, no prefix.
         (raw, "")
     } else {
@@ -1060,35 +1060,35 @@ mod tests {
 
     #[test]
     fn test_split_path_prefix_bucket_no_subfolder() {
-        let (id, prefix) = split_path_prefix("user/bucket", 2);
+        let (id, prefix) = split_path_prefix("user/bucket");
         assert_eq!(id, "user/bucket");
         assert_eq!(prefix, "");
     }
 
     #[test]
     fn test_split_path_prefix_bucket_with_subfolder() {
-        let (id, prefix) = split_path_prefix("user/bucket/a/b", 2);
+        let (id, prefix) = split_path_prefix("user/bucket/a/b");
         assert_eq!(id, "user/bucket");
         assert_eq!(prefix, "a/b");
     }
 
     #[test]
     fn test_split_path_prefix_bucket_single_subfolder() {
-        let (id, prefix) = split_path_prefix("user/bucket/checkpoints", 2);
+        let (id, prefix) = split_path_prefix("user/bucket/checkpoints");
         assert_eq!(id, "user/bucket");
         assert_eq!(prefix, "checkpoints");
     }
 
     #[test]
     fn test_split_path_prefix_single_segment() {
-        let (id, prefix) = split_path_prefix("gpt2", 2);
+        let (id, prefix) = split_path_prefix("gpt2");
         assert_eq!(id, "gpt2");
         assert_eq!(prefix, "");
     }
 
     #[test]
     fn test_split_path_prefix_repo_with_subfolder() {
-        let (id, prefix) = split_path_prefix("user/model/ckpt/v2", 2);
+        let (id, prefix) = split_path_prefix("user/model/ckpt/v2");
         assert_eq!(id, "user/model");
         assert_eq!(prefix, "ckpt/v2");
     }
