@@ -2318,14 +2318,15 @@ fn warm_cache_triggered_on_open_sequential_read() {
         assert_eq!(xet.warm_call_count.load(std::sync::atomic::Ordering::SeqCst), 1);
 
         // ── open #2 ──────────────────────────────────────────────────
-        // Second open of the same file should NOT trigger another warm (deduped by hash).
+        // After the warm task completes, hash is removed from the dedupe set.
+        // A new open() triggers a fresh warm (handles TTL expiry / cache eviction).
         let fh2 = vfs.open(attr.ino, false, false, None).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(WARM_DELAY_MS * 2)).await;
 
         assert_eq!(
             xet.warm_call_count.load(std::sync::atomic::Ordering::SeqCst),
-            1,
-            "second open should reuse the first warm (deduped by hash)"
+            2,
+            "second open (after first warm completed) should trigger a new warm"
         );
 
         vfs.release(fh2).await.unwrap();

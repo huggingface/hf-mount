@@ -82,9 +82,11 @@ pub struct VirtualFs {
     filter_os_files: bool,
     /// When true, prefetch buffers drain after serving (forward-only, no re-read cache).
     direct_io: bool,
-    /// Hashes for which a background warm task has already been spawned.
+    /// Hashes for which a background warm task is currently in flight.
     /// Prevents duplicate full-plan CAS fetches when the same file is opened multiple times.
-    warming_hashes: Mutex<HashSet<String>>,
+    /// Entries are removed when the warm task completes so a future open() re-warms if
+    /// the cached plan has expired or been evicted.
+    warming_hashes: Arc<Mutex<HashSet<String>>>,
 }
 
 /// Where to read file content from when opening read-only.
@@ -169,7 +171,7 @@ impl VirtualFs {
             serve_lookup_from_cache,
             filter_os_files,
             direct_io,
-            warming_hashes: Mutex::new(HashSet::new()),
+            warming_hashes: Arc::new(Mutex::new(HashSet::new())),
         });
 
         // Set root inode mtime and ownership (repos use the last commit date).
@@ -1276,9 +1278,12 @@ impl VirtualFs {
             if !already_warming {
                 let sessions = self.xet_sessions.clone();
                 let hash = xet_hash.clone();
+                let warming = self.warming_hashes.clone();
                 tokio::spawn(async move {
                     sessions.warm_reconstruction_cache(&hash).await;
-                    // Errors silently dropped — worst case each read pays a range CAS round-trip.
+                    // Remove hash so a future open() re-warms if the cached plan
+                    // expired (59 min TTL) or was evicted under pressure.
+                    warming.lock().expect("warming_hashes poisoned").remove(&hash);
                 });
             }
         }
