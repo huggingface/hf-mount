@@ -520,8 +520,28 @@ fn rename_replaces_destination() {
     });
 }
 
-/// Unlink sends remote delete and removes local inode.
-/// In simple mode (no flush_loop, no poll), delete is flushed immediately.
+/// Hub batch failure on unlink returns EIO but leaves the local inode intact.
+#[test]
+fn unlink_remote_fail_eio_local_untouched() {
+    let hub = MockHub::new();
+    hub.add_file("file.txt", 100, Some("hash1"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let attr = vfs.lookup(ROOT_INODE, "file.txt").await.unwrap();
+        let ino = attr.ino;
+
+        hub.fail_next_batch(1);
+        let result = vfs.unlink(ROOT_INODE, "file.txt").await;
+        assert_eq!(result.unwrap_err(), libc::EIO);
+
+        let inodes = vfs.inode_table.read().unwrap();
+        assert!(inodes.get(ino).is_some());
+    });
+}
+
+/// Unlink sends remote delete synchronously in simple mode.
 #[test]
 fn unlink_sends_remote_delete() {
     let hub = MockHub::new();
@@ -540,13 +560,12 @@ fn unlink_sends_remote_delete() {
         assert!(inodes.get(ino).is_none());
         drop(inodes);
 
-        // Delete was flushed immediately (no flush_loop/poll to batch it).
         let logs = hub.take_batch_log();
         assert!(!logs.is_empty(), "delete should have been sent to remote");
     });
 }
 
-/// Unlink a locally-created file removes inode and sends remote delete.
+/// Unlink a locally-created file (committed after release) removes inode + sends delete.
 #[test]
 fn unlink_locally_created_file() {
     let hub = MockHub::new();
@@ -570,8 +589,9 @@ fn unlink_locally_created_file() {
         assert!(inodes.get(ino).is_none());
         drop(inodes);
 
-        // In simple mode, delete is flushed immediately.
+        // Verify a delete batch op was sent to Hub
         let logs = hub.take_batch_log();
+        assert!(!logs.is_empty(), "unlink should send batch delete");
         let has_delete = logs
             .iter()
             .flatten()
@@ -1043,7 +1063,7 @@ fn flush_manager_check_error_surfaces() {
         // Wait for flush debounce (100ms in test config) + processing
         tokio::time::sleep(Duration::from_secs(3)).await;
 
-        let err = vfs.flush_manager.check_error(ino);
+        let err = vfs.flush_manager.as_ref().unwrap().check_error(ino);
         assert!(err.is_some(), "flush manager should have recorded an error");
     });
 }
