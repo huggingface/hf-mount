@@ -11,15 +11,17 @@ use crate::xet::{StagingDir, XetOps};
 
 use super::inode::InodeTable;
 
-type FlushRequest = u64;
-/// Sentinel value sent on the flush channel to wake the loop for delete-only batches.
-/// Harmlessly filtered out by flush_batch (no inode entry exists for this value).
-const WAKE_SENTINEL: FlushRequest = u64::MAX;
+enum FlushSignal {
+    /// Flush a dirty inode.
+    Dirty(u64),
+    /// Wake the loop to drain pending remote deletes (no dirty inode attached).
+    WakeDeletes,
+}
 
 // ── FlushManager ──────────────────────────────────────────────────────
 
 pub(crate) struct FlushManager {
-    tx: Mutex<Option<mpsc::UnboundedSender<FlushRequest>>>,
+    tx: Mutex<Option<mpsc::UnboundedSender<FlushSignal>>>,
     handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
     errors: Arc<Mutex<HashMap<u64, String>>>,
     /// Queued remote delete paths. Shared with flush_loop, flushed in batch cycle and shutdown.
@@ -40,7 +42,7 @@ impl FlushManager {
         let errors = Arc::new(Mutex::new(HashMap::new()));
         let pending_deletes = Arc::new(Mutex::new(Vec::new()));
 
-        let (tx, rx) = mpsc::unbounded_channel::<FlushRequest>();
+        let (tx, rx) = mpsc::unbounded_channel::<FlushSignal>();
         let bg_errors = errors.clone();
         let bg_deletes = pending_deletes.clone();
         let bg_hub = hub_client.clone();
@@ -68,7 +70,7 @@ impl FlushManager {
     /// Enqueue a dirty inode for flush.
     pub(crate) fn enqueue(&self, ino: u64) {
         if let Some(tx) = self.tx.lock().expect("flush_tx poisoned").as_ref()
-            && tx.send(ino).is_err()
+            && tx.send(FlushSignal::Dirty(ino)).is_err()
         {
             error!("Flush channel closed, cannot enqueue ino={}", ino);
         }
@@ -87,9 +89,8 @@ impl FlushManager {
             .expect("pending_deletes poisoned")
             .push(path);
         // Wake flush_loop so it drains pending_deletes even without dirty inodes.
-        // The sentinel is harmlessly skipped by flush_batch (no inode entry exists).
         if let Some(tx) = self.tx.lock().expect("flush_tx poisoned").as_ref() {
-            let _ = tx.send(WAKE_SENTINEL);
+            let _ = tx.send(FlushSignal::WakeDeletes);
         }
     }
 
@@ -112,7 +113,7 @@ impl FlushManager {
         // Enqueue all remaining dirty files
         if let Some(tx) = self.tx.lock().expect("flush_tx poisoned").as_ref() {
             for ino in dirty_inos {
-                let _ = tx.send(ino);
+                let _ = tx.send(FlushSignal::Dirty(ino));
             }
         }
         // Drop the sender to signal the flush loop to drain and exit
@@ -146,7 +147,7 @@ fn run_blocking<F: FnOnce()>(f: F) {
 
 #[allow(clippy::too_many_arguments)]
 async fn flush_loop(
-    mut rx: mpsc::UnboundedReceiver<FlushRequest>,
+    mut rx: mpsc::UnboundedReceiver<FlushSignal>,
     xet_sessions: Arc<dyn XetOps>,
     staging_dir: StagingDir,
     hub_client: Arc<dyn HubOps>,
@@ -157,13 +158,13 @@ async fn flush_loop(
     pending_deletes: Arc<Mutex<Vec<String>>>,
 ) {
     loop {
-        // Wait for the first request
+        // Wait for the first signal
         let first = match rx.recv().await {
-            Some(req) => req,
+            Some(sig) => sig,
             None => return, // channel closed, exit
         };
 
-        let mut pending = vec![first];
+        let mut signals = vec![first];
 
         // Debounce: keep collecting for debounce duration after each new item,
         // but cap total wait at max_batch_window to avoid unbounded delay.
@@ -175,7 +176,7 @@ async fn flush_loop(
             }
             let timeout = debounce.min(remaining);
             match tokio::time::timeout(timeout, rx.recv()).await {
-                Ok(Some(req)) => pending.push(req),
+                Ok(Some(sig)) => signals.push(sig),
                 _ => break, // timeout (debounce expired) or channel closed
             }
         }
@@ -183,12 +184,19 @@ async fn flush_loop(
         // Flush queued remote deletes alongside dirty writes.
         flush_pending_deletes(&pending_deletes, &*hub_client).await;
 
-        // Filter wake sentinels before passing to flush_batch.
-        pending.retain(|&ino| ino != WAKE_SENTINEL);
-        if !pending.is_empty() {
-            info!("Flushing batch of {} dirty file(s)", pending.len());
+        // Extract dirty inode IDs (WakeDeletes signals carry no inode).
+        let dirty_inos: Vec<u64> = signals
+            .into_iter()
+            .filter_map(|sig| match sig {
+                FlushSignal::Dirty(ino) => Some(ino),
+                FlushSignal::WakeDeletes => None,
+            })
+            .collect();
+
+        if !dirty_inos.is_empty() {
+            info!("Flushing batch of {} dirty file(s)", dirty_inos.len());
             flush_batch(
-                pending,
+                dirty_inos,
                 &*xet_sessions,
                 &staging_dir,
                 &*hub_client,
@@ -227,7 +235,7 @@ async fn flush_pending_deletes(queue: &Mutex<Vec<String>>, hub_client: &dyn HubO
 }
 
 async fn flush_batch(
-    pending: Vec<FlushRequest>,
+    pending: Vec<u64>,
     xet_sessions: &dyn XetOps,
     staging_dir: &StagingDir,
     hub_client: &dyn HubOps,
