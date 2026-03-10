@@ -1,4 +1,5 @@
-use std::path::PathBuf;
+use std::io::IsTerminal;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use clap::Parser;
@@ -119,6 +120,20 @@ pub struct Args {
     /// By default these files are rejected on create/mkdir/rename.
     #[arg(long, default_value_t = false)]
     pub no_filter_os_files: bool,
+
+    /// Run as a background daemon. The process forks after parsing args,
+    /// confirms the mount is active, then releases the terminal. Logs are
+    /// written to ~/.hf-mount/logs/. Unmount with: umount <mount_point>
+    #[arg(long, default_value_t = false)]
+    pub daemon: bool,
+}
+
+impl Args {
+    pub fn mount_point(&self) -> &Path {
+        match &self.source {
+            Source::Bucket { mount_point, .. } | Source::Repo { mount_point, .. } => mount_point,
+        }
+    }
 }
 
 /// Everything needed to run a mount backend (FUSE or NFS).
@@ -134,18 +149,22 @@ pub struct MountSetup {
     pub metadata_ttl_ms: u64,
 }
 
-/// Parse CLI args, build VFS and all dependencies.
-/// `is_nfs` controls whether advanced writes are forced (NFS has no open/close).
-pub fn setup(is_nfs: bool) -> MountSetup {
-    // Use RUST_LOG if set, otherwise default to hf_mount=info.
+// ── Phase 1: parse + tracing + env vars (no threads) ─────────────────
+
+/// Parse CLI args, initialize tracing and xet-core env vars.
+/// No threads are spawned. Safe to fork() after this returns.
+pub fn init() -> Args {
+    let args = Args::parse();
+
     let filter = if std::env::var("RUST_LOG").is_ok() {
         tracing_subscriber::EnvFilter::from_default_env()
     } else {
         tracing_subscriber::EnvFilter::new("hf_mount=info")
     };
-    tracing_subscriber::fmt().with_env_filter(filter).init();
-
-    let args = Args::parse();
+    // Disable ANSI colors when daemonizing (output goes to a log file)
+    // or when stderr is not a terminal.
+    let ansi = !args.daemon && std::io::stderr().is_terminal();
+    tracing_subscriber::fmt().with_env_filter(filter).with_ansi(ansi).init();
 
     // Tune xet-core for interactive FUSE reads (not batch downloads).
     for (k, v) in [
@@ -170,6 +189,14 @@ pub fn setup(is_nfs: bool) -> MountSetup {
         }
     }
 
+    args
+}
+
+// ── Phase 2: build runtime + VFS (spawns threads) ────────────────────
+
+/// Build tokio runtime, CAS client, Hub client, and VFS from parsed args.
+/// `is_nfs` controls whether advanced writes are forced (NFS has no open/close).
+pub fn build(args: Args, is_nfs: bool) -> MountSetup {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -269,6 +296,24 @@ pub fn setup(is_nfs: bool) -> MountSetup {
         if read_only { "read-only" } else { "read-write" },
         backend_name,
     );
+    info!(
+        "Config: advanced_writes={} direct_io={} poll_interval={}s metadata_ttl={}ms \
+         cache_dir={:?} cache_size={} no_disk_cache={} max_threads={} \
+         flush_debounce={}ms flush_max_batch={}ms uid={} gid={} filter_os_files={}",
+        advanced_writes,
+        args.direct_io,
+        args.poll_interval_secs,
+        args.metadata_ttl_ms,
+        args.cache_dir,
+        args.cache_size,
+        args.no_disk_cache,
+        args.max_threads,
+        args.flush_debounce_ms,
+        args.flush_max_batch_window_ms,
+        uid,
+        gid,
+        !args.no_filter_os_files,
+    );
 
     let metadata_ttl = std::time::Duration::from_millis(args.metadata_ttl_ms);
 
@@ -301,6 +346,15 @@ pub fn setup(is_nfs: bool) -> MountSetup {
         max_threads: args.max_threads,
         metadata_ttl_ms: args.metadata_ttl_ms,
     }
+}
+
+// ── Combined entry point (used by FUSE binary) ──────────────────────
+
+/// Parse CLI args, build VFS and all dependencies.
+/// `is_nfs` controls whether advanced writes are forced (NFS has no open/close).
+pub fn setup(is_nfs: bool) -> MountSetup {
+    let args = init();
+    build(args, is_nfs)
 }
 
 fn build_cas_config(

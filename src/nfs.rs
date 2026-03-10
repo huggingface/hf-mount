@@ -12,6 +12,7 @@ use nfsserve::tcp::{NFSTcp, NFSTcpListener};
 use nfsserve::vfs::{DirEntry, NFSFileSystem, ReadDirResult, VFSCapabilities};
 use tracing::info;
 
+use crate::daemon::DaemonGuard;
 use crate::virtual_fs::inode::InodeKind;
 use crate::virtual_fs::{VirtualFs, VirtualFsAttr};
 
@@ -355,6 +356,7 @@ pub async fn mount_nfs(
     mount_point: &Path,
     metadata_ttl_ms: u64,
     read_only: bool,
+    daemon_guard: Option<&mut DaemonGuard>,
 ) -> std::io::Result<()> {
     let vfs_for_shutdown = virtual_fs.clone();
     let adapter = NFSAdapter::new(virtual_fs, read_only);
@@ -426,6 +428,11 @@ pub async fn mount_nfs(
     }
 
     info!("NFS mount active at {}", mount_point_str);
+
+    // Signal the parent process that the mount is live (daemon mode).
+    if let Some(guard) = daemon_guard {
+        guard.notify_ready();
+    }
 
     // Wait for unmount signal, server exit, or Ctrl+C.
     // nfsserve sends `true` on MNT and `false` on UMNT — ignore mount events.
