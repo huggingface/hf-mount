@@ -67,6 +67,7 @@ For private repos or buckets, pass `--hf-token` or set the `HF_TOKEN` env var.
 
 - **FUSE & NFS backends** -- FUSE for standard Linux/macOS, NFS for environments without `/dev/fuse` (e.g., Kubernetes)
 - **Buckets & repos** -- mount buckets (read-write) or model/dataset/space repos (read-only)
+- **Subfolder mounting** -- mount only a subdirectory (e.g. `user/bucket/path/to/dir`, `user/model/ckpt/v2`)
 - **Lazy loading** -- files are fetched on demand from CAS, not eagerly downloaded
 - **Simple writes** (FUSE default) -- append-only, in-memory streaming to CAS, synchronous upload on close
 - **Advanced writes** (`--advanced-writes`, always-on for NFS) -- staging files on disk, random writes + seek, async debounced flush
@@ -116,6 +117,10 @@ hf-mount-fuse repo datasets/squad /mnt/squad
 
 # Specific revision
 hf-mount-fuse repo openai-community/gpt2 /mnt/gpt2 --revision v1.0
+
+# Subfolder only
+hf-mount-fuse repo openai-community/gpt2/onnx /mnt/onnx
+hf-mount-fuse repo datasets/squad/plain_text /mnt/squad-plain
 ```
 
 ### Mount a bucket (read-write)
@@ -125,6 +130,9 @@ hf-mount-fuse --hf-token $HF_TOKEN bucket myuser/my-bucket /mnt/data
 
 # Read-only
 hf-mount-fuse --hf-token $HF_TOKEN --read-only bucket myuser/my-bucket /mnt/data
+
+# Subfolder only
+hf-mount-fuse --hf-token $HF_TOKEN bucket myuser/my-bucket/checkpoints /mnt/ckpts
 ```
 
 ### NFS backend

@@ -8,7 +8,7 @@ use data::data_client::default_config;
 use tracing::info;
 
 use crate::cached_xet_client::CachedXetClient;
-use crate::hub_api::{HubApiClient, HubTokenRefresher, SourceKind, parse_repo_id};
+use crate::hub_api::{HubApiClient, HubTokenRefresher, SourceKind, parse_repo_id, split_path_prefix};
 use crate::virtual_fs::VirtualFs;
 use crate::xet::{StagingDir, XetSessions};
 
@@ -16,14 +16,14 @@ use crate::xet::{StagingDir, XetSessions};
 pub enum Source {
     /// Mount a HuggingFace bucket (read-write by default)
     Bucket {
-        /// Bucket ID (e.g. "username/my-bucket")
+        /// Bucket ID, optionally with a subfolder (e.g. "user/bucket" or "user/bucket/path/to/dir")
         bucket_id: String,
         /// Local directory where the filesystem will be mounted
         mount_point: PathBuf,
     },
     /// Mount a HuggingFace repo read-only (type auto-detected from prefix)
     Repo {
-        /// Repo ID (e.g. "user/model", "datasets/user/ds", "spaces/user/app")
+        /// Repo ID, optionally with a subfolder (e.g. "user/model", "user/model/sub/dir", "datasets/user/ds/train")
         repo_id: String,
         /// Local directory where the filesystem will be mounted
         mount_point: PathBuf,
@@ -212,30 +212,55 @@ pub fn build(source: Source, options: MountOptions, is_nfs: bool) -> MountSetup 
         .build()
         .expect("Failed to create tokio runtime");
 
-    let (mount_point, source_kind) = match source {
-        Source::Bucket { bucket_id, mount_point } => (mount_point, SourceKind::Bucket { bucket_id }),
+    let (mount_point, source_kind, path_prefix) = match source {
+        Source::Bucket { bucket_id, mount_point } => {
+            let (id, prefix) = split_path_prefix(&bucket_id, 2);
+            (
+                mount_point,
+                SourceKind::Bucket {
+                    bucket_id: id.to_string(),
+                },
+                prefix.to_string(),
+            )
+        }
         Source::Repo {
             repo_id,
             mount_point,
             revision,
         } => {
-            let (repo_type, repo_id) = parse_repo_id(&repo_id);
+            let (repo_type, rest) = parse_repo_id(&repo_id);
+            let (id, prefix) = split_path_prefix(&rest, 2);
             (
                 mount_point,
                 SourceKind::Repo {
-                    repo_id,
+                    repo_id: id.to_string(),
                     repo_type,
                     revision,
                 },
+                prefix.to_string(),
             )
         }
     };
 
     let hub_client = runtime.block_on(async {
-        HubApiClient::from_source(&options.hub_endpoint, options.hf_token.as_deref(), source_kind)
-            .await
-            .unwrap_or_else(|e| panic!("Failed to initialize Hub client: {e}"))
+        HubApiClient::from_source(
+            &options.hub_endpoint,
+            options.hf_token.as_deref(),
+            source_kind,
+            path_prefix,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("Failed to initialize Hub client: {e}"))
     });
+
+    // Validate that the subfolder exists on the remote.
+    if !hub_client.path_prefix().is_empty() {
+        runtime.block_on(async {
+            hub_client.validate_path_prefix().await.unwrap_or_else(|e| {
+                panic!("{e}");
+            });
+        });
+    }
 
     let read_only = options.read_only || hub_client.is_repo();
     if hub_client.is_repo() && !options.read_only {
@@ -299,9 +324,15 @@ pub fn build(source: Source, options: MountOptions, is_nfs: bool) -> MountSetup 
     }
 
     let backend_name = if is_nfs { "nfs" } else { "fuse" };
+    let subfolder_info = if hub_client.path_prefix().is_empty() {
+        String::new()
+    } else {
+        format!(" (subfolder: {})", hub_client.path_prefix())
+    };
     info!(
-        "Mounting {} at {:?} ({}, backend={})",
+        "Mounting {}{} at {:?} ({}, backend={})",
         hub_client.source(),
+        subfolder_info,
         mount_point,
         if read_only { "read-only" } else { "read-write" },
         backend_name,
