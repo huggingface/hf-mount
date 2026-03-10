@@ -12,6 +12,9 @@ use crate::xet::{StagingDir, XetOps};
 use super::inode::InodeTable;
 
 type FlushRequest = u64;
+/// Sentinel value sent on the flush channel to wake the loop for delete-only batches.
+/// Harmlessly filtered out by flush_batch (no inode entry exists for this value).
+const WAKE_SENTINEL: FlushRequest = u64::MAX;
 
 // ── FlushManager ──────────────────────────────────────────────────────
 
@@ -86,7 +89,7 @@ impl FlushManager {
         // Wake flush_loop so it drains pending_deletes even without dirty inodes.
         // The sentinel is harmlessly skipped by flush_batch (no inode entry exists).
         if let Some(tx) = self.tx.lock().expect("flush_tx poisoned").as_ref() {
-            let _ = tx.send(u64::MAX);
+            let _ = tx.send(WAKE_SENTINEL);
         }
     }
 
@@ -118,26 +121,24 @@ impl FlushManager {
         // Use block_in_place so this is safe even when called from within the tokio runtime
         // (e.g. NFS shutdown path which runs inside an async context).
         if let Some(handle) = self.handle.lock().expect("flush_handle poisoned").take() {
-            let wait = || {
+            run_blocking(|| {
                 if let Err(e) = runtime.block_on(handle) {
                     error!("Flush task panicked: {}", e);
                 }
-            };
-            // block_in_place is required when called from within the Tokio runtime
-            // (e.g. NFS shutdown), but panics on non-Tokio threads (e.g. FUSE destroy).
-            if tokio::runtime::Handle::try_current().is_ok() {
-                tokio::task::block_in_place(wait);
-            } else {
-                wait();
-            }
+            });
         }
         // Flush remaining queued deletes.
-        let flush = || runtime.block_on(self.flush_deletes());
-        if tokio::runtime::Handle::try_current().is_ok() {
-            tokio::task::block_in_place(flush);
-        } else {
-            flush();
-        }
+        run_blocking(|| runtime.block_on(self.flush_deletes()));
+    }
+}
+
+/// Run a blocking closure, using `block_in_place` when called from within the
+/// Tokio runtime (e.g. NFS shutdown) and directly otherwise (e.g. FUSE destroy).
+fn run_blocking<F: FnOnce()>(f: F) {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        tokio::task::block_in_place(f);
+    } else {
+        f();
     }
 }
 
@@ -182,18 +183,20 @@ async fn flush_loop(
         // Flush queued remote deletes alongside dirty writes.
         flush_pending_deletes(&pending_deletes, &*hub_client).await;
 
-        let count = pending.len();
-        info!("Flushing batch of {} dirty file(s)", count);
-
-        flush_batch(
-            pending,
-            &*xet_sessions,
-            &staging_dir,
-            &*hub_client,
-            &inodes,
-            &flush_errors,
-        )
-        .await;
+        // Filter wake sentinels before passing to flush_batch.
+        pending.retain(|&ino| ino != WAKE_SENTINEL);
+        if !pending.is_empty() {
+            info!("Flushing batch of {} dirty file(s)", pending.len());
+            flush_batch(
+                pending,
+                &*xet_sessions,
+                &staging_dir,
+                &*hub_client,
+                &inodes,
+                &flush_errors,
+            )
+            .await;
+        }
     }
 }
 
