@@ -117,8 +117,7 @@ impl PrefetchState {
         let is_sequential = if is_first_fetch && offset == 0 {
             true
         } else if is_first_fetch {
-            // First read at non-zero offset (e.g. pread mid-file): treat as seek.
-            self.window_size = INITIAL_WINDOW;
+            // First read at non-zero offset (e.g. pread mid-file): not sequential.
             false
         } else if offset >= old_buf_end && offset <= old_buf_end + FORWARD_SKIP {
             // Sequential or small forward skip: double window (TCP slow-start)
