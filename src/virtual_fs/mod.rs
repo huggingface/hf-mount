@@ -2174,14 +2174,17 @@ impl VirtualFs {
             (entry.inode, entry.full_path.clone(), needs_remote)
         };
 
-        // Queue the remote delete for batched flush instead of making an
-        // individual HTTP call per file. The background flush task sends them
-        // all in a single batch_operations request.
+        // Queue the remote delete for batched flush. When a FlushManager or
+        // poll loop exists, deletes are drained in the next batch cycle.
+        // Otherwise, flush immediately (no debounce mechanism available).
         if needs_remote_delete {
             self.pending_remote_deletes
                 .lock()
                 .expect("pending_deletes poisoned")
                 .push(full_path.clone());
+            if self.flush_manager.is_none() && self.poll_handle.lock().expect("poll_handle poisoned").is_none() {
+                self.flush_remote_deletes().await;
+            }
         }
 
         // Remote succeeded (or no remote needed) — now unlink locally.

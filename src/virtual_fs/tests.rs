@@ -520,10 +520,10 @@ fn rename_replaces_destination() {
     });
 }
 
-/// Unlink queues remote delete (doesn't fail synchronously even if batch would fail).
-/// The local inode is removed immediately; remote delete is batched.
+/// Unlink sends remote delete and removes local inode.
+/// In simple mode (no FlushManager, no poll), delete is flushed immediately.
 #[test]
-fn unlink_queues_remote_delete() {
+fn unlink_sends_remote_delete() {
     let hub = MockHub::new();
     hub.add_file("file.txt", 100, Some("hash1"), None);
     let xet = MockXet::new();
@@ -533,7 +533,6 @@ fn unlink_queues_remote_delete() {
         let attr = vfs.lookup(ROOT_INODE, "file.txt").await.unwrap();
         let ino = attr.ino;
 
-        // Unlink succeeds immediately (remote delete is queued, not synchronous).
         vfs.unlink(ROOT_INODE, "file.txt").await.unwrap();
 
         // Inode is gone locally.
@@ -541,14 +540,17 @@ fn unlink_queues_remote_delete() {
         assert!(inodes.get(ino).is_none());
         drop(inodes);
 
-        // Path is queued for remote delete.
+        // Delete was flushed immediately (no FlushManager/poll to batch it).
         let pending = vfs.pending_remote_deletes.lock().unwrap();
-        assert!(pending.contains(&"file.txt".to_string()));
+        assert!(pending.is_empty(), "queue should be drained after immediate flush");
+        drop(pending);
+
+        let logs = hub.take_batch_log();
+        assert!(!logs.is_empty(), "delete should have been sent to remote");
     });
 }
 
-/// Unlink a locally-created file removes inode and queues remote delete.
-/// Flushing sends the batched delete to Hub.
+/// Unlink a locally-created file removes inode and sends remote delete.
 #[test]
 fn unlink_locally_created_file() {
     let hub = MockHub::new();
@@ -572,14 +574,8 @@ fn unlink_locally_created_file() {
         assert!(inodes.get(ino).is_none());
         drop(inodes);
 
-        // Delete is queued, not sent yet.
+        // In simple mode, delete is flushed immediately.
         let logs = hub.take_batch_log();
-        assert!(logs.is_empty(), "delete should be queued, not sent immediately");
-
-        // Flush sends the batched delete.
-        vfs.flush_remote_deletes().await;
-        let logs = hub.take_batch_log();
-        assert!(!logs.is_empty(), "flush should send batch delete");
         let has_delete = logs
             .iter()
             .flatten()
