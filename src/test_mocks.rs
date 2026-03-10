@@ -330,7 +330,12 @@ impl XetOps for MockXet {
         }
     }
 
-    fn download_stream_boxed(&self, file_info: &XetFileInfo, offset: u64) -> Result<Box<dyn DownloadStreamOps>> {
+    fn download_stream_boxed(
+        &self,
+        file_info: &XetFileInfo,
+        offset: u64,
+        _end: Option<u64>,
+    ) -> Result<Box<dyn DownloadStreamOps>> {
         let prev_fail = self.range_fail_count.load(Ordering::SeqCst);
         if prev_fail > 0 {
             self.range_fail_count.fetch_sub(1, Ordering::SeqCst);

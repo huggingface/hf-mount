@@ -14,7 +14,7 @@ use xorb_object::SerializedXorbObject;
 
 type Result<T> = std::result::Result<T, cas_client::CasClientError>;
 
-const MAX_CACHE_ENTRIES: usize = 1024;
+const MAX_CACHE_ENTRIES: usize = 4096;
 /// Presigned URLs returned by the CAS server expire after 1 hour.
 /// Evict cache entries just before expiry to avoid serving stale URLs.
 const CACHE_TTL: Duration = Duration::from_secs(59 * 60);
@@ -40,9 +40,10 @@ impl CacheEntry {
 // TODO: move this into xet-core (cas_client or file_reconstruction) so all consumers benefit.
 pub struct CachedXetClient {
     inner: Arc<dyn Client>,
-    /// Only full-file reconstruction plans are cached (key = file hash, no range).
-    /// Range responses are derived on the fly via `derive_range_response`.
-    cache: Mutex<HashMap<MerkleHash, CacheEntry>>,
+    /// Reconstruction plan cache. Key is (file_hash, range) where `None` = full-file plan.
+    /// Full-file plans are preferred: range queries are derived locally when available.
+    /// Range-scoped entries serve as fast fallback while the full plan warms up.
+    cache: Mutex<HashMap<(MerkleHash, Option<FileRange>), CacheEntry>>,
     ttl: Duration,
 }
 
@@ -132,28 +133,23 @@ impl Client for CachedXetClient {
         file_id: &MerkleHash,
         bytes_range: Option<FileRange>,
     ) -> Result<Option<QueryReconstructionResponse>> {
-        // Clone the full-file plan under a brief lock, then derive outside the lock so
-        // concurrent pread() calls from N threads don't serialize on this mutex.
+        // 1. Try the full-file cache first (best case: derive range locally, 0ms).
+        let full_key = (*file_id, None);
         let cached_full = {
             let mut cache = self.cache.lock().expect("cache poisoned");
-            match cache.get(file_id) {
+            match cache.get(&full_key) {
                 Some(entry) if entry.is_valid(self.ttl) => Some(entry.response.clone()),
                 Some(_) => {
-                    // Expired — evict so the next caller fetches fresh URLs from CAS.
-                    cache.remove(file_id);
+                    cache.remove(&full_key);
                     None
                 }
                 None => None,
             }
-        }; // ← lock released here
+        };
 
         if let Some(full) = cached_full {
             if let Some(range) = bytes_range {
                 let resp = derive_range_response(&full, range);
-                // Mirror the CAS server's EOF contract:
-                // - Non-empty file, range past EOF → None
-                // - Empty file, range.start == 0 → Some(empty_terms)  (only valid range on empty file)
-                // - Empty file, range.start > 0  → None               (past EOF on empty file)
                 if resp.terms.is_empty() && (!full.terms.is_empty() || range.start > 0) {
                     return Ok(None);
                 }
@@ -170,19 +166,47 @@ impl Client for CachedXetClient {
             }
         }
 
+        // 2. Full plan not cached yet. For range queries, check the exact range cache.
+        if bytes_range.is_some() {
+            let range_key = (*file_id, bytes_range);
+            let cached_range = {
+                let mut cache = self.cache.lock().expect("cache poisoned");
+                match cache.get(&range_key) {
+                    Some(entry) if entry.is_valid(self.ttl) => Some(entry.response.clone()),
+                    Some(_) => {
+                        cache.remove(&range_key);
+                        None
+                    }
+                    None => None,
+                }
+            };
+            if let Some(resp) = cached_range {
+                tracing::debug!(
+                    "recon: RHIT file={:.8} range={:?} terms={}",
+                    file_id,
+                    bytes_range,
+                    resp.terms.len()
+                );
+                return Ok(Some(resp));
+            }
+        }
+
+        // 3. Cache miss — fetch from CAS.
         tracing::debug!("recon: CAS  file={:.8} range={:?}", file_id, bytes_range);
         let result = self.inner.get_reconstruction(file_id, bytes_range).await?;
 
-        // Only cache full-file plans. Range responses are never stored: they are always
-        // derived from the full-file plan, and the full-file plan is warmed at open() time.
-        if bytes_range.is_none()
-            && let Some(response) = &result
-        {
+        if let Some(response) = &result {
             let mut cache = self.cache.lock().expect("cache poisoned");
             if cache.len() >= MAX_CACHE_ENTRIES {
-                cache.clear();
+                // Evict range entries only — full-file plans (None key) are too valuable
+                // since all range queries can be derived from them.
+                cache.retain(|(_hash, range), _| range.is_none());
+                // If still over capacity (all full plans), clear everything.
+                if cache.len() >= MAX_CACHE_ENTRIES {
+                    cache.clear();
+                }
             }
-            cache.insert(*file_id, CacheEntry::new(response.clone()));
+            cache.insert((*file_id, bytes_range), CacheEntry::new(response.clone()));
         }
 
         Ok(result)
@@ -448,20 +472,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn range_query_hits_backend_when_no_full_file_cached() {
+    async fn range_query_cached_when_no_full_file_plan() {
         let inner_impl = Arc::new(MockClient::new(MockMode::ReturnSome));
         let inner: Arc<dyn Client> = inner_impl.clone();
         let client = CachedXetClient::new(inner);
         let key = hash_for(40);
         let r = Some(FileRange::new(10, 20));
 
-        // Range query with no full-file plan cached → hits backend.
-        // The response is NOT cached (range responses are never stored).
+        // Range query with no full-file plan cached → hits backend once, then cached.
         client.get_reconstruction(&key, r).await.unwrap();
         client.get_reconstruction(&key, r).await.unwrap();
 
-        assert_eq!(inner_impl.call_count((key, r)), 2); // no cache, each hits backend
-        assert_eq!(inner_impl.total_calls(), 2);
+        assert_eq!(inner_impl.call_count((key, r)), 1); // cached after first fetch
+        assert_eq!(inner_impl.total_calls(), 1);
     }
 
     #[tokio::test]
@@ -497,6 +520,27 @@ mod tests {
 
         assert_eq!(inner_impl.call_count((first, None)), 2);
         assert_eq!(inner_impl.call_count((overflow, None)), 1);
+    }
+
+    #[tokio::test]
+    async fn eviction_preserves_full_plans_over_range_entries() {
+        let inner_impl = Arc::new(MockClient::new(MockMode::ReturnSome));
+        let inner: Arc<dyn Client> = inner_impl.clone();
+        let client = CachedXetClient::new(inner);
+        let key = hash_for(1);
+
+        // Cache one full-file plan.
+        client.get_reconstruction(&key, None).await.unwrap();
+
+        // Fill the rest with range entries to trigger eviction.
+        for i in 0..MAX_CACHE_ENTRIES {
+            let r = Some(FileRange::new(i as u64 * 100, i as u64 * 100 + 50));
+            client.get_reconstruction(&hash_for(i + 1000), r).await.unwrap();
+        }
+
+        // Full plan should survive eviction — still cached.
+        client.get_reconstruction(&key, None).await.unwrap();
+        assert_eq!(inner_impl.call_count((key, None)), 1); // still cached
     }
 
     #[tokio::test]

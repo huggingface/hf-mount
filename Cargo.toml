@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 # xet-core crates
 data = { git = "https://github.com/huggingface/xet-core.git", rev = "b099c05" }
+file_reconstruction = { git = "https://github.com/huggingface/xet-core.git", rev = "b099c05" }
 mdb_shard = { git = "https://github.com/huggingface/xet-core.git", rev = "b099c05" }
 utils = { git = "https://github.com/huggingface/xet-core.git", rev = "b099c05" }
 hub_client = { git = "https://github.com/huggingface/xet-core.git", rev = "b099c05" }

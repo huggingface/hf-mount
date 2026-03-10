@@ -133,7 +133,14 @@ impl PrefetchState {
         };
 
         let needed = (size as u64).min(self.file_size - offset);
-        let fetch_size = needed.max(self.window_size).min(self.file_size - offset);
+        // For sequential reads, prefetch ahead (window_size) to amortise latency.
+        // For random/seek reads (RangeDownload), fetch only what's needed — any
+        // extra bytes are likely wasted on the next random seek.
+        let fetch_size = match strategy {
+            FetchStrategy::RangeDownload => needed,
+            _ => needed.max(self.window_size),
+        }
+        .min(self.file_size - offset);
 
         FetchPlan { strategy, fetch_size }
     }
