@@ -139,46 +139,32 @@ impl Drop for DaemonGuard {
     }
 }
 
+/// Run an unmount command, logging the attempt.
+fn run_unmount(cmd: &str, args: &[&str]) -> bool {
+    eprintln!("  trying: {} {}", cmd, args.join(" "));
+    std::process::Command::new(cmd)
+        .args(args)
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
 /// Try to unmount a mount point using all available strategies.
 #[allow(clippy::needless_return)]
 fn try_unmount(mount_point: &Path) -> bool {
     let mount_str = mount_point.to_string_lossy();
     #[cfg(target_os = "macos")]
     {
-        return std::process::Command::new("umount")
-            .arg(&*mount_str)
-            .status()
-            .is_ok_and(|s| s.success())
-            || std::process::Command::new("diskutil")
-                .args(["unmount", &mount_str])
-                .status()
-                .is_ok_and(|s| s.success());
+        return run_unmount("umount", &[&mount_str]) || run_unmount("diskutil", &["unmount", &mount_str]);
     }
     #[cfg(target_os = "linux")]
     {
         if unsafe { libc::getuid() } == 0 {
-            return std::process::Command::new("umount")
-                .arg(&*mount_str)
-                .status()
-                .is_ok_and(|s| s.success());
+            return run_unmount("umount", &[&mount_str]);
         }
-        // Non-root: try umount, sudo -n umount (NFS), fusermount3/fusermount (FUSE).
-        return std::process::Command::new("umount")
-            .arg(&*mount_str)
-            .status()
-            .is_ok_and(|s| s.success())
-            || std::process::Command::new("sudo")
-                .args(["-n", "umount", &mount_str])
-                .status()
-                .is_ok_and(|s| s.success())
-            || std::process::Command::new("fusermount3")
-                .args(["-u", "-z", &mount_str])
-                .status()
-                .is_ok_and(|s| s.success())
-            || std::process::Command::new("fusermount")
-                .args(["-u", "-z", &mount_str])
-                .status()
-                .is_ok_and(|s| s.success());
+        return run_unmount("umount", &[&mount_str])
+            || run_unmount("sudo", &["-n", "umount", &mount_str])
+            || run_unmount("fusermount3", &["-u", "-z", &mount_str])
+            || run_unmount("fusermount", &["-u", "-z", &mount_str]);
     }
 }
 
@@ -209,32 +195,35 @@ pub fn stop_daemon(mount_point: &Path) -> std::io::Result<()> {
         return Ok(());
     }
 
-    eprintln!("Stopping daemon (pid={pid}), unmounting {:?}...", mount_point);
+    eprint!("Stopping daemon (pid={pid})");
 
     if !try_unmount(mount_point) {
-        eprintln!("Warning: unmount command failed, waiting for daemon to exit...");
+        eprint!(" (unmount failed, waiting)");
     }
 
     // Wait up to 30s for the daemon to exit. The daemon may spend time
     // in shutdown() flushing dirty data after unmount.
     for _ in 0..60 {
         if !pid_alive(pid) {
-            eprintln!("Daemon stopped");
+            eprintln!(" done");
             return Ok(());
         }
+        eprint!(".");
         std::thread::sleep(std::time::Duration::from_millis(500));
     }
 
     // Still running, send SIGTERM.
-    eprintln!("Daemon still running, sending SIGTERM...");
+    eprint!(" sending SIGTERM");
     unsafe { libc::kill(pid, libc::SIGTERM) };
     for _ in 0..10 {
         if !pid_alive(pid) {
-            eprintln!("Daemon stopped");
+            eprintln!(" done");
             return Ok(());
         }
+        eprint!(".");
         std::thread::sleep(std::time::Duration::from_millis(500));
     }
+    eprintln!();
 
     Err(std::io::Error::new(
         std::io::ErrorKind::TimedOut,
@@ -339,16 +328,33 @@ pub fn daemonize(mount_point: &Path) -> std::io::Result<DaemonGuard> {
             // ── Parent ──
             unsafe { libc::close(write_fd) };
 
+            eprint!("Starting daemon (pid={child_pid})");
+
+            // Poll the pipe with a timeout so we can print dots while waiting.
+            let mut pfd = libc::pollfd {
+                fd: read_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            loop {
+                let ret = unsafe { libc::poll(&raw mut pfd, 1, 1000) };
+                if ret > 0 {
+                    break; // data or hangup ready
+                }
+                eprint!(".");
+            }
+
             let mut buf = [0u8; 1];
             let n = unsafe { libc::read(read_fd, buf.as_mut_ptr() as *mut _, 1) };
             unsafe { libc::close(read_fd) };
 
             if n == 1 && buf[0] == b'R' {
-                eprintln!("Daemon started (pid={child_pid}), logs: {}", log_file.display());
-                eprintln!("Stop with: hf-mount-daemon stop {}", canonical.display());
+                eprintln!(" ready");
+                eprintln!("  logs: {}", log_file.display());
+                eprintln!("  stop: hf-mount-daemon stop {}", canonical.display());
                 std::process::exit(0);
             } else {
-                eprintln!("Daemon failed to start. Log file: {}", log_file.display());
+                eprintln!(" failed");
                 if let Ok(log) = std::fs::read_to_string(&log_file) {
                     let log = log.trim();
                     if !log.is_empty() {
