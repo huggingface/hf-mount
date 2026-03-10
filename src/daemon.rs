@@ -142,8 +142,8 @@ fn read_pid_file(pid_file: &Path) -> Option<(i32, Option<String>, Option<String>
     let content = std::fs::read_to_string(pid_file).ok()?;
     let mut lines = content.lines();
     let pid: i32 = lines.next()?.trim().parse().ok()?;
-    let mount = lines.next().map(|s| s.trim().to_string());
-    let start_time = lines.next().map(|s| s.trim().to_string());
+    let mount = lines.next().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let start_time = lines.next().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
     Some((pid, mount, start_time))
 }
 
@@ -287,9 +287,9 @@ pub fn stop_daemon(mount_point: &Path) -> std::io::Result<()> {
         eprintln!("Warning: unmount command failed, waiting for daemon to exit...");
     }
 
-    // Wait up to 30s for the daemon to exit. The daemon may spend significant
+    // Wait up to 60s for the daemon to exit. The daemon may spend significant
     // time in shutdown() flushing dirty data after unmount.
-    for _ in 0..60 {
+    for _ in 0..120 {
         if !pid_alive(pid) {
             eprintln!("Daemon stopped");
             return Ok(());
@@ -298,7 +298,7 @@ pub fn stop_daemon(mount_point: &Path) -> std::io::Result<()> {
     }
 
     // Re-validate before sending SIGTERM: PID could have been recycled during
-    // the 30s wait.
+    // the 60s wait.
     if !is_our_daemon(pid) {
         eprintln!("Daemon (pid={pid}) exited (PID recycled), cleaning up");
         let _ = std::fs::remove_file(&pid_file);
@@ -317,7 +317,7 @@ pub fn stop_daemon(mount_point: &Path) -> std::io::Result<()> {
 
     Err(std::io::Error::new(
         std::io::ErrorKind::TimedOut,
-        format!("daemon (pid={pid}) did not stop after 35s"),
+        format!("daemon (pid={pid}) did not stop after 65s"),
     ))
 }
 
@@ -464,7 +464,7 @@ pub fn daemonize(mount_point: &Path) -> std::io::Result<DaemonGuard> {
 
             if n == 1 && buf[0] == b'R' {
                 eprintln!("Daemon started (pid={child_pid}), logs: {}", log_file.display());
-                eprintln!("Stop with: hf-mount-daemon stop {}", mount_point.display());
+                eprintln!("Stop with: hf-mount-daemon stop {}", canonical.display());
                 std::process::exit(0);
             } else {
                 eprintln!("Daemon failed to start. Check logs: {}", log_file.display());
