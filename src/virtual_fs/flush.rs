@@ -22,6 +22,7 @@ pub(crate) struct FlushManager {
 }
 
 impl FlushManager {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         xet_sessions: Arc<dyn XetOps>,
         staging_dir: StagingDir,
@@ -30,6 +31,7 @@ impl FlushManager {
         runtime: &tokio::runtime::Handle,
         debounce: Duration,
         max_batch_window: Duration,
+        pending_remote_deletes: Arc<Mutex<Vec<String>>>,
     ) -> Self {
         let errors = Arc::new(Mutex::new(HashMap::new()));
         let (tx, rx) = mpsc::unbounded_channel::<FlushRequest>();
@@ -44,6 +46,7 @@ impl FlushManager {
             bg_errors,
             debounce,
             max_batch_window,
+            pending_remote_deletes,
         ));
 
         Self {
@@ -106,6 +109,7 @@ async fn flush_loop(
     flush_errors: Arc<Mutex<HashMap<u64, String>>>,
     debounce: Duration,
     max_batch_window: Duration,
+    pending_remote_deletes: Arc<Mutex<Vec<String>>>,
 ) {
     loop {
         // Wait for the first request
@@ -130,6 +134,9 @@ async fn flush_loop(
                 _ => break, // timeout (debounce expired) or channel closed
             }
         }
+
+        // Flush queued remote deletes alongside dirty writes.
+        super::VirtualFs::flush_delete_queue(&pending_remote_deletes, &*hub_client).await;
 
         let count = pending.len();
         info!("Flushing batch of {} dirty file(s)", count);

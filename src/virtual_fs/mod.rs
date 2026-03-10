@@ -110,6 +110,8 @@ impl VirtualFs {
         let inodes = Arc::new(RwLock::new(InodeTable::new()));
         let negative_cache = Arc::new(RwLock::new(HashMap::new()));
 
+        let pending_remote_deletes = Arc::new(Mutex::new(Vec::new()));
+
         let flush_manager = if !read_only && advanced_writes {
             let sd = staging_dir
                 .as_ref()
@@ -122,6 +124,7 @@ impl VirtualFs {
                 &runtime,
                 flush_debounce,
                 flush_max_batch_window,
+                pending_remote_deletes.clone(),
             ))
         } else {
             None
@@ -129,7 +132,6 @@ impl VirtualFs {
 
         // Spawn remote change polling task (if interval > 0)
         let invalidator: Invalidator = Arc::new(Mutex::new(None));
-        let pending_remote_deletes = Arc::new(Mutex::new(Vec::new()));
         let poll_handle = if poll_interval_secs > 0 {
             let bg_hub = hub_client.clone();
             let bg_inodes = inodes.clone();
@@ -229,9 +231,9 @@ impl VirtualFs {
     }
 
     /// Drain `queue` and send all paths as a single `batch_operations` delete.
-    /// Re-queues paths on transient failure. Used by both `flush_remote_deletes`
-    /// and the poll loop (which is a static function without `&self`).
-    async fn flush_delete_queue(queue: &Mutex<Vec<String>>, hub_client: &dyn HubOps) {
+    /// Re-queues paths on transient failure. Used by `flush_remote_deletes`,
+    /// the poll loop, and the flush_manager batch cycle.
+    pub(super) async fn flush_delete_queue(queue: &Mutex<Vec<String>>, hub_client: &dyn HubOps) {
         let paths: Vec<String> = {
             let mut pending = queue.lock().expect("pending_deletes poisoned");
             if pending.is_empty() {
