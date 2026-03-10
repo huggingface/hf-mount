@@ -41,3 +41,7 @@ path = "src/bin/hf-mount-fuse.rs"
 [[bin]]
 name = "hf-mount-nfs"
 path = "src/bin/hf-mount-nfs.rs"
+
+[[bin]]
+name = "hf-mount-daemon"
+path = "src/bin/hf-mount-daemon.rs"

@@ -1,0 +1,95 @@
+use std::path::PathBuf;
+
+use clap::Parser;
+use tracing::{error, info};
+
+use hf_mount::setup::{MountOptions, Source};
+
+#[derive(Parser)]
+#[command(about = "Manage hf-mount background daemons")]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(clap::Subcommand)]
+enum Command {
+    /// Start a mount as a background daemon
+    Start {
+        /// Use FUSE backend instead of NFS (default: NFS)
+        #[arg(long)]
+        fuse: bool,
+
+        #[command(flatten)]
+        options: MountOptions,
+
+        #[command(subcommand)]
+        source: Source,
+    },
+    /// Stop a running daemon
+    Stop {
+        /// Mount point of the daemon to stop
+        mount_point: PathBuf,
+    },
+}
+
+fn main() {
+    let cli = Cli::parse();
+
+    match cli.command {
+        Command::Stop { mount_point } => match hf_mount::daemon::stop_daemon(&mount_point) {
+            Ok(()) => {}
+            Err(e) => {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        },
+        Command::Start { fuse, options, source } => {
+            let is_nfs = !fuse;
+            let mount_point = source.mount_point().to_path_buf();
+
+            // Phase 1: init tracing (no threads yet).
+            hf_mount::setup::init_tracing(true);
+
+            // Phase 2: fork before tokio runtime.
+            let mut daemon_guard = match hf_mount::daemon::daemonize(&mount_point) {
+                Ok(guard) => guard,
+                Err(e) => {
+                    error!("Failed to daemonize: {e}");
+                    std::process::exit(1);
+                }
+            };
+
+            // Phase 3: build runtime + VFS.
+            let s = hf_mount::setup::build(source, options, is_nfs);
+
+            // Phase 4: mount and serve.
+            if is_nfs {
+                if let Err(e) = s.runtime.block_on(hf_mount::nfs::mount_nfs(
+                    s.virtual_fs,
+                    &s.mount_point,
+                    s.metadata_ttl_ms,
+                    s.read_only,
+                    Some(&mut daemon_guard),
+                )) {
+                    error!("NFS mount failed: {e}");
+                    std::process::exit(1);
+                }
+            } else {
+                hf_mount::fuse::mount_fuse(
+                    s.virtual_fs,
+                    &s.mount_point,
+                    s.metadata_ttl,
+                    s.read_only,
+                    s.advanced_writes,
+                    s.direct_io,
+                    s.max_threads,
+                    &s.runtime,
+                    Some(&mut daemon_guard),
+                );
+            }
+
+            info!("Unmounted cleanly");
+        }
+    }
+}

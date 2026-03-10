@@ -33,12 +33,17 @@ pub enum Source {
     },
 }
 
-#[derive(Parser)]
-#[command(about = "Mount a HuggingFace bucket or repo as a filesystem")]
-pub struct Args {
-    #[command(subcommand)]
-    pub source: Source,
+impl Source {
+    pub fn mount_point(&self) -> &Path {
+        match self {
+            Source::Bucket { mount_point, .. } | Source::Repo { mount_point, .. } => mount_point,
+        }
+    }
+}
 
+/// Mount options shared across all binaries (FUSE, NFS, daemon).
+#[derive(clap::Args)]
+pub struct MountOptions {
     /// HuggingFace API token (also read from HF_TOKEN env var).
     /// Required for private repos/buckets, optional for public repos.
     #[arg(long, env = "HF_TOKEN")]
@@ -120,24 +125,17 @@ pub struct Args {
     /// By default these files are rejected on create/mkdir/rename.
     #[arg(long, default_value_t = false)]
     pub no_filter_os_files: bool,
-
-    /// Run as a background daemon. The process forks after parsing args,
-    /// confirms the mount is active, then releases the terminal. Logs are
-    /// written to ~/.hf-mount/logs/. Stop with: --stop or umount <mount_point>
-    #[arg(long, default_value_t = false)]
-    pub daemon: bool,
-
-    /// Stop a running daemon for the given mount point.
-    #[arg(long, default_value_t = false)]
-    pub stop: bool,
 }
 
-impl Args {
-    pub fn mount_point(&self) -> &Path {
-        match &self.source {
-            Source::Bucket { mount_point, .. } | Source::Repo { mount_point, .. } => mount_point,
-        }
-    }
+/// CLI args for the foreground FUSE/NFS binaries.
+#[derive(Parser)]
+#[command(about = "Mount a HuggingFace bucket or repo as a filesystem")]
+pub struct Args {
+    #[command(subcommand)]
+    pub source: Source,
+
+    #[command(flatten)]
+    pub options: MountOptions,
 }
 
 /// Everything needed to run a mount backend (FUSE or NFS).
@@ -153,24 +151,11 @@ pub struct MountSetup {
     pub metadata_ttl_ms: u64,
 }
 
-// ── Phase 1: parse + tracing + env vars (no threads) ─────────────────
+// ── Tracing + env vars (no threads) ──────────────────────────────────
 
-/// Parse CLI args, initialize tracing and xet-core env vars.
+/// Initialize tracing and xet-core env vars.
 /// No threads are spawned. Safe to fork() after this returns.
-pub fn init() -> Args {
-    let args = Args::parse();
-
-    // --stop: stop a running daemon and exit immediately (no setup needed).
-    if args.stop {
-        match crate::daemon::stop_daemon(args.mount_point()) {
-            Ok(()) => std::process::exit(0),
-            Err(e) => {
-                eprintln!("Error: {e}");
-                std::process::exit(1);
-            }
-        }
-    }
-
+pub fn init_tracing(daemon: bool) {
     let filter = if std::env::var("RUST_LOG").is_ok() {
         tracing_subscriber::EnvFilter::from_default_env()
     } else {
@@ -178,7 +163,7 @@ pub fn init() -> Args {
     };
     // Disable ANSI colors when daemonizing (output goes to a log file)
     // or when stderr is not a terminal.
-    let ansi = !args.daemon && std::io::stderr().is_terminal();
+    let ansi = !daemon && std::io::stderr().is_terminal();
     tracing_subscriber::fmt().with_env_filter(filter).with_ansi(ansi).init();
 
     // Tune xet-core for interactive FUSE reads (not batch downloads).
@@ -190,12 +175,8 @@ pub fn init() -> Args {
         ("HF_XET_RECONSTRUCTION_TARGET_BLOCK_COMPLETION_TIME", "30"),
         ("HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_SIZE", "134217728"),
         ("HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT", "268435456"),
-        // Raise read_timeout from 120s default so large shard uploads don't get killed
-        // by the global client read_timeout before the per-request timeout kicks in.
         ("HF_XET_CLIENT_READ_TIMEOUT", "600"),
-        // Upload tuning: skip slow adaptive concurrency ramp-up
         ("HF_XET_CLIENT_AC_INITIAL_UPLOAD_CONCURRENCY", "16"),
-        // Larger ingestion blocks = fewer CDC calls
         ("HF_XET_DATA_INGESTION_BLOCK_SIZE", "16777216"),
     ] {
         if std::env::var(k).is_err() {
@@ -203,21 +184,19 @@ pub fn init() -> Args {
             unsafe { std::env::set_var(k, v) };
         }
     }
-
-    args
 }
 
-// ── Phase 2: build runtime + VFS (spawns threads) ────────────────────
+// ── Build runtime + VFS (spawns threads) ─────────────────────────────
 
-/// Build tokio runtime, CAS client, Hub client, and VFS from parsed args.
+/// Build tokio runtime, CAS client, Hub client, and VFS.
 /// `is_nfs` controls whether advanced writes are forced (NFS has no open/close).
-pub fn build(args: Args, is_nfs: bool) -> MountSetup {
+pub fn build(source: Source, options: MountOptions, is_nfs: bool) -> MountSetup {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .expect("Failed to create tokio runtime");
 
-    let (mount_point, source) = match args.source {
+    let (mount_point, source_kind) = match source {
         Source::Bucket { bucket_id, mount_point } => (mount_point, SourceKind::Bucket { bucket_id }),
         Source::Repo {
             repo_id,
@@ -237,32 +216,31 @@ pub fn build(args: Args, is_nfs: bool) -> MountSetup {
     };
 
     let hub_client = runtime.block_on(async {
-        HubApiClient::from_source(&args.hub_endpoint, args.hf_token.as_deref(), source)
+        HubApiClient::from_source(&options.hub_endpoint, options.hf_token.as_deref(), source_kind)
             .await
             .unwrap_or_else(|e| panic!("Failed to initialize Hub client: {e}"))
     });
 
-    let read_only = args.read_only || hub_client.is_repo();
-    if hub_client.is_repo() && !args.read_only {
+    let read_only = options.read_only || hub_client.is_repo();
+    if hub_client.is_repo() && !options.read_only {
         info!("Repo mounts are always read-only");
     }
 
     let refresher = hub_client.token_refresher(read_only);
     let cas_config = build_cas_config(&runtime, &refresher);
 
-    // Ensure cache directory exists and is writable (needed for staging even without xorb cache).
-    std::fs::create_dir_all(&args.cache_dir)
-        .unwrap_or_else(|e| panic!("Failed to create cache dir {:?}: {e}", args.cache_dir));
+    std::fs::create_dir_all(&options.cache_dir)
+        .unwrap_or_else(|e| panic!("Failed to create cache dir {:?}: {e}", options.cache_dir));
 
-    let xorb_cache = if args.no_disk_cache {
+    let xorb_cache = if options.no_disk_cache {
         None
     } else {
-        let xorbs_dir = args.cache_dir.join("xorbs");
+        let xorbs_dir = options.cache_dir.join("xorbs");
         std::fs::create_dir_all(&xorbs_dir)
             .unwrap_or_else(|e| panic!("Failed to create xorbs dir {:?}: {e}", xorbs_dir));
         let config = data::CacheConfig {
             cache_directory: xorbs_dir,
-            cache_size: args.cache_size,
+            cache_size: options.cache_size,
         };
         Some(data::get_cache(&config).expect("Failed to create xorb cache"))
     };
@@ -279,27 +257,23 @@ pub fn build(args: Args, is_nfs: bool) -> MountSetup {
     let upload_config = if read_only { None } else { Some(cas_config) };
     let xet_sessions = XetSessions::new(download_session, upload_config, cached_client);
 
-    let advanced_writes = args.advanced_writes || (is_nfs && !read_only);
-    // Repos need a staging dir for HTTP download cache (open_readonly),
-    // even when advanced_writes is disabled.
+    let advanced_writes = options.advanced_writes || (is_nfs && !read_only);
     let staging_dir = if advanced_writes || hub_client.is_repo() {
-        Some(StagingDir::new(&args.cache_dir))
+        Some(StagingDir::new(&options.cache_dir))
     } else {
         None
     };
 
-    let uid = args.uid.unwrap_or_else(|| unsafe { libc::getuid() });
-    let gid = args.gid.unwrap_or_else(|| unsafe { libc::getgid() });
+    let uid = options.uid.unwrap_or_else(|| unsafe { libc::getuid() });
+    let gid = options.gid.unwrap_or_else(|| unsafe { libc::getgid() });
 
-    // Ignore EEXIST: the directory may already exist from a previous (possibly
-    // stale) mount. FUSE/NFS will fail at mount time if it's actually busy.
     if let Err(e) = std::fs::create_dir_all(&mount_point)
         && e.raw_os_error() != Some(libc::EEXIST)
     {
         panic!("Failed to create mount point {:?}: {e}", mount_point);
     }
 
-    if is_nfs && args.direct_io {
+    if is_nfs && options.direct_io {
         info!("--direct-io is ignored for NFS mounts (no NFS equivalent)");
     }
 
@@ -316,21 +290,21 @@ pub fn build(args: Args, is_nfs: bool) -> MountSetup {
          cache_dir={:?} cache_size={} no_disk_cache={} max_threads={} \
          flush_debounce={}ms flush_max_batch={}ms uid={} gid={} filter_os_files={}",
         advanced_writes,
-        args.direct_io,
-        args.poll_interval_secs,
-        args.metadata_ttl_ms,
-        args.cache_dir,
-        args.cache_size,
-        args.no_disk_cache,
-        args.max_threads,
-        args.flush_debounce_ms,
-        args.flush_max_batch_window_ms,
+        options.direct_io,
+        options.poll_interval_secs,
+        options.metadata_ttl_ms,
+        options.cache_dir,
+        options.cache_size,
+        options.no_disk_cache,
+        options.max_threads,
+        options.flush_debounce_ms,
+        options.flush_max_batch_window_ms,
         uid,
         gid,
-        !args.no_filter_os_files,
+        !options.no_filter_os_files,
     );
 
-    let metadata_ttl = std::time::Duration::from_millis(args.metadata_ttl_ms);
+    let metadata_ttl = std::time::Duration::from_millis(options.metadata_ttl_ms);
 
     let virtual_fs = VirtualFs::new(
         runtime.handle().clone(),
@@ -341,13 +315,13 @@ pub fn build(args: Args, is_nfs: bool) -> MountSetup {
         advanced_writes,
         uid,
         gid,
-        args.poll_interval_secs,
+        options.poll_interval_secs,
         metadata_ttl,
-        !args.metadata_ttl_minimal,
-        !args.no_filter_os_files,
-        args.direct_io && !is_nfs,
-        std::time::Duration::from_millis(args.flush_debounce_ms),
-        std::time::Duration::from_millis(args.flush_max_batch_window_ms),
+        !options.metadata_ttl_minimal,
+        !options.no_filter_os_files,
+        options.direct_io && !is_nfs,
+        std::time::Duration::from_millis(options.flush_debounce_ms),
+        std::time::Duration::from_millis(options.flush_max_batch_window_ms),
     );
 
     MountSetup {
@@ -356,20 +330,21 @@ pub fn build(args: Args, is_nfs: bool) -> MountSetup {
         mount_point,
         read_only,
         advanced_writes,
-        direct_io: args.direct_io,
+        direct_io: options.direct_io,
         metadata_ttl,
-        max_threads: args.max_threads,
-        metadata_ttl_ms: args.metadata_ttl_ms,
+        max_threads: options.max_threads,
+        metadata_ttl_ms: options.metadata_ttl_ms,
     }
 }
 
-// ── Combined entry point (used by FUSE binary) ──────────────────────
+// ── Combined entry point (foreground binaries) ──────────────────────
 
 /// Parse CLI args, build VFS and all dependencies.
 /// `is_nfs` controls whether advanced writes are forced (NFS has no open/close).
 pub fn setup(is_nfs: bool) -> MountSetup {
-    let args = init();
-    build(args, is_nfs)
+    let args = Args::parse();
+    init_tracing(false);
+    build(args.source, args.options, is_nfs)
 }
 
 fn build_cas_config(
