@@ -2260,10 +2260,14 @@ fn shutdown_flushes_dirty() {
 
 // ── Reconstruction cache warm-up tests ──────────────────────────────
 
-/// Warm is deferred: NOT triggered on open(), only on the first RangeDownload.
-/// Sequential reads use FileDownloadSession (own reconstruction path) so warm
-/// would be wasted. Only when a far seek triggers RangeDownload do we spawn warm
-/// to pre-fetch the full plan for subsequent range reads.
+/// Warm is deferred: NOT triggered on open(), only on the first signal of
+/// random access. Two triggers:
+/// 1. First RangeDownload (far seek after sequential reads)
+/// 2. First read at non-zero offset (pread into middle of file — prepare_fetch
+///    classifies this as StartStream, but it's likely random access)
+///
+/// Sequential reads from offset 0 never trigger warm (FileDownloadSession has
+/// its own reconstruction path).
 #[test]
 fn warm_triggered_on_first_range_download_not_on_open() {
     const WARM_DELAY_MS: u64 = 50;
@@ -2287,7 +2291,7 @@ fn warm_triggered_on_first_range_download_not_on_open() {
         assert_eq!(
             xet.warm_call_count.load(std::sync::atomic::Ordering::SeqCst),
             0,
-            "open should NOT trigger warm (deferred to first RangeDownload)"
+            "open should NOT trigger warm (deferred to first random-access signal)"
         );
 
         // ── sequential read at offset 0 — no warm ───────────────────
@@ -2298,7 +2302,7 @@ fn warm_triggered_on_first_range_download_not_on_open() {
         assert_eq!(
             xet.warm_call_count.load(std::sync::atomic::Ordering::SeqCst),
             0,
-            "sequential read should NOT trigger warm"
+            "sequential read from offset 0 should NOT trigger warm"
         );
 
         // ── far seek (> FORWARD_SKIP) — triggers warm ───────────────
@@ -2324,6 +2328,45 @@ fn warm_triggered_on_first_range_download_not_on_open() {
             xet.warm_call_count.load(std::sync::atomic::Ordering::SeqCst),
             1,
             "warm_triggered flag should prevent duplicate warm calls"
+        );
+
+        vfs.release(fh).await.unwrap();
+    });
+}
+
+/// When the first read targets a non-zero offset (e.g. safetensors mmap
+/// starting at a tensor deep in the file), warm should be triggered even
+/// though prepare_fetch classifies it as StartStream (no prior buffer).
+#[test]
+fn warm_triggered_on_first_read_at_nonzero_offset() {
+    const WARM_DELAY_MS: u64 = 50;
+    const FILE_SIZE: u64 = 30 * 1024 * 1024;
+
+    let hub = MockHub::new();
+    hub.add_file("model.safetensors", FILE_SIZE, Some("hash_st"), None);
+    let xet = MockXet::new();
+    let data: Vec<u8> = (0..FILE_SIZE as usize).map(|i| (i % 251) as u8).collect();
+    xet.add_file("hash_st", &data);
+    xet.set_warm_delay_ms(WARM_DELAY_MS);
+
+    let (rt, vfs) = vfs_readonly(&hub, &xet);
+
+    rt.block_on(async {
+        let attr = vfs.lookup(ROOT_INODE, "model.safetensors").await.unwrap();
+        let fh = vfs.open(attr.ino, false, false, None).await.unwrap();
+
+        // First read at non-zero offset — should trigger warm.
+        let mid_offset: u64 = 10 * 1024 * 1024; // 10 MiB
+        let (chunk, _) = vfs.read(fh, mid_offset, 4096).await.unwrap();
+        assert_eq!(chunk.len(), 4096);
+        assert_eq!(chunk[0], (mid_offset as usize % 251) as u8);
+
+        // Wait for background warm to complete.
+        tokio::time::sleep(std::time::Duration::from_millis(WARM_DELAY_MS * 2)).await;
+        assert_eq!(
+            xet.warm_call_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "first read at non-zero offset should trigger warm"
         );
 
         vfs.release(fh).await.unwrap();

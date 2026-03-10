@@ -1503,10 +1503,16 @@ impl VirtualFs {
                         prefetch_state.stream.is_some(),
                     );
 
-                    // Trigger background warm on first RangeDownload so subsequent
-                    // range reads can derive locally instead of hitting CAS per-range.
-                    // Sequential reads don't need warm (FileDownloadSession has its own path).
-                    if plan.strategy == prefetch::FetchStrategy::RangeDownload && !prefetch_state.warm_triggered {
+                    // Trigger background warm so subsequent range reads can derive
+                    // locally instead of hitting CAS per-range. Triggered on:
+                    // - Any RangeDownload (far seek, clearly random)
+                    // - First fetch at non-zero offset (pread into middle of file —
+                    //   prepare_fetch classifies this as StartStream since there's no
+                    //   prior buffer to compare against, but it's likely random access)
+                    let first_nonzero = cursor > 0 && prefetch_state.buf_start == 0 && prefetch_state.chunks_len == 0;
+                    if !prefetch_state.warm_triggered
+                        && (plan.strategy == prefetch::FetchStrategy::RangeDownload || first_nonzero)
+                    {
                         prefetch_state.warm_triggered = true;
                         let xet = self.xet_sessions.clone();
                         let hash = prefetch_state.xet_hash.clone();
