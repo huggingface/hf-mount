@@ -86,6 +86,11 @@ fn is_our_daemon(pid: i32) -> bool {
     true
 }
 
+/// Check if a PID file describes a live daemon for the given canonical mount point.
+fn is_daemon_alive(pf: &PidFileContents, canonical: &Path) -> bool {
+    is_our_daemon(pf.pid) && pf.mount.as_deref().is_none_or(|m| Path::new(m) == canonical)
+}
+
 /// Check if a PID is alive (any process, no identity check).
 fn pid_alive(pid: i32) -> bool {
     (unsafe { libc::kill(pid, 0) }) == 0
@@ -193,7 +198,7 @@ pub fn stop_daemon(mount_point: &Path) -> std::io::Result<()> {
     let pid = pf.pid;
 
     // Check if the process is actually our daemon for this mount point.
-    let daemon_alive = is_our_daemon(pid) && pf.mount.as_deref().is_none_or(|m| Path::new(m) == canonical);
+    let daemon_alive = is_daemon_alive(&pf, &canonical);
     if !daemon_alive {
         eprintln!("Daemon (pid={pid}) is not running, cleaning up stale pid file");
         let _ = std::fs::remove_file(&pid_file);
@@ -246,11 +251,14 @@ fn decode_path(encoded: &str) -> String {
     let mut chars = encoded.chars();
     while let Some(c) = chars.next() {
         if c == '%' {
-            let hi = chars.next().unwrap_or('0');
-            let lo = chars.next().unwrap_or('0');
-            if let Ok(byte) = u8::from_str_radix(&format!("{hi}{lo}"), 16) {
+            if let (Some(hi), Some(lo)) = (chars.next(), chars.next())
+                && let Ok(byte) = u8::from_str_radix(&format!("{hi}{lo}"), 16)
+            {
                 result.push(byte as char);
+                continue;
             }
+            // Truncated or invalid sequence: keep the literal '%'
+            result.push('%');
         } else {
             result.push(c);
         }
@@ -330,9 +338,7 @@ pub fn daemonize(mount_point: &Path, source_label: &str) -> std::io::Result<Daem
 
     // Refuse to start if a daemon is already running for this mount point.
     if let Some(existing) = read_pid_file(&pid_file) {
-        let is_ours =
-            is_our_daemon(existing.pid) && existing.mount.as_deref().is_none_or(|m| Path::new(m) == canonical);
-        if is_ours {
+        if is_daemon_alive(&existing, &canonical) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::AlreadyExists,
                 format!(
@@ -422,6 +428,14 @@ pub fn daemonize(mount_point: &Path, source_label: &str) -> std::io::Result<Daem
                 let ret = unsafe { libc::poll(&raw mut pfd, 1, 1000) };
                 if ret > 0 {
                     break; // data or hangup ready
+                }
+                if ret < 0 {
+                    let err = std::io::Error::last_os_error();
+                    if err.kind() == std::io::ErrorKind::Interrupted {
+                        continue; // EINTR, retry
+                    }
+                    eprintln!(" poll error: {err}");
+                    std::process::exit(1);
                 }
                 eprint!(".");
             }
