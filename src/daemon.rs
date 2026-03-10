@@ -35,6 +35,17 @@ fn canonical_mount_point(mount_point: &Path) -> PathBuf {
             c => normalized.push(c),
         }
     }
+
+    // Resolve symlinks in the parent directory (e.g. macOS /tmp → /private/tmp)
+    // so that start and stop derive the same PID file key even when the mount
+    // point doesn't exist yet.
+    if let Some(parent) = normalized.parent()
+        && let Ok(real_parent) = std::fs::canonicalize(parent)
+        && let Some(name) = normalized.file_name()
+    {
+        return real_parent.join(name);
+    }
+
     normalized
 }
 
