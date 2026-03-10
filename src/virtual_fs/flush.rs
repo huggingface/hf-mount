@@ -25,6 +25,8 @@ pub(crate) struct FlushManager {
     /// Queued remote delete paths. Drained in flush_loop, poll, rmdir, and shutdown.
     pending_deletes: Arc<Mutex<Vec<String>>>,
     hub_client: Arc<dyn HubOps>,
+    /// True when flush_loop is running (advanced_writes mode). Set once at construction.
+    has_flush_loop: bool,
 }
 
 impl FlushManager {
@@ -66,12 +68,14 @@ impl FlushManager {
             (None, None)
         };
 
+        let has_flush_loop = handle.is_some();
         Self {
             tx: Mutex::new(tx),
             handle: Mutex::new(handle),
             errors,
             pending_deletes,
             hub_client,
+            has_flush_loop,
         }
     }
 
@@ -90,7 +94,7 @@ impl FlushManager {
 
     /// Whether the background flush_loop is running (advanced_writes mode).
     pub(crate) fn has_flush_loop(&self) -> bool {
-        self.handle.lock().expect("flush_handle poisoned").is_some()
+        self.has_flush_loop
     }
 
     // ── Remote delete queue ─────────────────────────────────────────
@@ -105,10 +109,10 @@ impl FlushManager {
 
     /// Cancel a queued delete (e.g. when a new file is created at the same path).
     pub(crate) fn cancel_delete(&self, path: &str) {
-        self.pending_deletes
-            .lock()
-            .expect("pending_deletes poisoned")
-            .retain(|p| p != path);
+        let mut q = self.pending_deletes.lock().expect("pending_deletes poisoned");
+        if !q.is_empty() {
+            q.retain(|p| p != path);
+        }
     }
 
     /// Flush all queued remote deletes in a single batch API call.
