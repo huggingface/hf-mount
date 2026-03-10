@@ -95,26 +95,7 @@ impl FlushManager {
 
     /// Flush all queued remote deletes in a single batch API call.
     pub(crate) async fn flush_deletes(&self) {
-        let paths: Vec<String> = {
-            let mut pending = self.pending_deletes.lock().expect("pending_deletes poisoned");
-            if pending.is_empty() {
-                return;
-            }
-            std::mem::take(&mut *pending)
-        };
-        let count = paths.len();
-        let ops: Vec<BatchOp> = paths
-            .iter()
-            .map(|path| BatchOp::DeleteFile { path: path.clone() })
-            .collect();
-        info!("Flushing {count} queued remote deletes");
-        if let Err(e) = self.hub_client.batch_operations(&ops).await {
-            error!("Batch remote delete failed: {}", e);
-            self.pending_deletes
-                .lock()
-                .expect("pending_deletes poisoned")
-                .extend(paths);
-        }
+        flush_pending_deletes(&self.pending_deletes, &*self.hub_client).await;
     }
 
     // ── Shutdown ────────────────────────────────────────────────────
@@ -217,14 +198,17 @@ async fn flush_pending_deletes(queue: &Mutex<Vec<String>>, hub_client: &dyn HubO
         std::mem::take(&mut *pending)
     };
     let count = paths.len();
-    let ops: Vec<BatchOp> = paths
-        .iter()
-        .map(|path| BatchOp::DeleteFile { path: path.clone() })
-        .collect();
+    let ops: Vec<BatchOp> = paths.into_iter().map(|path| BatchOp::DeleteFile { path }).collect();
     info!("Flushing {count} queued remote deletes");
     if let Err(e) = hub_client.batch_operations(&ops).await {
         error!("Batch remote delete failed: {}", e);
-        queue.lock().expect("pending_deletes poisoned").extend(paths);
+        // Re-queue paths from the failed ops for retry.
+        let mut pending = queue.lock().expect("pending_deletes poisoned");
+        for op in ops {
+            if let BatchOp::DeleteFile { path } = op {
+                pending.push(path);
+            }
+        }
     }
 }
 
