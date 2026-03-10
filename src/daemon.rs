@@ -11,29 +11,54 @@ fn state_dir() -> PathBuf {
 
 /// Canonicalize a mount point path, falling back to a normalized absolute path
 /// if the target doesn't exist yet. The result is used to derive PID/log filenames.
+///
+/// When the full path doesn't exist, we canonicalize the longest existing ancestor
+/// (resolving symlinks) and append the remaining non-existent components. This
+/// ensures `/tmp/link/mnt` (where `/tmp/link` is a symlink) produces the same key
+/// regardless of whether `mnt` exists yet.
 fn canonical_mount_point(mount_point: &Path) -> PathBuf {
-    std::fs::canonicalize(mount_point).unwrap_or_else(|_| {
-        let abs = if mount_point.is_absolute() {
-            mount_point.to_path_buf()
-        } else {
-            std::env::current_dir()
-                .unwrap_or_else(|_| PathBuf::from("/"))
-                .join(mount_point)
-        };
-        // Normalize away `.` and `..` components so that `./mnt` and `mnt`
-        // resolve to the same key even when the directory doesn't exist yet.
-        let mut normalized = PathBuf::new();
-        for component in abs.components() {
-            match component {
-                std::path::Component::ParentDir => {
-                    normalized.pop();
-                }
-                std::path::Component::CurDir => {}
-                c => normalized.push(c),
+    if let Ok(p) = std::fs::canonicalize(mount_point) {
+        return p;
+    }
+
+    let abs = if mount_point.is_absolute() {
+        mount_point.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("/"))
+            .join(mount_point)
+    };
+
+    // Normalize away `.` and `..` components.
+    let mut normalized = PathBuf::new();
+    for component in abs.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                normalized.pop();
             }
+            std::path::Component::CurDir => {}
+            c => normalized.push(c),
         }
-        normalized
-    })
+    }
+
+    // Try to canonicalize the longest existing prefix (resolves symlinks in
+    // parents), then append the non-existent tail.
+    let mut existing = normalized.clone();
+    let mut tail = Vec::new();
+    while !existing.as_os_str().is_empty() && existing != Path::new("/") {
+        if let Ok(real) = std::fs::canonicalize(&existing) {
+            let mut result = real;
+            for part in tail.into_iter().rev() {
+                result.push(part);
+            }
+            return result;
+        }
+        if let Some(name) = existing.file_name().map(|n| n.to_os_string()) {
+            tail.push(name);
+        }
+        existing.pop();
+    }
+    normalized
 }
 
 /// Encode a path as a filename-safe string using percent-encoding.
@@ -78,6 +103,11 @@ pub struct DaemonGuard {
 }
 
 impl DaemonGuard {
+    /// Path to the PID file managed by this guard.
+    pub fn pid_file(&self) -> &Path {
+        &self.pid_file
+    }
+
     /// Signal the parent that the mount is active and it can exit.
     pub fn notify_ready(&mut self) {
         if !self.notified {
@@ -208,6 +238,26 @@ pub fn daemonize(mount_point: &Path) -> std::io::Result<DaemonGuard> {
         // Stale PID file from a dead process, remove it.
         let _ = std::fs::remove_file(&pid_file);
     }
+
+    // Claim the PID file atomically (O_EXCL) so concurrent starts don't race.
+    // We write a placeholder PID (parent's) that the child overwrites after fork.
+    use std::io::Write;
+    let mut pid_claim = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&pid_file)
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    format!("another daemon start is in progress for {:?}", mount_point),
+                )
+            } else {
+                e
+            }
+        })?;
+    writeln!(pid_claim, "{}", std::process::id())?;
+    drop(pid_claim);
 
     // Pipe for ready notification: child writes, parent reads.
     let (read_fd, write_fd) = {

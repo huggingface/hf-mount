@@ -541,6 +541,9 @@ pub fn mount_fuse(
 
     info!("FUSE mount active at {:?}", mount_point);
 
+    // Grab the PID file path before signalling ready (for cleanup in signal handler).
+    let daemon_pid_file = daemon_guard.as_ref().map(|g| g.pid_file().to_path_buf());
+
     // Signal the parent process that the mount is live (daemon mode).
     if let Some(guard) = daemon_guard {
         guard.notify_ready();
@@ -562,6 +565,10 @@ pub fn mount_fuse(
             // don't silently lose writes.
             error!("Unmount failed, flushing dirty files before exit...");
             vfs_for_signal.shutdown();
+            // Clean up PID file since process::exit skips DaemonGuard drop.
+            if let Some(pid_file) = &daemon_pid_file {
+                let _ = std::fs::remove_file(pid_file);
+            }
             std::process::exit(1);
         }
     });
