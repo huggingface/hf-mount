@@ -148,7 +148,11 @@ fn try_unmount(mount_point: &Path) -> bool {
         return std::process::Command::new("umount")
             .arg(&*mount_str)
             .status()
-            .is_ok_and(|s| s.success());
+            .is_ok_and(|s| s.success())
+            || std::process::Command::new("diskutil")
+                .args(["unmount", &mount_str])
+                .status()
+                .is_ok_and(|s| s.success());
     }
     #[cfg(target_os = "linux")]
     {
