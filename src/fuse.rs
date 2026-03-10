@@ -132,6 +132,17 @@ impl Filesystem for FuseAdapter {
                 ));
             }
         }
+
+        // Allow idmapped mounts (Linux 6.2+). Required for pods running in
+        // user namespaces (hostUsers: false) where the kernel needs to remap
+        // uid/gid on the FUSE mount.
+        if config.add_capabilities(InitFlags::FUSE_ALLOW_IDMAP).is_err() {
+            info!(
+                "kernel does not support FUSE_ALLOW_IDMAP; \
+                 user namespace (idmapped) mounts may fail"
+            );
+        }
+
         Ok(())
     }
 
