@@ -53,7 +53,7 @@ pub trait DownloadStreamOps: Send {
 pub struct XetSessions {
     session: Arc<FileDownloadSession>,
     upload_config: Option<Arc<TranslatorConfig>>,
-    /// Kept separately from `session` so we can call `get_reconstruction` for cache warming.
+    /// Kept separately from `session` for bounded range downloads via `FileReconstructor`.
     cas_client: Arc<dyn Client>,
 }
 

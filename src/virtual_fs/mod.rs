@@ -1259,9 +1259,6 @@ impl VirtualFs {
     }
 
     /// Allocate a lazy file handle backed by a prefetch buffer.
-    /// Warm is NOT triggered here — it's deferred to the first RangeDownload in fetch_data().
-    /// Sequential reads use FileDownloadSession (own reconstruction), so warm would just
-    /// duplicate the CAS call. Deferring avoids that waste.
     fn open_lazy(&self, xet_hash: String, size: u64) -> VirtualFsResult<u64> {
         let prefetch = Arc::new(tokio::sync::Mutex::new(PrefetchState::new(
             xet_hash,
