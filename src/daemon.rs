@@ -136,14 +136,32 @@ fn pid_alive(pid: i32) -> bool {
     (unsafe { libc::kill(pid, 0) }) == 0
 }
 
-/// Read a PID file. Returns the PID and optional mount path.
-/// PID file format: line 1 = PID, line 2 = canonical mount path (optional for compat).
-fn read_pid_file(pid_file: &Path) -> Option<(i32, Option<String>)> {
+/// Read a PID file. Returns the PID, optional mount path, and optional start time.
+/// PID file format: line 1 = PID, line 2 = canonical mount path, line 3 = start time nonce.
+fn read_pid_file(pid_file: &Path) -> Option<(i32, Option<String>, Option<String>)> {
     let content = std::fs::read_to_string(pid_file).ok()?;
     let mut lines = content.lines();
     let pid: i32 = lines.next()?.trim().parse().ok()?;
     let mount = lines.next().map(|s| s.trim().to_string());
-    Some((pid, mount))
+    let start_time = lines.next().map(|s| s.trim().to_string());
+    Some((pid, mount, start_time))
+}
+
+/// Get a process's start time as a string for identity verification.
+/// Returns None if the info is unavailable (not an error, just skip the check).
+fn process_start_time(_pid: i32) -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        let stat = std::fs::read_to_string(format!("/proc/{_pid}/stat")).ok()?;
+        // Fields are space-separated, but field 2 (comm) can contain spaces and parens.
+        // Find the last ')' to skip past comm, then parse remaining fields.
+        let after_comm = stat.rfind(')')? + 2;
+        let fields: Vec<&str> = stat[after_comm..].split_whitespace().collect();
+        // starttime is field 22 (1-indexed), which is index 19 after comm (fields 3..=N).
+        return fields.get(19).map(|s| s.to_string());
+    }
+    #[allow(unreachable_code)]
+    None
 }
 
 /// Guard held by the daemon child process. Signals readiness to the parent
@@ -234,7 +252,7 @@ fn try_unmount(mount_point: &Path) -> bool {
 pub fn stop_daemon(mount_point: &Path) -> std::io::Result<()> {
     let pid_file = pid_path(mount_point);
     let canonical = canonical_mount_point(mount_point);
-    let (pid, stored_mount) = read_pid_file(&pid_file).ok_or_else(|| {
+    let (pid, stored_mount, stored_start) = read_pid_file(&pid_file).ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::NotFound,
             format!(
@@ -246,7 +264,12 @@ pub fn stop_daemon(mount_point: &Path) -> std::io::Result<()> {
     })?;
 
     // Check if the process is actually our daemon for this mount point.
-    let daemon_alive = is_our_daemon(pid) && stored_mount.as_deref().is_none_or(|m| Path::new(m) == canonical);
+    // Verify: executable is hf-mount, mount path matches, start time matches.
+    let daemon_alive = is_our_daemon(pid)
+        && stored_mount.as_deref().is_none_or(|m| Path::new(m) == canonical)
+        && stored_start
+            .as_deref()
+            .is_none_or(|stored| process_start_time(pid).as_deref() == Some(stored));
     if !daemon_alive {
         eprintln!("Daemon (pid={pid}) is not running, cleaning up stale pid file");
         let _ = std::fs::remove_file(&pid_file);
@@ -319,9 +342,12 @@ pub fn daemonize(mount_point: &Path) -> std::io::Result<DaemonGuard> {
     std::fs::create_dir_all(pid_file.parent().unwrap())?;
 
     // Refuse to start if a daemon is already running for this mount point.
-    if let Some((existing_pid, stored_mount)) = read_pid_file(&pid_file) {
-        let is_ours =
-            is_our_daemon(existing_pid) && stored_mount.as_deref().is_none_or(|m| Path::new(m) == canonical);
+    if let Some((existing_pid, stored_mount, stored_start)) = read_pid_file(&pid_file) {
+        let is_ours = is_our_daemon(existing_pid)
+            && stored_mount.as_deref().is_none_or(|m| Path::new(m) == canonical)
+            && stored_start
+                .as_deref()
+                .is_none_or(|stored| process_start_time(existing_pid).as_deref() == Some(stored));
         if is_ours {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::AlreadyExists,
@@ -353,14 +379,39 @@ pub fn daemonize(mount_point: &Path) -> std::io::Result<DaemonGuard> {
                 e
             }
         })?;
-    writeln!(pid_claim, "{}\n{}", std::process::id(), canonical.display())?;
+    let self_start = process_start_time(std::process::id() as i32).unwrap_or_default();
+    writeln!(
+        pid_claim,
+        "{}\n{}\n{}",
+        std::process::id(),
+        canonical.display(),
+        self_start
+    )?;
     drop(pid_claim);
 
     // Pipe for ready notification: child writes, parent reads.
+    // Set CLOEXEC so helpers (mount.nfs, sudo) don't inherit the write end,
+    // which would keep the pipe open and block the parent if the child dies.
     let (read_fd, write_fd) = {
         let mut fds = [0i32; 2];
-        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
-            return Err(std::io::Error::last_os_error());
+        #[cfg(target_os = "linux")]
+        {
+            if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // Set CLOEXEC via fcntl on platforms without pipe2.
+            for &fd in &fds {
+                unsafe {
+                    let flags = libc::fcntl(fd, libc::F_GETFD);
+                    libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+                }
+            }
         }
         (fds[0], fds[1])
     };
@@ -389,8 +440,12 @@ pub fn daemonize(mount_point: &Path) -> std::io::Result<DaemonGuard> {
             // Drop the original fd (stdout/stderr now own the file).
             drop(log);
 
-            // Write PID file with mount path for identity validation.
-            std::fs::write(&pid_file, format!("{}\n{}\n", std::process::id(), canonical.display()))?;
+            // Write PID file with mount path and start time for identity validation.
+            let child_start = process_start_time(std::process::id() as i32).unwrap_or_default();
+            std::fs::write(
+                &pid_file,
+                format!("{}\n{}\n{}\n", std::process::id(), canonical.display(), child_start),
+            )?;
 
             Ok(DaemonGuard {
                 write_fd,
