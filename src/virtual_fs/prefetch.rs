@@ -23,13 +23,25 @@ pub(crate) const FORWARD_SKIP: u64 = 16 * 1_048_576; // 16 MiB
 
 // ── FetchPlan ────────────────────────────────────────────────────────
 
+/// How data should be fetched for this read, determined by access pattern:
+///
+/// - **StartStream / ContinueStream** (sequential): offset is contiguous with the
+///   previous buffer end (or first read at offset 0). Uses an unbounded stream from
+///   `download_stream_from_offset` with the xorb disk cache enabled, and prefetches
+///   ahead (`window_size`) to amortise latency.
+///
+/// - **RangeDownload** (random/seek): offset is non-contiguous (backward seek, or
+///   forward jump beyond `FORWARD_SKIP`). Uses a bounded `FileRange` via
+///   `FileReconstructor` so the CAS API only returns terms covering the needed bytes.
+///   Skips the xorb disk cache (it downloads full 64MB xorbs even for small ranges)
+///   and fetches only `needed` bytes (no prefetch window).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FetchStrategy {
     /// First sequential read from offset 0, no stream yet: start one.
     StartStream,
     /// Sequential read, existing stream at the right position: keep reading.
     ContinueStream,
-    /// Non-sequential or gap: use a range download.
+    /// Non-sequential or gap: use a bounded range download.
     RangeDownload,
 }
 
