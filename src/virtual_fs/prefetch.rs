@@ -128,15 +128,26 @@ impl PrefetchState {
             false
         };
 
-        // Decide fetch strategy — stream only when offset matches buffer position exactly
-        let strategy = if is_sequential && offset == self.buf_start {
-            if self.stream.is_none() && is_first_fetch && offset == 0 {
-                FetchStrategy::StartStream
+        // Decide fetch strategy
+        let strategy = if is_sequential {
+            if offset == self.buf_start {
+                // Contiguous with buffer — keep streaming.
+                if self.stream.is_none() && is_first_fetch && offset == 0 {
+                    FetchStrategy::StartStream
+                } else {
+                    FetchStrategy::ContinueStream
+                }
             } else {
-                FetchStrategy::ContinueStream
+                // Small forward gap (within FORWARD_SKIP): restart stream at new offset.
+                // Keeps windowed prefetch for strided sequential patterns (e.g. tar skip).
+                if let Some(s) = self.stream.take() {
+                    debug!("prefetch: restarting stream (forward skip)");
+                    drop(s);
+                }
+                FetchStrategy::StartStream
             }
         } else {
-            // Not streamable: cancel stale stream
+            // Far seek: cancel stale stream, use bounded range download.
             if let Some(s) = self.stream.take() {
                 debug!("prefetch: cancelling stream");
                 drop(s);

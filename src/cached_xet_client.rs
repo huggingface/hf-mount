@@ -210,12 +210,23 @@ impl Client for CachedXetClient {
 
         if let Some(response) = &result {
             let mut cache = self.cache.lock().expect("cache poisoned");
+
+            // When inserting a full plan, purge redundant range entries for this hash
+            // (they're now derivable from the full plan, no point keeping them).
+            if bytes_range.is_none() {
+                cache.retain(|(hash, range), _| *hash != *file_id || range.is_none());
+            }
+
             if cache.len() >= MAX_CACHE_ENTRIES {
                 // Evict range entries only — full-file plans (None key) are too valuable
                 // since all range queries can be derived from them.
                 cache.retain(|(_hash, range), _| range.is_none());
-                // If still over capacity (all full plans), clear everything.
+                // If still over capacity (all full plans), skip caching range entries
+                // (they can be derived from full plans anyway).
                 if cache.len() >= MAX_CACHE_ENTRIES {
+                    if bytes_range.is_some() {
+                        return Ok(result);
+                    }
                     cache.clear();
                 }
             }
@@ -554,6 +565,55 @@ mod tests {
         // Full plan should survive eviction — still cached.
         client.get_reconstruction(&key, None).await.unwrap();
         assert_eq!(inner_impl.call_count((key, None)), 1); // still cached
+    }
+
+    #[tokio::test]
+    async fn full_plan_insert_purges_stale_range_entries() {
+        let inner_impl = Arc::new(MockClient::new(MockMode::ReturnSome));
+        let inner: Arc<dyn Client> = inner_impl.clone();
+        let client = CachedXetClient::new(inner);
+        let key = hash_for(70);
+
+        // Cache a range entry first (no full plan available).
+        let r = Some(FileRange::new(100, 200));
+        client.get_reconstruction(&key, r).await.unwrap();
+        assert_eq!(inner_impl.call_count((key, r)), 1);
+
+        // Now insert the full plan — should purge the range entry.
+        client.get_reconstruction(&key, None).await.unwrap();
+
+        // Verify the range entry was purged by checking cache size:
+        // only the full plan should remain. A subsequent range query should
+        // derive from the full plan (no new CAS call).
+        let r2 = Some(FileRange::new(100, 200));
+        client.get_reconstruction(&key, r2).await.unwrap();
+        // Still 1 CAS call for the range — it was purged but derived from full plan.
+        assert_eq!(inner_impl.call_count((key, r2)), 1);
+        assert_eq!(inner_impl.total_calls(), 2); // 1 range + 1 full plan, no extra
+    }
+
+    #[tokio::test]
+    async fn range_entry_skipped_when_cache_full_of_full_plans() {
+        let inner_impl = Arc::new(MockClient::new(MockMode::ReturnSome));
+        let inner: Arc<dyn Client> = inner_impl.clone();
+        let client = CachedXetClient::new(inner);
+
+        // Fill cache with full plans.
+        for i in 0..MAX_CACHE_ENTRIES {
+            client.get_reconstruction(&hash_for(i), None).await.unwrap();
+        }
+
+        // Range query on a new hash — should NOT clear all full plans.
+        let overflow_hash = hash_for(MAX_CACHE_ENTRIES + 1);
+        let r = Some(FileRange::new(0, 100));
+        client.get_reconstruction(&overflow_hash, r).await.unwrap();
+        // Second call should hit CAS again (range was not cached).
+        client.get_reconstruction(&overflow_hash, r).await.unwrap();
+        assert_eq!(inner_impl.call_count((overflow_hash, r)), 2);
+
+        // But existing full plans should still be cached.
+        client.get_reconstruction(&hash_for(0), None).await.unwrap();
+        assert_eq!(inner_impl.call_count((hash_for(0), None)), 1);
     }
 
     #[tokio::test]

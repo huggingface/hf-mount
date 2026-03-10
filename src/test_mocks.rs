@@ -226,6 +226,8 @@ pub struct MockXet {
     pub warm_call_count: AtomicU32,
     /// Optional delay injected into warm_reconstruction_cache (simulates CAS round-trip).
     warm_delay_ms: AtomicU64,
+    /// Log of (offset, end) pairs passed to download_stream_boxed.
+    pub stream_calls: Mutex<Vec<(u64, Option<u64>)>>,
 }
 
 impl MockXet {
@@ -241,6 +243,7 @@ impl MockXet {
             range_empty_count: AtomicU32::new(0),
             warm_call_count: AtomicU32::new(0),
             warm_delay_ms: AtomicU64::new(0),
+            stream_calls: Mutex::new(Vec::new()),
         })
     }
 
@@ -334,8 +337,10 @@ impl XetOps for MockXet {
         &self,
         file_info: &XetFileInfo,
         offset: u64,
-        _end: Option<u64>,
+        end: Option<u64>,
     ) -> Result<Box<dyn DownloadStreamOps>> {
+        self.stream_calls.lock().unwrap().push((offset, end));
+
         let prev_fail = self.range_fail_count.load(Ordering::SeqCst);
         if prev_fail > 0 {
             self.range_fail_count.fetch_sub(1, Ordering::SeqCst);
@@ -347,14 +352,17 @@ impl XetOps for MockXet {
             return Ok(Box::new(MockDownloadStream {
                 data: Vec::new(),
                 offset: 0,
+                end: 0,
                 chunk_size: 4096,
             }));
         }
         let files = self.files.lock().unwrap();
         let content = files.get(file_info.hash()).cloned().unwrap_or_default();
+        let bounded_end = end.map(|e| e as usize).unwrap_or(content.len());
         Ok(Box::new(MockDownloadStream {
             data: content,
             offset: offset as usize,
+            end: bounded_end,
             chunk_size: 4096,
         }))
     }
@@ -397,18 +405,20 @@ impl StreamingWriterOps for MockStreamingWriter {
 pub struct MockDownloadStream {
     data: Vec<u8>,
     offset: usize,
+    /// Upper bound (exclusive) on data this stream will serve.
+    end: usize,
     chunk_size: usize,
 }
 
 #[async_trait::async_trait]
 impl DownloadStreamOps for MockDownloadStream {
     async fn next(&mut self) -> Result<Option<Bytes>> {
-        if self.offset >= self.data.len() {
+        if self.offset >= self.end.min(self.data.len()) {
             return Ok(None);
         }
-        let end = (self.offset + self.chunk_size).min(self.data.len());
-        let chunk = Bytes::copy_from_slice(&self.data[self.offset..end]);
-        self.offset = end;
+        let chunk_end = (self.offset + self.chunk_size).min(self.end).min(self.data.len());
+        let chunk = Bytes::copy_from_slice(&self.data[self.offset..chunk_end]);
+        self.offset = chunk_end;
         Ok(Some(chunk))
     }
 }

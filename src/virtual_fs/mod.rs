@@ -82,6 +82,9 @@ pub struct VirtualFs {
     filter_os_files: bool,
     /// When true, prefetch buffers drain after serving (forward-only, no re-read cache).
     direct_io: bool,
+    /// Hashes for which a background warm task has already been spawned.
+    /// Prevents duplicate full-plan CAS fetches when the same file is opened multiple times.
+    warming_hashes: Mutex<HashSet<String>>,
 }
 
 /// Where to read file content from when opening read-only.
@@ -166,6 +169,7 @@ impl VirtualFs {
             serve_lookup_from_cache,
             filter_os_files,
             direct_io,
+            warming_hashes: Mutex::new(HashSet::new()),
         });
 
         // Set root inode mtime and ownership (repos use the last commit date).
@@ -1264,12 +1268,19 @@ impl VirtualFs {
     /// while the full-file plan warms up in the background for subsequent reads.
     fn open_lazy(&self, xet_hash: String, size: u64) -> VirtualFsResult<u64> {
         if !xet_hash.is_empty() {
-            let sessions = self.xet_sessions.clone();
-            let hash = xet_hash.clone();
-            tokio::spawn(async move {
-                sessions.warm_reconstruction_cache(&hash).await;
-                // Errors silently dropped — worst case each read pays a range CAS round-trip.
-            });
+            let already_warming = !self
+                .warming_hashes
+                .lock()
+                .expect("warming_hashes poisoned")
+                .insert(xet_hash.clone());
+            if !already_warming {
+                let sessions = self.xet_sessions.clone();
+                let hash = xet_hash.clone();
+                tokio::spawn(async move {
+                    sessions.warm_reconstruction_cache(&hash).await;
+                    // Errors silently dropped — worst case each read pays a range CAS round-trip.
+                });
+            }
         }
         let prefetch = Arc::new(tokio::sync::Mutex::new(PrefetchState::new(
             xet_hash,
