@@ -14,6 +14,9 @@ use xorb_object::SerializedXorbObject;
 
 type Result<T> = std::result::Result<T, cas_client::CasClientError>;
 
+/// Cache key: file hash + optional byte range (`None` = full-file plan).
+type ReconCacheKey = (MerkleHash, Option<FileRange>);
+
 const MAX_CACHE_ENTRIES: usize = 4096;
 /// Presigned URLs returned by the CAS server expire after 1 hour.
 /// Evict cache entries just before expiry to avoid serving stale URLs.
@@ -43,7 +46,7 @@ pub struct CachedXetClient {
     /// Reconstruction plan cache. Key is (file_hash, range) where `None` = full-file plan.
     /// Full-file plans are preferred: range queries are derived locally when available.
     /// Range-scoped entries serve as fast fallback while the full plan warms up.
-    cache: Mutex<HashMap<(MerkleHash, Option<FileRange>), CacheEntry>>,
+    cache: Mutex<HashMap<ReconCacheKey, CacheEntry>>,
     ttl: Duration,
 }
 
@@ -133,23 +136,60 @@ impl Client for CachedXetClient {
         file_id: &MerkleHash,
         bytes_range: Option<FileRange>,
     ) -> Result<Option<QueryReconstructionResponse>> {
-        // 1. Try the full-file cache first (best case: derive range locally, 0ms).
-        let full_key = (*file_id, None);
-        let cached_full = {
+        // Single lock: check exact key first, then full-file plan as fallback.
+        // For range queries the exact CAS response has tighter ChunkRanges (trimmed
+        // at chunk granularity) than what derive_range_response produces from the
+        // full plan, so prefer it when available.
+        enum CacheResult {
+            ExactHit(QueryReconstructionResponse),
+            FullPlan(QueryReconstructionResponse, FileRange),
+            Miss,
+        }
+
+        let cached = {
             let mut cache = self.cache.lock().expect("cache poisoned");
-            match cache.get(&full_key) {
+
+            // Helper: look up a key, evict if expired, return the response if valid.
+            let try_get = |cache: &mut HashMap<ReconCacheKey, CacheEntry>, key: ReconCacheKey| match cache.get(&key) {
                 Some(entry) if entry.is_valid(self.ttl) => Some(entry.response.clone()),
                 Some(_) => {
-                    cache.remove(&full_key);
+                    cache.remove(&key);
                     None
                 }
                 None => None,
-            }
-        };
+            };
 
-        if let Some(full) = cached_full {
-            if let Some(range) = bytes_range {
+            // 1. Exact key (range or full).
+            if let Some(resp) = try_get(&mut cache, (*file_id, bytes_range)) {
+                CacheResult::ExactHit(resp)
+            }
+            // 2. For range queries, fall back to the full-file plan.
+            else if let Some(range) = bytes_range {
+                match try_get(&mut cache, (*file_id, None)) {
+                    Some(full) => CacheResult::FullPlan(full, range),
+                    None => CacheResult::Miss,
+                }
+            } else {
+                CacheResult::Miss
+            }
+        }; // lock released
+
+        match cached {
+            CacheResult::ExactHit(resp) => {
+                tracing::debug!(
+                    "recon: HIT  file={:.8} range={:?} terms={}",
+                    file_id,
+                    bytes_range,
+                    resp.terms.len()
+                );
+                return Ok(Some(resp));
+            }
+            CacheResult::FullPlan(full, range) => {
                 let resp = derive_range_response(&full, range);
+                // Mirror the CAS server's EOF contract:
+                // - Non-empty file, range past EOF → None
+                // - Empty file, range.start == 0 → Some(empty_terms)  (only valid range)
+                // - Empty file, range.start > 0  → None               (past EOF)
                 if resp.terms.is_empty() && (!full.terms.is_empty() || range.start > 0) {
                     return Ok(None);
                 }
@@ -160,35 +200,8 @@ impl Client for CachedXetClient {
                     resp.terms.len()
                 );
                 return Ok(Some(resp));
-            } else {
-                tracing::debug!("recon: HIT  file={:.8} range=None terms={}", file_id, full.terms.len());
-                return Ok(Some(full));
             }
-        }
-
-        // 2. Full plan not cached yet. For range queries, check the exact range cache.
-        if bytes_range.is_some() {
-            let range_key = (*file_id, bytes_range);
-            let cached_range = {
-                let mut cache = self.cache.lock().expect("cache poisoned");
-                match cache.get(&range_key) {
-                    Some(entry) if entry.is_valid(self.ttl) => Some(entry.response.clone()),
-                    Some(_) => {
-                        cache.remove(&range_key);
-                        None
-                    }
-                    None => None,
-                }
-            };
-            if let Some(resp) = cached_range {
-                tracing::debug!(
-                    "recon: RHIT file={:.8} range={:?} terms={}",
-                    file_id,
-                    bytes_range,
-                    resp.terms.len()
-                );
-                return Ok(Some(resp));
-            }
+            CacheResult::Miss => {}
         }
 
         // 3. Cache miss — fetch from CAS.
