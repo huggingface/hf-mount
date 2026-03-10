@@ -212,7 +212,10 @@ pub fn stop_daemon(mount_point: &Path) -> std::io::Result<()> {
     eprint!("Stopping daemon (pid={pid})");
 
     if !try_unmount(mount_point) {
-        eprint!(" (unmount failed, waiting)");
+        eprintln!();
+        return Err(std::io::Error::other(format!(
+            "failed to unmount {mount_point:?} (is something still using it?)"
+        )));
     }
 
     // Wait up to 30s for the daemon to exit. The daemon may spend time

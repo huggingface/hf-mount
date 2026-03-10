@@ -65,7 +65,7 @@ pub struct VirtualFs {
     pending_commits: Mutex<HashMap<u64, CommitHookRx>>,
     /// Debounced batch flush pipeline (None when read_only).
     flush_manager: Option<flush::FlushManager>,
-    /// Background poll task handle, taken in shutdown().
+    /// Background poll task handle, aborted in shutdown().
     poll_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Kernel cache invalidation callback. Set via `set_invalidator()` after mount.
     /// The poll loop calls this to actively invalidate stale inodes when remote changes
@@ -82,6 +82,9 @@ pub struct VirtualFs {
     filter_os_files: bool,
     /// When true, prefetch buffers drain after serving (forward-only, no re-read cache).
     direct_io: bool,
+    /// Queued remote delete operations. `unlink()` pushes paths here instead of
+    /// making individual HTTP calls. Flushed in rmdir, poll, and shutdown.
+    pending_remote_deletes: Arc<Mutex<Vec<String>>>,
 }
 
 /// Where to read file content from when opening read-only.
@@ -126,11 +129,13 @@ impl VirtualFs {
 
         // Spawn remote change polling task (if interval > 0)
         let invalidator: Invalidator = Arc::new(Mutex::new(None));
+        let pending_remote_deletes = Arc::new(Mutex::new(Vec::new()));
         let poll_handle = if poll_interval_secs > 0 {
             let bg_hub = hub_client.clone();
             let bg_inodes = inodes.clone();
             let bg_neg_cache = negative_cache.clone();
             let bg_invalidator = invalidator.clone();
+            let bg_pending_deletes = pending_remote_deletes.clone();
             let interval = Duration::from_secs(poll_interval_secs);
 
             Some(runtime.spawn(Self::poll_remote_changes(
@@ -138,6 +143,7 @@ impl VirtualFs {
                 bg_inodes,
                 bg_neg_cache,
                 bg_invalidator,
+                bg_pending_deletes,
                 interval,
             )))
         } else {
@@ -166,6 +172,7 @@ impl VirtualFs {
             serve_lookup_from_cache,
             filter_os_files,
             direct_io,
+            pending_remote_deletes,
         });
 
         // Set root inode mtime and ownership (repos use the last commit date).
@@ -202,7 +209,7 @@ impl VirtualFs {
     /// Graceful shutdown: abort polling, drain flush queue, wait for completion.
     pub fn shutdown(&self) {
         info!("Shutting down VFS, flushing pending writes...");
-        // Abort the polling task.
+        // Abort background tasks.
         if let Some(handle) = self.poll_handle.lock().expect("poll_handle poisoned").take() {
             handle.abort();
         }
@@ -211,7 +218,45 @@ impl VirtualFs {
             let dirty = self.inode_table.read().expect("inodes poisoned").dirty_inos();
             fm.shutdown(dirty, &self.runtime);
         }
+        // Flush any queued remote deletes before exiting.
+        self.runtime.block_on(self.flush_remote_deletes());
         info!("Flush loop finished, VFS shut down.");
+    }
+
+    /// Flush all queued remote delete operations in a single batch API call.
+    async fn flush_remote_deletes(&self) {
+        Self::flush_delete_queue(&self.pending_remote_deletes, &*self.hub_client).await;
+    }
+
+    /// Drain `queue` and send all paths as a single `batch_operations` delete.
+    /// Re-queues paths on transient failure. Used by both `flush_remote_deletes`
+    /// and the poll loop (which is a static function without `&self`).
+    async fn flush_delete_queue(queue: &Mutex<Vec<String>>, hub_client: &dyn HubOps) {
+        let paths: Vec<String> = {
+            let mut pending = queue.lock().expect("pending_deletes poisoned");
+            if pending.is_empty() {
+                return;
+            }
+            std::mem::take(&mut *pending)
+        };
+        let count = paths.len();
+        let ops: Vec<BatchOp> = paths
+            .iter()
+            .map(|path| BatchOp::DeleteFile { path: path.clone() })
+            .collect();
+        info!("Flushing {count} queued remote deletes");
+        if let Err(e) = hub_client.batch_operations(&ops).await {
+            error!("Batch remote delete failed: {}", e);
+            let mut pending = queue.lock().expect("pending_deletes poisoned");
+            pending.extend(paths);
+        }
+    }
+
+    /// Remove a path from the pending delete queue (e.g. when a new file is
+    /// created at the same path, so the queued delete would be stale).
+    fn cancel_queued_delete(&self, path: &str) {
+        let mut pending = self.pending_remote_deletes.lock().expect("pending_deletes poisoned");
+        pending.retain(|p| p != path);
     }
 
     // ── Background tasks ───────────────────────────────────────────────
@@ -222,10 +267,15 @@ impl VirtualFs {
         inodes: Arc<RwLock<InodeTable>>,
         negative_cache: Arc<RwLock<HashMap<String, Instant>>>,
         invalidator: Invalidator,
+        pending_remote_deletes: Arc<Mutex<Vec<String>>>,
         interval: Duration,
     ) {
         loop {
             tokio::time::sleep(interval).await;
+
+            // Flush any queued remote deletes before polling, so the remote
+            // state is up-to-date and we don't re-discover deleted files.
+            Self::flush_delete_queue(&pending_remote_deletes, &*hub_client).await;
 
             let remote_entries = match hub_client.list_tree("", true).await {
                 Ok(entries) => entries,
@@ -1975,6 +2025,7 @@ impl VirtualFs {
         };
 
         self.negative_cache_remove(&full_path);
+        self.cancel_queued_delete(&full_path);
 
         if self.advanced_writes {
             // Advanced mode: staging file on disk + async flush
@@ -2121,18 +2172,14 @@ impl VirtualFs {
             (entry.inode, entry.full_path.clone(), needs_remote)
         };
 
-        // Delete from remote first — if this fails, local state is untouched and
-        // the caller gets EIO with a consistent filesystem.
-        if needs_remote_delete
-            && let Err(e) = self
-                .hub_client
-                .batch_operations(&[BatchOp::DeleteFile {
-                    path: full_path.clone(),
-                }])
-                .await
-        {
-            error!("Remote delete failed for {}: {}", full_path, e);
-            return Err(libc::EIO);
+        // Queue the remote delete for batched flush instead of making an
+        // individual HTTP call per file. The background flush task sends them
+        // all in a single batch_operations request.
+        if needs_remote_delete {
+            self.pending_remote_deletes
+                .lock()
+                .expect("pending_deletes poisoned")
+                .push(full_path.clone());
         }
 
         // Remote succeeded (or no remote needed) — now unlink locally.
@@ -2236,12 +2283,94 @@ impl VirtualFs {
         Err(libc::ENOTSUP)
     }
 
+    /// Recursively remove a directory and all its descendants.
+    /// Loads the full subtree, batch-deletes all remote files in one API call,
+    /// then removes all local inodes. Much faster than file-by-file unlink
+    /// for large trees (used by NFS remove).
+    pub async fn rmdir_recursive(&self, parent: u64, name: &str) -> VirtualFsResult<()> {
+        if self.read_only {
+            return Err(libc::EROFS);
+        }
+
+        debug!("rmdir_recursive: parent={}, name={}", parent, name);
+
+        // Flush any queued remote deletes first (files already unlinked locally).
+        self.flush_remote_deletes().await;
+
+        self.ensure_children_loaded(parent).await?;
+
+        let ino = {
+            let inodes = self.inode_table.read().expect("inodes poisoned");
+            match inodes.lookup_child(parent, name) {
+                Some(entry) if entry.kind == InodeKind::Directory => entry.inode,
+                Some(_) => return Err(libc::ENOTDIR),
+                None => return Err(libc::ENOENT),
+            }
+        };
+
+        // Load the full subtree so we know all remote files.
+        self.ensure_subtree_loaded(ino).await?;
+
+        // Single DFS pass: collect remote file paths and staging file inos.
+        let (remote_deletes, staging_inos) = {
+            let inodes = self.inode_table.read().expect("inodes poisoned");
+            let mut remote_paths = Vec::new();
+            let mut staging = Vec::new();
+            let mut stack = vec![ino];
+            while let Some(current) = stack.pop() {
+                if let Some(entry) = inodes.get(current) {
+                    if entry.kind == InodeKind::File {
+                        if entry.xet_hash.is_some() {
+                            remote_paths.push(entry.full_path.clone());
+                        }
+                        staging.push(current);
+                    }
+                    for child in &entry.children {
+                        stack.push(child.ino);
+                    }
+                }
+            }
+            (remote_paths, staging)
+        };
+
+        // Batch-delete all remote files in one API call.
+        if !remote_deletes.is_empty() {
+            let ops: Vec<BatchOp> = remote_deletes
+                .into_iter()
+                .map(|path| BatchOp::DeleteFile { path })
+                .collect();
+            if let Err(e) = self.hub_client.batch_operations(&ops).await {
+                error!("Remote batch delete failed for rmdir_recursive: {}", e);
+                return Err(libc::EIO);
+            }
+        }
+
+        // Clean up staging files.
+        if let Some(ref staging_dir) = self.staging_dir {
+            for file_ino in staging_inos {
+                let _ = std::fs::remove_file(staging_dir.path(file_ino));
+            }
+        }
+
+        // Remove all local inodes (remove() handles recursive cleanup).
+        let mut inodes = self.inode_table.write().expect("inodes poisoned");
+        inodes.remove(ino);
+        inodes.touch_parent(parent, SystemTime::now());
+
+        info!("Recursively deleted directory: {}", name);
+        Ok(())
+    }
+
     pub async fn rmdir(&self, parent: u64, name: &str) -> VirtualFsResult<()> {
         if self.read_only {
             return Err(libc::EROFS);
         }
 
         debug!("rmdir: parent={}, name={}", parent, name);
+
+        // Flush any queued remote deletes (e.g. from rm -rf that unlinked
+        // files before calling rmdir on the now-empty directory).
+        self.flush_remote_deletes().await;
 
         self.ensure_children_loaded(parent).await?;
 
