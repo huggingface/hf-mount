@@ -221,7 +221,9 @@ pub fn parse_repo_id(repo_id: &str) -> (RepoType, String) {
 
 /// Split a raw identifier into `(id, path_prefix)` after the first 2 `/`-separated segments.
 /// E.g. `split_path_prefix("user/bucket/a/b")` → `("user/bucket", "a/b")`.
-pub fn split_path_prefix(raw: &str) -> (&str, &str) {
+/// Trailing slashes are trimmed, and `.`/`..` components in the prefix are rejected.
+pub fn split_path_prefix(raw: &str) -> std::result::Result<(&str, &str), &'static str> {
+    let raw = raw.trim_end_matches('/');
     let mut end = 0;
     let mut count = 0;
     for (i, ch) in raw.char_indices() {
@@ -235,9 +237,13 @@ pub fn split_path_prefix(raw: &str) -> (&str, &str) {
     }
     if count < 2 {
         // Not enough segments — entire string is the ID, no prefix.
-        (raw, "")
+        Ok((raw, ""))
     } else {
-        (&raw[..end], &raw[end + 1..])
+        let prefix = &raw[end + 1..];
+        if prefix.split('/').any(|s| s == "." || s == "..") {
+            return Err("path prefix must not contain '.' or '..' components");
+        }
+        Ok((&raw[..end], prefix))
     }
 }
 
@@ -403,14 +409,18 @@ impl HubApiClient {
         if self.path_prefix.is_empty() {
             return Ok(());
         }
-        // list_tree will prepend the prefix. If it errors, the subfolder doesn't exist.
-        self.list_tree("", false).await.map_err(|e| {
+        let entries = self.list_tree("", false).await.map_err(|e| {
             Error::Hub(format!(
                 "Subfolder '{}' not found in {}: {e}",
-                self.path_prefix,
-                self.source,
+                self.path_prefix, self.source,
             ))
         })?;
+        if entries.is_empty() {
+            return Err(Error::Hub(format!(
+                "Subfolder '{}' is empty or does not exist in {}",
+                self.path_prefix, self.source,
+            )));
+        }
         Ok(())
     }
 
@@ -693,12 +703,13 @@ impl HubApiClient {
         };
         let url = format!("{}/api/buckets/{}/batch", self.endpoint, bucket_id);
 
-        // Prepend path_prefix to each op's path before serializing.
-        let prefixed_ops: Vec<BatchOp> = if self.path_prefix.is_empty() {
-            ops.to_vec()
-        } else {
-            ops.iter()
-                .map(|op| match op {
+        // Build NDJSON body, prepending path_prefix to each op's path.
+        let mut body = String::new();
+        for op in ops {
+            if self.path_prefix.is_empty() {
+                body.push_str(&serde_json::to_string(op)?);
+            } else {
+                let prefixed = match op {
                     BatchOp::AddFile {
                         path,
                         xet_hash,
@@ -713,14 +724,9 @@ impl HubApiClient {
                     BatchOp::DeleteFile { path } => BatchOp::DeleteFile {
                         path: self.prefixed_path(path),
                     },
-                })
-                .collect()
-        };
-
-        // Build NDJSON body
-        let mut body = String::new();
-        for op in &prefixed_ops {
-            body.push_str(&serde_json::to_string(op)?);
+                };
+                body.push_str(&serde_json::to_string(&prefixed)?);
+            }
             body.push('\n');
         }
 
@@ -1060,37 +1066,54 @@ mod tests {
 
     #[test]
     fn test_split_path_prefix_bucket_no_subfolder() {
-        let (id, prefix) = split_path_prefix("user/bucket");
+        let (id, prefix) = split_path_prefix("user/bucket").unwrap();
         assert_eq!(id, "user/bucket");
         assert_eq!(prefix, "");
     }
 
     #[test]
     fn test_split_path_prefix_bucket_with_subfolder() {
-        let (id, prefix) = split_path_prefix("user/bucket/a/b");
+        let (id, prefix) = split_path_prefix("user/bucket/a/b").unwrap();
         assert_eq!(id, "user/bucket");
         assert_eq!(prefix, "a/b");
     }
 
     #[test]
     fn test_split_path_prefix_bucket_single_subfolder() {
-        let (id, prefix) = split_path_prefix("user/bucket/checkpoints");
+        let (id, prefix) = split_path_prefix("user/bucket/checkpoints").unwrap();
         assert_eq!(id, "user/bucket");
         assert_eq!(prefix, "checkpoints");
     }
 
     #[test]
     fn test_split_path_prefix_single_segment() {
-        let (id, prefix) = split_path_prefix("gpt2");
+        let (id, prefix) = split_path_prefix("gpt2").unwrap();
         assert_eq!(id, "gpt2");
         assert_eq!(prefix, "");
     }
 
     #[test]
     fn test_split_path_prefix_repo_with_subfolder() {
-        let (id, prefix) = split_path_prefix("user/model/ckpt/v2");
+        let (id, prefix) = split_path_prefix("user/model/ckpt/v2").unwrap();
         assert_eq!(id, "user/model");
         assert_eq!(prefix, "ckpt/v2");
+    }
+
+    #[test]
+    fn test_split_path_prefix_trailing_slash() {
+        let (id, prefix) = split_path_prefix("user/bucket/checkpoints/").unwrap();
+        assert_eq!(id, "user/bucket");
+        assert_eq!(prefix, "checkpoints");
+    }
+
+    #[test]
+    fn test_split_path_prefix_rejects_dotdot() {
+        assert!(split_path_prefix("user/bucket/../other").is_err());
+    }
+
+    #[test]
+    fn test_split_path_prefix_rejects_dot() {
+        assert!(split_path_prefix("user/bucket/./foo").is_err());
     }
 
     // ── prefixed_path / strip_path_prefix tests ───────────────────────
