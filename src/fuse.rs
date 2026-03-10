@@ -10,6 +10,7 @@ use fuser::{
 };
 use tracing::{error, info};
 
+use crate::daemon::DaemonGuard;
 use crate::virtual_fs::inode::InodeKind;
 use crate::virtual_fs::{VirtualFs, VirtualFsAttr};
 
@@ -485,6 +486,7 @@ pub fn mount_fuse(
     direct_io: bool,
     max_threads: usize,
     runtime: &tokio::runtime::Runtime,
+    daemon_guard: Option<&mut DaemonGuard>,
 ) {
     let adapter = FuseAdapter::new(
         runtime.handle().clone(),
@@ -535,6 +537,13 @@ pub fn mount_fuse(
             std::process::exit(1);
         }
     };
+
+    info!("FUSE mount active at {:?}", mount_point);
+
+    // Signal the parent process that the mount is live (daemon mode).
+    if let Some(guard) = daemon_guard {
+        guard.notify_ready();
+    }
 
     // Catch SIGINT/SIGTERM and trigger a clean unmount. On success, fuser
     // calls destroy() which runs shutdown(). On failure, we flush here before

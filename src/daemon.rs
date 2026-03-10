@@ -59,6 +59,77 @@ impl Drop for DaemonGuard {
     }
 }
 
+/// Stop a running daemon by unmounting and waiting for the process to exit.
+/// Reads the PID file, unmounts the mount point, then waits for the process.
+pub fn stop_daemon(mount_point: &Path) -> std::io::Result<()> {
+    let pid_file = pid_path(mount_point);
+    let pid_str = std::fs::read_to_string(&pid_file).map_err(|e| {
+        std::io::Error::new(
+            e.kind(),
+            format!(
+                "no daemon found for {:?} (pid file: {}): {e}",
+                mount_point,
+                pid_file.display()
+            ),
+        )
+    })?;
+    let pid: i32 = pid_str
+        .trim()
+        .parse()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("invalid pid file: {e}")))?;
+
+    // Check if the process is actually running.
+    if unsafe { libc::kill(pid, 0) } != 0 {
+        eprintln!("Daemon (pid={pid}) is not running, cleaning up stale pid file");
+        let _ = std::fs::remove_file(&pid_file);
+        return Ok(());
+    }
+
+    eprintln!("Stopping daemon (pid={pid}), unmounting {:?}...", mount_point);
+
+    // Unmount (this triggers the daemon's clean shutdown).
+    let mount_str = mount_point.to_string_lossy();
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("umount").arg(&*mount_str).status();
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if unsafe { libc::getuid() } == 0 {
+            let _ = std::process::Command::new("umount").arg(&*mount_str).status();
+        } else {
+            let _ = std::process::Command::new("sudo")
+                .args(["-n", "umount", &mount_str])
+                .status();
+        }
+    }
+
+    // Wait up to 10s for the daemon to exit.
+    for _ in 0..20 {
+        if unsafe { libc::kill(pid, 0) } != 0 {
+            eprintln!("Daemon stopped");
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+
+    // Still running, send SIGTERM.
+    eprintln!("Daemon still running, sending SIGTERM...");
+    unsafe { libc::kill(pid, libc::SIGTERM) };
+    for _ in 0..10 {
+        if unsafe { libc::kill(pid, 0) } != 0 {
+            eprintln!("Daemon stopped");
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        format!("daemon (pid={pid}) did not stop after 15s"),
+    ))
+}
+
 /// Fork the process into a background daemon.
 ///
 /// - Parent: waits for the child to confirm the mount is active, prints

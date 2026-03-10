@@ -123,9 +123,13 @@ pub struct Args {
 
     /// Run as a background daemon. The process forks after parsing args,
     /// confirms the mount is active, then releases the terminal. Logs are
-    /// written to ~/.hf-mount/logs/. Unmount with: umount <mount_point>
+    /// written to ~/.hf-mount/logs/. Stop with: --stop or umount <mount_point>
     #[arg(long, default_value_t = false)]
     pub daemon: bool,
+
+    /// Stop a running daemon for the given mount point.
+    #[arg(long, default_value_t = false)]
+    pub stop: bool,
 }
 
 impl Args {
@@ -155,6 +159,17 @@ pub struct MountSetup {
 /// No threads are spawned. Safe to fork() after this returns.
 pub fn init() -> Args {
     let args = Args::parse();
+
+    // --stop: stop a running daemon and exit immediately (no setup needed).
+    if args.stop {
+        match crate::daemon::stop_daemon(args.mount_point()) {
+            Ok(()) => std::process::exit(0),
+            Err(e) => {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
 
     let filter = if std::env::var("RUST_LOG").is_ok() {
         tracing_subscriber::EnvFilter::from_default_env()
