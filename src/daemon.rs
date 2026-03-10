@@ -9,20 +9,48 @@ fn state_dir() -> PathBuf {
         .join(".hf-mount")
 }
 
-fn sanitize_path(mount_point: &Path) -> String {
-    mount_point.to_string_lossy().trim_matches('/').replace('/', "_")
+/// Canonicalize a mount point path, falling back to the absolute path if
+/// the target doesn't exist yet. The result is used to derive PID/log filenames.
+fn canonical_mount_point(mount_point: &Path) -> PathBuf {
+    std::fs::canonicalize(mount_point).unwrap_or_else(|_| {
+        if mount_point.is_absolute() {
+            mount_point.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("/"))
+                .join(mount_point)
+        }
+    })
+}
+
+/// Encode a path as a filename-safe string. Uses `-` as separator instead
+/// of replacing `/` with `_` (which would cause collisions like `/a_b/c`
+/// vs `/a/b_c`). Leading `/` is stripped.
+fn encode_path(path: &Path) -> String {
+    path.to_string_lossy().trim_matches('/').replace('/', "-")
 }
 
 fn pid_path(mount_point: &Path) -> PathBuf {
-    state_dir()
-        .join("pids")
-        .join(format!("{}.pid", sanitize_path(mount_point)))
+    let key = encode_path(&canonical_mount_point(mount_point));
+    state_dir().join("pids").join(format!("{key}.pid"))
 }
 
 fn log_path(mount_point: &Path) -> PathBuf {
-    state_dir()
-        .join("logs")
-        .join(format!("{}.log", sanitize_path(mount_point)))
+    let key = encode_path(&canonical_mount_point(mount_point));
+    state_dir().join("logs").join(format!("{key}.log"))
+}
+
+/// Check if a PID is alive.
+fn pid_alive(pid: i32) -> bool {
+    (unsafe { libc::kill(pid, 0) }) == 0
+}
+
+/// Read a PID from a PID file. Returns None if the file doesn't exist or
+/// contains garbage.
+fn read_pid(pid_file: &Path) -> Option<i32> {
+    std::fs::read_to_string(pid_file)
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
 }
 
 /// Guard held by the daemon child process. Signals readiness to the parent
@@ -79,7 +107,7 @@ pub fn stop_daemon(mount_point: &Path) -> std::io::Result<()> {
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("invalid pid file: {e}")))?;
 
     // Check if the process is actually running.
-    if unsafe { libc::kill(pid, 0) } != 0 {
+    if !pid_alive(pid) {
         eprintln!("Daemon (pid={pid}) is not running, cleaning up stale pid file");
         let _ = std::fs::remove_file(&pid_file);
         return Ok(());
@@ -106,7 +134,7 @@ pub fn stop_daemon(mount_point: &Path) -> std::io::Result<()> {
 
     // Wait up to 10s for the daemon to exit.
     for _ in 0..20 {
-        if unsafe { libc::kill(pid, 0) } != 0 {
+        if !pid_alive(pid) {
             eprintln!("Daemon stopped");
             return Ok(());
         }
@@ -117,7 +145,7 @@ pub fn stop_daemon(mount_point: &Path) -> std::io::Result<()> {
     eprintln!("Daemon still running, sending SIGTERM...");
     unsafe { libc::kill(pid, libc::SIGTERM) };
     for _ in 0..10 {
-        if unsafe { libc::kill(pid, 0) } != 0 {
+        if !pid_alive(pid) {
             eprintln!("Daemon stopped");
             return Ok(());
         }
@@ -138,6 +166,8 @@ pub fn stop_daemon(mount_point: &Path) -> std::io::Result<()> {
 ///   file, writes a PID file, and returns a `DaemonGuard`. The caller must
 ///   call `guard.notify_ready()` once the mount is confirmed.
 ///
+/// Returns an error if a daemon is already running for this mount point.
+///
 /// # Safety
 /// Must be called before any threads are spawned (before tokio runtime).
 pub fn daemonize(mount_point: &Path) -> std::io::Result<DaemonGuard> {
@@ -146,6 +176,22 @@ pub fn daemonize(mount_point: &Path) -> std::io::Result<DaemonGuard> {
 
     std::fs::create_dir_all(log_file.parent().unwrap())?;
     std::fs::create_dir_all(pid_file.parent().unwrap())?;
+
+    // Refuse to start if a daemon is already running for this mount point.
+    if let Some(existing_pid) = read_pid(&pid_file) {
+        if pid_alive(existing_pid) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!(
+                    "daemon already running (pid={existing_pid}) for {:?}. Stop it first with: hf-mount-daemon stop {}",
+                    mount_point,
+                    mount_point.display()
+                ),
+            ));
+        }
+        // Stale PID file from a dead process, remove it.
+        let _ = std::fs::remove_file(&pid_file);
+    }
 
     // Pipe for ready notification: child writes, parent reads.
     let (read_fd, write_fd) = {
@@ -200,7 +246,7 @@ pub fn daemonize(mount_point: &Path) -> std::io::Result<DaemonGuard> {
 
             if n == 1 && buf[0] == b'R' {
                 eprintln!("Daemon started (pid={child_pid}), logs: {}", log_file.display());
-                eprintln!("Unmount with: umount {}", mount_point.display());
+                eprintln!("Stop with: hf-mount-daemon stop {}", mount_point.display());
                 std::process::exit(0);
             } else {
                 eprintln!("Daemon failed to start. Check logs: {}", log_file.display());

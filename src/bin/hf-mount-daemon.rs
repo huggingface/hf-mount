@@ -45,51 +45,61 @@ fn main() {
             }
         },
         Command::Start { fuse, options, source } => {
-            let is_nfs = !fuse;
-            let mount_point = source.mount_point().to_path_buf();
-
-            // Phase 1: init tracing (no threads yet).
-            hf_mount::setup::init_tracing(true);
-
-            // Phase 2: fork before tokio runtime.
-            let mut daemon_guard = match hf_mount::daemon::daemonize(&mount_point) {
-                Ok(guard) => guard,
-                Err(e) => {
-                    error!("Failed to daemonize: {e}");
-                    std::process::exit(1);
-                }
-            };
-
-            // Phase 3: build runtime + VFS.
-            let s = hf_mount::setup::build(source, options, is_nfs);
-
-            // Phase 4: mount and serve.
-            if is_nfs {
-                if let Err(e) = s.runtime.block_on(hf_mount::nfs::mount_nfs(
-                    s.virtual_fs,
-                    &s.mount_point,
-                    s.metadata_ttl_ms,
-                    s.read_only,
-                    Some(&mut daemon_guard),
-                )) {
-                    error!("NFS mount failed: {e}");
-                    std::process::exit(1);
-                }
-            } else {
-                hf_mount::fuse::mount_fuse(
-                    s.virtual_fs,
-                    &s.mount_point,
-                    s.metadata_ttl,
-                    s.read_only,
-                    s.advanced_writes,
-                    s.direct_io,
-                    s.max_threads,
-                    &s.runtime,
-                    Some(&mut daemon_guard),
-                );
-            }
-
-            info!("Unmounted cleanly");
+            // Use a wrapper so DaemonGuard is always dropped (cleaning up
+            // the PID file), even on error. process::exit skips destructors.
+            let code = start_daemon(fuse, options, source);
+            std::process::exit(code);
         }
     }
+}
+
+/// Run the daemon start flow. Returns an exit code so the caller can exit
+/// after all locals (including DaemonGuard) have been dropped.
+fn start_daemon(fuse: bool, options: MountOptions, source: Source) -> i32 {
+    let is_nfs = !fuse;
+    let mount_point = source.mount_point().to_path_buf();
+
+    // Phase 1: init tracing (no threads yet).
+    hf_mount::setup::init_tracing(true);
+
+    // Phase 2: fork before tokio runtime.
+    let mut daemon_guard = match hf_mount::daemon::daemonize(&mount_point) {
+        Ok(guard) => guard,
+        Err(e) => {
+            error!("Failed to daemonize: {e}");
+            return 1;
+        }
+    };
+
+    // Phase 3: build runtime + VFS.
+    let s = hf_mount::setup::build(source, options, is_nfs);
+
+    // Phase 4: mount and serve.
+    if is_nfs {
+        if let Err(e) = s.runtime.block_on(hf_mount::nfs::mount_nfs(
+            s.virtual_fs,
+            &s.mount_point,
+            s.metadata_ttl_ms,
+            s.read_only,
+            Some(&mut daemon_guard),
+        )) {
+            error!("NFS mount failed: {e}");
+            return 1;
+        }
+    } else {
+        hf_mount::fuse::mount_fuse(
+            s.virtual_fs,
+            &s.mount_point,
+            s.metadata_ttl,
+            s.read_only,
+            s.advanced_writes,
+            s.direct_io,
+            s.max_threads,
+            &s.runtime,
+            Some(&mut daemon_guard),
+        );
+    }
+
+    info!("Unmounted cleanly");
+    0
 }
