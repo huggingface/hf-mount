@@ -10,6 +10,7 @@ use fuser::{
 };
 use tracing::{error, info};
 
+use crate::daemon::DaemonGuard;
 use crate::virtual_fs::inode::InodeKind;
 use crate::virtual_fs::{VirtualFs, VirtualFsAttr};
 
@@ -486,6 +487,7 @@ impl Filesystem for FuseAdapter {
 }
 
 /// Mount the VFS as a FUSE filesystem and block until unmount.
+/// Returns `true` if the mount ran and exited cleanly, `false` on startup failure.
 #[allow(clippy::too_many_arguments)]
 pub fn mount_fuse(
     virtual_fs: Arc<VirtualFs>,
@@ -496,7 +498,8 @@ pub fn mount_fuse(
     direct_io: bool,
     max_threads: usize,
     runtime: &tokio::runtime::Runtime,
-) {
+    daemon_guard: Option<&mut DaemonGuard>,
+) -> bool {
     let adapter = FuseAdapter::new(
         runtime.handle().clone(),
         virtual_fs.clone(),
@@ -530,7 +533,7 @@ pub fn mount_fuse(
             } else {
                 error!("FUSE session failed: {}", e);
             }
-            std::process::exit(1);
+            return false;
         }
     };
     let notifier = session.notifier();
@@ -543,9 +546,25 @@ pub fn mount_fuse(
         Ok(bg) => bg,
         Err(e) => {
             error!("FUSE spawn failed: {}", e);
-            std::process::exit(1);
+            return false;
         }
     };
+
+    info!("FUSE mount active at {:?}", mount_point);
+
+    // Grab the PID file path before signalling ready (for cleanup in signal handler).
+    let daemon_pid_file = daemon_guard.as_ref().map(|g| g.pid_file().to_path_buf());
+
+    // Signal the parent process that the mount is live (daemon mode).
+    if let Some(guard) = daemon_guard {
+        guard.notify_ready();
+    }
+
+    // Flag set once the FUSE session has ended normally (bg.join returned).
+    // Prevents the signal handler from calling process::exit during the
+    // post-unmount shutdown flush.
+    let session_ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let session_ended_signal = session_ended.clone();
 
     // Catch SIGINT/SIGTERM and trigger a clean unmount. On success, fuser
     // calls destroy() which runs shutdown(). On failure, we flush here before
@@ -557,21 +576,32 @@ pub fn mount_fuse(
     let mp = mount_point.to_path_buf();
     runtime.spawn(async move {
         wait_for_signal().await;
+        // If the FUSE session already ended (normal unmount path), the
+        // safety-net shutdown below will handle flushing. Don't interfere.
+        if session_ended_signal.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
         info!("Received signal, unmounting...");
         if !unmount_fuse(&mp) {
             // Unmount failed -- flush dirty data before force-exiting so we
             // don't silently lose writes.
             error!("Unmount failed, flushing dirty files before exit...");
             vfs_for_signal.shutdown();
+            // Clean up PID file since process::exit skips DaemonGuard drop.
+            if let Some(pid_file) = &daemon_pid_file {
+                let _ = std::fs::remove_file(pid_file);
+            }
             std::process::exit(1);
         }
     });
 
     let _ = bg.join();
+    session_ended.store(true, std::sync::atomic::Ordering::Release);
     // Safety net: flush after FUSE session ends. Covers external unmount
     // (e.g. `fusermount -u`) where destroy() may not fire. Idempotent
     // because shutdown() takes handles from Mutex<Option<...>>.
     virtual_fs.shutdown();
+    true
 }
 
 /// Wait for SIGINT, SIGTERM, or SIGHUP.

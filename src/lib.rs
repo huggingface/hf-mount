@@ -1,4 +1,5 @@
 pub mod cached_xet_client;
+pub mod daemon;
 pub mod error;
 pub mod fuse;
 pub mod hub_api;

@@ -10,6 +10,7 @@ fn main() {
         &s.mount_point,
         s.metadata_ttl_ms,
         s.read_only,
+        None,
     )) {
         error!("NFS mount failed: {}", e);
         std::process::exit(1);
