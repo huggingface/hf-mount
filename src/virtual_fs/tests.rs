@@ -2260,21 +2260,14 @@ fn shutdown_flushes_dirty() {
 
 // ── Reconstruction cache warm-up tests ──────────────────────────────
 
-/// `open()` must trigger exactly one `warm_reconstruction_cache` call per file handle,
-/// and that call must complete before the first `read()` is served.
-///
-/// We inject a 50 ms delay into the warm call to ensure the warm task is still
-/// running when `read()` is called.  If `read()` did NOT wait for the watch, the
-/// first read would race with the warm task and the assertion on `warm_call_count`
-/// at read time might pass trivially — so we also verify timing:
-///   - with the warm delay the first read takes ≥ 50 ms (waited for warm)
-///   - first read proceeds immediately (no blocking wait for warm)
-///   - warm task runs in the background and eventually completes
-///   - a second `open()` on the same inode triggers a second warm call.
+/// Warm is deferred: NOT triggered on open(), only on the first RangeDownload.
+/// Sequential reads use FileDownloadSession (own reconstruction path) so warm
+/// would be wasted. Only when a far seek triggers RangeDownload do we spawn warm
+/// to pre-fetch the full plan for subsequent range reads.
 #[test]
-fn warm_cache_triggered_on_open_sequential_read() {
+fn warm_triggered_on_first_range_download_not_on_open() {
     const WARM_DELAY_MS: u64 = 50;
-    const FILE_SIZE: u64 = 1024 * 1024; // 1 MiB — small so data fetch is trivial
+    const FILE_SIZE: u64 = 30 * 1024 * 1024; // 30 MiB — large enough for a far seek
 
     let hub = MockHub::new();
     hub.add_file("file.bin", FILE_SIZE, Some("hash_abc"), None);
@@ -2288,48 +2281,52 @@ fn warm_cache_triggered_on_open_sequential_read() {
     rt.block_on(async {
         let attr = vfs.lookup(ROOT_INODE, "file.bin").await.unwrap();
 
-        // ── open #1 ──────────────────────────────────────────────────
-        // Warm task starts in background with 50 ms delay.
-        let fh1 = vfs.open(attr.ino, false, false, None).await.unwrap();
+        // ── open — no warm triggered ─────────────────────────────────
+        let fh = vfs.open(attr.ino, false, false, None).await.unwrap();
         tokio::task::yield_now().await;
-
-        // First read proceeds immediately — no blocking wait for warm.
-        let t0 = std::time::Instant::now();
-        let (chunk, _) = vfs.read(fh1, 0, 4096).await.unwrap();
-        let elapsed_first = t0.elapsed();
-
-        assert_eq!(chunk.len(), 4096);
-        assert_eq!(chunk[0], 0u8); // pattern byte at offset 0
-        // Read should NOT block on warm — it fetches a range plan directly.
-        assert!(
-            elapsed_first.as_millis() < WARM_DELAY_MS as u128,
-            "first read took {}ms — should be immediate (no warm wait)",
-            elapsed_first.as_millis(),
-        );
-
-        let (chunk2, _) = vfs.read(fh1, 4096, 4096).await.unwrap();
-        assert_eq!(chunk2.len(), 4096);
-        assert_eq!(chunk2[0], (4096 % 251) as u8);
-
-        vfs.release(fh1).await.unwrap();
-
-        // Wait for the background warm task to complete.
-        tokio::time::sleep(std::time::Duration::from_millis(WARM_DELAY_MS * 2)).await;
-        assert_eq!(xet.warm_call_count.load(std::sync::atomic::Ordering::SeqCst), 1);
-
-        // ── open #2 ──────────────────────────────────────────────────
-        // Each open() spawns a warm task. Concurrent CAS calls are coalesced by
-        // single-flight in CachedXetClient, but the mock XetOps still sees each call.
-        let fh2 = vfs.open(attr.ino, false, false, None).await.unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(WARM_DELAY_MS * 2)).await;
-
         assert_eq!(
             xet.warm_call_count.load(std::sync::atomic::Ordering::SeqCst),
-            2,
-            "each open should trigger a warm call (CAS dedup is at client level)"
+            0,
+            "open should NOT trigger warm (deferred to first RangeDownload)"
         );
 
-        vfs.release(fh2).await.unwrap();
+        // ── sequential read at offset 0 — no warm ───────────────────
+        let (chunk, _) = vfs.read(fh, 0, 4096).await.unwrap();
+        assert_eq!(chunk.len(), 4096);
+        assert_eq!(chunk[0], 0u8);
+        tokio::task::yield_now().await;
+        assert_eq!(
+            xet.warm_call_count.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "sequential read should NOT trigger warm"
+        );
+
+        // ── far seek (> FORWARD_SKIP) — triggers warm ───────────────
+        let far_offset = 25 * 1024 * 1024; // 25 MiB, well past FORWARD_SKIP (16 MiB)
+        let (chunk2, _) = vfs.read(fh, far_offset, 4096).await.unwrap();
+        assert_eq!(chunk2.len(), 4096);
+        assert_eq!(chunk2[0], (far_offset as usize % 251) as u8);
+
+        // Wait for background warm to complete.
+        tokio::time::sleep(std::time::Duration::from_millis(WARM_DELAY_MS * 2)).await;
+        assert_eq!(
+            xet.warm_call_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "first RangeDownload should trigger exactly one warm call"
+        );
+
+        // ── second far seek — no extra warm ──────────────────────────
+        let far_offset2 = 28 * 1024 * 1024;
+        let (chunk3, _) = vfs.read(fh, far_offset2, 4096).await.unwrap();
+        assert_eq!(chunk3.len(), 4096);
+        tokio::time::sleep(std::time::Duration::from_millis(WARM_DELAY_MS * 2)).await;
+        assert_eq!(
+            xet.warm_call_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "warm_triggered flag should prevent duplicate warm calls"
+        );
+
+        vfs.release(fh).await.unwrap();
     });
 }
 

@@ -82,6 +82,10 @@ pub(crate) struct PrefetchState {
     pub(crate) stream: Option<Box<dyn DownloadStreamOps>>,
     /// When true, drain consumed bytes after serving (no re-read from buffer).
     forward_only: bool,
+    /// Whether a background warm task has been triggered for this handle.
+    /// Set on the first RangeDownload — sequential reads don't need warm
+    /// (they use FileDownloadSession which has its own reconstruction path).
+    pub(crate) warm_triggered: bool,
 }
 
 impl PrefetchState {
@@ -98,6 +102,7 @@ impl PrefetchState {
             window_size: INITIAL_WINDOW,
             stream: None,
             forward_only,
+            warm_triggered: false,
         }
     }
 

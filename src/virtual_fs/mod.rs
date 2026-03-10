@@ -1259,19 +1259,10 @@ impl VirtualFs {
     }
 
     /// Allocate a lazy file handle backed by a prefetch buffer.
-    /// Starts reconstruction cache warmup in the background — open() returns immediately.
-    /// Reads proceed immediately; the first read fetches a range plan (~70ms) from CAS
-    /// while the full-file plan warms up in the background for subsequent reads.
+    /// Warm is NOT triggered here — it's deferred to the first RangeDownload in fetch_data().
+    /// Sequential reads use FileDownloadSession (own reconstruction), so warm would just
+    /// duplicate the CAS call. Deferring avoids that waste.
     fn open_lazy(&self, xet_hash: String, size: u64) -> VirtualFsResult<u64> {
-        if !xet_hash.is_empty() {
-            // Spawn background warm — concurrent opens coalesce via single-flight
-            // in CachedXetClient::get_reconstruction (only one CAS call per key).
-            let sessions = self.xet_sessions.clone();
-            let hash = xet_hash.clone();
-            tokio::spawn(async move {
-                sessions.warm_reconstruction_cache(&hash).await;
-            });
-        }
         let prefetch = Arc::new(tokio::sync::Mutex::new(PrefetchState::new(
             xet_hash,
             size,
@@ -1511,6 +1502,18 @@ impl VirtualFs {
                         file_size,
                         prefetch_state.stream.is_some(),
                     );
+
+                    // Trigger background warm on first RangeDownload so subsequent
+                    // range reads can derive locally instead of hitting CAS per-range.
+                    // Sequential reads don't need warm (FileDownloadSession has its own path).
+                    if plan.strategy == prefetch::FetchStrategy::RangeDownload && !prefetch_state.warm_triggered {
+                        prefetch_state.warm_triggered = true;
+                        let xet = self.xet_sessions.clone();
+                        let hash = prefetch_state.xet_hash.clone();
+                        self.runtime.spawn(async move {
+                            xet.warm_reconstruction_cache(&hash).await;
+                        });
+                    }
 
                     let (chunks, total) = self.fetch_data(&mut prefetch_state, cursor, &plan, file_size).await?;
 

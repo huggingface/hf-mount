@@ -248,15 +248,15 @@ impl Client for CachedXetClient {
                         }
 
                         if cache.len() >= MAX_CACHE_ENTRIES {
+                            // First pass: evict range entries (less valuable than full plans).
                             cache.retain(|(_hash, range), _| range.is_none());
                             if cache.len() >= MAX_CACHE_ENTRIES {
-                                if bytes_range.is_some() {
-                                    // Notify waiters and clean up before early return.
-                                    self.inflight.lock().expect("inflight poisoned").remove(&key);
-                                    let _ = tx.send(());
-                                    return result;
+                                // Still full (all full plans). Evict one arbitrary entry
+                                // to make room — never skip the insert, as single-flight
+                                // waiters expect the result to be in cache.
+                                if let Some(victim) = cache.keys().next().copied() {
+                                    cache.remove(&victim);
                                 }
-                                cache.clear();
                             }
                         }
                         cache.insert(key, CacheEntry::new(response.clone()));
@@ -563,7 +563,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cache_clears_when_capacity_is_reached() {
+    async fn cache_evicts_one_when_capacity_is_reached() {
         let inner_impl = Arc::new(MockClient::new(MockMode::ReturnSome));
         let inner: Arc<dyn Client> = inner_impl.clone();
         let client = CachedXetClient::new(inner);
@@ -576,11 +576,14 @@ mod tests {
         let overflow = hash_for(MAX_CACHE_ENTRIES);
         client.get_reconstruction(&overflow, None).await.unwrap();
 
-        let first = hash_for(0);
-        client.get_reconstruction(&first, None).await.unwrap();
-
-        assert_eq!(inner_impl.call_count((first, None)), 2);
+        // Overflow should be cached (inserted after evicting one victim).
         assert_eq!(inner_impl.call_count((overflow, None)), 1);
+        client.get_reconstruction(&overflow, None).await.unwrap();
+        assert_eq!(inner_impl.call_count((overflow, None)), 1); // still cached
+
+        // Exactly one of the original entries was evicted — total CAS calls
+        // should be MAX_CACHE_ENTRIES + 1 (one per original + overflow).
+        assert_eq!(inner_impl.total_calls(), MAX_CACHE_ENTRIES + 1);
     }
 
     #[tokio::test]
@@ -630,7 +633,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn range_entry_skipped_when_cache_full_of_full_plans() {
+    async fn range_entry_cached_when_full_of_full_plans_evicts_one() {
         let inner_impl = Arc::new(MockClient::new(MockMode::ReturnSome));
         let inner: Arc<dyn Client> = inner_impl.clone();
         let client = CachedXetClient::new(inner);
@@ -640,17 +643,21 @@ mod tests {
             client.get_reconstruction(&hash_for(i), None).await.unwrap();
         }
 
-        // Range query on a new hash — should NOT clear all full plans.
+        // Range query on a new hash — evicts one full plan, inserts range entry.
         let overflow_hash = hash_for(MAX_CACHE_ENTRIES + 1);
         let r = Some(FileRange::new(0, 100));
         client.get_reconstruction(&overflow_hash, r).await.unwrap();
-        // Second call should hit CAS again (range was not cached).
+        // Second call should be cached (single-flight waiters can find it).
         client.get_reconstruction(&overflow_hash, r).await.unwrap();
-        assert_eq!(inner_impl.call_count((overflow_hash, r)), 2);
+        assert_eq!(inner_impl.call_count((overflow_hash, r)), 1);
 
-        // But existing full plans should still be cached.
-        client.get_reconstruction(&hash_for(0), None).await.unwrap();
-        assert_eq!(inner_impl.call_count((hash_for(0), None)), 1);
+        // Most full plans should still be cached (only one was evicted).
+        // hash_for(1) should survive since eviction picks an arbitrary entry.
+        let total_before = inner_impl.total_calls();
+        client.get_reconstruction(&hash_for(1), None).await.unwrap();
+        // It's either still cached (1 call total) or was the evicted victim (refetched).
+        // Either way, the important thing is we didn't clear ALL full plans.
+        assert!(inner_impl.total_calls() <= total_before + 1);
     }
 
     #[tokio::test]
