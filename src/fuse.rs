@@ -549,6 +549,12 @@ pub fn mount_fuse(
         guard.notify_ready();
     }
 
+    // Flag set once the FUSE session has ended normally (bg.join returned).
+    // Prevents the signal handler from calling process::exit during the
+    // post-unmount shutdown flush.
+    let session_ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let session_ended_signal = session_ended.clone();
+
     // Catch SIGINT/SIGTERM and trigger a clean unmount. On success, fuser
     // calls destroy() which runs shutdown(). On failure, we flush here before
     // exiting so dirty data is not silently lost.
@@ -559,6 +565,11 @@ pub fn mount_fuse(
     let mp = mount_point.to_path_buf();
     runtime.spawn(async move {
         wait_for_signal().await;
+        // If the FUSE session already ended (normal unmount path), the
+        // safety-net shutdown below will handle flushing. Don't interfere.
+        if session_ended_signal.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
         info!("Received signal, unmounting...");
         if !unmount_fuse(&mp) {
             // Unmount failed -- flush dirty data before force-exiting so we
@@ -574,6 +585,7 @@ pub fn mount_fuse(
     });
 
     let _ = bg.join();
+    session_ended.store(true, std::sync::atomic::Ordering::Release);
     // Safety net: flush after FUSE session ends. Covers external unmount
     // (e.g. `fusermount -u`) where destroy() may not fire. Idempotent
     // because shutdown() takes handles from Mutex<Option<...>>.

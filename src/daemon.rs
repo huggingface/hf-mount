@@ -162,6 +162,7 @@ pub fn stop_daemon(mount_point: &Path) -> std::io::Result<()> {
     eprintln!("Stopping daemon (pid={pid}), unmounting {:?}...", mount_point);
 
     // Unmount (this triggers the daemon's clean shutdown).
+    // Try multiple strategies: umount for NFS/root, fusermount for FUSE user mounts.
     let mount_str = mount_point.to_string_lossy();
     #[cfg(target_os = "macos")]
     {
@@ -169,17 +170,35 @@ pub fn stop_daemon(mount_point: &Path) -> std::io::Result<()> {
     }
     #[cfg(target_os = "linux")]
     {
-        if unsafe { libc::getuid() } == 0 {
-            let _ = std::process::Command::new("umount").arg(&*mount_str).status();
+        let is_root = unsafe { libc::getuid() } == 0;
+        let unmounted = if is_root {
+            std::process::Command::new("umount")
+                .arg(&*mount_str)
+                .status()
+                .is_ok_and(|s| s.success())
         } else {
-            let _ = std::process::Command::new("sudo")
-                .args(["-n", "umount", &mount_str])
-                .status();
+            // Try umount (works for NFS), then fusermount3/fusermount (FUSE user mounts).
+            std::process::Command::new("umount")
+                .arg(&*mount_str)
+                .status()
+                .is_ok_and(|s| s.success())
+                || std::process::Command::new("fusermount3")
+                    .args(["-u", "-z", &mount_str])
+                    .status()
+                    .is_ok_and(|s| s.success())
+                || std::process::Command::new("fusermount")
+                    .args(["-u", "-z", &mount_str])
+                    .status()
+                    .is_ok_and(|s| s.success())
+        };
+        if !unmounted {
+            eprintln!("Warning: unmount command failed, waiting for daemon to exit...");
         }
     }
 
-    // Wait up to 10s for the daemon to exit.
-    for _ in 0..20 {
+    // Wait up to 30s for the daemon to exit. The daemon may spend significant
+    // time in shutdown() flushing dirty data after unmount.
+    for _ in 0..60 {
         if !pid_alive(pid) {
             eprintln!("Daemon stopped");
             return Ok(());
@@ -200,7 +219,7 @@ pub fn stop_daemon(mount_point: &Path) -> std::io::Result<()> {
 
     Err(std::io::Error::new(
         std::io::ErrorKind::TimedOut,
-        format!("daemon (pid={pid}) did not stop after 15s"),
+        format!("daemon (pid={pid}) did not stop after 35s"),
     ))
 }
 
