@@ -296,7 +296,7 @@ impl NFSFileSystem for NFSAdapter {
         let child_ino = self.virtual_fs.lookup(dirid, name).await.map_err(errno_to_nfs)?.ino;
         let attr = self.virtual_fs.getattr(child_ino).map_err(errno_to_nfs)?;
         match attr.kind {
-            InodeKind::Directory => self.virtual_fs.rmdir_recursive(dirid, name).await.map_err(errno_to_nfs),
+            InodeKind::Directory => self.virtual_fs.rmdir(dirid, name).await.map_err(errno_to_nfs),
             _ => self.virtual_fs.unlink(dirid, name).await.map_err(errno_to_nfs),
         }
     }
