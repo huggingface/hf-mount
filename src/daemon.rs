@@ -333,7 +333,13 @@ pub fn daemonize(mount_point: &Path) -> std::io::Result<DaemonGuard> {
                 eprintln!("Stop with: hf-mount-daemon stop {}", canonical.display());
                 std::process::exit(0);
             } else {
-                eprintln!("Daemon failed to start. Check logs: {}", log_file.display());
+                eprintln!("Daemon failed to start. Log file: {}", log_file.display());
+                if let Ok(log) = std::fs::read_to_string(&log_file) {
+                    let log = log.trim();
+                    if !log.is_empty() {
+                        eprintln!("\n{log}");
+                    }
+                }
                 std::process::exit(1);
             }
         }
