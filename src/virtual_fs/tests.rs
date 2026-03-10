@@ -2318,15 +2318,15 @@ fn warm_cache_triggered_on_open_sequential_read() {
         assert_eq!(xet.warm_call_count.load(std::sync::atomic::Ordering::SeqCst), 1);
 
         // ── open #2 ──────────────────────────────────────────────────
-        // After the warm task completes, hash is removed from the dedupe set.
-        // A new open() triggers a fresh warm (handles TTL expiry / cache eviction).
+        // Each open() spawns a warm task. Concurrent CAS calls are coalesced by
+        // single-flight in CachedXetClient, but the mock XetOps still sees each call.
         let fh2 = vfs.open(attr.ino, false, false, None).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(WARM_DELAY_MS * 2)).await;
 
         assert_eq!(
             xet.warm_call_count.load(std::sync::atomic::Ordering::SeqCst),
             2,
-            "second open (after first warm completed) should trigger a new warm"
+            "each open should trigger a warm call (CAS dedup is at client level)"
         );
 
         vfs.release(fh2).await.unwrap();

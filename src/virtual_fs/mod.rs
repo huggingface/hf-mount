@@ -82,11 +82,6 @@ pub struct VirtualFs {
     filter_os_files: bool,
     /// When true, prefetch buffers drain after serving (forward-only, no re-read cache).
     direct_io: bool,
-    /// Hashes for which a background warm task is currently in flight.
-    /// Prevents duplicate full-plan CAS fetches when the same file is opened multiple times.
-    /// Entries are removed when the warm task completes so a future open() re-warms if
-    /// the cached plan has expired or been evicted.
-    warming_hashes: Arc<Mutex<HashSet<String>>>,
 }
 
 /// Where to read file content from when opening read-only.
@@ -171,7 +166,6 @@ impl VirtualFs {
             serve_lookup_from_cache,
             filter_os_files,
             direct_io,
-            warming_hashes: Arc::new(Mutex::new(HashSet::new())),
         });
 
         // Set root inode mtime and ownership (repos use the last commit date).
@@ -1270,22 +1264,13 @@ impl VirtualFs {
     /// while the full-file plan warms up in the background for subsequent reads.
     fn open_lazy(&self, xet_hash: String, size: u64) -> VirtualFsResult<u64> {
         if !xet_hash.is_empty() {
-            let already_warming = !self
-                .warming_hashes
-                .lock()
-                .expect("warming_hashes poisoned")
-                .insert(xet_hash.clone());
-            if !already_warming {
-                let sessions = self.xet_sessions.clone();
-                let hash = xet_hash.clone();
-                let warming = self.warming_hashes.clone();
-                tokio::spawn(async move {
-                    sessions.warm_reconstruction_cache(&hash).await;
-                    // Remove hash so a future open() re-warms if the cached plan
-                    // expired (59 min TTL) or was evicted under pressure.
-                    warming.lock().expect("warming_hashes poisoned").remove(&hash);
-                });
-            }
+            // Spawn background warm — concurrent opens coalesce via single-flight
+            // in CachedXetClient::get_reconstruction (only one CAS call per key).
+            let sessions = self.xet_sessions.clone();
+            let hash = xet_hash.clone();
+            tokio::spawn(async move {
+                sessions.warm_reconstruction_cache(&hash).await;
+            });
         }
         let prefetch = Arc::new(tokio::sync::Mutex::new(PrefetchState::new(
             xet_hash,
