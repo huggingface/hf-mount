@@ -148,6 +148,25 @@ impl Client for CachedXetClient {
             Lead(tokio::sync::broadcast::Sender<()>),
         }
 
+        // Drop guard for single-flight leader: ensures the inflight entry is removed
+        // and waiters are notified even if the leader task is cancelled/dropped mid-await.
+        // Without this, a cancelled leader would leave a dangling entry in `inflight`,
+        // causing all future callers for that key to block forever on `rx.recv()`.
+        struct InflightGuard<'a> {
+            inflight: &'a Mutex<HashMap<ReconCacheKey, tokio::sync::broadcast::Sender<()>>>,
+            key: ReconCacheKey,
+            tx: Option<tokio::sync::broadcast::Sender<()>>,
+        }
+
+        impl<'a> Drop for InflightGuard<'a> {
+            fn drop(&mut self) {
+                self.inflight.lock().expect("inflight poisoned").remove(&self.key);
+                if let Some(tx) = self.tx.take() {
+                    let _ = tx.send(());
+                }
+            }
+        }
+
         loop {
             // --- 1. Cache check ---
             // Single lock: check exact key first, then full-file plan as fallback.
@@ -234,6 +253,13 @@ impl Client for CachedXetClient {
                     continue;
                 }
                 Action::Lead(tx) => {
+                    // Guard ensures cleanup + notification even if this task is cancelled.
+                    let guard = InflightGuard {
+                        inflight: &self.inflight,
+                        key,
+                        tx: Some(tx),
+                    };
+
                     // We're the leader — make the CAS call.
                     tracing::debug!("recon: CAS  file={:.8} range={:?}", file_id, bytes_range);
                     let result = self.inner.get_reconstruction(file_id, bytes_range).await;
@@ -262,9 +288,8 @@ impl Client for CachedXetClient {
                         cache.insert(key, CacheEntry::new(response.clone()));
                     }
 
-                    // Notify waiters and clean up.
-                    self.inflight.lock().expect("inflight poisoned").remove(&key);
-                    let _ = tx.send(());
+                    // Guard handles cleanup + notification on drop.
+                    drop(guard);
 
                     return result;
                 }
