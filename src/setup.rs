@@ -337,6 +337,49 @@ pub fn build(source: Source, options: MountOptions, is_nfs: bool) -> MountSetup 
     }
 }
 
+// ── Preflight check (no threads, fork-safe) ─────────────────────────
+
+/// Validate that the Hub source exists and the token works.
+/// Uses a single-threaded runtime so no threads are spawned (fork-safe).
+pub fn preflight_check(source: &Source, options: &MountOptions) -> Result<(), String> {
+    let (source_kind, _) = match source {
+        Source::Bucket { bucket_id, mount_point } => (
+            SourceKind::Bucket {
+                bucket_id: bucket_id.clone(),
+            },
+            mount_point.as_path(),
+        ),
+        Source::Repo {
+            repo_id,
+            mount_point,
+            revision,
+        } => {
+            let (repo_type, repo_id) = parse_repo_id(repo_id);
+            (
+                SourceKind::Repo {
+                    repo_id,
+                    repo_type,
+                    revision: revision.clone(),
+                },
+                mount_point.as_path(),
+            )
+        }
+    };
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("Failed to create runtime: {e}"))?;
+
+    rt.block_on(async {
+        HubApiClient::from_source(&options.hub_endpoint, options.hf_token.as_deref(), source_kind)
+            .await
+            .map_err(|e| format!("{e}"))
+    })?;
+
+    Ok(())
+}
+
 // ── Combined entry point (foreground binaries) ──────────────────────
 
 /// Parse CLI args, build VFS and all dependencies.

@@ -62,7 +62,13 @@ fn start_daemon(fuse: bool, options: MountOptions, source: Source) -> i32 {
     // Phase 1: init tracing (no threads yet).
     hf_mount::setup::init_tracing(true);
 
-    // Phase 2: fork before tokio runtime.
+    // Phase 2: validate source before forking (errors go to stderr, not log file).
+    if let Err(e) = hf_mount::setup::preflight_check(&source, &options) {
+        error!("{e}");
+        return 1;
+    }
+
+    // Phase 3: fork before tokio runtime.
     let mut daemon_guard = match hf_mount::daemon::daemonize(&mount_point) {
         Ok(guard) => guard,
         Err(e) => {
