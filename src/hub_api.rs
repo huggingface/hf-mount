@@ -200,6 +200,9 @@ pub struct HubApiClient {
     /// Last modification time (from repo/bucket info endpoint).
     /// Used as default mtime when per-file mtime is unavailable.
     last_modified: SystemTime,
+    /// Optional subfolder prefix. When non-empty, all API calls transparently
+    /// prepend this to outgoing paths and strip it from incoming TreeEntry paths.
+    path_prefix: String,
 }
 
 /// Parse a repo ID, extracting the type from an optional prefix.
@@ -216,6 +219,34 @@ pub fn parse_repo_id(repo_id: &str) -> (RepoType, String) {
     }
 }
 
+/// Split a raw identifier into `(id, path_prefix)` after the first 2 `/`-separated segments.
+/// E.g. `split_path_prefix("user/bucket/a/b")` → `("user/bucket", "a/b")`.
+/// Trailing slashes are trimmed, and `.`/`..` components in the prefix are rejected.
+pub fn split_path_prefix(raw: &str) -> std::result::Result<(&str, &str), &'static str> {
+    let raw = raw.trim_end_matches('/');
+    let mut end = 0;
+    let mut count = 0;
+    for (i, ch) in raw.char_indices() {
+        if ch == '/' {
+            count += 1;
+            if count == 2 {
+                end = i;
+                break;
+            }
+        }
+    }
+    if count < 2 {
+        // Not enough segments — entire string is the ID, no prefix.
+        Ok((raw, ""))
+    } else {
+        let prefix = &raw[end + 1..];
+        if prefix.split('/').any(|s| s == "." || s == "..") {
+            return Err("path prefix must not contain '.' or '..' components");
+        }
+        Ok((&raw[..end], prefix))
+    }
+}
+
 fn make_clients() -> (Client, Client) {
     let client = Client::new();
     let head_client = Client::builder()
@@ -229,7 +260,12 @@ impl HubApiClient {
     /// Create a client from a `SourceKind` (bucket or repo).
     /// Create a client from a source kind. For repos, resolves aliases
     /// (e.g. "gpt2" → "openai-community/gpt2") and fetches repo metadata.
-    pub async fn from_source(endpoint: &str, token: Option<&str>, source: SourceKind) -> Result<Arc<Self>> {
+    pub async fn from_source(
+        endpoint: &str,
+        token: Option<&str>,
+        source: SourceKind,
+        path_prefix: String,
+    ) -> Result<Arc<Self>> {
         let (client, head_client) = make_clients();
         let endpoint = endpoint.trim_end_matches('/').to_string();
 
@@ -296,6 +332,7 @@ impl HubApiClient {
             token: token.map(|t| t.to_string()),
             source,
             last_modified,
+            path_prefix,
         }))
     }
 
@@ -311,6 +348,7 @@ impl HubApiClient {
                 bucket_id: bucket_id.to_string(),
             },
             last_modified: UNIX_EPOCH,
+            path_prefix: String::new(),
         })
     }
 
@@ -335,21 +373,88 @@ impl HubApiClient {
         matches!(self.source, SourceKind::Repo { .. })
     }
 
+    /// Return the path prefix (subfolder) this client is scoped to.
+    pub fn path_prefix(&self) -> &str {
+        &self.path_prefix
+    }
+
+    /// Join `path_prefix` and `path` into the full API path.
+    fn prefixed_path(&self, path: &str) -> String {
+        if self.path_prefix.is_empty() {
+            path.to_string()
+        } else if path.is_empty() {
+            self.path_prefix.clone()
+        } else {
+            format!("{}/{}", self.path_prefix, path)
+        }
+    }
+
+    /// Strip `path_prefix` from the beginning of `full`. Returns `None` if the
+    /// path doesn't start with the prefix (shouldn't happen for correctly scoped results).
+    fn strip_path_prefix<'a>(&self, full: &'a str) -> Option<&'a str> {
+        if self.path_prefix.is_empty() {
+            return Some(full);
+        }
+        if full == self.path_prefix {
+            // The prefix directory itself — caller should filter this out.
+            return Some("");
+        }
+        full.strip_prefix(&self.path_prefix)
+            .and_then(|rest| rest.strip_prefix('/'))
+    }
+
+    /// Validate that the path prefix exists on the remote.
+    /// Calls list_tree("", false) which internally prepends the prefix.
+    pub async fn validate_path_prefix(&self) -> Result<()> {
+        if self.path_prefix.is_empty() {
+            return Ok(());
+        }
+        let entries = self.list_tree("", false).await.map_err(|e| {
+            Error::Hub(format!(
+                "Subfolder '{}' not found in {}: {e}",
+                self.path_prefix, self.source,
+            ))
+        })?;
+        if entries.is_empty() {
+            return Err(Error::Hub(format!(
+                "Subfolder '{}' is empty or does not exist in {}",
+                self.path_prefix, self.source,
+            )));
+        }
+        Ok(())
+    }
+
     /// List tree entries at the given prefix (follows `Link` header pagination).
     /// When `recursive` is true, returns all entries under the prefix;
     /// otherwise returns a single directory level.
     pub async fn list_tree(&self, prefix: &str, recursive: bool) -> Result<Vec<TreeEntry>> {
-        match &self.source {
-            SourceKind::Bucket { bucket_id } => self.list_tree_bucket(bucket_id, prefix).await,
+        let api_prefix = self.prefixed_path(prefix);
+        let mut entries = match &self.source {
+            SourceKind::Bucket { bucket_id } => self.list_tree_bucket(bucket_id, &api_prefix).await?,
             SourceKind::Repo {
                 repo_id,
                 repo_type,
                 revision,
             } => {
-                self.list_tree_repo(repo_id, *repo_type, revision, prefix, recursive)
-                    .await
+                self.list_tree_repo(repo_id, *repo_type, revision, &api_prefix, recursive)
+                    .await?
             }
+        };
+
+        // Strip path prefix from returned entries and filter out the prefix dir itself.
+        if !self.path_prefix.is_empty() {
+            entries.retain_mut(|e| {
+                match self.strip_path_prefix(&e.path) {
+                    Some(stripped) if !stripped.is_empty() => {
+                        e.path = stripped.to_string();
+                        true
+                    }
+                    _ => false, // filter out prefix dir itself or unrelated entries
+                }
+            });
         }
+
+        Ok(entries)
     }
 
     async fn list_tree_bucket(&self, bucket_id: &str, prefix: &str) -> Result<Vec<TreeEntry>> {
@@ -471,10 +576,11 @@ impl HubApiClient {
     /// Fetch metadata for a single file via HEAD on the resolve endpoint.
     /// Returns `None` if 404 (file does not exist remotely).
     pub async fn head_file(&self, path: &str) -> Result<Option<HeadFileInfo>> {
+        let api_path = self.prefixed_path(path);
         let url = match &self.source {
             // Buckets: /buckets/{id}/resolve/{path} (no /api/ prefix)
             SourceKind::Bucket { bucket_id } => {
-                format!("{}/buckets/{}/resolve/{}", self.endpoint, bucket_id, path)
+                format!("{}/buckets/{}/resolve/{}", self.endpoint, bucket_id, api_path)
             }
             // Repos: /{resolve_prefix}{id}/resolve/{revision}/{path}
             SourceKind::Repo {
@@ -488,7 +594,7 @@ impl HubApiClient {
                     repo_type.resolve_prefix(),
                     repo_id,
                     revision,
-                    path,
+                    api_path,
                 )
             }
         };
@@ -597,10 +703,30 @@ impl HubApiClient {
         };
         let url = format!("{}/api/buckets/{}/batch", self.endpoint, bucket_id);
 
-        // Build NDJSON body
+        // Build NDJSON body, prepending path_prefix to each op's path.
         let mut body = String::new();
         for op in ops {
-            body.push_str(&serde_json::to_string(op)?);
+            if self.path_prefix.is_empty() {
+                body.push_str(&serde_json::to_string(op)?);
+            } else {
+                let prefixed = match op {
+                    BatchOp::AddFile {
+                        path,
+                        xet_hash,
+                        mtime,
+                        content_type,
+                    } => BatchOp::AddFile {
+                        path: self.prefixed_path(path),
+                        xet_hash: xet_hash.clone(),
+                        mtime: *mtime,
+                        content_type: content_type.clone(),
+                    },
+                    BatchOp::DeleteFile { path } => BatchOp::DeleteFile {
+                        path: self.prefixed_path(path),
+                    },
+                };
+                body.push_str(&serde_json::to_string(&prefixed)?);
+            }
             body.push('\n');
         }
 
@@ -629,9 +755,10 @@ impl HubApiClient {
     /// sidecar `{dest}.etag` file is present, sends `If-None-Match`. On 304 the
     /// existing cached file is kept as-is.
     pub async fn download_file_http(&self, path: &str, dest: &Path) -> Result<()> {
+        let api_path = self.prefixed_path(path);
         let url = match &self.source {
             SourceKind::Bucket { bucket_id } => {
-                format!("{}/buckets/{}/resolve/{}", self.endpoint, bucket_id, path)
+                format!("{}/buckets/{}/resolve/{}", self.endpoint, bucket_id, api_path)
             }
             SourceKind::Repo {
                 repo_id,
@@ -644,7 +771,7 @@ impl HubApiClient {
                     repo_type.resolve_prefix(),
                     repo_id,
                     revision,
-                    path,
+                    api_path,
                 )
             }
         };
@@ -933,5 +1060,110 @@ mod tests {
         assert_eq!(RepoType::Model.resolve_prefix(), "");
         assert_eq!(RepoType::Dataset.resolve_prefix(), "datasets/");
         assert_eq!(RepoType::Space.resolve_prefix(), "spaces/");
+    }
+
+    // ── split_path_prefix tests ───────────────────────────────────────
+
+    #[test]
+    fn test_split_path_prefix_bucket_no_subfolder() {
+        let (id, prefix) = split_path_prefix("user/bucket").unwrap();
+        assert_eq!(id, "user/bucket");
+        assert_eq!(prefix, "");
+    }
+
+    #[test]
+    fn test_split_path_prefix_bucket_with_subfolder() {
+        let (id, prefix) = split_path_prefix("user/bucket/a/b").unwrap();
+        assert_eq!(id, "user/bucket");
+        assert_eq!(prefix, "a/b");
+    }
+
+    #[test]
+    fn test_split_path_prefix_bucket_single_subfolder() {
+        let (id, prefix) = split_path_prefix("user/bucket/checkpoints").unwrap();
+        assert_eq!(id, "user/bucket");
+        assert_eq!(prefix, "checkpoints");
+    }
+
+    #[test]
+    fn test_split_path_prefix_single_segment() {
+        let (id, prefix) = split_path_prefix("gpt2").unwrap();
+        assert_eq!(id, "gpt2");
+        assert_eq!(prefix, "");
+    }
+
+    #[test]
+    fn test_split_path_prefix_repo_with_subfolder() {
+        let (id, prefix) = split_path_prefix("user/model/ckpt/v2").unwrap();
+        assert_eq!(id, "user/model");
+        assert_eq!(prefix, "ckpt/v2");
+    }
+
+    #[test]
+    fn test_split_path_prefix_trailing_slash() {
+        let (id, prefix) = split_path_prefix("user/bucket/checkpoints/").unwrap();
+        assert_eq!(id, "user/bucket");
+        assert_eq!(prefix, "checkpoints");
+    }
+
+    #[test]
+    fn test_split_path_prefix_rejects_dotdot() {
+        assert!(split_path_prefix("user/bucket/../other").is_err());
+    }
+
+    #[test]
+    fn test_split_path_prefix_rejects_dot() {
+        assert!(split_path_prefix("user/bucket/./foo").is_err());
+    }
+
+    // ── prefixed_path / strip_path_prefix tests ───────────────────────
+
+    fn make_client_with_prefix(prefix: &str) -> HubApiClient {
+        let (client, head_client) = make_clients();
+        HubApiClient {
+            client,
+            head_client,
+            endpoint: "https://huggingface.co".to_string(),
+            token: None,
+            source: SourceKind::Bucket {
+                bucket_id: "user/bucket".to_string(),
+            },
+            last_modified: UNIX_EPOCH,
+            path_prefix: prefix.to_string(),
+        }
+    }
+
+    #[test]
+    fn test_prefixed_path_empty_prefix() {
+        let c = make_client_with_prefix("");
+        assert_eq!(c.prefixed_path("file.txt"), "file.txt");
+        assert_eq!(c.prefixed_path("a/b"), "a/b");
+        assert_eq!(c.prefixed_path(""), "");
+    }
+
+    #[test]
+    fn test_prefixed_path_with_prefix() {
+        let c = make_client_with_prefix("sub/dir");
+        assert_eq!(c.prefixed_path("file.txt"), "sub/dir/file.txt");
+        assert_eq!(c.prefixed_path("a/b"), "sub/dir/a/b");
+        assert_eq!(c.prefixed_path(""), "sub/dir");
+    }
+
+    #[test]
+    fn test_strip_path_prefix_empty_prefix() {
+        let c = make_client_with_prefix("");
+        assert_eq!(c.strip_path_prefix("file.txt"), Some("file.txt"));
+        assert_eq!(c.strip_path_prefix("a/b/c"), Some("a/b/c"));
+    }
+
+    #[test]
+    fn test_strip_path_prefix_with_prefix() {
+        let c = make_client_with_prefix("sub/dir");
+        assert_eq!(c.strip_path_prefix("sub/dir/file.txt"), Some("file.txt"));
+        assert_eq!(c.strip_path_prefix("sub/dir/a/b"), Some("a/b"));
+        // The prefix directory itself → empty string
+        assert_eq!(c.strip_path_prefix("sub/dir"), Some(""));
+        // Unrelated path → None
+        assert_eq!(c.strip_path_prefix("other/file.txt"), None);
     }
 }
