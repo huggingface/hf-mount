@@ -39,6 +39,17 @@ impl Source {
             Source::Bucket { mount_point, .. } | Source::Repo { mount_point, .. } => mount_point,
         }
     }
+
+    /// Human-readable label matching `SourceKind::Display` format.
+    pub fn label(&self) -> String {
+        match self {
+            Source::Bucket { bucket_id, .. } => format!("bucket/{bucket_id}"),
+            Source::Repo { repo_id, revision, .. } => {
+                let (repo_type, parsed_id) = parse_repo_id(repo_id);
+                format!("{repo_type}/{parsed_id}/{revision}")
+            }
+        }
+    }
 }
 
 /// Mount options shared across all binaries (FUSE, NFS, daemon).
@@ -156,6 +167,7 @@ pub struct MountSetup {
 /// Initialize tracing and xet-core env vars.
 /// No threads are spawned. Safe to fork() after this returns.
 pub fn init_tracing(daemon: bool) {
+    // Use RUST_LOG if set, otherwise default to hf_mount=info.
     let filter = if std::env::var("RUST_LOG").is_ok() {
         tracing_subscriber::EnvFilter::from_default_env()
     } else {
@@ -175,8 +187,12 @@ pub fn init_tracing(daemon: bool) {
         ("HF_XET_RECONSTRUCTION_TARGET_BLOCK_COMPLETION_TIME", "30"),
         ("HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_SIZE", "134217728"),
         ("HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT", "268435456"),
+        // Raise read_timeout from 120s default so large shard uploads don't get killed
+        // by the global client read_timeout before the per-request timeout kicks in.
         ("HF_XET_CLIENT_READ_TIMEOUT", "600"),
+        // Upload tuning: skip slow adaptive concurrency ramp-up
         ("HF_XET_CLIENT_AC_INITIAL_UPLOAD_CONCURRENCY", "16"),
+        // Larger ingestion blocks = fewer CDC calls
         ("HF_XET_DATA_INGESTION_BLOCK_SIZE", "16777216"),
     ] {
         if std::env::var(k).is_err() {
@@ -229,6 +245,7 @@ pub fn build(source: Source, options: MountOptions, is_nfs: bool) -> MountSetup 
     let refresher = hub_client.token_refresher(read_only);
     let cas_config = build_cas_config(&runtime, &refresher);
 
+    // Ensure cache directory exists and is writable (needed for staging even without xorb cache).
     std::fs::create_dir_all(&options.cache_dir)
         .unwrap_or_else(|e| panic!("Failed to create cache dir {:?}: {e}", options.cache_dir));
 
@@ -258,6 +275,8 @@ pub fn build(source: Source, options: MountOptions, is_nfs: bool) -> MountSetup 
     let xet_sessions = XetSessions::new(download_session, upload_config, cached_client);
 
     let advanced_writes = options.advanced_writes || (is_nfs && !read_only);
+    // Repos need a staging dir for HTTP download cache (open_readonly),
+    // even when advanced_writes is disabled.
     let staging_dir = if advanced_writes || hub_client.is_repo() {
         Some(StagingDir::new(&options.cache_dir))
     } else {
@@ -267,6 +286,8 @@ pub fn build(source: Source, options: MountOptions, is_nfs: bool) -> MountSetup 
     let uid = options.uid.unwrap_or_else(|| unsafe { libc::getuid() });
     let gid = options.gid.unwrap_or_else(|| unsafe { libc::getgid() });
 
+    // Ignore EEXIST: the directory may already exist from a previous (possibly
+    // stale) mount. FUSE/NFS will fail at mount time if it's actually busy.
     if let Err(e) = std::fs::create_dir_all(&mount_point)
         && e.raw_os_error() != Some(libc::EEXIST)
     {

@@ -91,14 +91,22 @@ fn pid_alive(pid: i32) -> bool {
     (unsafe { libc::kill(pid, 0) }) == 0
 }
 
-/// Read a PID file. Returns the PID and optional mount path.
-/// PID file format: line 1 = PID, line 2 = canonical mount path.
-fn read_pid_file(pid_file: &Path) -> Option<(i32, Option<String>)> {
+/// Parsed contents of a PID file.
+struct PidFileContents {
+    pid: i32,
+    mount: Option<String>,
+    source: Option<String>,
+}
+
+/// Read a PID file.
+/// Format: line 1 = PID, line 2 = canonical mount path, line 3 = source label.
+fn read_pid_file(pid_file: &Path) -> Option<PidFileContents> {
     let content = std::fs::read_to_string(pid_file).ok()?;
     let mut lines = content.lines();
     let pid: i32 = lines.next()?.trim().parse().ok()?;
     let mount = lines.next().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
-    Some((pid, mount))
+    let source = lines.next().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    Some(PidFileContents { pid, mount, source })
 }
 
 /// Guard held by the daemon child process. Signals readiness to the parent
@@ -172,7 +180,7 @@ fn try_unmount(mount_point: &Path) -> bool {
 pub fn stop_daemon(mount_point: &Path) -> std::io::Result<()> {
     let pid_file = pid_path(mount_point);
     let canonical = canonical_mount_point(mount_point);
-    let (pid, stored_mount) = read_pid_file(&pid_file).ok_or_else(|| {
+    let pf = read_pid_file(&pid_file).ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::NotFound,
             format!(
@@ -182,9 +190,10 @@ pub fn stop_daemon(mount_point: &Path) -> std::io::Result<()> {
             ),
         )
     })?;
+    let pid = pf.pid;
 
     // Check if the process is actually our daemon for this mount point.
-    let daemon_alive = is_our_daemon(pid) && stored_mount.as_deref().is_none_or(|m| Path::new(m) == canonical);
+    let daemon_alive = is_our_daemon(pid) && pf.mount.as_deref().is_none_or(|m| Path::new(m) == canonical);
     if !daemon_alive {
         eprintln!("Daemon (pid={pid}) is not running, cleaning up stale pid file");
         let _ = std::fs::remove_file(&pid_file);
@@ -253,6 +262,7 @@ fn decode_path(encoded: &str) -> String {
 pub struct DaemonInfo {
     pub pid: i32,
     pub mount_point: String,
+    pub source: Option<String>,
     pub log_file: PathBuf,
 }
 
@@ -269,15 +279,15 @@ pub fn list_daemons() -> Vec<DaemonInfo> {
         if path.extension().and_then(|e| e.to_str()) != Some("pid") {
             continue;
         }
-        let Some((pid, stored_mount)) = read_pid_file(&path) else {
+        let Some(pf) = read_pid_file(&path) else {
             continue;
         };
-        if !is_our_daemon(pid) {
+        if !is_our_daemon(pf.pid) {
             continue;
         }
 
         // Derive mount point from stored path or from the filename.
-        let mount_point = stored_mount.unwrap_or_else(|| {
+        let mount_point = pf.mount.unwrap_or_else(|| {
             let stem = path.file_stem().unwrap_or_default().to_string_lossy();
             decode_path(&stem)
         });
@@ -288,8 +298,9 @@ pub fn list_daemons() -> Vec<DaemonInfo> {
         ));
 
         daemons.push(DaemonInfo {
-            pid,
+            pid: pf.pid,
             mount_point,
+            source: pf.source,
             log_file,
         });
     }
@@ -309,7 +320,7 @@ pub fn list_daemons() -> Vec<DaemonInfo> {
 ///
 /// # Safety
 /// Must be called before any threads are spawned (before tokio runtime).
-pub fn daemonize(mount_point: &Path) -> std::io::Result<DaemonGuard> {
+pub fn daemonize(mount_point: &Path, source_label: &str) -> std::io::Result<DaemonGuard> {
     let log_file = log_path(mount_point);
     let pid_file = pid_path(mount_point);
     let canonical = canonical_mount_point(mount_point);
@@ -318,13 +329,15 @@ pub fn daemonize(mount_point: &Path) -> std::io::Result<DaemonGuard> {
     std::fs::create_dir_all(pid_file.parent().unwrap())?;
 
     // Refuse to start if a daemon is already running for this mount point.
-    if let Some((existing_pid, stored_mount)) = read_pid_file(&pid_file) {
-        let is_ours = is_our_daemon(existing_pid) && stored_mount.as_deref().is_none_or(|m| Path::new(m) == canonical);
+    if let Some(existing) = read_pid_file(&pid_file) {
+        let is_ours =
+            is_our_daemon(existing.pid) && existing.mount.as_deref().is_none_or(|m| Path::new(m) == canonical);
         if is_ours {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::AlreadyExists,
                 format!(
-                    "daemon already running (pid={existing_pid}) for {:?}. Stop it first with: hf-mount-daemon stop {}",
+                    "daemon already running (pid={}) for {:?}. Stop it first with: hf-mount-daemon stop {}",
+                    existing.pid,
                     mount_point,
                     mount_point.display()
                 ),
@@ -381,8 +394,11 @@ pub fn daemonize(mount_point: &Path) -> std::io::Result<DaemonGuard> {
             }
             drop(log);
 
-            // Write PID file with mount path for identity validation.
-            std::fs::write(&pid_file, format!("{}\n{}\n", std::process::id(), canonical.display()))?;
+            // Write PID file: line 1 = PID, line 2 = mount path, line 3 = source.
+            std::fs::write(
+                &pid_file,
+                format!("{}\n{}\n{}\n", std::process::id(), canonical.display(), source_label),
+            )?;
 
             Ok(DaemonGuard {
                 write_fd,

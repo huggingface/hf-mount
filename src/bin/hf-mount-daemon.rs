@@ -52,7 +52,8 @@ fn main() {
                 eprintln!("No running daemons");
             } else {
                 for d in &daemons {
-                    eprintln!("pid={:<8} {}", d.pid, d.mount_point);
+                    let source = d.source.as_deref().unwrap_or("?");
+                    eprintln!("pid={:<8} {} → {}", d.pid, source, d.mount_point);
                 }
             }
         }
@@ -70,6 +71,7 @@ fn main() {
 fn start_daemon(fuse: bool, options: MountOptions, source: Source) -> i32 {
     let is_nfs = !fuse;
     let mount_point = source.mount_point().to_path_buf();
+    let source_label = source.label();
 
     // Phase 1: init tracing (no threads yet).
     hf_mount::setup::init_tracing(true);
@@ -79,7 +81,7 @@ fn start_daemon(fuse: bool, options: MountOptions, source: Source) -> i32 {
     // happens after fork in build(), errors are surfaced via the daemon log.
 
     // Phase 2: fork before tokio runtime.
-    let mut daemon_guard = match hf_mount::daemon::daemonize(&mount_point) {
+    let mut daemon_guard = match hf_mount::daemon::daemonize(&mount_point, &source_label) {
         Ok(guard) => guard,
         Err(e) => {
             error!("Failed to daemonize: {e}");
