@@ -31,6 +31,8 @@ enum Command {
         /// Mount point of the daemon to stop
         mount_point: PathBuf,
     },
+    /// List running daemons
+    Status,
 }
 
 fn main() {
@@ -44,6 +46,16 @@ fn main() {
                 std::process::exit(1);
             }
         },
+        Command::Status => {
+            let daemons = hf_mount::daemon::list_daemons();
+            if daemons.is_empty() {
+                eprintln!("No running daemons");
+            } else {
+                for d in &daemons {
+                    eprintln!("pid={:<8} {}", d.pid, d.mount_point);
+                }
+            }
+        }
         Command::Start { fuse, options, source } => {
             // Use a wrapper so DaemonGuard is always dropped (cleaning up
             // the PID file), even on error. process::exit skips destructors.

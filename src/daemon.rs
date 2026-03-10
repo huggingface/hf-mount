@@ -231,6 +231,72 @@ pub fn stop_daemon(mount_point: &Path) -> std::io::Result<()> {
     ))
 }
 
+/// Decode a percent-encoded filename back to a path.
+fn decode_path(encoded: &str) -> String {
+    let mut result = String::with_capacity(encoded.len());
+    let mut chars = encoded.chars();
+    while let Some(c) = chars.next() {
+        if c == '%' {
+            let hi = chars.next().unwrap_or('0');
+            let lo = chars.next().unwrap_or('0');
+            if let Ok(byte) = u8::from_str_radix(&format!("{hi}{lo}"), 16) {
+                result.push(byte as char);
+            }
+        } else {
+            result.push(c);
+        }
+    }
+    format!("/{result}")
+}
+
+/// Information about a running daemon.
+pub struct DaemonInfo {
+    pub pid: i32,
+    pub mount_point: String,
+    pub log_file: PathBuf,
+}
+
+/// List all running daemons by scanning PID files.
+pub fn list_daemons() -> Vec<DaemonInfo> {
+    let pids_dir = state_dir().join("pids");
+    let Ok(entries) = std::fs::read_dir(&pids_dir) else {
+        return vec![];
+    };
+
+    let mut daemons = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("pid") {
+            continue;
+        }
+        let Some((pid, stored_mount)) = read_pid_file(&path) else {
+            continue;
+        };
+        if !is_our_daemon(pid) {
+            continue;
+        }
+
+        // Derive mount point from stored path or from the filename.
+        let mount_point = stored_mount.unwrap_or_else(|| {
+            let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+            decode_path(&stem)
+        });
+
+        let log_file = state_dir().join("logs").join(format!(
+            "{}.log",
+            path.file_stem().unwrap_or_default().to_string_lossy()
+        ));
+
+        daemons.push(DaemonInfo {
+            pid,
+            mount_point,
+            log_file,
+        });
+    }
+
+    daemons
+}
+
 /// Fork the process into a background daemon.
 ///
 /// - Parent: waits for the child to confirm the mount is active, prints
