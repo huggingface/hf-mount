@@ -81,7 +81,57 @@ fn log_path(mount_point: &Path) -> PathBuf {
     state_dir().join("logs").join(format!("{key}.log"))
 }
 
-/// Check if a PID is alive.
+/// Check if a PID belongs to a live hf-mount daemon process.
+/// Uses kill(pid, 0) to check liveness, then verifies the process is
+/// actually ours (not a recycled PID) by checking the executable name.
+fn is_our_daemon(pid: i32) -> bool {
+    if (unsafe { libc::kill(pid, 0) }) != 0 {
+        return false;
+    }
+
+    // Verify process identity to avoid acting on recycled PIDs.
+    #[cfg(target_os = "linux")]
+    {
+        // /proc/<pid>/exe is a symlink to the executable.
+        if let Ok(exe) = std::fs::read_link(format!("/proc/{pid}/exe")) {
+            let name = exe.file_name().unwrap_or_default().to_string_lossy();
+            return name.starts_with("hf-mount");
+        }
+        // /proc not available (container?), fall through to assume ours.
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        // Use sysctl KERN_PROCARGS2 to get the executable path.
+        let mut buf = [0u8; 4096];
+        let mut len = buf.len();
+        let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+        let ret = unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                3,
+                buf.as_mut_ptr() as *mut _,
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if ret == 0 && len > 4 {
+            // First 4 bytes are argc, then the executable path as a NUL-terminated string.
+            if let Some(end) = buf[4..len].iter().position(|&b| b == 0) {
+                let exe = String::from_utf8_lossy(&buf[4..4 + end]);
+                if let Some(name) = Path::new(exe.as_ref()).file_name() {
+                    return name.to_string_lossy().starts_with("hf-mount");
+                }
+            }
+        }
+        // sysctl failed (permissions?), fall through to assume ours.
+    }
+
+    true
+}
+
+/// Check if a PID is alive (any process, no identity check).
 fn pid_alive(pid: i32) -> bool {
     (unsafe { libc::kill(pid, 0) }) == 0
 }
@@ -133,6 +183,50 @@ impl Drop for DaemonGuard {
     }
 }
 
+/// Try to unmount a mount point using all available strategies.
+/// Returns true if any unmount command succeeded.
+#[allow(clippy::needless_return)]
+fn try_unmount(mount_point: &Path) -> bool {
+    let mount_str = mount_point.to_string_lossy();
+    #[cfg(target_os = "macos")]
+    {
+        return std::process::Command::new("umount")
+            .arg(&*mount_str)
+            .status()
+            .is_ok_and(|s| s.success());
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let is_root = unsafe { libc::getuid() } == 0;
+        if is_root {
+            return std::process::Command::new("umount")
+                .arg(&*mount_str)
+                .status()
+                .is_ok_and(|s| s.success());
+        }
+        // Try multiple strategies for non-root:
+        // 1. umount (may work for some mount types)
+        // 2. sudo -n umount (NFS mounts created with sudo mount.nfs)
+        // 3. fusermount3/fusermount (FUSE user mounts)
+        return std::process::Command::new("umount")
+            .arg(&*mount_str)
+            .status()
+            .is_ok_and(|s| s.success())
+            || std::process::Command::new("sudo")
+                .args(["-n", "umount", &mount_str])
+                .status()
+                .is_ok_and(|s| s.success())
+            || std::process::Command::new("fusermount3")
+                .args(["-u", "-z", &mount_str])
+                .status()
+                .is_ok_and(|s| s.success())
+            || std::process::Command::new("fusermount")
+                .args(["-u", "-z", &mount_str])
+                .status()
+                .is_ok_and(|s| s.success());
+    }
+}
+
 /// Stop a running daemon by unmounting and waiting for the process to exit.
 /// Reads the PID file, unmounts the mount point, then waits for the process.
 pub fn stop_daemon(mount_point: &Path) -> std::io::Result<()> {
@@ -152,48 +246,21 @@ pub fn stop_daemon(mount_point: &Path) -> std::io::Result<()> {
         .parse()
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("invalid pid file: {e}")))?;
 
-    // Check if the process is actually running.
-    if !pid_alive(pid) {
+    // Check if the process is actually our daemon.
+    let daemon_alive = is_our_daemon(pid);
+    if !daemon_alive {
         eprintln!("Daemon (pid={pid}) is not running, cleaning up stale pid file");
         let _ = std::fs::remove_file(&pid_file);
+        // Still try to unmount in case the mount survived a crash.
+        try_unmount(mount_point);
         return Ok(());
     }
 
     eprintln!("Stopping daemon (pid={pid}), unmounting {:?}...", mount_point);
 
     // Unmount (this triggers the daemon's clean shutdown).
-    // Try multiple strategies: umount for NFS/root, fusermount for FUSE user mounts.
-    let mount_str = mount_point.to_string_lossy();
-    #[cfg(target_os = "macos")]
-    {
-        let _ = std::process::Command::new("umount").arg(&*mount_str).status();
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let is_root = unsafe { libc::getuid() } == 0;
-        let unmounted = if is_root {
-            std::process::Command::new("umount")
-                .arg(&*mount_str)
-                .status()
-                .is_ok_and(|s| s.success())
-        } else {
-            // Try umount (works for NFS), then fusermount3/fusermount (FUSE user mounts).
-            std::process::Command::new("umount")
-                .arg(&*mount_str)
-                .status()
-                .is_ok_and(|s| s.success())
-                || std::process::Command::new("fusermount3")
-                    .args(["-u", "-z", &mount_str])
-                    .status()
-                    .is_ok_and(|s| s.success())
-                || std::process::Command::new("fusermount")
-                    .args(["-u", "-z", &mount_str])
-                    .status()
-                    .is_ok_and(|s| s.success())
-        };
-        if !unmounted {
-            eprintln!("Warning: unmount command failed, waiting for daemon to exit...");
-        }
+    if !try_unmount(mount_point) {
+        eprintln!("Warning: unmount command failed, waiting for daemon to exit...");
     }
 
     // Wait up to 30s for the daemon to exit. The daemon may spend significant
@@ -244,7 +311,7 @@ pub fn daemonize(mount_point: &Path) -> std::io::Result<DaemonGuard> {
 
     // Refuse to start if a daemon is already running for this mount point.
     if let Some(existing_pid) = read_pid(&pid_file) {
-        if pid_alive(existing_pid) {
+        if is_our_daemon(existing_pid) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::AlreadyExists,
                 format!(
