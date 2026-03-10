@@ -16,46 +16,66 @@ type FlushRequest = u64;
 // ── FlushManager ──────────────────────────────────────────────────────
 
 pub(crate) struct FlushManager {
+    /// Channel for dirty file flush requests (None when advanced_writes is off).
     tx: Mutex<Option<mpsc::UnboundedSender<FlushRequest>>>,
+    /// Background flush_loop task handle (None when advanced_writes is off).
     handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Per-inode flush errors surfaced to callers via check_error().
     errors: Arc<Mutex<HashMap<u64, String>>>,
+    /// Queued remote delete paths. Drained in flush_loop, poll, rmdir, and shutdown.
+    pending_deletes: Arc<Mutex<Vec<String>>>,
+    hub_client: Arc<dyn HubOps>,
 }
 
 impl FlushManager {
+    /// Create a FlushManager. Always created, but the background flush_loop
+    /// only runs when `advanced_writes` is true.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         xet_sessions: Arc<dyn XetOps>,
-        staging_dir: StagingDir,
+        staging_dir: Option<StagingDir>,
         hub_client: Arc<dyn HubOps>,
         inodes: Arc<RwLock<InodeTable>>,
         runtime: &tokio::runtime::Handle,
         debounce: Duration,
         max_batch_window: Duration,
-        pending_remote_deletes: Arc<Mutex<Vec<String>>>,
+        advanced_writes: bool,
     ) -> Self {
         let errors = Arc::new(Mutex::new(HashMap::new()));
-        let (tx, rx) = mpsc::unbounded_channel::<FlushRequest>();
+        let pending_deletes = Arc::new(Mutex::new(Vec::new()));
 
-        let bg_errors = errors.clone();
-        let handle = runtime.spawn(flush_loop(
-            rx,
-            xet_sessions,
-            staging_dir,
-            hub_client,
-            inodes,
-            bg_errors,
-            debounce,
-            max_batch_window,
-            pending_remote_deletes,
-        ));
+        let (tx, handle) = if advanced_writes {
+            let sd = staging_dir.expect("--advanced-writes requires a staging directory");
+            let (tx, rx) = mpsc::unbounded_channel::<FlushRequest>();
+            let bg_errors = errors.clone();
+            let bg_deletes = pending_deletes.clone();
+            let bg_hub = hub_client.clone();
+            let handle = runtime.spawn(flush_loop(
+                rx,
+                xet_sessions,
+                sd,
+                bg_hub,
+                inodes,
+                bg_errors,
+                debounce,
+                max_batch_window,
+                bg_deletes,
+            ));
+            (Some(tx), Some(handle))
+        } else {
+            (None, None)
+        };
 
         Self {
-            tx: Mutex::new(Some(tx)),
-            handle: Mutex::new(Some(handle)),
+            tx: Mutex::new(tx),
+            handle: Mutex::new(handle),
             errors,
+            pending_deletes,
+            hub_client,
         }
     }
 
+    /// Enqueue a dirty inode for flush (advanced_writes only).
     pub(crate) fn enqueue(&self, ino: u64) {
         if let Some(tx) = self.tx.lock().expect("flush_tx poisoned").as_ref()
             && tx.send(ino).is_err()
@@ -67,6 +87,65 @@ impl FlushManager {
     pub(crate) fn check_error(&self, ino: u64) -> Option<String> {
         self.errors.lock().expect("flush_errors poisoned").remove(&ino)
     }
+
+    /// Whether the background flush_loop is running (advanced_writes mode).
+    pub(crate) fn has_flush_loop(&self) -> bool {
+        self.handle.lock().expect("flush_handle poisoned").is_some()
+    }
+
+    // ── Remote delete queue ─────────────────────────────────────────
+
+    /// Queue a path for batched remote deletion.
+    pub(crate) fn enqueue_delete(&self, path: String) {
+        self.pending_deletes
+            .lock()
+            .expect("pending_deletes poisoned")
+            .push(path);
+    }
+
+    /// Cancel a queued delete (e.g. when a new file is created at the same path).
+    pub(crate) fn cancel_delete(&self, path: &str) {
+        self.pending_deletes
+            .lock()
+            .expect("pending_deletes poisoned")
+            .retain(|p| p != path);
+    }
+
+    /// Flush all queued remote deletes in a single batch API call.
+    pub(crate) async fn flush_deletes(&self) {
+        Self::flush_delete_queue(&self.pending_deletes, &*self.hub_client).await;
+    }
+
+    /// Get an Arc clone of the delete queue for the poll loop.
+    pub(crate) fn delete_queue(&self) -> Arc<Mutex<Vec<String>>> {
+        self.pending_deletes.clone()
+    }
+
+    /// Drain `queue` and send all paths as a single `batch_operations` delete.
+    /// Re-queues paths on transient failure. Used by flush_deletes(),
+    /// the flush_loop, and the poll loop.
+    pub(crate) async fn flush_delete_queue(queue: &Mutex<Vec<String>>, hub_client: &dyn HubOps) {
+        let paths: Vec<String> = {
+            let mut pending = queue.lock().expect("pending_deletes poisoned");
+            if pending.is_empty() {
+                return;
+            }
+            std::mem::take(&mut *pending)
+        };
+        let count = paths.len();
+        let ops: Vec<BatchOp> = paths
+            .iter()
+            .map(|path| BatchOp::DeleteFile { path: path.clone() })
+            .collect();
+        info!("Flushing {count} queued remote deletes");
+        if let Err(e) = hub_client.batch_operations(&ops).await {
+            error!("Batch remote delete failed: {}", e);
+            let mut pending = queue.lock().expect("pending_deletes poisoned");
+            pending.extend(paths);
+        }
+    }
+
+    // ── Shutdown ────────────────────────────────────────────────────
 
     pub(crate) fn shutdown(&self, dirty_inos: Vec<u64>, runtime: &tokio::runtime::Handle) {
         // Enqueue all remaining dirty files
@@ -94,6 +173,9 @@ impl FlushManager {
                 wait();
             }
         }
+        // Flush remaining queued deletes (flush_loop already drained its share on exit,
+        // but deletes queued after the loop exited still need to be sent).
+        runtime.block_on(self.flush_deletes());
     }
 }
 
@@ -109,7 +191,7 @@ async fn flush_loop(
     flush_errors: Arc<Mutex<HashMap<u64, String>>>,
     debounce: Duration,
     max_batch_window: Duration,
-    pending_remote_deletes: Arc<Mutex<Vec<String>>>,
+    pending_deletes: Arc<Mutex<Vec<String>>>,
 ) {
     loop {
         // Wait for the first request
@@ -136,7 +218,7 @@ async fn flush_loop(
         }
 
         // Flush queued remote deletes alongside dirty writes.
-        super::VirtualFs::flush_delete_queue(&pending_remote_deletes, &*hub_client).await;
+        FlushManager::flush_delete_queue(&pending_deletes, &*hub_client).await;
 
         let count = pending.len();
         info!("Flushing batch of {} dirty file(s)", count);

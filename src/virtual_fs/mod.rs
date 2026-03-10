@@ -63,8 +63,9 @@ pub struct VirtualFs {
     /// Per-inode pending commit receivers. release() publishes the commit result here;
     /// open() awaits it instead of blindly blocking on staging_lock.
     pending_commits: Mutex<HashMap<u64, CommitHookRx>>,
-    /// Debounced batch flush pipeline (None when read_only).
-    flush_manager: Option<flush::FlushManager>,
+    /// Manages batched dirty-file flushes and remote delete queue.
+    /// Always present (even in read-only mode it handles delete queue draining).
+    flush_manager: flush::FlushManager,
     /// Background poll task handle, aborted in shutdown().
     poll_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Kernel cache invalidation callback. Set via `set_invalidator()` after mount.
@@ -82,9 +83,6 @@ pub struct VirtualFs {
     filter_os_files: bool,
     /// When true, prefetch buffers drain after serving (forward-only, no re-read cache).
     direct_io: bool,
-    /// Queued remote delete operations. `unlink()` pushes paths here instead of
-    /// making individual HTTP calls. Flushed in rmdir, poll, and shutdown.
-    pending_remote_deletes: Arc<Mutex<Vec<String>>>,
 }
 
 /// Where to read file content from when opening read-only.
@@ -110,25 +108,16 @@ impl VirtualFs {
         let inodes = Arc::new(RwLock::new(InodeTable::new()));
         let negative_cache = Arc::new(RwLock::new(HashMap::new()));
 
-        let pending_remote_deletes = Arc::new(Mutex::new(Vec::new()));
-
-        let flush_manager = if !read_only && advanced_writes {
-            let sd = staging_dir
-                .as_ref()
-                .expect("--advanced-writes requires a staging directory");
-            Some(flush::FlushManager::new(
-                xet_sessions.clone(),
-                sd.clone(),
-                hub_client.clone(),
-                inodes.clone(),
-                &runtime,
-                flush_debounce,
-                flush_max_batch_window,
-                pending_remote_deletes.clone(),
-            ))
-        } else {
-            None
-        };
+        let flush_manager = flush::FlushManager::new(
+            xet_sessions.clone(),
+            if advanced_writes { staging_dir.clone() } else { None },
+            hub_client.clone(),
+            inodes.clone(),
+            &runtime,
+            flush_debounce,
+            flush_max_batch_window,
+            !read_only && advanced_writes,
+        );
 
         // Spawn remote change polling task (if interval > 0)
         let invalidator: Invalidator = Arc::new(Mutex::new(None));
@@ -137,7 +126,7 @@ impl VirtualFs {
             let bg_inodes = inodes.clone();
             let bg_neg_cache = negative_cache.clone();
             let bg_invalidator = invalidator.clone();
-            let bg_pending_deletes = pending_remote_deletes.clone();
+            let bg_pending_deletes = flush_manager.delete_queue();
             let interval = Duration::from_secs(poll_interval_secs);
 
             Some(runtime.spawn(Self::poll_remote_changes(
@@ -174,7 +163,6 @@ impl VirtualFs {
             serve_lookup_from_cache,
             filter_os_files,
             direct_io,
-            pending_remote_deletes,
         });
 
         // Set root inode mtime and ownership (repos use the last commit date).
@@ -216,49 +204,9 @@ impl VirtualFs {
             handle.abort();
         }
         // Flush all dirty files that may not have received a release() yet.
-        if let Some(fm) = &self.flush_manager {
-            let dirty = self.inode_table.read().expect("inodes poisoned").dirty_inos();
-            fm.shutdown(dirty, &self.runtime);
-        }
-        // Flush any queued remote deletes before exiting.
-        self.runtime.block_on(self.flush_remote_deletes());
+        let dirty = self.inode_table.read().expect("inodes poisoned").dirty_inos();
+        self.flush_manager.shutdown(dirty, &self.runtime);
         info!("Flush loop finished, VFS shut down.");
-    }
-
-    /// Flush all queued remote delete operations in a single batch API call.
-    async fn flush_remote_deletes(&self) {
-        Self::flush_delete_queue(&self.pending_remote_deletes, &*self.hub_client).await;
-    }
-
-    /// Drain `queue` and send all paths as a single `batch_operations` delete.
-    /// Re-queues paths on transient failure. Used by `flush_remote_deletes`,
-    /// the poll loop, and the flush_manager batch cycle.
-    pub(super) async fn flush_delete_queue(queue: &Mutex<Vec<String>>, hub_client: &dyn HubOps) {
-        let paths: Vec<String> = {
-            let mut pending = queue.lock().expect("pending_deletes poisoned");
-            if pending.is_empty() {
-                return;
-            }
-            std::mem::take(&mut *pending)
-        };
-        let count = paths.len();
-        let ops: Vec<BatchOp> = paths
-            .iter()
-            .map(|path| BatchOp::DeleteFile { path: path.clone() })
-            .collect();
-        info!("Flushing {count} queued remote deletes");
-        if let Err(e) = hub_client.batch_operations(&ops).await {
-            error!("Batch remote delete failed: {}", e);
-            let mut pending = queue.lock().expect("pending_deletes poisoned");
-            pending.extend(paths);
-        }
-    }
-
-    /// Remove a path from the pending delete queue (e.g. when a new file is
-    /// created at the same path, so the queued delete would be stale).
-    fn cancel_queued_delete(&self, path: &str) {
-        let mut pending = self.pending_remote_deletes.lock().expect("pending_deletes poisoned");
-        pending.retain(|p| p != path);
     }
 
     // ── Background tasks ───────────────────────────────────────────────
@@ -277,7 +225,7 @@ impl VirtualFs {
 
             // Flush any queued remote deletes before polling, so the remote
             // state is up-to-date and we don't re-discover deleted files.
-            Self::flush_delete_queue(&pending_remote_deletes, &*hub_client).await;
+            flush::FlushManager::flush_delete_queue(&pending_remote_deletes, &*hub_client).await;
 
             let remote_entries = match hub_client.list_tree("", true).await {
                 Ok(entries) => entries,
@@ -1059,9 +1007,7 @@ impl VirtualFs {
     /// Used by NFS (which has no close/flush RPC) to ensure writes
     /// eventually get committed to the Hub.
     pub fn schedule_flush(&self, ino: u64) {
-        if let Some(fm) = &self.flush_manager {
-            fm.enqueue(ino);
-        }
+        self.flush_manager.enqueue(ino);
     }
 
     pub fn getattr(&self, ino: u64) -> VirtualFsResult<VirtualFsAttr> {
@@ -1749,9 +1695,7 @@ impl VirtualFs {
         }
 
         // Advanced writes mode: check if a previous async flush failed
-        if let Some(fm) = &self.flush_manager
-            && let Some(err_msg) = fm.check_error(ino)
-        {
+        if let Some(err_msg) = self.flush_manager.check_error(ino) {
             error!("Deferred flush error for ino={}: {}", ino, err_msg);
             return Err(libc::EIO);
         }
@@ -1786,8 +1730,8 @@ impl VirtualFs {
                     .expect("inodes poisoned")
                     .get(ino)
                     .is_some_and(|e| e.nlink == 0);
-                if !is_unlinked && let Some(fm) = &self.flush_manager {
-                    fm.enqueue(ino);
+                if !is_unlinked {
+                    self.flush_manager.enqueue(ino);
                 }
             }
             Some(OpenFile::Streaming { ino, channel }) => {
@@ -2027,7 +1971,7 @@ impl VirtualFs {
         };
 
         self.negative_cache_remove(&full_path);
-        self.cancel_queued_delete(&full_path);
+        self.flush_manager.cancel_delete(&full_path);
 
         if self.advanced_writes {
             // Advanced mode: staging file on disk + async flush
@@ -2174,16 +2118,14 @@ impl VirtualFs {
             (entry.inode, entry.full_path.clone(), needs_remote)
         };
 
-        // Queue the remote delete for batched flush. When a FlushManager or
+        // Queue the remote delete for batched flush. When a flush_loop or
         // poll loop exists, deletes are drained in the next batch cycle.
         // Otherwise, flush immediately (no debounce mechanism available).
         if needs_remote_delete {
-            self.pending_remote_deletes
-                .lock()
-                .expect("pending_deletes poisoned")
-                .push(full_path.clone());
-            if self.flush_manager.is_none() && self.poll_handle.lock().expect("poll_handle poisoned").is_none() {
-                self.flush_remote_deletes().await;
+            self.flush_manager.enqueue_delete(full_path.clone());
+            if !self.flush_manager.has_flush_loop() && self.poll_handle.lock().expect("poll_handle poisoned").is_none()
+            {
+                self.flush_manager.flush_deletes().await;
             }
         }
 
@@ -2297,7 +2239,7 @@ impl VirtualFs {
 
         // Flush any queued remote deletes (e.g. from rm -rf that unlinked
         // files before calling rmdir on the now-empty directory).
-        self.flush_remote_deletes().await;
+        self.flush_manager.flush_deletes().await;
 
         self.ensure_children_loaded(parent).await?;
 
@@ -2742,9 +2684,7 @@ impl VirtualFs {
 
                 // Schedule flush so the truncation is committed to CAS/bucket
                 drop(inodes);
-                if let Some(fm) = &self.flush_manager {
-                    fm.enqueue(ino);
-                }
+                self.flush_manager.enqueue(ino);
             }
         }
 

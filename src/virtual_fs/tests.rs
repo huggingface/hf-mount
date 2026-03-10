@@ -521,7 +521,7 @@ fn rename_replaces_destination() {
 }
 
 /// Unlink sends remote delete and removes local inode.
-/// In simple mode (no FlushManager, no poll), delete is flushed immediately.
+/// In simple mode (no flush_loop, no poll), delete is flushed immediately.
 #[test]
 fn unlink_sends_remote_delete() {
     let hub = MockHub::new();
@@ -540,11 +540,7 @@ fn unlink_sends_remote_delete() {
         assert!(inodes.get(ino).is_none());
         drop(inodes);
 
-        // Delete was flushed immediately (no FlushManager/poll to batch it).
-        let pending = vfs.pending_remote_deletes.lock().unwrap();
-        assert!(pending.is_empty(), "queue should be drained after immediate flush");
-        drop(pending);
-
+        // Delete was flushed immediately (no flush_loop/poll to batch it).
         let logs = hub.take_batch_log();
         assert!(!logs.is_empty(), "delete should have been sent to remote");
     });
@@ -1047,10 +1043,8 @@ fn flush_manager_check_error_surfaces() {
         // Wait for flush debounce (100ms in test config) + processing
         tokio::time::sleep(Duration::from_secs(3)).await;
 
-        if let Some(fm) = &vfs.flush_manager {
-            let err = fm.check_error(ino);
-            assert!(err.is_some(), "flush manager should have recorded an error");
-        }
+        let err = vfs.flush_manager.check_error(ino);
+        assert!(err.is_some(), "flush manager should have recorded an error");
     });
 }
 
