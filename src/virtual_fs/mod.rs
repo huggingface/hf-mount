@@ -1578,10 +1578,11 @@ impl VirtualFs {
                     let written = n as u32;
                     let new_end = offset + written as u64;
                     let mut inodes = self.inode_table.write().expect("inodes poisoned");
-                    if let Some(entry) = inodes.get_mut(handle_ino)
-                        && new_end > entry.size
-                    {
-                        entry.size = new_end;
+                    if let Some(entry) = inodes.get_mut(handle_ino) {
+                        if new_end > entry.size {
+                            entry.size = new_end;
+                        }
+                        entry.dirty = true;
                     }
                     Ok(written)
                 }
@@ -2508,6 +2509,10 @@ impl VirtualFs {
         no_replace: bool,
     ) -> VirtualFsResult<()> {
         self.negative_cache_remove(&info.new_full_path);
+        // Cancel any queued remote delete for the destination path (e.g. rm a && mv b a).
+        if let Some(fm) = &self.flush_manager {
+            fm.cancel_delete(&info.new_full_path);
+        }
 
         let mut inodes = self.inode_table.write().expect("inodes poisoned");
 

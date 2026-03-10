@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::mpsc;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::hub_api::{BatchOp, HubOps};
 use crate::xet::{StagingDir, XetOps};
@@ -83,6 +83,11 @@ impl FlushManager {
             .lock()
             .expect("pending_deletes poisoned")
             .push(path);
+        // Wake flush_loop so it drains pending_deletes even without dirty inodes.
+        // The sentinel is harmlessly skipped by flush_batch (no inode entry exists).
+        if let Some(tx) = self.tx.lock().expect("flush_tx poisoned").as_ref() {
+            let _ = tx.send(u64::MAX);
+        }
     }
 
     /// Cancel a queued delete (e.g. when a new file is created at the same path).
@@ -127,7 +132,12 @@ impl FlushManager {
             }
         }
         // Flush remaining queued deletes.
-        runtime.block_on(self.flush_deletes());
+        let flush = || runtime.block_on(self.flush_deletes());
+        if tokio::runtime::Handle::try_current().is_ok() {
+            tokio::task::block_in_place(flush);
+        } else {
+            flush();
+        }
     }
 }
 
@@ -209,6 +219,7 @@ async fn flush_pending_deletes(queue: &Mutex<Vec<String>>, hub_client: &dyn HubO
                 pending.push(path);
             }
         }
+        warn!("{count} remote delete(s) re-queued for retry");
     }
 }
 
