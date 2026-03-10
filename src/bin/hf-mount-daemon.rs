@@ -86,18 +86,18 @@ fn start_daemon(fuse: bool, options: MountOptions, source: Source) -> i32 {
             error!("NFS mount failed: {e}");
             return 1;
         }
-    } else {
-        hf_mount::fuse::mount_fuse(
-            s.virtual_fs,
-            &s.mount_point,
-            s.metadata_ttl,
-            s.read_only,
-            s.advanced_writes,
-            s.direct_io,
-            s.max_threads,
-            &s.runtime,
-            Some(&mut daemon_guard),
-        );
+    } else if !hf_mount::fuse::mount_fuse(
+        s.virtual_fs,
+        &s.mount_point,
+        s.metadata_ttl,
+        s.read_only,
+        s.advanced_writes,
+        s.direct_io,
+        s.max_threads,
+        &s.runtime,
+        Some(&mut daemon_guard),
+    ) {
+        return 1;
     }
 
     info!("Unmounted cleanly");

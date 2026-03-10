@@ -476,6 +476,7 @@ impl Filesystem for FuseAdapter {
 }
 
 /// Mount the VFS as a FUSE filesystem and block until unmount.
+/// Returns `true` if the mount ran and exited cleanly, `false` on startup failure.
 #[allow(clippy::too_many_arguments)]
 pub fn mount_fuse(
     virtual_fs: Arc<VirtualFs>,
@@ -487,7 +488,7 @@ pub fn mount_fuse(
     max_threads: usize,
     runtime: &tokio::runtime::Runtime,
     daemon_guard: Option<&mut DaemonGuard>,
-) {
+) -> bool {
     let adapter = FuseAdapter::new(
         runtime.handle().clone(),
         virtual_fs.clone(),
@@ -521,7 +522,7 @@ pub fn mount_fuse(
             } else {
                 error!("FUSE session failed: {}", e);
             }
-            std::process::exit(1);
+            return false;
         }
     };
     let notifier = session.notifier();
@@ -534,7 +535,7 @@ pub fn mount_fuse(
         Ok(bg) => bg,
         Err(e) => {
             error!("FUSE spawn failed: {}", e);
-            std::process::exit(1);
+            return false;
         }
     };
 
@@ -570,6 +571,7 @@ pub fn mount_fuse(
     // (e.g. `fusermount -u`) where destroy() may not fire. Idempotent
     // because shutdown() takes handles from Mutex<Option<...>>.
     virtual_fs.shutdown();
+    true
 }
 
 /// Wait for SIGINT, SIGTERM, or SIGHUP.

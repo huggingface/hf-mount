@@ -9,25 +9,41 @@ fn state_dir() -> PathBuf {
         .join(".hf-mount")
 }
 
-/// Canonicalize a mount point path, falling back to the absolute path if
-/// the target doesn't exist yet. The result is used to derive PID/log filenames.
+/// Canonicalize a mount point path, falling back to a normalized absolute path
+/// if the target doesn't exist yet. The result is used to derive PID/log filenames.
 fn canonical_mount_point(mount_point: &Path) -> PathBuf {
     std::fs::canonicalize(mount_point).unwrap_or_else(|_| {
-        if mount_point.is_absolute() {
+        let abs = if mount_point.is_absolute() {
             mount_point.to_path_buf()
         } else {
             std::env::current_dir()
                 .unwrap_or_else(|_| PathBuf::from("/"))
                 .join(mount_point)
+        };
+        // Normalize away `.` and `..` components so that `./mnt` and `mnt`
+        // resolve to the same key even when the directory doesn't exist yet.
+        let mut normalized = PathBuf::new();
+        for component in abs.components() {
+            match component {
+                std::path::Component::ParentDir => {
+                    normalized.pop();
+                }
+                std::path::Component::CurDir => {}
+                c => normalized.push(c),
+            }
         }
+        normalized
     })
 }
 
-/// Encode a path as a filename-safe string. Uses `-` as separator instead
-/// of replacing `/` with `_` (which would cause collisions like `/a_b/c`
-/// vs `/a/b_c`). Leading `/` is stripped.
+/// Encode a path as a filename-safe string using percent-encoding.
+/// `/` becomes `%2F`, `%` becomes `%25`, producing an injective mapping
+/// (no two distinct paths map to the same key).
 fn encode_path(path: &Path) -> String {
-    path.to_string_lossy().trim_matches('/').replace('/', "-")
+    path.to_string_lossy()
+        .trim_matches('/')
+        .replace('%', "%25")
+        .replace('/', "%2F")
 }
 
 fn pid_path(mount_point: &Path) -> PathBuf {
