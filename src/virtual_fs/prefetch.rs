@@ -122,7 +122,12 @@ impl PrefetchState {
             debug!("prefetch window doubled to {}", self.window_size);
             true
         } else {
-            // Far seek: reset to initial window, cancel stream
+            // Far seek (backward, or forward jump > FORWARD_SKIP): treat as random.
+            // Trade-off: if the app actually reads sequentially from here, we pay one
+            // extra CAS round-trip (~70ms) for the first RangeDownload; the next
+            // contiguous read will hit is_sequential and restart streaming with
+            // window=INITIAL. This is a good default for mmap/safetensors workloads
+            // which are heavily random — avoids wasting ~8MB of prefetch on every seek.
             self.window_size = INITIAL_WINDOW;
             debug!("prefetch window reset to {}", self.window_size);
             false
