@@ -5,34 +5,32 @@ edition = "2024"
 
 [dependencies]
 # xet-core crates
+cas_client = { git = "https://github.com/huggingface/xet-core.git", rev = "b099c05" }
+cas_types = { git = "https://github.com/huggingface/xet-core.git", rev = "b099c05" }
 data = { git = "https://github.com/huggingface/xet-core.git", rev = "b099c05" }
 file_reconstruction = { git = "https://github.com/huggingface/xet-core.git", rev = "b099c05" }
 mdb_shard = { git = "https://github.com/huggingface/xet-core.git", rev = "b099c05" }
-utils = { git = "https://github.com/huggingface/xet-core.git", rev = "b099c05" }
-hub_client = { git = "https://github.com/huggingface/xet-core.git", rev = "b099c05" }
-xet_runtime = { git = "https://github.com/huggingface/xet-core.git", rev = "b099c05" }
-cas_client = { git = "https://github.com/huggingface/xet-core.git", rev = "b099c05" }
-cas_types = { git = "https://github.com/huggingface/xet-core.git", rev = "b099c05" }
-xorb_object = { git = "https://github.com/huggingface/xet-core.git", rev = "b099c05" }
 merklehash = { git = "https://github.com/huggingface/xet-core.git", rev = "b099c05" }
+utils = { git = "https://github.com/huggingface/xet-core.git", rev = "b099c05" }
+xorb_object = { git = "https://github.com/huggingface/xet-core.git", rev = "b099c05" }
 
 # External crates
-fuser = { version = "0.17", features = ["macos-no-mount"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
-reqwest = { version = "0.12", features = ["json", "stream"] }
-futures = "0.3"
-clap = { version = "4", features = ["derive", "env"] }
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-libc = "0.2"
 async-trait = "0.1"
 bytes = "1"
 chrono = "0.4"
-uuid = { version = "1", features = ["v4"] }
-ulid = "1"
+clap = { version = "4", features = ["derive", "env"] }
+fuser = { version = "0.17", features = ["macos-no-mount"] }
+futures = "0.3"
+libc = "0.2"
 nfsserve = "0.10"
+reqwest = { version = "0.12", features = ["json", "stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+ulid = "1"
+uuid = { version = "1", features = ["v4"] }
 
 [[bin]]
 name = "hf-mount-fuse"
