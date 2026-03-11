@@ -2510,8 +2510,12 @@ impl VirtualFs {
     ) -> VirtualFsResult<()> {
         self.negative_cache_remove(&info.new_full_path);
         // Cancel any queued remote delete for the destination path (e.g. rm a && mv b a).
+        // For directories, also cancel descendant deletes (e.g. rm -rf dir && mv newdir dir).
         if let Some(fm) = &self.flush_manager {
             fm.cancel_delete(&info.new_full_path);
+            if info.kind == InodeKind::Directory {
+                fm.cancel_delete_prefix(&format!("{}/", info.new_full_path));
+            }
         }
 
         let mut inodes = self.inode_table.write().expect("inodes poisoned");

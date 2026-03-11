@@ -102,6 +102,14 @@ impl FlushManager {
         }
     }
 
+    /// Cancel all queued deletes under a directory prefix (e.g. `rm -rf dir && mv newdir dir`).
+    pub(crate) fn cancel_delete_prefix(&self, prefix: &str) {
+        let mut q = self.pending_deletes.lock().expect("pending_deletes poisoned");
+        if !q.is_empty() {
+            q.retain(|p| !p.starts_with(prefix));
+        }
+    }
+
     /// Flush all queued remote deletes in a single batch API call.
     pub(crate) async fn flush_deletes(&self) {
         flush_pending_deletes(&self.pending_deletes, &*self.hub_client).await;
@@ -210,6 +218,12 @@ async fn flush_loop(
 
 /// Drain delete queue and send as a single batch_operations call.
 /// Re-queues paths on transient failure.
+///
+/// Note: there is a small race window between `take()` and the Hub response where
+/// `cancel_delete` cannot revoke an in-flight delete. The same race exists for dirty
+/// writes (flush_batch reads inode state, then a concurrent rename can change the path).
+/// In both cases the next flush cycle corrects the state, and the window is bounded by
+/// a single Hub round-trip (~100ms). A proper fix would require CAS/versioning on the Hub.
 async fn flush_pending_deletes(queue: &Mutex<Vec<String>>, hub_client: &dyn HubOps) {
     let paths: Vec<String> = {
         let mut pending = queue.lock().expect("pending_deletes poisoned");
