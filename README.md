@@ -100,6 +100,7 @@ cargo build --release
 Binaries:
 - `target/release/hf-mount-fuse`
 - `target/release/hf-mount-nfs`
+- `target/release/hf-mount-daemon`
 
 ## Usage
 
@@ -143,14 +144,33 @@ Use `hf-mount-nfs` when `/dev/fuse` is unavailable (e.g., unprivileged container
 hf-mount-nfs --hf-token $HF_TOKEN bucket myuser/my-bucket /mnt/data
 ```
 
+### Background daemon
+
+`hf-mount-daemon` runs the mount in the background, with automatic PID tracking and log management:
+
+```bash
+# Start a daemon (NFS by default, --fuse for FUSE)
+hf-mount-daemon start --hf-token $HF_TOKEN bucket myuser/my-bucket /mnt/data
+hf-mount-daemon start --fuse repo gpt2 /mnt/gpt2
+
+# List running daemons
+hf-mount-daemon status
+
+# Stop a daemon (unmounts and waits for flush)
+hf-mount-daemon stop /mnt/data
+```
+
+Logs are written to `~/.hf-mount/logs/`. PID files are stored in `~/.hf-mount/pids/`.
+
 ### Unmount
 
 ```bash
-# FUSE
-fusermount -u /mnt/data
+# Foreground mounts
+fusermount -u /mnt/data   # FUSE (Linux)
+umount /mnt/data           # FUSE (macOS) or NFS
 
-# NFS
-sudo umount /mnt/data
+# Daemon mounts
+hf-mount-daemon stop /mnt/data
 ```
 
 ### Options
