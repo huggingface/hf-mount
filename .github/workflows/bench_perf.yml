@@ -5,8 +5,9 @@ name: Performance Benchmarks
 # For comparable results, run on a high-network instance of equivalent class.
 #
 # Triggers:
-#   - Every push to main     → publishes results to gh-pages (historical charts)
-#   - PR labeled "performance" → posts results as PR comment, no publish
+#   - Every push to main     -> publishes results to gh-pages (historical charts)
+#   - PR labeled "performance" -> posts results as PR comment, no publish
+#   - Manual dispatch        -> full 100G benchmarks with pre-populated bucket
 
 on:
   push:
@@ -14,6 +15,24 @@ on:
   pull_request:
     branches: [main]
     types: [labeled]
+  workflow_dispatch:
+    inputs:
+      bucket:
+        description: "Pre-populated bucket for big file benchmarks (e.g. XciD/hf-bench)"
+        required: true
+        default: "XciD/hf-bench"
+      job_filter:
+        description: "Job name filter (empty = all jobs including 100G)"
+        required: false
+        default: ""
+      iterations:
+        description: "Number of iterations per job"
+        required: false
+        default: "3"
+      categories:
+        description: "Comma-separated benchmark categories"
+        required: false
+        default: "read"
 
 jobs:
   check-trigger:
@@ -27,6 +46,9 @@ jobs:
           if [[ "${{ github.event_name }}" == "push" ]]; then
             echo "should-run=true" >> "$GITHUB_OUTPUT"
             echo "publish=true" >> "$GITHUB_OUTPUT"
+          elif [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "should-run=true" >> "$GITHUB_OUTPUT"
+            echo "publish=false" >> "$GITHUB_OUTPUT"
           elif [[ "${{ github.event.label.name }}" == "performance" ]]; then
             echo "should-run=true" >> "$GITHUB_OUTPUT"
             echo "publish=false" >> "$GITHUB_OUTPUT"
@@ -41,12 +63,12 @@ jobs:
     if: needs.check-trigger.outputs.should-run == 'true'
     runs-on:
       group: hf-mount-ci-m5dn-24xlarge
+    timeout-minutes: 120
     permissions:
       contents: write
       pull-requests: write
     env:
-      HF_TOKEN: ${{ secrets.HF_TOKEN_HUB_CI }}
-      HF_ENDPOINT: https://hub-ci.huggingface.co
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
     steps:
       - uses: actions/checkout@v4
 
@@ -65,11 +87,19 @@ jobs:
 
       - name: Run throughput benchmarks
         run: |
-          # Use small filter in CI to keep runtime reasonable (skip 100G jobs).
-          # Remove HF_JOB_NAME_FILTER or set iterations=10 for full comparison runs.
-          HF_JOB_NAME_FILTER=small iterations=3 \
-            HF_CATEGORIES=read,write,mix \
-            ./scripts/fs_bench.sh 2>&1 | tee bench.log
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            # Full benchmarks with pre-populated bucket
+            HF_BENCH_BUCKET="${{ inputs.bucket }}" \
+              HF_JOB_NAME_FILTER="${{ inputs.job_filter }}" \
+              iterations=${{ inputs.iterations }} \
+              HF_CATEGORIES="${{ inputs.categories }}" \
+              ./scripts/fs_bench.sh 2>&1 | tee bench.log
+          else
+            # CI: small files only to keep runtime reasonable
+            HF_JOB_NAME_FILTER=small iterations=3 \
+              HF_CATEGORIES=read,write,mix \
+              ./scripts/fs_bench.sh 2>&1 | tee bench.log
+          fi
 
       - name: Publish throughput results to gh-pages
         uses: benchmark-action/github-action-benchmark@v1
@@ -122,12 +152,12 @@ jobs:
     if: needs.check-trigger.outputs.should-run == 'true'
     runs-on:
       group: hf-mount-ci-m5dn-24xlarge
+    timeout-minutes: 30
     permissions:
       contents: write
       pull-requests: write
     env:
-      HF_TOKEN: ${{ secrets.HF_TOKEN_HUB_CI }}
-      HF_ENDPOINT: https://hub-ci.huggingface.co
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
     steps:
       - uses: actions/checkout@v4
 
