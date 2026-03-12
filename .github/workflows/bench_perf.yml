@@ -40,6 +40,7 @@ jobs:
     timeout-minutes: 120
     permissions:
       contents: write
+      pull-requests: write
     env:
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
     steps:
@@ -97,6 +98,33 @@ jobs:
           echo "|-----|-----------|" >> "$GITHUB_STEP_SUMMARY"
           jq -r '.[] | "| \(.name) | \(.value | round) \(.unit) |"' results/fuse/output.json >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || echo "| (no results) | |" >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Post PR comment
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          RESULTS=$(jq -r '.[] | "| \(.name) | \(.value | round) \(.unit) |"' results/fuse/output.json)
+          PR="${{ github.event.pull_request.number }}"
+          MARKER="<!-- perf-throughput-results -->"
+          BODY=$(cat <<EOFBODY
+          ${MARKER}
+          ## Throughput Benchmark Results
+
+          | Job | Throughput |
+          |-----|-----------|
+          ${RESULTS}
+          EOFBODY
+          )
+
+          COMMENT_ID=$(gh api "repos/${{ github.repository }}/issues/${PR}/comments" \
+            --jq ".[] | select(.body | startswith(\"${MARKER}\")) | .id" | head -1)
+          if [[ -n "${COMMENT_ID}" ]]; then
+            gh api "repos/${{ github.repository }}/issues/comments/${COMMENT_ID}" \
+              -X PATCH -f body="${BODY}"
+          else
+            gh pr comment "${PR}" --body "${BODY}"
+          fi
+
   latency-bench:
     name: Latency (TTFB)
     runs-on:
@@ -104,6 +132,7 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: write
+      pull-requests: write
     env:
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
     steps:
@@ -149,3 +178,30 @@ jobs:
           echo "| Job | Latency |" >> "$GITHUB_STEP_SUMMARY"
           echo "|-----|---------|" >> "$GITHUB_STEP_SUMMARY"
           jq -r '.[] | "| \(.name) | \(.value | . * 100 | round | . / 100) \(.unit) |"' results/fuse/output.json >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || echo "| (no results) | |" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Post PR comment
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          RESULTS=$(jq -r '.[] | "| \(.name) | \(.value | . * 100 | round | . / 100) \(.unit) |"' results/fuse/output.json)
+          PR="${{ github.event.pull_request.number }}"
+          MARKER="<!-- perf-latency-results -->"
+          BODY=$(cat <<EOFBODY
+          ${MARKER}
+          ## Latency Benchmark Results (TTFB)
+
+          | Job | Latency |
+          |-----|---------|
+          ${RESULTS}
+          EOFBODY
+          )
+
+          COMMENT_ID=$(gh api "repos/${{ github.repository }}/issues/${PR}/comments" \
+            --jq ".[] | select(.body | startswith(\"${MARKER}\")) | .id" | head -1)
+          if [[ -n "${COMMENT_ID}" ]]; then
+            gh api "repos/${{ github.repository }}/issues/comments/${COMMENT_ID}" \
+              -X PATCH -f body="${BODY}"
+          else
+            gh pr comment "${PR}" --body "${BODY}"
+          fi
