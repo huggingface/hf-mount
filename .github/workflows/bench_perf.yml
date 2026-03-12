@@ -40,7 +40,7 @@ jobs:
     needs: check-trigger
     if: needs.check-trigger.outputs.should-run == 'true'
     runs-on:
-      group: hf-mount-ci
+      group: hf-mount-ci-m5dn-24xlarge
     permissions:
       contents: write
       pull-requests: write
@@ -121,7 +121,7 @@ jobs:
     needs: check-trigger
     if: needs.check-trigger.outputs.should-run == 'true'
     runs-on:
-      group: hf-mount-ci
+      group: hf-mount-ci-m5dn-24xlarge
     permissions:
       contents: write
       pull-requests: write

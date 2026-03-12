@@ -21,7 +21,7 @@ jobs:
   lint-test:
     name: Lint & Unit Tests
     runs-on:
-      group: hf-mount-ci
+      group: hf-mount-ci-m5dn-24xlarge
     steps:
       - uses: actions/checkout@v4
 
@@ -52,7 +52,7 @@ jobs:
   smoke-test:
     name: Smoke Tests (FUSE + NFS)
     runs-on:
-      group: hf-mount-ci
+      group: hf-mount-ci-m5dn-24xlarge
     needs: lint-test
     env:
       HF_TOKEN: ${{ secrets.HF_TOKEN_HUB_CI }}
@@ -84,7 +84,7 @@ jobs:
   pjdfstest:
     name: POSIX Compliance (pjdfstest)
     runs-on:
-      group: hf-mount-ci
+      group: hf-mount-ci-m5dn-24xlarge
     needs: lint-test
     env:
       HF_TOKEN: ${{ secrets.HF_TOKEN_HUB_CI }}
@@ -150,7 +150,7 @@ jobs:
   bench:
     name: Benchmarks (fio small)
     runs-on:
-      group: hf-mount-ci
+      group: hf-mount-ci-m5dn-24xlarge
     needs: lint-test
     env:
       HF_TOKEN: ${{ secrets.HF_TOKEN_HUB_CI }}

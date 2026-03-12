@@ -201,7 +201,7 @@ run_fio_job() {
   for i in $(seq 1 "${iterations}"); do
     echo -n "${i};" >&2
     set +e
-    timeout 300s fio \
+    timeout 900s fio \
       --thread \
       --output="${results_dir}/${job_name}_iter${i}.json" \
       --output-format=json \
@@ -243,7 +243,7 @@ run_fio_latency_job() {
 
   echo -n "Running latency job ${job_name}... " >&2
   set +e
-  timeout 300s fio \
+  timeout 900s fio \
     --thread \
     --output="${results_dir}/${job_name}_iter1.json" \
     --output-format=json \
@@ -275,7 +275,7 @@ run_fio_create_job() {
   for i in $(seq 1 "${iterations}"); do
     echo -n "${i};" >&2
     set +e
-    timeout 300s fio \
+    timeout 900s fio \
       --thread \
       --output="${results_dir}/${job_name}_iter${i}.json" \
       --output-format=json \
@@ -335,18 +335,23 @@ run_read_category() {
   [[ ${#job_files[@]} -gt 0 ]] || return 0
 
   # Phase 1: populate all test files on a single writable mount
-  local populate_cache="/tmp/hf-bench-populate-$$"
-  do_mount "${populate_cache}"
-  for job_file in "${job_files[@]}"; do
-    echo "Populating data for $(basename "${job_file}")" >&2
-    local write_job
-    write_job=$(make_write_job "${job_file}")
-    fio --thread --directory="${_MOUNT_DIR}" --eta=never "${write_job}" &>/dev/null
-    rm -f "${write_job}"
-  done
-  echo "Unmounting to commit writes..." >&2
-  do_unmount
-  rm -rf "${_MOUNT_DIR}" 2>/dev/null || true
+  # Skip when reusing a pre-existing bucket (files are already there).
+  if [[ -z "${HF_BENCH_BUCKET:-}" ]]; then
+    local populate_cache="/tmp/hf-bench-populate-$$"
+    do_mount "${populate_cache}"
+    for job_file in "${job_files[@]}"; do
+      echo "Populating data for $(basename "${job_file}")" >&2
+      local write_job
+      write_job=$(make_write_job "${job_file}")
+      fio --thread --directory="${_MOUNT_DIR}" --eta=never "${write_job}" &>/dev/null
+      rm -f "${write_job}"
+    done
+    echo "Unmounting to commit writes..." >&2
+    do_unmount
+    rm -rf "${_MOUNT_DIR}" 2>/dev/null || true
+  else
+    echo "Skipping populate (reusing existing bucket ${HF_BENCH_BUCKET})" >&2
+  fi
 
   # Phase 2: benchmark each job on a fresh cold-cache mount
   for job_file in "${job_files[@]}"; do
