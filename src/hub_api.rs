@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -188,6 +188,9 @@ pub struct CasTokenInfo {
 
 // ── HubApiClient ──────────────────────────────────────────────────────
 
+/// How often the token file is re-read from disk.
+const TOKEN_FILE_REFRESH: std::time::Duration = std::time::Duration::from_secs(30);
+
 pub struct HubApiClient {
     client: Client,
     /// Client that does NOT follow redirects — used for HEAD requests where we
@@ -195,6 +198,12 @@ pub struct HubApiClient {
     head_client: Client,
     endpoint: String,
     token: Option<String>,
+    /// Path to a file containing the API token. Re-read periodically so
+    /// the CSI driver can refresh credentials without remounting.
+    /// Takes precedence over `token` when the file exists and is non-empty.
+    token_file: Option<PathBuf>,
+    /// Cached token from `token_file`, refreshed every 30s.
+    token_file_cache: std::sync::Mutex<Option<(std::time::Instant, String)>>,
     source: SourceKind,
     /// Last modification time (from repo/bucket info endpoint).
     /// Used as default mtime when per-file mtime is unavailable.
@@ -262,6 +271,7 @@ impl HubApiClient {
     pub async fn from_source(
         endpoint: &str,
         token: Option<&str>,
+        token_file: Option<PathBuf>,
         source: SourceKind,
         path_prefix: String,
     ) -> Result<Arc<Self>> {
@@ -329,6 +339,8 @@ impl HubApiClient {
             head_client,
             endpoint,
             token: token.map(|t| t.to_string()),
+            token_file,
+            token_file_cache: std::sync::Mutex::new(None),
             source,
             last_modified,
             path_prefix,
@@ -343,6 +355,8 @@ impl HubApiClient {
             head_client,
             endpoint: endpoint.trim_end_matches('/').to_string(),
             token: token.map(|t| t.to_string()),
+            token_file: None,
+            token_file_cache: std::sync::Mutex::new(None),
             source: SourceKind::Bucket {
                 bucket_id: bucket_id.to_string(),
             },
@@ -353,6 +367,28 @@ impl HubApiClient {
 
     /// Attach bearer auth to a request if a token is configured.
     fn auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        if let Some(path) = &self.token_file {
+            // Check TTL under lock, but do file I/O outside it to avoid
+            // blocking concurrent requests on slow storage.
+            let need_refresh = {
+                let cache = self.token_file_cache.lock().expect("token_file_cache poisoned");
+                match &*cache {
+                    Some((at, _)) => at.elapsed() >= TOKEN_FILE_REFRESH,
+                    None => true,
+                }
+            };
+            if need_refresh && let Ok(contents) = std::fs::read_to_string(path) {
+                let token = contents.trim().to_string();
+                if !token.is_empty() {
+                    let mut cache = self.token_file_cache.lock().expect("token_file_cache poisoned");
+                    *cache = Some((std::time::Instant::now(), token));
+                }
+            }
+            let cache = self.token_file_cache.lock().expect("token_file_cache poisoned");
+            if let Some((_, ref token)) = *cache {
+                return req.bearer_auth(token);
+            }
+        }
         match &self.token {
             Some(t) => req.bearer_auth(t),
             None => req,
@@ -1117,13 +1153,15 @@ mod tests {
 
     // ── prefixed_path / strip_path_prefix tests ───────────────────────
 
-    fn make_client_with_prefix(prefix: &str) -> HubApiClient {
+    fn make_test_client(prefix: &str, token_file: Option<PathBuf>) -> HubApiClient {
         let (client, head_client) = make_clients();
         HubApiClient {
             client,
             head_client,
             endpoint: "https://huggingface.co".to_string(),
-            token: None,
+            token: Some("static-token".to_string()),
+            token_file,
+            token_file_cache: std::sync::Mutex::new(None),
             source: SourceKind::Bucket {
                 bucket_id: "user/bucket".to_string(),
             },
@@ -1134,7 +1172,7 @@ mod tests {
 
     #[test]
     fn test_prefixed_path_empty_prefix() {
-        let c = make_client_with_prefix("");
+        let c = make_test_client("", None);
         assert_eq!(c.prefixed_path("file.txt"), "file.txt");
         assert_eq!(c.prefixed_path("a/b"), "a/b");
         assert_eq!(c.prefixed_path(""), "");
@@ -1142,7 +1180,7 @@ mod tests {
 
     #[test]
     fn test_prefixed_path_with_prefix() {
-        let c = make_client_with_prefix("sub/dir");
+        let c = make_test_client("sub/dir", None);
         assert_eq!(c.prefixed_path("file.txt"), "sub/dir/file.txt");
         assert_eq!(c.prefixed_path("a/b"), "sub/dir/a/b");
         assert_eq!(c.prefixed_path(""), "sub/dir");
@@ -1150,19 +1188,98 @@ mod tests {
 
     #[test]
     fn test_strip_path_prefix_empty_prefix() {
-        let c = make_client_with_prefix("");
+        let c = make_test_client("", None);
         assert_eq!(c.strip_path_prefix("file.txt"), Some("file.txt"));
         assert_eq!(c.strip_path_prefix("a/b/c"), Some("a/b/c"));
     }
 
     #[test]
     fn test_strip_path_prefix_with_prefix() {
-        let c = make_client_with_prefix("sub/dir");
+        let c = make_test_client("sub/dir", None);
         assert_eq!(c.strip_path_prefix("sub/dir/file.txt"), Some("file.txt"));
         assert_eq!(c.strip_path_prefix("sub/dir/a/b"), Some("a/b"));
         // The prefix directory itself → empty string
         assert_eq!(c.strip_path_prefix("sub/dir"), Some(""));
         // Unrelated path → None
         assert_eq!(c.strip_path_prefix("other/file.txt"), None);
+    }
+
+    // ── token file cache tests ────────────────────────────────────────
+
+    fn cached_token(client: &HubApiClient) -> Option<String> {
+        client.token_file_cache.lock().unwrap().as_ref().map(|(_, t)| t.clone())
+    }
+
+    fn test_token_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("hf-mount-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn token_file_populates_cache_on_first_auth() {
+        let dir = test_token_dir();
+        let path = dir.join("token-pop");
+        std::fs::write(&path, "file-token\n").unwrap();
+
+        let client = make_test_client("", Some(path.clone()));
+        let req = client.client.get("http://example.com");
+        let _ = client.auth(req);
+
+        assert_eq!(cached_token(&client).as_deref(), Some("file-token"));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn token_file_cache_reused_within_ttl() {
+        let dir = test_token_dir();
+        let path = dir.join("token-ttl");
+        std::fs::write(&path, "token-v1").unwrap();
+
+        let client = make_test_client("", Some(path.clone()));
+        let req = client.client.get("http://example.com");
+        let _ = client.auth(req);
+        assert_eq!(cached_token(&client).as_deref(), Some("token-v1"));
+
+        // Update file, but cache should still serve old value.
+        std::fs::write(&path, "token-v2").unwrap();
+        let req = client.client.get("http://example.com");
+        let _ = client.auth(req);
+        assert_eq!(cached_token(&client).as_deref(), Some("token-v1"));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn token_file_refreshes_after_ttl() {
+        let dir = test_token_dir();
+        let path = dir.join("token-refresh");
+        std::fs::write(&path, "token-v1").unwrap();
+
+        let client = make_test_client("", Some(path.clone()));
+        let req = client.client.get("http://example.com");
+        let _ = client.auth(req);
+
+        // Force cache expiry by backdating the timestamp.
+        {
+            let mut cache = client.token_file_cache.lock().unwrap();
+            if let Some((ref mut at, _)) = *cache {
+                *at -= TOKEN_FILE_REFRESH + std::time::Duration::from_secs(1);
+            }
+        }
+
+        std::fs::write(&path, "token-v2").unwrap();
+        let req = client.client.get("http://example.com");
+        let _ = client.auth(req);
+        assert_eq!(cached_token(&client).as_deref(), Some("token-v2"));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn token_file_missing_falls_back_to_static() {
+        let path = PathBuf::from("/tmp/nonexistent-token-file-test");
+        let client = make_test_client("", Some(path));
+        let req = client.client.get("http://example.com");
+        let _ = client.auth(req);
+        assert!(cached_token(&client).is_none());
     }
 }

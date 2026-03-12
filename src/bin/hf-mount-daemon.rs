@@ -21,7 +21,7 @@ enum Command {
         fuse: bool,
 
         #[command(flatten)]
-        options: MountOptions,
+        options: Box<MountOptions>,
 
         #[command(subcommand)]
         source: Source,
@@ -60,7 +60,7 @@ fn main() {
         Command::Start { fuse, options, source } => {
             // Use a wrapper so DaemonGuard is always dropped (cleaning up
             // the PID file), even on error. process::exit skips destructors.
-            let code = start_daemon(fuse, options, source);
+            let code = start_daemon(fuse, *options, source);
             std::process::exit(code);
         }
     }

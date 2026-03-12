@@ -61,6 +61,13 @@ pub struct MountOptions {
     #[arg(long, env = "HF_TOKEN")]
     pub hf_token: Option<String>,
 
+    /// Path to a file containing the API token. The file is re-read before
+    /// each Hub request, allowing the CSI driver to refresh credentials
+    /// without remounting. Takes precedence over --hf-token when the file
+    /// exists and is non-empty.
+    #[arg(long)]
+    pub token_file: Option<PathBuf>,
+
     /// HuggingFace Hub endpoint URL
     #[arg(long, default_value = "https://huggingface.co")]
     pub hub_endpoint: String,
@@ -247,6 +254,7 @@ pub fn build(source: Source, options: MountOptions, is_nfs: bool) -> MountSetup 
         HubApiClient::from_source(
             &options.hub_endpoint,
             options.hf_token.as_deref(),
+            options.token_file.clone(),
             source_kind,
             path_prefix,
         )
