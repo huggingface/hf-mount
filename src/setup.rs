@@ -3,9 +3,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use clap::Parser;
-use data::FileDownloadSession;
-use data::data_client::default_config;
 use tracing::info;
+use xet_data::processing::configurations::TranslatorConfig;
+use xet_data::processing::data_client::default_config;
+use xet_data::processing::{CacheConfig, FileDownloadSession, create_remote_client, get_cache};
 
 use crate::cached_xet_client::CachedXetClient;
 use crate::hub_api::{HubApiClient, HubTokenRefresher, SourceKind, parse_repo_id, split_path_prefix};
@@ -280,15 +281,15 @@ pub fn build(source: Source, options: MountOptions, is_nfs: bool) -> MountSetup 
         let xorbs_dir = options.cache_dir.join("xorbs");
         std::fs::create_dir_all(&xorbs_dir)
             .unwrap_or_else(|e| panic!("Failed to create xorbs dir {:?}: {e}", xorbs_dir));
-        let config = data::CacheConfig {
+        let config = CacheConfig {
             cache_directory: xorbs_dir,
             cache_size: options.cache_size,
         };
-        Some(data::get_cache(&config).expect("Failed to create xorb cache"))
+        Some(get_cache(&config).expect("Failed to create xorb cache"))
     };
 
     let raw_client = runtime
-        .block_on(data::create_remote_client(
+        .block_on(create_remote_client(
             &cas_config,
             &uuid::Uuid::new_v4().to_string(),
             false,
@@ -399,10 +400,7 @@ pub fn setup(is_nfs: bool) -> MountSetup {
     build(args.source, args.options, is_nfs)
 }
 
-fn build_cas_config(
-    runtime: &tokio::runtime::Runtime,
-    refresher: &Arc<HubTokenRefresher>,
-) -> Arc<data::configurations::TranslatorConfig> {
+fn build_cas_config(runtime: &tokio::runtime::Runtime, refresher: &Arc<HubTokenRefresher>) -> Arc<TranslatorConfig> {
     let jwt = runtime
         .block_on(refresher.fetch_initial())
         .unwrap_or_else(|e| panic!("Failed to get CAS token: {e}"));

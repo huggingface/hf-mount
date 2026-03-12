@@ -8,8 +8,11 @@ use std::process::{Child, Command};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use data::{FileUploadSession, XetFileInfo};
 use reqwest::Client;
+use xet_core_structures::metadata_shard::file_structs::Sha256;
+use xet_data::processing::configurations::TranslatorConfig;
+use xet_data::processing::data_client::default_config;
+use xet_data::processing::{FileUploadSession, XetFileInfo};
 
 pub fn endpoint() -> String {
     std::env::var("HF_ENDPOINT").unwrap_or_else(|_| "https://huggingface.co".to_string())
@@ -135,15 +138,13 @@ pub async fn whoami(endpoint: &str, token: &str) -> String {
 }
 
 /// Build an Arc<TranslatorConfig> for CAS writes.
-pub async fn build_write_config(
-    hub: &Arc<hf_mount::hub_api::HubApiClient>,
-) -> Arc<data::configurations::TranslatorConfig> {
+pub async fn build_write_config(hub: &Arc<hf_mount::hub_api::HubApiClient>) -> Arc<TranslatorConfig> {
     let write_jwt = hub.get_cas_write_token().await.expect("get_cas_write_token failed");
 
     let write_refresher = hub.token_refresher(false);
 
     Arc::new(
-        data::data_client::default_config(
+        default_config(
             write_jwt.cas_url,
             None,
             Some((write_jwt.access_token, write_jwt.exp)),
@@ -155,15 +156,12 @@ pub async fn build_write_config(
 }
 
 /// Upload a single file to CAS via an upload session.
-pub async fn upload_file(
-    config: std::sync::Arc<data::configurations::TranslatorConfig>,
-    staged_path: &Path,
-) -> XetFileInfo {
+pub async fn upload_file(config: Arc<TranslatorConfig>, staged_path: &Path) -> XetFileInfo {
     let upload_session = FileUploadSession::new(config, None)
         .await
         .expect("FileUploadSession::new failed");
 
-    let files = vec![(staged_path.to_path_buf(), None::<mdb_shard::Sha256>, ulid::Ulid::new())];
+    let files = vec![(staged_path.to_path_buf(), None::<Sha256>, ulid::Ulid::new())];
     let mut results = upload_session.upload_files(files).await.expect("upload_files failed");
 
     let file_info = results.pop().expect("upload returned no file info");

@@ -3,16 +3,17 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use cas_client::adaptive_concurrency::ConnectionPermit;
-use cas_client::{Client, ProgressCallback, URLProvider};
-use cas_types::{
+use xet_client::ClientError;
+use xet_client::cas_client::adaptive_concurrency::ConnectionPermit;
+use xet_client::cas_client::{Client, ProgressCallback, URLProvider};
+use xet_client::cas_types::{
     BatchQueryReconstructionResponse, FileRange, HexMerkleHash, QueryReconstructionResponse, XorbReconstructionTerm,
 };
-use mdb_shard::file_structs::MDBFileInfo;
-use merklehash::MerkleHash;
-use xorb_object::SerializedXorbObject;
+use xet_core_structures::merklehash::MerkleHash;
+use xet_core_structures::metadata_shard::file_structs::MDBFileInfo;
+use xet_core_structures::xorb_object::SerializedXorbObject;
 
-type Result<T> = std::result::Result<T, cas_client::CasClientError>;
+type Result<T> = std::result::Result<T, ClientError>;
 
 /// Cache key: file hash + optional byte range (`None` = full-file plan).
 type ReconCacheKey = (MerkleHash, Option<FileRange>);
@@ -330,10 +331,10 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use cas_client::CasClientError;
-    use cas_types::FileRange;
-    use merklehash::compute_data_hash;
     use tokio::task::JoinSet;
+    use xet_client::ClientError;
+    use xet_client::cas_types::FileRange;
+    use xet_core_structures::merklehash::compute_data_hash;
 
     #[derive(Clone, Copy)]
     #[allow(clippy::enum_variant_names)]
@@ -409,7 +410,7 @@ mod tests {
                     fetch_info: HashMap::new(),
                 })),
                 MockMode::ReturnNone => Ok(None),
-                MockMode::ReturnErr => Err(CasClientError::Other("boom".to_string())),
+                MockMode::ReturnErr => Err(ClientError::Other("boom".to_string())),
             }
         }
 

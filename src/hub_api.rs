@@ -6,8 +6,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 use tracing::info;
-use utils::auth::{TokenInfo, TokenRefresher};
-use utils::errors::AuthError;
+use xet_client::cas_client::auth::{AuthError, TokenInfo, TokenRefresher};
 
 use crate::error::{Error, Result};
 
