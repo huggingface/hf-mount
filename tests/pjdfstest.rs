@@ -51,9 +51,12 @@ fn ensure_pjdfstest() -> bool {
         eprintln!("Cached pjdfstest has wrong revision, rebuilding...");
     }
 
-    // Remove stale directory (e.g. from interrupted previous run on self-hosted runner)
+    // Remove stale directory (e.g. from interrupted previous run on self-hosted runner).
+    // Use rm -rf as fallback since remove_dir_all can fail on root-owned files left by pjdfstest.
+    let _ = std::fs::remove_dir_all(PJDFSTEST_DIR);
     if std::path::Path::new(PJDFSTEST_DIR).exists() {
-        std::fs::remove_dir_all(PJDFSTEST_DIR).ok();
+        eprintln!("Stale {PJDFSTEST_DIR} remains after remove_dir_all, trying rm -rf...");
+        Command::new("rm").args(["-rf", PJDFSTEST_DIR]).status().ok();
     }
 
     eprintln!("Building pjdfstest...");
