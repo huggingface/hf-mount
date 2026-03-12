@@ -6,15 +6,11 @@ name: Performance Benchmarks
 #
 # Triggers:
 #   - Every push to main     -> publishes results to gh-pages (historical charts)
-#   - PR labeled "performance" -> posts results as PR comment, no publish
 #   - Manual dispatch        -> full 100G benchmarks with pre-populated bucket
 
 on:
   push:
     branches: [main]
-  pull_request:
-    branches: [main]
-    types: [labeled]
   workflow_dispatch:
     inputs:
       bucket:
@@ -35,38 +31,13 @@ on:
         default: "read"
 
 jobs:
-  check-trigger:
-    runs-on: ubuntu-latest
-    outputs:
-      should-run: ${{ steps.check.outputs.should-run }}
-      publish: ${{ steps.check.outputs.publish }}
-    steps:
-      - id: check
-        run: |
-          if [[ "${{ github.event_name }}" == "push" ]]; then
-            echo "should-run=true" >> "$GITHUB_OUTPUT"
-            echo "publish=true" >> "$GITHUB_OUTPUT"
-          elif [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            echo "should-run=true" >> "$GITHUB_OUTPUT"
-            echo "publish=false" >> "$GITHUB_OUTPUT"
-          elif [[ "${{ github.event.label.name }}" == "performance" ]]; then
-            echo "should-run=true" >> "$GITHUB_OUTPUT"
-            echo "publish=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "should-run=false" >> "$GITHUB_OUTPUT"
-            echo "publish=false" >> "$GITHUB_OUTPUT"
-          fi
-
   bench:
     name: Throughput
-    needs: check-trigger
-    if: needs.check-trigger.outputs.should-run == 'true'
     runs-on:
       group: hf-mount-ci-m5dn-24xlarge
     timeout-minutes: 120
     permissions:
       contents: write
-      pull-requests: write
     env:
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
     steps:
@@ -95,7 +66,7 @@ jobs:
               HF_CATEGORIES="${{ inputs.categories }}" \
               ./scripts/fs_bench.sh 2>&1 | tee bench.log
           else
-            # CI: small files only to keep runtime reasonable
+            # Push to main: small files only to keep runtime reasonable
             HF_JOB_NAME_FILTER=small iterations=3 \
               HF_CATEGORIES=read,write,mix \
               ./scripts/fs_bench.sh 2>&1 | tee bench.log
@@ -109,53 +80,28 @@ jobs:
           output-file-path: results/fuse/output.json
           benchmark-data-dir-path: dev/bench
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          auto-push: ${{ needs.check-trigger.outputs.publish == 'true' }}
+          auto-push: ${{ github.event_name == 'push' }}
           comment-on-alert: true
           alert-threshold: 150%
           fail-on-alert: false
           summary-always: true
 
-      - name: Post PR comment
-        if: github.event_name == 'pull_request'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Post results summary
+        if: always()
         run: |
-          RESULTS=$(jq -r '.[] | "| \(.name) | \(.value | round) \(.unit) |"' results/fuse/output.json)
-          PR="${{ github.event.pull_request.number }}"
-          MARKER="<!-- perf-bench-results -->"
-          BODY="${MARKER}
-          ## Performance Benchmark Results
-
-          | Job | Throughput |
-          |-----|-----------|
-          ${RESULTS}
-
-          <details><summary>Full log</summary>
-
-          \`\`\`
-          $(tail -50 bench.log)
-          \`\`\`
-          </details>"
-
-          COMMENT_ID=$(gh api "repos/${{ github.repository }}/issues/${PR}/comments" \
-            --jq ".[] | select(.body | startswith(\"${MARKER}\")) | .id" | head -1)
-          if [[ -n "${COMMENT_ID}" ]]; then
-            gh api "repos/${{ github.repository }}/issues/comments/${COMMENT_ID}" \
-              -X PATCH -f body="${BODY}"
-          else
-            gh pr comment "${PR}" --body "${BODY}"
-          fi
+          echo "## Throughput Benchmark Results" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Job | Throughput |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|-----|-----------|" >> "$GITHUB_STEP_SUMMARY"
+          jq -r '.[] | "| \(.name) | \(.value | round) \(.unit) |"' results/fuse/output.json >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || echo "| (no results) | |" >> "$GITHUB_STEP_SUMMARY"
 
   latency-bench:
     name: Latency (TTFB)
-    needs: check-trigger
-    if: needs.check-trigger.outputs.should-run == 'true'
     runs-on:
       group: hf-mount-ci-m5dn-24xlarge
     timeout-minutes: 30
     permissions:
       contents: write
-      pull-requests: write
     env:
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
     steps:
@@ -187,8 +133,17 @@ jobs:
           output-file-path: results/fuse/output.json
           benchmark-data-dir-path: dev/latency_bench
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          auto-push: ${{ needs.check-trigger.outputs.publish == 'true' }}
+          auto-push: ${{ github.event_name == 'push' }}
           comment-on-alert: true
           alert-threshold: 150%
           fail-on-alert: false
           summary-always: true
+
+      - name: Post results summary
+        if: always()
+        run: |
+          echo "## Latency Benchmark Results (TTFB)" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Job | Latency |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|-----|---------|" >> "$GITHUB_STEP_SUMMARY"
+          jq -r '.[] | "| \(.name) | \(.value | . * 100 | round | . / 100) \(.unit) |"' results/fuse/output.json >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || echo "| (no results) | |" >> "$GITHUB_STEP_SUMMARY"
