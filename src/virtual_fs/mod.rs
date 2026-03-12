@@ -7,8 +7,8 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::{Bytes, BytesMut};
-use data::XetFileInfo;
 use tracing::{debug, error, info, warn};
+use xet_data::processing::XetFileInfo;
 
 use crate::hub_api::{BatchOp, HubOps};
 

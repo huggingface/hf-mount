@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
-use data::XetFileInfo;
+use xet_data::processing::XetFileInfo;
 
 use crate::error::{Error, Result};
 use crate::hub_api::{BatchOp, HeadFileInfo, HubOps, SourceKind, TreeEntry};

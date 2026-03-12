@@ -2,13 +2,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use bytes::Bytes;
-use cas_client::Client;
-use cas_types::FileRange;
-use data::configurations::TranslatorConfig;
-use data::{FileDownloadSession, FileUploadSession, SingleFileCleaner, XetFileInfo};
-use file_reconstruction::FileReconstructor;
-use merklehash::MerkleHash;
 use ulid::Ulid;
+use xet_client::cas_client::Client;
+use xet_client::cas_types::FileRange;
+use xet_core_structures::merklehash::MerkleHash;
+use xet_data::file_reconstruction::{DownloadStream, FileReconstructor};
+use xet_data::processing::configurations::TranslatorConfig;
+use xet_data::processing::file_cleaner::Sha256Policy;
+use xet_data::processing::{FileDownloadSession, FileUploadSession, SingleFileCleaner, XetFileInfo};
 
 use crate::error::{Error, Result};
 
@@ -40,7 +41,7 @@ pub trait StreamingWriterOps: Send {
     fn is_empty(&self) -> bool;
 }
 
-/// Streaming download trait (abstracts data::DownloadStream for testing).
+/// Streaming download trait (abstracts DownloadStream for testing).
 #[async_trait::async_trait]
 pub trait DownloadStreamOps: Send {
     async fn next(&mut self) -> Result<Option<Bytes>>;
@@ -73,12 +74,7 @@ impl XetSessions {
     /// Start a streaming download for a byte range.
     /// When `end` is `Some`, only bytes `[offset, end)` are fetched (bounded range).
     /// When `end` is `None`, fetches from `offset` to end of file (unbounded stream).
-    pub fn download_stream(
-        &self,
-        file_info: &XetFileInfo,
-        offset: u64,
-        end: Option<u64>,
-    ) -> Result<data::DownloadStream> {
+    pub fn download_stream(&self, file_info: &XetFileInfo, offset: u64, end: Option<u64>) -> Result<DownloadStream> {
         match end {
             None => self
                 .session
@@ -111,9 +107,7 @@ impl XetOps for XetSessions {
         let session = FileUploadSession::new(config.clone(), None)
             .await
             .map_err(|e| Error::Xet(e.to_string()))?;
-        let cleaner = session
-            .start_clean(None, 0, Some(mdb_shard::Sha256::default()), Ulid::new())
-            .await;
+        let cleaner = session.start_clean(None, None, Sha256Policy::Skip, Ulid::new()).await;
         Ok(Box::new(StreamingWriter {
             cleaner,
             session,
@@ -140,10 +134,7 @@ impl XetOps for XetSessions {
             .await
             .map_err(|e| Error::Xet(e.to_string()))?;
 
-        let files: Vec<_> = paths
-            .iter()
-            .map(|p| (p.to_path_buf(), Some(mdb_shard::Sha256::default()), Ulid::new()))
-            .collect();
+        let files: Vec<_> = paths.iter().map(|p| (p.to_path_buf(), None, Ulid::new())).collect();
 
         let results = upload_session
             .upload_files(files)
@@ -174,7 +165,7 @@ impl XetOps for XetSessions {
 
 // ── DownloadStreamWrapper ─────────────────────────────────────────────
 
-struct DownloadStreamWrapper(data::DownloadStream);
+struct DownloadStreamWrapper(DownloadStream);
 
 #[async_trait::async_trait]
 impl DownloadStreamOps for DownloadStreamWrapper {

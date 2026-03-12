@@ -195,6 +195,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "bandwidth"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7a464cd54c99441ba44d3d09f6f980f8c29d068645022852ab66cbaad42ef6a0"
+dependencies = [
+ "rustversion",
+ "serde",
+]
+
+[[package]]
 name = "base64"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -286,65 +296,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cas_client"
-version = "0.14.5"
-source = "git+https://github.com/huggingface/xet-core.git?rev=b099c05#b099c05773b4844d58221529ef1c073c472bc13b"
-dependencies = [
- "anyhow",
- "async-trait",
- "axum",
- "base64",
- "bytes",
- "cas_types",
- "chrono",
- "clap",
- "deduplication",
- "error_printer",
- "file_utils",
- "futures",
- "futures-util",
- "heed",
- "http",
- "hyper",
- "lazy_static",
- "mdb_shard",
- "merklehash",
- "more-asserts",
- "rand 0.9.2",
- "reqwest 0.13.2",
- "reqwest-middleware",
- "reqwest-retry",
- "serde",
- "serde_json",
- "statrs",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tokio-retry",
- "tower-http",
- "tracing",
- "tracing-log",
- "tracing-subscriber",
- "url",
- "utils",
- "warp",
- "web-time",
- "xet_runtime",
- "xorb_object",
-]
-
-[[package]]
-name = "cas_types"
-version = "0.1.0"
-source = "git+https://github.com/huggingface/xet-core.git?rev=b099c05#b099c05773b4844d58221529ef1c073c472bc13b"
-dependencies = [
- "merklehash",
- "serde",
- "serde_repr",
- "thiserror 2.0.18",
-]
-
-[[package]]
 name = "cc"
 version = "1.2.56"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -391,28 +342,6 @@ dependencies = [
  "num-traits",
  "wasm-bindgen",
  "windows-link",
-]
-
-[[package]]
-name = "chunk_cache"
-version = "0.1.0"
-source = "git+https://github.com/huggingface/xet-core.git?rev=b099c05#b099c05773b4844d58221529ef1c073c472bc13b"
-dependencies = [
- "async-trait",
- "base64",
- "cas_types",
- "crc32fast",
- "error_printer",
- "file_utils",
- "merklehash",
- "mockall",
- "once_cell",
- "rand 0.9.2",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "utils",
- "xet_runtime",
 ]
 
 [[package]]
@@ -564,6 +493,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "crossbeam-channel"
+version = "0.5.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "82b8f8f868b36967f9606790d1903570de9ceaf870a7bf9fbbd3016d636a2cb2"
+dependencies = [
+ "crossbeam-utils",
+]
+
+[[package]]
 name = "crossbeam-queue"
 version = "0.3.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -630,64 +568,6 @@ name = "ctor-proc-macro"
 version = "0.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "52560adf09603e58c9a7ee1fe1dcb95a16927b17c127f0ac02d6e768a0e25bc1"
-
-[[package]]
-name = "data"
-version = "0.14.5"
-source = "git+https://github.com/huggingface/xet-core.git?rev=b099c05#b099c05773b4844d58221529ef1c073c472bc13b"
-dependencies = [
- "anyhow",
- "async-trait",
- "bytes",
- "cas_client",
- "cas_types",
- "chrono",
- "chunk_cache",
- "clap",
- "deduplication",
- "error_printer",
- "file_reconstruction",
- "http",
- "hub_client",
- "itertools",
- "lazy_static",
- "mdb_shard",
- "merklehash",
- "more-asserts",
- "progress_tracking",
- "prometheus",
- "rand 0.9.2",
- "regex",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "ulid",
- "utils",
- "walkdir",
- "xet_runtime",
- "xorb_object",
-]
-
-[[package]]
-name = "deduplication"
-version = "0.14.5"
-source = "git+https://github.com/huggingface/xet-core.git?rev=b099c05#b099c05773b4844d58221529ef1c073c472bc13b"
-dependencies = [
- "async-trait",
- "bytes",
- "gearhash",
- "lazy_static",
- "mdb_shard",
- "merklehash",
- "more-asserts",
- "progress_tracking",
- "utils",
- "xet_runtime",
-]
 
 [[package]]
 name = "deranged"
@@ -833,54 +713,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "error_printer"
-version = "0.14.5"
-source = "git+https://github.com/huggingface/xet-core.git?rev=b099c05#b099c05773b4844d58221529ef1c073c472bc13b"
-dependencies = [
- "tracing",
-]
-
-[[package]]
 name = "fastrand"
 version = "2.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "37909eebbb50d72f9059c3b6d82c0463f2ff062c9e95845c43a6c9c0355411be"
-
-[[package]]
-name = "file_reconstruction"
-version = "0.14.5"
-source = "git+https://github.com/huggingface/xet-core.git?rev=b099c05#b099c05773b4844d58221529ef1c073c472bc13b"
-dependencies = [
- "async-trait",
- "bytes",
- "cas_client",
- "cas_types",
- "chunk_cache",
- "merklehash",
- "more-asserts",
- "progress_tracking",
- "thiserror 2.0.18",
- "tokio",
- "tokio-util",
- "tracing",
- "utils",
- "xet_config",
- "xet_runtime",
-]
-
-[[package]]
-name = "file_utils"
-version = "0.14.2"
-source = "git+https://github.com/huggingface/xet-core.git?rev=b099c05#b099c05773b4844d58221529ef1c073c472bc13b"
-dependencies = [
- "colored",
- "lazy_static",
- "libc",
- "rand 0.9.2",
- "tracing",
- "whoami",
- "winapi",
-]
 
 [[package]]
 name = "filetime"
@@ -1117,6 +953,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "git-version"
+version = "0.3.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1ad568aa3db0fcbc81f2f116137f263d7304f512a1209b35b85150d3ef88ad19"
+dependencies = [
+ "git-version-macro",
+]
+
+[[package]]
+name = "git-version-macro"
+version = "0.3.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "53010ccb100b96a67bc32c0175f0ed1426b31b655d562898e57325f81c023ac0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
 name = "h2"
 version = "0.4.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1241,17 +1097,11 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "bytes",
- "cas_client",
- "cas_types",
  "chrono",
  "clap",
- "data",
- "file_reconstruction",
  "fuser",
  "futures",
  "libc",
- "mdb_shard",
- "merklehash",
  "nfsserve",
  "reqwest 0.12.28",
  "serde",
@@ -1260,9 +1110,11 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "ulid",
- "utils",
  "uuid",
- "xorb_object",
+ "xet-client",
+ "xet-core-structures",
+ "xet-data",
+ "xet-runtime",
 ]
 
 [[package]]
@@ -1311,19 +1163,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
 
 [[package]]
-name = "hub_client"
-version = "0.1.0"
-source = "git+https://github.com/huggingface/xet-core.git?rev=b099c05#b099c05773b4844d58221529ef1c073c472bc13b"
+name = "human-bandwidth"
+version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8a5afe042873d564e1fccc5d50983e1e6341ffcae8fb7603c6c542de7129a785"
 dependencies = [
- "anyhow",
- "async-trait",
- "cas_client",
- "http",
- "reqwest 0.13.2",
- "reqwest-middleware",
- "serde",
- "thiserror 2.0.18",
- "urlencoding",
+ "bandwidth",
 ]
 
 [[package]]
@@ -1761,36 +1606,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "mdb_shard"
-version = "0.14.5"
-source = "git+https://github.com/huggingface/xet-core.git?rev=b099c05#b099c05773b4844d58221529ef1c073c472bc13b"
-dependencies = [
- "anyhow",
- "async-trait",
- "blake3",
- "bytes",
- "clap",
- "futures",
- "futures-util",
- "heapify",
- "itertools",
- "lazy_static",
- "merklehash",
- "more-asserts",
- "rand 0.9.2",
- "regex",
- "serde",
- "static_assertions",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "utils",
- "uuid",
- "xet_runtime",
-]
-
-[[package]]
 name = "memchr"
 version = "2.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1803,21 +1618,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
 dependencies = [
  "autocfg",
-]
-
-[[package]]
-name = "merklehash"
-version = "0.14.5"
-source = "git+https://github.com/huggingface/xet-core.git?rev=b099c05#b099c05773b4844d58221529ef1c073c472bc13b"
-dependencies = [
- "base64",
- "blake3",
- "bytemuck",
- "getrandom 0.4.2",
- "heed",
- "rand 0.9.2",
- "safe-transmute",
- "serde",
 ]
 
 [[package]]
@@ -2364,19 +2164,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8fd00f0bb2e90d81d1044c2b32617f68fcb9fa3bb7640c23e9c748e53fb30934"
 dependencies = [
  "unicode-ident",
-]
-
-[[package]]
-name = "progress_tracking"
-version = "0.1.0"
-source = "git+https://github.com/huggingface/xet-core.git?rev=b099c05#b099c05773b4844d58221529ef1c073c472bc13b"
-dependencies = [
- "async-trait",
- "merklehash",
- "more-asserts",
- "tokio",
- "ulid",
- "utils",
 ]
 
 [[package]]
@@ -3358,9 +3145,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "743bd48c283afc0388f9b8827b976905fb217ad9e647fae3a379a9283c4def2c"
 dependencies = [
  "deranged",
+ "itoa",
  "num-conv",
  "powerfmt",
+ "serde_core",
  "time-core",
+ "time-macros",
 ]
 
 [[package]]
@@ -3368,6 +3158,16 @@ name = "time-core"
 version = "0.1.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7694e1cfe791f8d31026952abf09c69ca6f6fa4e1a1229e18988f06a04a12dca"
+
+[[package]]
+name = "time-macros"
+version = "0.2.27"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2e70e4c5a0e0a8a4823ad65dfe1a6930e4f4d756dcd9dd7939022b5e8c501215"
+dependencies = [
+ "num-conv",
+ "time-core",
+]
 
 [[package]]
 name = "tinystr"
@@ -3554,6 +3354,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "tracing-appender"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "786d480bce6247ab75f005b14ae1624ad978d3029d9113f0a22fa1ac773faeaf"
+dependencies = [
+ "crossbeam-channel",
+ "thiserror 2.0.18",
+ "time",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "tracing-attributes"
 version = "0.1.31"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3703,36 +3515,6 @@ name = "utf8parse"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
-
-[[package]]
-name = "utils"
-version = "0.14.5"
-source = "git+https://github.com/huggingface/xet-core.git?rev=b099c05#b099c05773b4844d58221529ef1c073c472bc13b"
-dependencies = [
- "async-trait",
- "bincode",
- "bytes",
- "chrono",
- "ctor",
- "derivative",
- "duration-str",
- "error_printer",
- "futures",
- "lazy_static",
- "merklehash",
- "more-asserts",
- "pin-project",
- "rand 0.9.2",
- "serde",
- "serde_json",
- "shellexpand",
- "sysinfo",
- "thiserror 2.0.18",
- "tokio",
- "tokio-util",
- "tracing",
- "web-time",
-]
 
 [[package]]
 name = "uuid"
@@ -4516,57 +4298,161 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9edde0db4769d2dc68579893f2306b26c6ecfbe0ef499b013d731b7b9247e0b9"
 
 [[package]]
-name = "xet_config"
-version = "0.14.5"
-source = "git+https://github.com/huggingface/xet-core.git?rev=b099c05#b099c05773b4844d58221529ef1c073c472bc13b"
-dependencies = [
- "const-str",
- "konst",
- "utils",
-]
-
-[[package]]
-name = "xet_runtime"
-version = "0.1.0"
-source = "git+https://github.com/huggingface/xet-core.git?rev=b099c05#b099c05773b4844d58221529ef1c073c472bc13b"
-dependencies = [
- "dirs",
- "error_printer",
- "libc",
- "oneshot",
- "reqwest 0.13.2",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "utils",
- "xet_config",
-]
-
-[[package]]
-name = "xorb_object"
-version = "0.1.0"
-source = "git+https://github.com/huggingface/xet-core.git?rev=b099c05#b099c05773b4844d58221529ef1c073c472bc13b"
+name = "xet-client"
+version = "1.4.0"
+source = "git+https://github.com/huggingface/xet-core.git?rev=0d7808b#0d7808baf5ae8d32fc33f642665ee9ac57e61bd0"
 dependencies = [
  "anyhow",
+ "async-trait",
+ "axum",
+ "base64",
+ "bytes",
+ "clap",
+ "crc32fast",
+ "derivative",
+ "duration-str",
+ "futures",
+ "futures-util",
+ "heed",
+ "http",
+ "human-bandwidth",
+ "hyper",
+ "lazy_static",
+ "mockall",
+ "more-asserts",
+ "once_cell",
+ "rand 0.9.2",
+ "reqwest 0.13.2",
+ "reqwest-middleware",
+ "reqwest-retry",
+ "serde",
+ "serde_json",
+ "serde_repr",
+ "statrs",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-retry",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "urlencoding",
+ "warp",
+ "web-time",
+ "xet-core-structures",
+ "xet-runtime",
+]
+
+[[package]]
+name = "xet-core-structures"
+version = "1.4.0"
+source = "git+https://github.com/huggingface/xet-core.git?rev=0d7808b#0d7808baf5ae8d32fc33f642665ee9ac57e61bd0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64",
+ "bincode",
  "blake3",
+ "bytemuck",
  "bytes",
  "clap",
  "countio",
  "csv",
- "deduplication",
  "futures",
+ "futures-util",
+ "getrandom 0.4.2",
  "half",
+ "heapify",
+ "heed",
+ "itertools",
+ "lazy_static",
  "lz4_flex",
- "mdb_shard",
- "merklehash",
  "more-asserts",
  "rand 0.9.2",
+ "regex",
+ "safe-transmute",
  "serde",
+ "static_assertions",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
  "tracing",
- "utils",
- "xet_runtime",
+ "uuid",
+ "web-time",
+ "xet-runtime",
+]
+
+[[package]]
+name = "xet-data"
+version = "1.4.0"
+source = "git+https://github.com/huggingface/xet-core.git?rev=0d7808b#0d7808baf5ae8d32fc33f642665ee9ac57e61bd0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bytes",
+ "chrono",
+ "clap",
+ "gearhash",
+ "http",
+ "itertools",
+ "lazy_static",
+ "more-asserts",
+ "prometheus",
+ "rand 0.9.2",
+ "regex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "ulid",
+ "walkdir",
+ "xet-client",
+ "xet-core-structures",
+ "xet-runtime",
+]
+
+[[package]]
+name = "xet-runtime"
+version = "1.4.0"
+source = "git+https://github.com/huggingface/xet-core.git?rev=0d7808b#0d7808baf5ae8d32fc33f642665ee9ac57e61bd0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "chrono",
+ "colored",
+ "const-str",
+ "ctor",
+ "dirs",
+ "duration-str",
+ "futures",
+ "futures-util",
+ "git-version",
+ "konst",
+ "lazy_static",
+ "libc",
+ "more-asserts",
+ "oneshot",
+ "pin-project",
+ "rand 0.9.2",
+ "reqwest 0.13.2",
+ "serde",
+ "serde_json",
+ "shellexpand",
+ "sysinfo",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+ "whoami",
+ "winapi",
 ]
 
 [[package]]

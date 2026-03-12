@@ -5,14 +5,10 @@ edition = "2024"
 
 [dependencies]
 # xet-core crates
-cas_client = { git = "https://github.com/huggingface/xet-core.git", rev = "b099c05" }
-cas_types = { git = "https://github.com/huggingface/xet-core.git", rev = "b099c05" }
-data = { git = "https://github.com/huggingface/xet-core.git", rev = "b099c05" }
-file_reconstruction = { git = "https://github.com/huggingface/xet-core.git", rev = "b099c05" }
-mdb_shard = { git = "https://github.com/huggingface/xet-core.git", rev = "b099c05" }
-merklehash = { git = "https://github.com/huggingface/xet-core.git", rev = "b099c05" }
-utils = { git = "https://github.com/huggingface/xet-core.git", rev = "b099c05" }
-xorb_object = { git = "https://github.com/huggingface/xet-core.git", rev = "b099c05" }
+xet-client = { git = "https://github.com/huggingface/xet-core.git", rev = "0d7808b" }
+xet-core-structures = { git = "https://github.com/huggingface/xet-core.git", rev = "0d7808b" }
+xet-data = { git = "https://github.com/huggingface/xet-core.git", rev = "0d7808b" }
+xet-runtime = { git = "https://github.com/huggingface/xet-core.git", rev = "0d7808b" }
 
 # External crates
 async-trait = "0.1"
