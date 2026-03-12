@@ -1,5 +1,6 @@
 mod common;
 
+use std::fs::File;
 use std::process::Command;
 
 /// Expected results (established 2026-03-06).
@@ -36,6 +37,13 @@ const PJDFSTEST_DIR: &str = "/tmp/pjdfstest";
 const PJDFSTEST_REV: &str = "03eb25706d8dbf3611c3f820b45b7a5e09a36c06";
 
 fn ensure_pjdfstest() -> bool {
+    // Acquire a file lock to prevent FUSE and NFS tests from racing on the build.
+    let lock_path = format!("{PJDFSTEST_DIR}.lock");
+    let lock_file = File::create(&lock_path).expect("failed to create pjdfstest lock file");
+    use std::os::unix::io::AsRawFd;
+    let fd = lock_file.as_raw_fd();
+    unsafe { libc::flock(fd, libc::LOCK_EX) };
+
     let binary = format!("{}/pjdfstest", PJDFSTEST_DIR);
     // Verify both binary existence AND correct revision to avoid stale cache on self-hosted runners.
     if std::path::Path::new(&binary).exists() {
