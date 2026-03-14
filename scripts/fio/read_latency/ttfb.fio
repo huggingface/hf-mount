@@ -1,0 +1,13 @@
+[global]
+name=fs_bench
+# large write block size not used as part of benchmark, but speeds up file layout
+bs=1B,1M
+
+[time_to_first_byte_read]
+size=1G
+io_limit=1B
+rw=read
+ioengine=sync
+fallocate=none
+direct=1
+loops=10

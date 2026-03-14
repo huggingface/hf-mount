@@ -1,0 +1,207 @@
+name: Performance Benchmarks
+
+# Mirrors the mountpoint-s3 benchmark CI approach.
+# mountpoint-s3 runs on m5dn.24xlarge (100 Gbps, NVMe local cache).
+# For comparable results, run on a high-network instance of equivalent class.
+#
+# Triggers:
+#   - Every push to main     -> publishes results to gh-pages (historical charts)
+#   - Manual dispatch        -> full 100G benchmarks with pre-populated bucket
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      bucket:
+        description: "Pre-populated bucket for big file benchmarks (e.g. XciD/hf-bench)"
+        required: true
+        default: "XciD/hf-bench"
+      job_filter:
+        description: "Job name filter (empty = all jobs including 100G)"
+        required: false
+        default: ""
+      iterations:
+        description: "Number of iterations per job"
+        required: false
+        default: "3"
+      categories:
+        description: "Comma-separated benchmark categories"
+        required: false
+        default: "read"
+
+jobs:
+  bench:
+    name: Throughput
+    runs-on:
+      group: hf-mount-ci-m5dn-24xlarge
+    timeout-minutes: 120
+    permissions:
+      contents: write
+      pull-requests: write
+    env:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fuse3 libfuse3-dev fio jq
+          echo 'user_allow_other' | sudo tee -a /etc/fuse.conf
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Run throughput benchmarks
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            # Full benchmarks with pre-populated bucket
+            HF_BENCH_BUCKET="${{ inputs.bucket }}" \
+              HF_JOB_NAME_FILTER="${{ inputs.job_filter }}" \
+              iterations=${{ inputs.iterations }} \
+              HF_CATEGORIES="${{ inputs.categories }}" \
+              ./scripts/fs_bench.sh 2>&1 | tee bench.log
+          else
+            # Push to main: small files only to keep runtime reasonable
+            HF_JOB_NAME_FILTER=small iterations=3 \
+              HF_CATEGORIES=read,write,mix \
+              ./scripts/fs_bench.sh 2>&1 | tee bench.log
+          fi
+
+      - name: Publish throughput results to gh-pages
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          name: Throughput (MiB/s)
+          tool: customBiggerIsBetter
+          output-file-path: results/fuse/output.json
+          benchmark-data-dir-path: dev/bench
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          auto-push: ${{ github.event_name == 'push' }}
+          comment-on-alert: true
+          alert-threshold: 150%
+          fail-on-alert: false
+          summary-always: true
+
+      - name: Post results summary
+        if: always()
+        run: |
+          echo "## Throughput Benchmark Results" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Job | Throughput |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|-----|-----------|" >> "$GITHUB_STEP_SUMMARY"
+          jq -r '.[] | "| \(.name) | \(.value | round) \(.unit) |"' results/fuse/output.json >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || echo "| (no results) | |" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Post PR comment
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          RESULTS=$(jq -r '.[] | "| \(.name) | \(.value | round) \(.unit) |"' results/fuse/output.json)
+          PR="${{ github.event.pull_request.number }}"
+          MARKER="<!-- perf-throughput-results -->"
+          BODY=$(cat <<EOFBODY
+          ${MARKER}
+          ## Throughput Benchmark Results
+
+          | Job | Throughput |
+          |-----|-----------|
+          ${RESULTS}
+          EOFBODY
+          )
+
+          COMMENT_ID=$(gh api "repos/${{ github.repository }}/issues/${PR}/comments" \
+            --jq ".[] | select(.body | startswith(\"${MARKER}\")) | .id" | head -1)
+          if [[ -n "${COMMENT_ID}" ]]; then
+            gh api "repos/${{ github.repository }}/issues/comments/${COMMENT_ID}" \
+              -X PATCH -f body="${BODY}"
+          else
+            gh pr comment "${PR}" --body "${BODY}"
+          fi
+
+  latency-bench:
+    name: Latency (TTFB)
+    runs-on:
+      group: hf-mount-ci-m5dn-24xlarge
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      pull-requests: write
+    env:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fuse3 libfuse3-dev fio jq
+          echo 'user_allow_other' | sudo tee -a /etc/fuse.conf
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Run latency benchmarks
+        run: |
+          HF_CATEGORIES=read_latency,write_latency \
+            ./scripts/fs_bench.sh 2>&1 | tee latency.log
+
+      - name: Publish latency results to gh-pages
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          name: Latency - TTFB (ms)
+          tool: customSmallerIsBetter
+          output-file-path: results/fuse/output.json
+          benchmark-data-dir-path: dev/latency_bench
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          auto-push: ${{ github.event_name == 'push' }}
+          comment-on-alert: true
+          alert-threshold: 150%
+          fail-on-alert: false
+          summary-always: true
+
+      - name: Post results summary
+        if: always()
+        run: |
+          echo "## Latency Benchmark Results (TTFB)" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Job | Latency |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|-----|---------|" >> "$GITHUB_STEP_SUMMARY"
+          jq -r '.[] | "| \(.name) | \(.value | . * 100 | round | . / 100) \(.unit) |"' results/fuse/output.json >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || echo "| (no results) | |" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Post PR comment
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          RESULTS=$(jq -r '.[] | "| \(.name) | \(.value | . * 100 | round | . / 100) \(.unit) |"' results/fuse/output.json)
+          PR="${{ github.event.pull_request.number }}"
+          MARKER="<!-- perf-latency-results -->"
+          BODY=$(cat <<EOFBODY
+          ${MARKER}
+          ## Latency Benchmark Results (TTFB)
+
+          | Job | Latency |
+          |-----|---------|
+          ${RESULTS}
+          EOFBODY
+          )
+
+          COMMENT_ID=$(gh api "repos/${{ github.repository }}/issues/${PR}/comments" \
+            --jq ".[] | select(.body | startswith(\"${MARKER}\")) | .id" | head -1)
+          if [[ -n "${COMMENT_ID}" ]]; then
+            gh api "repos/${{ github.repository }}/issues/comments/${COMMENT_ID}" \
+              -X PATCH -f body="${BODY}"
+          else
+            gh pr comment "${PR}" --body "${BODY}"
+          fi
