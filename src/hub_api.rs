@@ -278,8 +278,20 @@ impl HubApiClient {
         let (client, head_client) = make_clients();
         let endpoint = endpoint.trim_end_matches('/').to_string();
 
+        // Read token from file if no inline token was provided.
+        let file_token = if token.is_none() {
+            token_file
+                .as_ref()
+                .and_then(|p| std::fs::read_to_string(p).ok())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        } else {
+            None
+        };
+        let effective_token: Option<&str> = token.or(file_token.as_deref());
+
         let auth = |req: reqwest::RequestBuilder| -> reqwest::RequestBuilder {
-            match token {
+            match effective_token {
                 Some(t) => req.bearer_auth(t),
                 None => req,
             }
