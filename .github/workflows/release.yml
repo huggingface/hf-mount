@@ -45,8 +45,13 @@ jobs:
           echo '[target.aarch64-unknown-linux-gnu]' >> ~/.cargo/config.toml
           echo 'linker = "aarch64-linux-gnu-gcc"' >> ~/.cargo/config.toml
 
-      - name: Build
+      - name: Build (native)
+        if: matrix.arch == 'x86_64'
         run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Build (cross, vendored OpenSSL)
+        if: matrix.arch == 'aarch64'
+        run: cargo build --release --target ${{ matrix.target }} --features vendored-openssl
 
       - name: Package
         run: |
@@ -63,14 +68,16 @@ jobs:
 
   build-macos:
     name: Build macOS (${{ matrix.arch }})
-    runs-on: macos-latest
+    runs-on: ${{ matrix.runner }}
     strategy:
       matrix:
         include:
           - arch: arm64
             target: aarch64-apple-darwin
+            runner: macos-14
           - arch: x86_64
             target: x86_64-apple-darwin
+            runner: macos-13
     steps:
       - uses: actions/checkout@v4
 
