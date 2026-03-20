@@ -221,20 +221,34 @@ impl NFSFileSystem for NFSAdapter {
     }
 
     async fn write(&self, id: fileid3, offset: u64, data: &[u8]) -> Result<fattr3, nfsstat3> {
-        // Write requires a handle already in the pool (from create).
-        let file_handle = self
-            .handle_pool
-            .lock()
-            .expect("handle_pool poisoned")
-            .get(id)
-            .ok_or(nfsstat3::NFS3ERR_STALE)?;
-        // NFS always uses advanced_writes (staging files), so write() is a
-        // synchronous pwrite() — safe to call from async context.
-        self.virtual_fs
-            .write(id, file_handle, offset, data)
+        // Fast path: try existing pool handle (writable if file was created or already upgraded).
+        let existing = self.handle_pool.lock().expect("handle_pool poisoned").get(id);
+        if let Some(fh) = existing {
+            match self.virtual_fs.write(id, fh, offset, data) {
+                Ok(_) => {
+                    self.virtual_fs.schedule_flush(id);
+                    return self
+                        .virtual_fs
+                        .getattr(id)
+                        .map(|a| vfs_attr_to_nfs(&a))
+                        .map_err(errno_to_nfs);
+                }
+                Err(libc::EBADF) => {
+                    // Handle was opened read-only (from a prior read). Upgrade to writable.
+                    self.evict_handle(id, fh).await;
+                }
+                Err(e) => return Err(errno_to_nfs(e)),
+            }
+        }
+
+        // Slow path: open a writable handle (sparse staging for existing CAS files).
+        let fh = self
+            .virtual_fs
+            .open(id, true, false, None)
+            .await
             .map_err(errno_to_nfs)?;
-        // NFS has no close/flush RPC, so schedule a debounced flush after
-        // each write to ensure data eventually gets committed to the Hub.
+        self.insert_handle(id, fh).await;
+        self.virtual_fs.write(id, fh, offset, data).map_err(errno_to_nfs)?;
         self.virtual_fs.schedule_flush(id);
         self.virtual_fs
             .getattr(id)
