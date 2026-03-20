@@ -42,7 +42,7 @@ ls /tmp/gpt2
 
 ### Load a model directly from the mount
 
-No download step -- the model is read on demand from CAS:
+No download step -- the model is read on demand from Hugging Face:
 
 ```python
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -68,12 +68,22 @@ For private repos or buckets, pass `--hf-token` or set the `HF_TOKEN` env var.
 - **FUSE & NFS backends** -- FUSE for standard Linux/macOS, NFS for environments without `/dev/fuse` (e.g., Kubernetes)
 - **Buckets & repos** -- mount buckets (read-write) or model/dataset/space repos (read-only)
 - **Subfolder mounting** -- mount only a subdirectory (e.g. `user/bucket/path/to/dir`, `user/model/ckpt/v2`)
-- **Lazy loading** -- files are fetched on demand from CAS, not eagerly downloaded
-- **Simple writes** (FUSE default) -- append-only, in-memory streaming to CAS, synchronous upload on close
+- **Lazy loading** -- files are fetched on demand, not eagerly downloaded
+- **Simple writes** (FUSE default) -- append-only, in-memory streaming upload, synchronous on close
 - **Advanced writes** (`--advanced-writes`, always-on for NFS) -- staging files on disk, random writes + seek, async debounced flush
 - **POSIX metadata** -- chmod, chown, timestamps, symlinks (ephemeral, see below)
 - **Remote sync** -- background polling detects remote changes and updates the local view
 - **Read-only mode** -- `--read-only` flag for safe mounts (always on for repos)
+
+### Important caveats
+
+**hf-mount is not a general-purpose networked filesystem.** It is designed for ML workloads where large files are read sequentially (model loading, dataset iteration) and writes are infrequent.
+
+- **Eventual consistency**: files can be stale for up to 10 s (metadata TTL) after a remote change. There is no push notification from the Hub; all consistency relies on client-side polling. See [Consistency model](#consistency-model) for details.
+- **No multi-writer support**: concurrent writers to the same file from different mounts will overwrite each other. Last writer wins, no conflict detection.
+- **Writes are not durable until flushed**: in streaming mode, data lives in memory until `close()`. In advanced mode, data lives on local disk until the async flush completes (up to 30 s after close). A crash before flush means data loss.
+- **Not POSIX-complete**: hard links are not supported (ENOTSUP). File locking is advisory only. `mmap` writes are not supported. Some edge cases in rename/unlink semantics may differ from a local filesystem.
+- **Network-dependent**: every cache miss requires a network round-trip to HF. First reads are slow; sequential access benefits from adaptive prefetch.
 
 ### Ephemeral POSIX metadata
 
@@ -90,6 +100,8 @@ unmount/remount. Only file content and directory structure are stored remotely.
 - **Rust** 1.85+ (nightly required for `cargo fmt` only)
 - **Linux**: `fuse3` and `libfuse3-dev` (FUSE), `nfs-common` (NFS client for mount)
 - **macOS**: [macFUSE](https://osxfuse.github.io/) (FUSE), NFS client built-in
+
+hf-mount uses [xet-core](https://github.com/huggingface/xet-core) for content-addressable storage and efficient file transfers.
 
 ## Build
 
@@ -180,7 +192,7 @@ hf-mount-daemon stop /mnt/data
 | `--hf-token` | `$HF_TOKEN` | HF API token. Required for private repos/buckets, optional for public repos |
 | `--hub-endpoint` | `https://huggingface.co` | Hub API endpoint |
 | `--cache-dir` | `/tmp/hf-mount-cache` | Local cache directory |
-| `--cache-size` | `10000000000` (~10 GB) | Max on-disk xorb chunk cache size in bytes |
+| `--cache-size` | `10000000000` (~10 GB) | Max on-disk chunk cache size in bytes |
 | `--read-only` | `false` | Mount read-only (always on for repos) |
 | `--advanced-writes` | `false` | Staging files + async flush (random writes, seek, overwrite) |
 | `--poll-interval-secs` | `30` | Remote change polling interval (0 to disable) |
@@ -189,7 +201,7 @@ hf-mount-daemon stop /mnt/data
 | `--metadata-ttl-minimal` | `false` | HEAD on every lookup (skip TTL cache) |
 | `--flush-debounce-ms` | `2000` | Advanced writes only. Flush debounce delay (ms) |
 | `--flush-max-batch-window-ms` | `30000` | Advanced writes only. Max flush batch window (ms) |
-| `--no-disk-cache` | `false` | Disable xorb chunk cache (every read fetches from CAS) |
+| `--no-disk-cache` | `false` | Disable local chunk cache (every read fetches from HF) |
 | `--no-filter-os-files` | `false` | Disable filtering of OS junk files (.DS_Store, Thumbs.db, etc.) |
 | `--uid` / `--gid` | current user | Override UID/GID for mounted files |
 
@@ -222,10 +234,10 @@ graph TD
     FLUSH --> XET
     FLUSH --> HUB
 
-    XET["<b>xet.rs</b><br/>XetSessions + StagingDir"]
+    XET["<b>xet.rs</b><br/>Storage Client"]
     HUB["<b>hub_api.rs</b><br/>Hub API Client"]
 
-    XET --> CAS["CAS Storage<br/><i>xet-core</i>"]
+    XET --> HF_STORAGE["HF Storage"]
     HUB --> HUB_API["Hub API"]
 
     VFS -.->|"poll loop"| HUB
@@ -238,8 +250,8 @@ sequenceDiagram
     participant App
     participant VFS as VirtualFs
     participant PF as PrefetchState
-    participant Xet as XetSessions
-    participant CAS as CAS Storage
+    participant Xet as Storage Client
+    participant HF as HF Storage
     participant Hub as Hub API
 
     Note over App,Hub: Read path (lazy)
@@ -254,8 +266,8 @@ sequenceDiagram
         VFS->>PF: prepare_fetch(cursor, remaining)
         PF-->>VFS: FetchPlan{strategy, fetch_size}
         VFS->>Xet: download_stream(file_info, offset)
-        Xet->>CAS: GET stream/range
-        CAS-->>Xet: bytes
+        Xet->>HF: GET stream/range
+        HF-->>Xet: bytes
         Xet-->>VFS: chunks
         VFS->>PF: store_fetched(cursor, chunks)
         VFS-->>App: assembled response
@@ -265,10 +277,10 @@ sequenceDiagram
     App->>VFS: create(parent, name)
     VFS-->>App: file handle
     App->>VFS: write(fh, data) [append-only]
-    VFS->>VFS: stream to CAS in memory
+    VFS->>VFS: stream to HF in memory
     App->>VFS: close(fh)
     VFS->>Xet: finish stream upload
-    Xet->>CAS: PUT chunks
+    Xet->>HF: PUT chunks
     VFS->>Hub: batch_operations (commit)
     VFS-->>App: close returns (sync)
     Note over App: No random writes, no modify existing files
@@ -276,14 +288,14 @@ sequenceDiagram
     Note over App,Hub: Write path (--advanced-writes)
     App->>VFS: open(ino) for write
     VFS->>Xet: download to staging file
-    Xet->>CAS: GET full file
+    Xet->>HF: GET full file
     App->>VFS: write(fh, offset, data)
     VFS->>VFS: pwrite to staging file (local disk)
     App->>VFS: close(fh)
     VFS->>VFS: enqueue flush(ino)
     Note over VFS: debounce 2s / max 30s
     VFS->>Xet: upload staging files (batch)
-    Xet->>CAS: PUT files
+    Xet->>HF: PUT files
     VFS->>Hub: batch_operations (commit)
     Note over App: Requires local disk space for staging
 ```
@@ -294,7 +306,7 @@ hf-mount provides **eventual consistency** with remote changes. Files may be sta
 
 ### Read consistency
 
-Reads are served from an in-memory prefetch buffer. When the buffer misses, data is fetched from CAS on demand. Remote file changes are detected through two mechanisms:
+Reads are served from an in-memory prefetch buffer. When the buffer misses, data is fetched from HF on demand. Remote file changes are detected through two mechanisms:
 
 1. **HEAD revalidation on lookup** (FUSE only) -- When the kernel metadata TTL expires (default 10 s), the next file access triggers a `HEAD` request on the Hub resolve endpoint. If the file changed, the page cache is invalidated and subsequent reads fetch the new content. **This means a file can be stale for up to `--metadata-ttl-ms` after a remote update.**
 
@@ -312,9 +324,9 @@ Between TTL expiry and the next HEAD check, reads return the previously cached v
 | Flush | Synchronous on close | Async, debounced (2 s / 30 s max) |
 | Disk space needed | None | Full file size per open file |
 
-**Streaming mode** buffers writes in memory and uploads to CAS on `close()`. Supports new file creation and overwriting existing files (via `O_TRUNC`). Random writes and partial modifications are not supported.
+**Streaming mode** buffers writes in memory and uploads on `close()`. Supports new file creation and overwriting existing files (via `O_TRUNC`). Random writes and partial modifications are not supported.
 
-**Advanced mode** downloads the full file to a local staging directory before allowing edits. This requires enough local disk space to hold all concurrently open files. After `close()`, dirty files are flushed asynchronously (debounce 2 s, max batch window 30 s) -- uploaded to CAS then committed via the Hub API. Coming soon: sparse downloads to avoid fetching the full file for small edits.
+**Advanced mode** downloads the full file to a local staging directory before allowing edits. This requires enough local disk space to hold all concurrently open files. After `close()`, dirty files are flushed asynchronously (debounce 2 s, max batch window 30 s) -- uploaded then committed via the Hub API.
 
 ### FUSE vs NFS
 
