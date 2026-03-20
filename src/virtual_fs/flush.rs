@@ -383,7 +383,10 @@ async fn flush_batch(
                     // staging file (which contains the user's dirty writes) with the
                     // original CAS content, silently losing data. Let the error
                     // propagate so the flush can be retried.
-                    error!("flush: range_upload failed ino={} path={}: {}", item.ino, item.full_path, e);
+                    error!(
+                        "flush: range_upload failed ino={} path={}: {}",
+                        item.ino, item.full_path, e
+                    );
                     let msg = format!("range_upload failed: {e}");
                     let mut errs = flush_errors.lock().expect("flush_errors poisoned");
                     for it in &to_flush {

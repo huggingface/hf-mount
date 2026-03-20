@@ -230,10 +230,7 @@ impl XetOps for XetSessions {
         // already covered by a dirty input, append a synthetic delete to drop the bytes
         // beyond file_size from the original file.
         if file_size < sparse_state.original_size {
-            let last_covered = dirty_inputs
-                .last()
-                .map(|d| d.original_range.end)
-                .unwrap_or(0);
+            let last_covered = dirty_inputs.last().map(|d| d.original_range.end).unwrap_or(0);
             let truncate_start = file_size.max(last_covered);
             if truncate_start < sparse_state.original_size {
                 dirty_inputs.push(DirtyInput {
