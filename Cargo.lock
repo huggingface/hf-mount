@@ -3843,7 +3843,7 @@ checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
 [[package]]
 name = "xet-client"
 version = "1.5.2"
-source = "git+https://github.com/huggingface/xet-core.git?branch=main#145b819fc1487f6a385a3670d7b0c237a4c4db8d"
+source = "git+https://github.com/huggingface/xet-core.git?branch=feat%2Ffile-chunk-hashes-and-compose#a8c8d01d97f686809cf245120a6225e397c57485"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3880,7 +3880,7 @@ dependencies = [
 [[package]]
 name = "xet-core-structures"
 version = "1.5.2"
-source = "git+https://github.com/huggingface/xet-core.git?branch=main#145b819fc1487f6a385a3670d7b0c237a4c4db8d"
+source = "git+https://github.com/huggingface/xet-core.git?branch=feat%2Ffile-chunk-hashes-and-compose#a8c8d01d97f686809cf245120a6225e397c57485"
 dependencies = [
  "async-trait",
  "base64",
@@ -3916,7 +3916,7 @@ dependencies = [
 [[package]]
 name = "xet-data"
 version = "1.5.2"
-source = "git+https://github.com/huggingface/xet-core.git?branch=main#145b819fc1487f6a385a3670d7b0c237a4c4db8d"
+source = "git+https://github.com/huggingface/xet-core.git?branch=feat%2Ffile-chunk-hashes-and-compose#a8c8d01d97f686809cf245120a6225e397c57485"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3948,7 +3948,7 @@ dependencies = [
 [[package]]
 name = "xet-runtime"
 version = "1.5.2"
-source = "git+https://github.com/huggingface/xet-core.git?branch=main#145b819fc1487f6a385a3670d7b0c237a4c4db8d"
+source = "git+https://github.com/huggingface/xet-core.git?branch=feat%2Ffile-chunk-hashes-and-compose#a8c8d01d97f686809cf245120a6225e397c57485"
 dependencies = [
  "anyhow",
  "async-trait",

@@ -270,6 +270,11 @@ struct FlushItem {
     /// Hash from the last successful commit, used to skip redundant Hub commits
     /// when the CAS upload produces the same hash (content unchanged).
     prev_xet_hash: Option<String>,
+    /// Size of the file as the user sees it (including sparse holes).
+    file_size: u64,
+    /// Set when the staging file is sparse and only the dirty windows should be
+    /// re-uploaded via `range_upload` (composing CAS prefix/suffix).
+    sparse_write: Option<Arc<crate::virtual_fs::inode::SparseWriteState>>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -334,6 +339,8 @@ async fn flush_batch(
                     pending_deletes: entry.pending_deletes.clone(),
                     dirty_generation: entry.dirty_generation,
                     prev_xet_hash: entry.xet_hash.clone(),
+                    file_size: entry.size,
+                    sparse_write: entry.sparse_write.clone(),
                 })
             })
             .collect()
@@ -347,14 +354,56 @@ async fn flush_batch(
         return;
     }
 
-    // Upload in chunks to bound FD usage (xet-core opens all staging files per
-    // upload session), but accumulate all batch ops for a single Hub commit to
-    // preserve the global adds-before-deletes ordering required by the Hub API.
+    // Sparse items (opened for write without downloading) go through `range_upload`
+    // which composes CAS prefix/suffix segments with re-chunked dirty windows; regular
+    // items go through the batched `upload_files` path. We walk in order, batching
+    // contiguous runs of regular items so a single Hub commit preserves the original
+    // adds-before-deletes ordering. Chunk size bounds FD usage (xet-core opens all
+    // staging files per upload session).
     const UPLOAD_CHUNK_SIZE: usize = 500;
-    let mut upload_results = Vec::with_capacity(to_flush.len());
+    let mut upload_results: Vec<xet_data::processing::XetFileInfo> = Vec::with_capacity(to_flush.len());
 
-    for (chunk_idx, chunk) in to_flush.chunks(UPLOAD_CHUNK_SIZE).enumerate() {
-        let staging_paths: Vec<&std::path::Path> = chunk.iter().map(|item| item.staging_path.as_path()).collect();
+    let mut i = 0;
+    while i < to_flush.len() {
+        let item = &to_flush[i];
+        if let Some(sw) = &item.sparse_write {
+            match xet_sessions.range_upload(sw, &item.staging_path, item.file_size).await {
+                Ok(file_info) => {
+                    debug!(
+                        "flush: range_upload ino={} path={} hash={} size={}",
+                        item.ino,
+                        item.full_path,
+                        file_info.hash(),
+                        file_info.file_size().unwrap_or(0)
+                    );
+                    upload_results.push(file_info);
+                }
+                Err(e) => {
+                    // Don't fall back to download_to_file: that would overwrite the
+                    // staging file (which contains the user's dirty writes) with the
+                    // original CAS content, silently losing data. Let the error
+                    // propagate so the flush can be retried.
+                    error!("flush: range_upload failed ino={} path={}: {}", item.ino, item.full_path, e);
+                    let msg = format!("range_upload failed: {e}");
+                    let mut errs = flush_errors.lock().expect("flush_errors poisoned");
+                    for it in &to_flush {
+                        errs.insert(it.ino, msg.clone());
+                    }
+                    return;
+                }
+            }
+            i += 1;
+            continue;
+        }
+
+        let chunk_end = (i + UPLOAD_CHUNK_SIZE).min(to_flush.len());
+        let chunk_end = (i..chunk_end)
+            .take_while(|j| to_flush[*j].sparse_write.is_none())
+            .last()
+            .map(|j| j + 1)
+            .unwrap_or(i + 1);
+        let chunk = &to_flush[i..chunk_end];
+        let staging_paths: Vec<&std::path::Path> = chunk.iter().map(|it| it.staging_path.as_path()).collect();
         match xet_sessions.upload_files(&staging_paths).await {
             Ok(results) => {
                 assert_eq!(
@@ -369,15 +418,16 @@ async fn flush_batch(
             Err(e) => {
                 // Abort the entire batch: committing partial results could apply
                 // deletes without the corresponding adds from this failed chunk.
-                error!("Batch upload failed (chunk {}), aborting flush: {}", chunk_idx, e);
+                error!("Batch upload failed, aborting flush: {}", e);
                 let msg = format!("upload failed: {e}");
                 let mut errs = flush_errors.lock().expect("flush_errors poisoned");
-                for item in &to_flush {
-                    errs.insert(item.ino, msg.clone());
+                for it in &to_flush {
+                    errs.insert(it.ino, msg.clone());
                 }
                 return;
             }
         }
+        i = chunk_end;
     }
 
     // Uploads are done — drop the staging locks so unlink/truncate and the

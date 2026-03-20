@@ -69,7 +69,7 @@ impl CachedXetClient {
     }
 }
 
-/// Derive a range-scoped `QueryReconstructionResponse` from a cached full-file response.
+/// Derive a range-scoped `QueryReconstructionResponseV2` from a cached full-file response.
 ///
 /// The full-file response lists all terms in file order with their unpacked byte lengths.
 /// We walk the terms, track cumulative byte offsets, and keep only terms that overlap
@@ -323,6 +323,14 @@ impl Client for CachedXetClient {
             .upload_xorb(prefix, serialized_cas_object, progress_callback, upload_permit)
             .await
     }
+
+    async fn get_file_chunk_hashes(
+        &self,
+        file_id: &MerkleHash,
+        dirty_ranges: Vec<xet_client::cas_types::FileRange>,
+    ) -> Result<xet_client::cas_types::FileChunkHashesResponse> {
+        self.inner.get_file_chunk_hashes(file_id, dirty_ranges).await
+    }
 }
 
 #[cfg(test)]
@@ -461,6 +469,14 @@ mod tests {
             _progress_callback: Option<ProgressCallback>,
             _upload_permit: ConnectionPermit,
         ) -> Result<u64> {
+            unimplemented!("not needed in these tests")
+        }
+
+        async fn get_file_chunk_hashes(
+            &self,
+            _file_id: &MerkleHash,
+            _dirty_ranges: Vec<xet_client::cas_types::FileRange>,
+        ) -> Result<xet_client::cas_types::FileChunkHashesResponse> {
             unimplemented!("not needed in these tests")
         }
     }
