@@ -2,6 +2,11 @@
 name = "hf-mount"
 version = "0.1.0"
 edition = "2024"
+license = "Apache-2.0"
+description = "Mount Hugging Face Buckets and repos as a local filesystem using FUSE or NFS"
+repository = "https://github.com/huggingface/hf-mount"
+keywords = ["fuse", "nfs", "huggingface", "filesystem", "mount"]
+categories = ["filesystem", "command-line-utilities"]
 
 [dependencies]
 # xet-core crates
@@ -15,7 +20,7 @@ async-trait = "0.1"
 bytes = "1"
 chrono = "0.4"
 clap = { version = "4", features = ["derive", "env"] }
-fuser = { version = "0.17", features = ["macos-no-mount"] }
+fuser = "0.17"
 futures = "0.3"
 libc = "0.2"
 nfsserve = "0.10"

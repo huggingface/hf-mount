@@ -517,9 +517,26 @@ pub fn mount_fuse(
     if read_only {
         config.mount_options.push(fuser::MountOption::RO);
     }
+    // macFUSE: show the volume in Finder sidebar
+    #[cfg(target_os = "macos")]
+    {
+        let volname = mount_point
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "hf-mount".to_string());
+        config
+            .mount_options
+            .push(fuser::MountOption::CUSTOM(format!("volname={volname}")));
+        config
+            .mount_options
+            .push(fuser::MountOption::CUSTOM("local".to_string()));
+    }
     config.acl = fuser::SessionACL::All;
-    config.clone_fd = true;
-    config.n_threads = Some(max_threads);
+    // clone_fd and multi-threading are only supported on Linux by fuser
+    if cfg!(target_os = "linux") {
+        config.clone_fd = true;
+        config.n_threads = Some(max_threads);
+    }
 
     let session = match fuser::Session::new(adapter, mount_point, &config) {
         Ok(s) => s,
@@ -595,7 +612,9 @@ pub fn mount_fuse(
         }
     });
 
-    let _ = bg.join();
+    if let Err(err) = bg.join() {
+        error!("FUSE session error: {}", err);
+    }
     session_ended.store(true, std::sync::atomic::Ordering::Release);
     // Safety net: flush after FUSE session ends. Covers external unmount
     // (e.g. `fusermount -u`) where destroy() may not fire. Idempotent
