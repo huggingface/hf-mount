@@ -3,15 +3,19 @@
 Use any Hugging Face model or dataset as if it were a local directory. No download, no copy, no waiting.
 
 ```bash
-hf-mount-fuse repo gpt2 /mnt/gpt2
+hf-mount-nfs repo gpt2 /tmp/gpt2
 ```
 
 ```python
 from transformers import AutoModelForCausalLM
-model = AutoModelForCausalLM.from_pretrained("/mnt/gpt2")  # reads on demand, no download step
+model = AutoModelForCausalLM.from_pretrained("/tmp/gpt2")  # reads on demand, no download step
 ```
 
-hf-mount exposes [Hugging Face Hub](https://huggingface.co) repos and [Buckets](https://huggingface.co/docs/huggingface_hub/guides/buckets) as a local filesystem via FUSE or NFS. Files are fetched lazily on first read, so only the bytes your code actually touches ever leave the network.
+hf-mount exposes [Hugging Face Hub](https://huggingface.co) repos and [Buckets](https://huggingface.co/docs/huggingface_hub/guides/buckets) as a local filesystem. Files are fetched lazily on first read, so only the bytes your code actually touches ever leave the network.
+
+Two backends are available:
+- **NFS** (recommended) -- works everywhere, no root, no kernel extension
+- **FUSE** -- tighter kernel integration, requires root or [macFUSE](https://osxfuse.github.io/) on macOS
 
 ## Install
 
@@ -19,21 +23,23 @@ hf-mount exposes [Hugging Face Hub](https://huggingface.co) repos and [Buckets](
 
 Download the latest release for your platform from [GitHub Releases](https://github.com/huggingface/hf-mount/releases):
 
-| Platform | Binary |
-| --- | --- |
-| Linux x86_64 | `hf-mount-fuse-x86_64-linux` |
-| Linux aarch64 | `hf-mount-fuse-aarch64-linux` |
-| macOS Apple Silicon | `hf-mount-fuse-arm64-apple-darwin` |
-| macOS Intel | `hf-mount-fuse-x86_64-apple-darwin` |
+| Platform | NFS | FUSE |
+| --- | --- | --- |
+| Linux x86_64 | `hf-mount-nfs-x86_64-linux` | `hf-mount-fuse-x86_64-linux` |
+| Linux aarch64 | `hf-mount-nfs-aarch64-linux` | `hf-mount-fuse-aarch64-linux` |
+| macOS Apple Silicon | `hf-mount-nfs-arm64-apple-darwin` | `hf-mount-fuse-arm64-apple-darwin` |
+| macOS Intel | `hf-mount-nfs-x86_64-apple-darwin` | `hf-mount-fuse-x86_64-apple-darwin` |
 
 ```bash
-# Example: Linux x86_64
-curl -L -o hf-mount-fuse https://github.com/huggingface/hf-mount/releases/latest/download/hf-mount-fuse-x86_64-linux
-chmod +x hf-mount-fuse
-sudo mv hf-mount-fuse /usr/local/bin/
+# Example: Linux x86_64 (NFS, no root needed)
+curl -L -o hf-mount-nfs https://github.com/huggingface/hf-mount/releases/latest/download/hf-mount-nfs-x86_64-linux
+chmod +x hf-mount-nfs
+mv hf-mount-nfs ~/.local/bin/
 ```
 
-### System dependencies
+### System dependencies (FUSE only)
+
+The NFS backend has no system dependencies. For FUSE:
 
 **Linux**: `sudo apt-get install -y fuse3`
 
@@ -44,22 +50,19 @@ sudo mv hf-mount-fuse /usr/local/bin/
 Requires Rust 1.85+.
 
 ```bash
-# Linux
-sudo apt-get install -y fuse3 libfuse3-dev
 cargo build --release
-
-# macOS (macFUSE must be installed first)
-cargo build --release
+# FUSE on Linux: sudo apt-get install -y fuse3 libfuse3-dev
+# FUSE on macOS: brew install macfuse
 ```
 
-Binaries: `target/release/hf-mount-fuse`, `target/release/hf-mount-nfs`, `target/release/hf-mount-daemon`
+Binaries: `target/release/hf-mount-nfs`, `target/release/hf-mount-fuse`, `target/release/hf-mount-daemon`
 
 ## Quick start
 
 ```bash
 # Mount a public model (no token needed)
 mkdir /tmp/gpt2
-hf-mount-fuse repo gpt2 /tmp/gpt2
+hf-mount-nfs repo gpt2 /tmp/gpt2
 ls /tmp/gpt2
 
 # Use it from Python
@@ -71,8 +74,7 @@ print(tok.decode(model.generate(**tok('Hello', return_tensors='pt'), max_new_tok
 "
 
 # Unmount
-fusermount -u /tmp/gpt2   # Linux
-umount /tmp/gpt2           # macOS
+umount /tmp/gpt2
 ```
 
 For private repos or [Buckets](https://huggingface.co/docs/huggingface_hub/guides/buckets), pass `--hf-token` or set the `HF_TOKEN` env var.
@@ -97,21 +99,23 @@ See [Consistency model](#consistency-model) for details.
 
 ### Mount a repo (read-only)
 
+All examples use `hf-mount-nfs`. Replace with `hf-mount-fuse` if you prefer the FUSE backend.
+
 ```bash
 # Public model (no token needed)
-hf-mount-fuse repo gpt2 /mnt/gpt2
+hf-mount-nfs repo gpt2 /tmp/gpt2
 
 # Private model
-hf-mount-fuse --hf-token $HF_TOKEN repo myorg/my-private-model /mnt/model
+hf-mount-nfs --hf-token $HF_TOKEN repo myorg/my-private-model /tmp/model
 
 # Dataset
-hf-mount-fuse repo datasets/squad /mnt/squad
+hf-mount-nfs repo datasets/squad /tmp/squad
 
 # Specific revision
-hf-mount-fuse repo openai-community/gpt2 /mnt/gpt2 --revision v1.0
+hf-mount-nfs repo openai-community/gpt2 /tmp/gpt2 --revision v1.0
 
 # Subfolder only
-hf-mount-fuse repo openai-community/gpt2/onnx /mnt/onnx
+hf-mount-nfs repo openai-community/gpt2/onnx /tmp/onnx
 ```
 
 ### Mount a Bucket (read-write)
@@ -119,21 +123,21 @@ hf-mount-fuse repo openai-community/gpt2/onnx /mnt/onnx
 [Buckets](https://huggingface.co/docs/huggingface_hub/guides/buckets) are S3-like object storage on the Hub, designed for large-scale mutable data (training checkpoints, logs, artifacts) without git version control.
 
 ```bash
-hf-mount-fuse --hf-token $HF_TOKEN bucket myuser/my-bucket /mnt/data
+hf-mount-nfs --hf-token $HF_TOKEN bucket myuser/my-bucket /tmp/data
 
 # Read-only
-hf-mount-fuse --hf-token $HF_TOKEN --read-only bucket myuser/my-bucket /mnt/data
+hf-mount-nfs --hf-token $HF_TOKEN --read-only bucket myuser/my-bucket /tmp/data
 
 # Subfolder only
-hf-mount-fuse --hf-token $HF_TOKEN bucket myuser/my-bucket/checkpoints /mnt/ckpts
+hf-mount-nfs --hf-token $HF_TOKEN bucket myuser/my-bucket/checkpoints /tmp/ckpts
 ```
 
-### NFS backend
+### FUSE backend
 
-Use `hf-mount-nfs` when `/dev/fuse` is unavailable (e.g., unprivileged Kubernetes containers). Requires `nfs-common` on Linux (`sudo apt-get install -y nfs-common`).
+Use `hf-mount-fuse` for tighter kernel integration (page cache invalidation, per-file metadata revalidation). Requires `fuse3` on Linux or [macFUSE](https://osxfuse.github.io/) on macOS.
 
 ```bash
-hf-mount-nfs --hf-token $HF_TOKEN bucket myuser/my-bucket /mnt/data
+hf-mount-fuse --hf-token $HF_TOKEN bucket myuser/my-bucket /mnt/data
 ```
 
 ### Background daemon
@@ -157,9 +161,9 @@ Logs are written to `~/.hf-mount/logs/`. PID files are stored in `~/.hf-mount/pi
 ### Unmount
 
 ```bash
-fusermount -u /mnt/data   # FUSE (Linux)
-umount /mnt/data           # FUSE (macOS) or NFS
-hf-mount-daemon stop /mnt  # daemon mounts
+umount /tmp/data                 # NFS or FUSE (macOS)
+fusermount -u /tmp/data          # FUSE (Linux)
+hf-mount-daemon stop /tmp/data   # daemon mounts
 ```
 
 ### Options
