@@ -6,7 +6,7 @@ use clap::Parser;
 use tracing::info;
 use xet_data::processing::configurations::TranslatorConfig;
 use xet_data::processing::data_client::default_config;
-use xet_data::processing::{CacheConfig, FileDownloadSession, create_remote_client, get_cache};
+use xet_data::processing::{CacheConfig, FileDownloadSession, get_cache};
 
 use crate::cached_xet_client::CachedXetClient;
 use crate::hub_api::{HubApiClient, HubTokenRefresher, SourceKind, parse_repo_id, split_path_prefix};
@@ -296,17 +296,23 @@ pub fn build(source: Source, options: MountOptions, is_nfs: bool) -> MountSetup 
         Some(get_cache(&config).expect("Failed to create xorb cache"))
     };
 
-    let raw_client = runtime
-        .block_on(create_remote_client(
-            &cas_config,
-            &uuid::Uuid::new_v4().to_string(),
-            false,
-        ))
-        .expect("Failed to create CAS client");
+    let raw_client: Arc<dyn xet_client::cas_client::Client> = xet_client::cas_client::RemoteClient::new(
+        &cas_config.session.endpoint,
+        &cas_config.session.auth,
+        &uuid::Uuid::new_v4().to_string(),
+        false,
+        cas_config.session.custom_headers.clone(),
+    );
     let cached_client = CachedXetClient::new(raw_client);
-    let download_session = FileDownloadSession::from_client(cached_client.clone(), None, xorb_cache);
+    let download_session = match xorb_cache {
+        Some(cache) => FileDownloadSession::with_chunk_cache(cached_client.clone(), cache),
+        None => FileDownloadSession::from_client(cached_client.clone()),
+    };
+    // Separate session without chunk cache for bounded range downloads (seeks, sparse fills).
+    // The chunk cache fetches full xorbs (~64MB) even for small ranges.
+    let nocache_session = FileDownloadSession::from_client(cached_client.clone());
     let upload_config = if read_only { None } else { Some(cas_config) };
-    let xet_sessions = XetSessions::new(download_session, upload_config, cached_client);
+    let xet_sessions = XetSessions::new(download_session, nocache_session, upload_config, cached_client);
 
     let advanced_writes = options.advanced_writes || (is_nfs && !read_only);
     // Repos need a staging dir for HTTP download cache (open_readonly),
@@ -416,7 +422,6 @@ fn build_cas_config(runtime: &tokio::runtime::Runtime, refresher: &Arc<HubTokenR
     Arc::new(
         default_config(
             jwt.cas_url,
-            None,
             Some((jwt.access_token, jwt.exp)),
             Some(refresher.clone()),
             None,

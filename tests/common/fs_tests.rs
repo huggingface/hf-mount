@@ -352,6 +352,190 @@ pub fn run_write_tests(mp: &str, remote_file: &str, remote_content: &str) -> Tes
         std::fs::remove_dir(&src_dir)?;
     }
 
+    // ── Sparse write tests (operate on CAS-backed remote file) ──
+
+    // 19. Mid-file write on CAS file: overwrite a few bytes in the middle,
+    //     read back the full file — prefix and suffix should be original CAS content.
+    eprintln!("  [write] sparse mid-file write on CAS file");
+    {
+        // Create a fresh remote file with known content (moved_remote.txt still exists from step 6)
+        let path = format!("{}/moved_remote.txt", mp);
+        let original = std::fs::read_to_string(&path)?;
+        assert!(
+            !original.is_empty(),
+            "moved_remote.txt should have content from earlier steps"
+        );
+        let original_bytes = original.as_bytes();
+
+        // Open without truncate (sparse staging, no download), write mid-file
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new().write(true).open(&path)?;
+            f.seek(SeekFrom::Start(5))?;
+            f.write_all(b"SPARSE")?;
+        }
+
+        // Read full file: bytes [0,5) and [11,end) should be original CAS content,
+        // bytes [5,11) should be "SPARSE"
+        let after = std::fs::read(&path)?;
+        assert_eq!(after.len(), original_bytes.len(), "size should not change");
+        assert_eq!(&after[..5], &original_bytes[..5], "prefix should be original CAS bytes");
+        assert_eq!(&after[5..11], b"SPARSE", "mid-file write should be visible");
+        assert_eq!(
+            &after[11..],
+            &original_bytes[11..],
+            "suffix should be original CAS bytes"
+        );
+    }
+
+    // 20. Append past EOF on CAS file: gap should be zeros.
+    eprintln!("  [write] sparse append past EOF");
+    {
+        let path = format!("{}/append_test.txt", mp);
+        std::fs::write(&path, "hello")?;
+        // Wait for flush so the file is committed to CAS
+        std::thread::sleep(std::time::Duration::from_secs(5));
+
+        // Re-read to confirm it's there
+        assert_eq!(std::fs::read_to_string(&path)?, "hello");
+
+        // Now open without truncate and write past EOF
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new().write(true).open(&path)?;
+            f.seek(SeekFrom::Start(10))?;
+            f.write_all(b"WORLD")?;
+        }
+
+        let content = std::fs::read(&path)?;
+        assert_eq!(content.len(), 15);
+        assert_eq!(&content[..5], b"hello", "original prefix");
+        assert_eq!(&content[5..10], &[0u8; 5], "gap should be zeros");
+        assert_eq!(&content[10..15], b"WORLD", "appended data");
+    }
+
+    // 21. Write at offset 0 on the same handle (no re-open from CAS).
+    // This tests the write-at-zero path without needing CAS reconstruction.
+    eprintln!("  [write] write at offset 0 on open handle");
+    {
+        use std::io::Write;
+        let path = format!("{}/offset_zero.txt", mp);
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&path)?;
+        f.write_all(b"0123456789")?;
+        // Seek back to 0 and overwrite prefix
+        f.seek(SeekFrom::Start(0))?;
+        f.write_all(b"HEAD")?;
+        f.seek(SeekFrom::Start(0))?;
+        let mut content = String::new();
+        f.read_to_string(&mut content)?;
+        assert_eq!(content, "HEAD456789", "write at offset 0 should overwrite prefix");
+    }
+
+    // ── CAS round-trip tests ──
+    // These verify that data survives the full write → flush → CAS → read-from-CAS cycle.
+
+    // 22. CAS round-trip: write, wait for flush, close+reopen, read from CAS.
+    // The re-open creates a new handle that reads from CAS (not staging cache).
+    eprintln!("  [write] CAS round-trip: write → flush → re-read from CAS");
+    {
+        let path = format!("{}/cas_roundtrip.txt", mp);
+        std::fs::write(&path, "round trip content 12345")?;
+        // Wait for async flush to commit to CAS
+        std::thread::sleep(std::time::Duration::from_secs(5));
+        // Re-read: should come from CAS now
+        let content = std::fs::read_to_string(&path)?;
+        assert_eq!(content, "round trip content 12345", "CAS round-trip content mismatch");
+    }
+
+    // 23. Multi-write accumulation: multiple writes at different offsets on a CAS file,
+    //     then verify the composed content after flush.
+    eprintln!("  [write] multi-write accumulation on CAS file");
+    {
+        let path = format!("{}/cas_roundtrip.txt", mp);
+        // File is now in CAS from test 22. Open without truncate (sparse).
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new().write(true).open(&path)?;
+            f.seek(SeekFrom::Start(0))?;
+            f.write_all(b"AAAA")?; // [0, 4)
+            f.seek(SeekFrom::Start(10))?;
+            f.write_all(b"BBBB")?; // [10, 14)
+            f.seek(SeekFrom::Start(20))?;
+            f.write_all(b"CCCC")?; // [20, 24)
+        }
+        // "round trip content 12345" with AAAA@0, BBBB@10, CCCC@20
+        //  AAAAd trip BBBB 12345CCCC5
+        //  0   4     10  14    20  24
+        let content = std::fs::read(&path)?;
+        assert_eq!(content.len(), 24);
+        assert_eq!(&content[..4], b"AAAA", "first write @0");
+        assert_eq!(&content[4..10], b"d trip", "original CAS [4..10)");
+        assert_eq!(&content[10..14], b"BBBB", "second write @10");
+        assert_eq!(&content[14..20], b"tent 1", "original CAS [14..20)");
+        assert_eq!(&content[20..24], b"CCCC", "third write @20");
+    }
+
+    // 24. Large file round-trip: write a file larger than one CAS chunk (~256KB),
+    //     flush, then read back.
+    eprintln!("  [write] large file (512KB) round-trip");
+    {
+        let path = format!("{}/large_file.bin", mp);
+        let data: Vec<u8> = (0..512 * 1024).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&path, &data)?;
+        std::thread::sleep(std::time::Duration::from_secs(5));
+        let readback = std::fs::read(&path)?;
+        assert_eq!(readback.len(), data.len(), "large file size mismatch");
+        assert_eq!(readback, data, "large file content mismatch");
+    }
+
+    // 25. Large file mid-write: write a 512KB file, flush, then overwrite 1KB in the middle.
+    //     Verify prefix + edit + suffix are all correct after round-trip.
+    eprintln!("  [write] large file mid-write via range_upload");
+    {
+        let path = format!("{}/large_file.bin", mp);
+        // File is now in CAS from test 24. Open without truncate (sparse + range_upload).
+        let original: Vec<u8> = (0..512 * 1024).map(|i| (i % 251) as u8).collect();
+        let edit_offset = 200_000usize;
+        let edit_data = vec![0xABu8; 1024];
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new().write(true).open(&path)?;
+            f.seek(SeekFrom::Start(edit_offset as u64))?;
+            f.write_all(&edit_data)?;
+        }
+        // Read back immediately (from staging + fill_sparse_holes)
+        let content = std::fs::read(&path)?;
+        assert_eq!(content.len(), original.len());
+        assert_eq!(&content[..edit_offset], &original[..edit_offset], "prefix before edit");
+        assert_eq!(&content[edit_offset..edit_offset + 1024], &edit_data, "edited region");
+        assert_eq!(
+            &content[edit_offset + 1024..],
+            &original[edit_offset + 1024..],
+            "suffix after edit"
+        );
+
+        // Wait for flush (range_upload) then re-read from CAS
+        std::thread::sleep(std::time::Duration::from_secs(5));
+        let cas_content = std::fs::read(&path)?;
+        assert_eq!(cas_content.len(), original.len(), "CAS round-trip size");
+        assert_eq!(&cas_content[..edit_offset], &original[..edit_offset], "CAS prefix");
+        assert_eq!(
+            &cas_content[edit_offset..edit_offset + 1024],
+            &edit_data,
+            "CAS edited region"
+        );
+        assert_eq!(
+            &cas_content[edit_offset + 1024..],
+            &original[edit_offset + 1024..],
+            "CAS suffix"
+        );
+    }
+
     eprintln!("  [write] all passed");
     Ok(())
 }

@@ -5,10 +5,10 @@ edition = "2024"
 
 [dependencies]
 # xet-core crates
-xet-client = { git = "https://github.com/huggingface/xet-core.git", rev = "0d7808b" }
-xet-core-structures = { git = "https://github.com/huggingface/xet-core.git", rev = "0d7808b" }
-xet-data = { git = "https://github.com/huggingface/xet-core.git", rev = "0d7808b" }
-xet-runtime = { git = "https://github.com/huggingface/xet-core.git", rev = "0d7808b" }
+xet-client = { git = "https://github.com/huggingface/xet-core.git", branch = "adrien/combined-hf-mount" }
+xet-core-structures = { git = "https://github.com/huggingface/xet-core.git", branch = "adrien/combined-hf-mount" }
+xet-data = { git = "https://github.com/huggingface/xet-core.git", branch = "adrien/combined-hf-mount" }
+xet-runtime = { git = "https://github.com/huggingface/xet-core.git", branch = "adrien/combined-hf-mount" }
 
 # External crates
 async-trait = "0.1"

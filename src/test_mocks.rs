@@ -11,6 +11,7 @@ use xet_data::processing::XetFileInfo;
 
 use crate::error::{Error, Result};
 use crate::hub_api::{BatchOp, HeadFileInfo, HubOps, SourceKind, TreeEntry};
+use crate::virtual_fs::inode::SparseWriteState;
 use crate::xet::{DownloadStreamOps, StagingDir, StreamingWriterOps, XetOps};
 
 // ── MockHub ───────────────────────────────────────────────────────────
@@ -121,6 +122,10 @@ impl MockHub {
         *self.batch_barrier.lock().unwrap() = Some(barrier);
     }
 
+    pub fn clear_batch_barrier(&self) {
+        *self.batch_barrier.lock().unwrap() = None;
+    }
+
     pub fn take_batch_log(&self) -> Vec<Vec<BatchOp>> {
         std::mem::take(&mut *self.batch_log.lock().unwrap())
     }
@@ -217,6 +222,7 @@ pub struct MockXet {
     writer_create_fail: AtomicBool,
     upload_fail: AtomicBool,
     download_fail: AtomicBool,
+    range_upload_fail: AtomicBool,
     writer_fail_after: AtomicU64,
     /// Number of range download calls that should fail before succeeding.
     range_fail_count: AtomicU32,
@@ -234,6 +240,7 @@ impl MockXet {
             writer_create_fail: AtomicBool::new(false),
             upload_fail: AtomicBool::new(false),
             download_fail: AtomicBool::new(false),
+            range_upload_fail: AtomicBool::new(false),
             writer_fail_after: AtomicU64::new(u64::MAX),
             range_fail_count: AtomicU32::new(0),
             range_empty_count: AtomicU32::new(0),
@@ -265,6 +272,14 @@ impl MockXet {
     /// Make the next N range downloads return Ok(empty) before succeeding.
     pub fn empty_range_downloads(&self, n: u32) {
         self.range_empty_count.store(n, Ordering::SeqCst);
+    }
+
+    pub fn fail_range_upload(&self) {
+        self.range_upload_fail.store(true, Ordering::SeqCst);
+    }
+
+    pub fn get_file(&self, hash: &str) -> Option<Vec<u8>> {
+        self.files.lock().unwrap().get(hash).cloned()
     }
 
     fn next_hash_string(&self) -> String {
@@ -321,7 +336,49 @@ impl XetOps for MockXet {
         // re-enabled when xet-core adds chunk sizes to XorbReconstructionTerm.
     }
 
-    fn download_stream_boxed(
+    async fn range_upload(
+        &self,
+        sparse_state: &SparseWriteState,
+        staging_path: &std::path::Path,
+        _file_size: u64,
+    ) -> crate::error::Result<XetFileInfo> {
+        if self.range_upload_fail.swap(false, Ordering::SeqCst) {
+            return Err(crate::error::Error::Xet("mock range_upload failure".into()));
+        }
+
+        let original = self
+            .files
+            .lock()
+            .unwrap()
+            .get(&sparse_state.original_hash)
+            .cloned()
+            .unwrap_or_default();
+        let staging = std::fs::read(staging_path).map_err(Error::Io)?;
+        let total_size = staging.len();
+
+        // Compose: original as base (capped to sparse_state.original_size),
+        // overlay dirty ranges from staging. Region past original_size is zeros
+        // (extension), matching real upload_ranges behavior.
+        let mut composed = vec![0u8; total_size];
+        let orig_end = (sparse_state.original_size as usize)
+            .min(original.len())
+            .min(total_size);
+        composed[..orig_end].copy_from_slice(&original[..orig_end]);
+        for &(start, end) in &sparse_state.dirty_ranges {
+            let start = start as usize;
+            let end = (end as usize).min(total_size);
+            if start < end {
+                composed[start..end].copy_from_slice(&staging[start..end]);
+            }
+        }
+
+        let hash = self.next_hash_string();
+        let size = composed.len() as u64;
+        self.files.lock().unwrap().insert(hash.clone(), composed);
+        Ok(XetFileInfo::new(hash, size))
+    }
+
+    async fn download_stream_boxed(
         &self,
         file_info: &XetFileInfo,
         offset: u64,
@@ -439,10 +496,13 @@ pub fn make_test_vfs(
     opts: TestOpts,
     runtime: &tokio::runtime::Runtime,
 ) -> Arc<crate::virtual_fs::VirtualFs> {
+    static TEST_VFS_COUNTER: AtomicU64 = AtomicU64::new(0);
+    let unique_id = TEST_VFS_COUNTER.fetch_add(1, Ordering::SeqCst);
+
     // Repos need a staging dir for HTTP download cache (open_readonly),
     // even when advanced_writes is disabled (mirrors setup.rs logic).
     let staging_dir = if opts.advanced_writes || hub.is_repo() {
-        let path = std::env::temp_dir().join(format!("hf_mount_test_{}", std::process::id()));
+        let path = std::env::temp_dir().join(format!("hf_mount_test_{}_{unique_id}", std::process::id()));
         std::fs::create_dir_all(&path).expect("failed to create temp staging dir");
         Some(StagingDir::new(&path))
     } else {

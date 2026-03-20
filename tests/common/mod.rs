@@ -9,10 +9,9 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use reqwest::Client;
-use xet_core_structures::metadata_shard::file_structs::Sha256;
 use xet_data::processing::configurations::TranslatorConfig;
 use xet_data::processing::data_client::default_config;
-use xet_data::processing::{FileUploadSession, XetFileInfo};
+use xet_data::processing::{FileUploadSession, Sha256Policy, XetFileInfo};
 
 pub fn endpoint() -> String {
     std::env::var("HF_ENDPOINT").unwrap_or_else(|_| "https://huggingface.co".to_string())
@@ -146,7 +145,6 @@ pub async fn build_write_config(hub: &Arc<hf_mount::hub_api::HubApiClient>) -> A
     Arc::new(
         default_config(
             write_jwt.cas_url,
-            None,
             Some((write_jwt.access_token, write_jwt.exp)),
             Some(write_refresher),
             None,
@@ -157,11 +155,11 @@ pub async fn build_write_config(hub: &Arc<hf_mount::hub_api::HubApiClient>) -> A
 
 /// Upload a single file to CAS via an upload session.
 pub async fn upload_file(config: Arc<TranslatorConfig>, staged_path: &Path) -> XetFileInfo {
-    let upload_session = FileUploadSession::new(config, None)
+    let upload_session = FileUploadSession::new(config)
         .await
         .expect("FileUploadSession::new failed");
 
-    let files = vec![(staged_path.to_path_buf(), None::<Sha256>, ulid::Ulid::new())];
+    let files = vec![(staged_path.to_path_buf(), Sha256Policy::Skip)];
     let mut results = upload_session.upload_files(files).await.expect("upload_files failed");
 
     let file_info = results.pop().expect("upload returned no file info");

@@ -4300,7 +4300,7 @@ checksum = "9edde0db4769d2dc68579893f2306b26c6ecfbe0ef499b013d731b7b9247e0b9"
 [[package]]
 name = "xet-client"
 version = "1.4.0"
-source = "git+https://github.com/huggingface/xet-core.git?rev=0d7808b#0d7808baf5ae8d32fc33f642665ee9ac57e61bd0"
+source = "git+https://github.com/huggingface/xet-core.git?branch=adrien%2Fcombined-hf-mount#abc592dc9c56e5d1ab8c655b5f3cbe4e4d3e10b5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4347,7 +4347,7 @@ dependencies = [
 [[package]]
 name = "xet-core-structures"
 version = "1.4.0"
-source = "git+https://github.com/huggingface/xet-core.git?rev=0d7808b#0d7808baf5ae8d32fc33f642665ee9ac57e61bd0"
+source = "git+https://github.com/huggingface/xet-core.git?branch=adrien%2Fcombined-hf-mount#abc592dc9c56e5d1ab8c655b5f3cbe4e4d3e10b5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4387,7 +4387,7 @@ dependencies = [
 [[package]]
 name = "xet-data"
 version = "1.4.0"
-source = "git+https://github.com/huggingface/xet-core.git?rev=0d7808b#0d7808baf5ae8d32fc33f642665ee9ac57e61bd0"
+source = "git+https://github.com/huggingface/xet-core.git?branch=adrien%2Fcombined-hf-mount#abc592dc9c56e5d1ab8c655b5f3cbe4e4d3e10b5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4410,7 +4410,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
- "ulid",
+ "url",
  "walkdir",
  "xet-client",
  "xet-core-structures",
@@ -4420,7 +4420,7 @@ dependencies = [
 [[package]]
 name = "xet-runtime"
 version = "1.4.0"
-source = "git+https://github.com/huggingface/xet-core.git?rev=0d7808b#0d7808baf5ae8d32fc33f642665ee9ac57e61bd0"
+source = "git+https://github.com/huggingface/xet-core.git?branch=adrien%2Fcombined-hf-mount#abc592dc9c56e5d1ab8c655b5f3cbe4e4d3e10b5"
 dependencies = [
  "async-trait",
  "bytes",

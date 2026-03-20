@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -54,6 +55,90 @@ pub struct InodeEntry {
     /// When this inode's metadata was last validated against the remote (via HEAD).
     /// Used to avoid redundant HEAD requests within the revalidation TTL.
     pub last_revalidated: Option<Instant>,
+    /// Tracks the original file state and dirty byte range when the file is opened
+    /// for write without downloading the full original content (sparse staging).
+    /// At flush time, only the dirty range (plus CDC boundary chunks) needs to be
+    /// re-uploaded. None means either a new file or the full file was downloaded.
+    pub sparse_write: Option<Arc<SparseWriteState>>,
+    /// Incremented on each write(). flush_batch snapshots this value; at commit time,
+    /// it only clears dirty/sparse_write if the generation still matches (no concurrent
+    /// writes happened since the snapshot).
+    pub flush_generation: u64,
+}
+
+/// Tracks which regions of a sparse staging file have been modified.
+/// The staging file is sparse: bytes in [0, original_size) are a hole (zeros)
+/// unless a dirty range overlaps them, in which case they are lazily downloaded
+/// from CAS. At flush time, only the modified regions need re-chunking/uploading.
+#[derive(Debug, Clone)]
+pub struct SparseWriteState {
+    /// Hash of the original file in CAS.
+    pub original_hash: String,
+    /// Size of the original file in CAS.
+    pub original_size: u64,
+    /// Sorted, non-overlapping dirty byte ranges (start, end).
+    pub dirty_ranges: Vec<(u64, u64)>,
+}
+
+impl SparseWriteState {
+    pub fn new(original_hash: String, original_size: u64) -> Self {
+        Self {
+            original_hash,
+            original_size,
+            dirty_ranges: Vec::new(),
+        }
+    }
+
+    /// Record a write at [offset, offset+len). Merges overlapping/adjacent ranges.
+    /// Uses binary search to find the affected region in O(log n + k) where k is
+    /// the number of ranges merged (typically 0-1 for sequential writes).
+    pub fn track_write(&mut self, offset: u64, len: u64) {
+        if len == 0 {
+            return;
+        }
+        // If writing past original_size, extend the range back to original_size.
+        // The gap [original_size, offset) is zeros in the sparse staging file and
+        // must be included in dirty_inputs so upload_ranges doesn't miss them
+        // (CAS has no data beyond original_size).
+        let mut new_start = if offset > self.original_size {
+            self.original_size
+        } else {
+            offset
+        };
+        let mut new_end = offset + len;
+
+        // Binary search: first range whose end >= new_start (could overlap on the left)
+        let first = self.dirty_ranges.partition_point(|&(_, e)| e < new_start);
+        // Binary search: first range whose start > new_end (past the overlap zone)
+        let last = self.dirty_ranges[first..].partition_point(|&(s, _)| s <= new_end) + first;
+
+        // Merge all overlapping ranges [first..last) into the new range
+        if first < last {
+            new_start = new_start.min(self.dirty_ranges[first].0);
+            new_end = new_end.max(self.dirty_ranges[last - 1].1);
+        }
+
+        // Replace the overlapping slice with the single merged range
+        self.dirty_ranges.splice(first..last, [(new_start, new_end)]);
+    }
+
+    /// Remove dirty ranges past `new_size` and cap overlapping ones.
+    pub fn trim_dirty_ranges(&mut self, new_size: u64) {
+        self.dirty_ranges.retain_mut(|&mut (ref s, ref mut e)| {
+            if *s >= new_size {
+                return false;
+            }
+            *e = (*e).min(new_size);
+            true
+        });
+    }
+
+    /// Clip the sparse state to a new (smaller) file size.
+    /// Removes dirty ranges past new_size, caps original_size.
+    pub fn clip_to_size(&mut self, new_size: u64) {
+        self.original_size = self.original_size.min(new_size);
+        self.trim_dirty_ranges(new_size);
+    }
 }
 
 pub struct InodeTable {
@@ -99,6 +184,8 @@ impl InodeTable {
             children: Vec::new(),
             pending_deletes: Vec::new(),
             last_revalidated: None,
+            sparse_write: None,
+            flush_generation: 0,
         };
         table.inodes.insert(ROOT_INODE, root);
         table.path_to_inode.insert(String::new(), ROOT_INODE);
@@ -198,6 +285,8 @@ impl InodeTable {
             children: Vec::new(),
             pending_deletes: Vec::new(),
             last_revalidated: Some(Instant::now()),
+            sparse_write: None,
+            flush_generation: 0,
         };
 
         self.inodes.insert(inode, entry);
@@ -1372,5 +1461,243 @@ mod tests {
         // remove_orphan should clean it up
         table.remove_orphan(file_ino);
         assert!(table.get(file_ino).is_none());
+    }
+
+    // ── SparseWriteState::track_write ───────────────────────────────
+
+    //  0    10   20   30
+    //  |    [####]    |       write(10, 10)
+    #[test]
+    fn sparse_single_write() {
+        let mut sw = SparseWriteState::new("h".into(), 100);
+        sw.track_write(10, 10);
+        assert_eq!(sw.dirty_ranges, vec![(10, 20)]);
+    }
+
+    //  len=0 → no-op, dirty_ranges unchanged
+    #[test]
+    fn sparse_zero_length_write_noop() {
+        let mut sw = SparseWriteState::new("h".into(), 100);
+        sw.track_write(10, 0);
+        assert!(sw.dirty_ranges.is_empty(), "zero-length write should be a no-op");
+        sw.track_write(50, 10);
+        sw.track_write(55, 0); // no-op inside existing range
+        assert_eq!(sw.dirty_ranges, vec![(50, 60)]);
+    }
+
+    //  0    10   20   30   40
+    //  |    [AAA]     [BBB]       two disjoint, no merge
+    #[test]
+    fn sparse_two_disjoint() {
+        let mut sw = SparseWriteState::new("h".into(), 100);
+        sw.track_write(10, 10);
+        sw.track_write(30, 10);
+        assert_eq!(sw.dirty_ranges, vec![(10, 20), (30, 40)]);
+    }
+
+    //  0    10   20  30
+    //  |    [AAA][BBB]           adjacent → merge into [10, 30)
+    #[test]
+    fn sparse_two_adjacent_merge() {
+        let mut sw = SparseWriteState::new("h".into(), 100);
+        sw.track_write(10, 10);
+        sw.track_write(20, 10);
+        assert_eq!(sw.dirty_ranges, vec![(10, 30)]);
+    }
+
+    //  0    10 15 20 25
+    //  |    [AAAA]            first
+    //  |       [BBBBB]        second overlaps → merge into [10, 25)
+    #[test]
+    fn sparse_two_overlapping_merge() {
+        let mut sw = SparseWriteState::new("h".into(), 100);
+        sw.track_write(10, 10);
+        sw.track_write(15, 10);
+        assert_eq!(sw.dirty_ranges, vec![(10, 25)]);
+    }
+
+    //  0  5  10   20 25
+    //  |     [AAA]           existing
+    //  |  [BBBBBBBBB]        new engulfs existing → [5, 25)
+    #[test]
+    fn sparse_engulf_existing() {
+        let mut sw = SparseWriteState::new("h".into(), 100);
+        sw.track_write(10, 10);
+        sw.track_write(5, 20);
+        assert_eq!(sw.dirty_ranges, vec![(5, 25)]);
+    }
+
+    //  0  5  10   20 25
+    //  |  [AAAAAAAAA]        existing
+    //  |     [BBB]           new inside existing → no change [5, 25)
+    #[test]
+    fn sparse_existing_engulfs_new() {
+        let mut sw = SparseWriteState::new("h".into(), 100);
+        sw.track_write(5, 20);
+        sw.track_write(10, 10);
+        assert_eq!(sw.dirty_ranges, vec![(5, 25)]);
+    }
+
+    //  0    10   20   30   40
+    //  |    [AA]      [CC]        two disjoint
+    //  |       [BBBBBBB]          bridges the gap → merge all into [10, 40)
+    #[test]
+    fn sparse_three_merge_into_one() {
+        let mut sw = SparseWriteState::new("h".into(), 100);
+        sw.track_write(10, 10);
+        sw.track_write(30, 10);
+        sw.track_write(15, 20);
+        assert_eq!(sw.dirty_ranges, vec![(10, 40)]);
+    }
+
+    //  0    10
+    //  [####]          write at offset 0
+    #[test]
+    fn sparse_write_at_zero() {
+        let mut sw = SparseWriteState::new("h".into(), 100);
+        sw.track_write(0, 10);
+        assert_eq!(sw.dirty_ranges, vec![(0, 10)]);
+    }
+
+    //  0         100  150
+    //  |...CAS...|[###]      write past original_size (append)
+    #[test]
+    fn sparse_append_past_size() {
+        let mut sw = SparseWriteState::new("h".into(), 100);
+        sw.track_write(100, 50);
+        assert_eq!(sw.dirty_ranges, vec![(100, 150)]);
+    }
+
+    //  0    10   20   30
+    //  [AAA][BBB][CCC]       3 sequential → merge into [0, 30)
+    #[test]
+    fn sparse_sequential_adjacent() {
+        let mut sw = SparseWriteState::new("h".into(), 100);
+        sw.track_write(0, 10);
+        sw.track_write(10, 10);
+        sw.track_write(20, 10);
+        assert_eq!(sw.dirty_ranges, vec![(0, 30)]);
+    }
+
+    //  0    10   20   30   40
+    //  |              [BBB]      inserted first (higher offset)
+    //  |    [AAA]                inserted second (lower) → sorted: [(10,20), (30,40)]
+    #[test]
+    fn sparse_reverse_order_insert() {
+        let mut sw = SparseWriteState::new("h".into(), 100);
+        sw.track_write(30, 10);
+        sw.track_write(10, 10);
+        assert_eq!(sw.dirty_ranges, vec![(10, 20), (30, 40)]);
+    }
+
+    //  0    10   20   30     50   60
+    //  |    [AAA]           [BBB]        before clip
+    //  |    [AAA]     ^                  after clip_to_size(30): B removed
+    #[test]
+    fn sparse_clip_to_size_removes_past_ranges() {
+        let mut sw = SparseWriteState::new("h".into(), 100);
+        sw.track_write(10, 10);
+        sw.track_write(50, 10);
+        sw.clip_to_size(30);
+        assert_eq!(sw.original_size, 30);
+        assert_eq!(sw.dirty_ranges, vec![(10, 20)]);
+    }
+
+    //  0  5  10 15
+    //  |  [AAAA]          before clip
+    //  |  [AAA]^          after clip_to_size(10): range capped at 10
+    #[test]
+    fn sparse_clip_to_size_caps_overlapping_range() {
+        let mut sw = SparseWriteState::new("h".into(), 100);
+        sw.track_write(5, 10);
+        sw.clip_to_size(10);
+        assert_eq!(sw.original_size, 10);
+        assert_eq!(sw.dirty_ranges, vec![(5, 10)]);
+    }
+
+    //  clip_to_size(100) on original_size=50 → no-op
+    #[test]
+    fn sparse_clip_to_size_noop_when_larger() {
+        let mut sw = SparseWriteState::new("h".into(), 50);
+        sw.track_write(10, 10);
+        sw.clip_to_size(100);
+        assert_eq!(sw.original_size, 50);
+        assert_eq!(sw.dirty_ranges, vec![(10, 20)]);
+    }
+
+    //  0                              100
+    //  [################################]   full file overwrite
+    #[test]
+    fn sparse_full_file_write() {
+        let mut sw = SparseWriteState::new("h".into(), 100);
+        sw.track_write(0, 100);
+        assert_eq!(sw.dirty_ranges, vec![(0, 100)]);
+    }
+
+    //  0  1
+    //  [#]   single byte write
+    #[test]
+    fn sparse_single_byte_write() {
+        let mut sw = SparseWriteState::new("h".into(), 100);
+        sw.track_write(50, 1);
+        assert_eq!(sw.dirty_ranges, vec![(50, 51)]);
+    }
+
+    //  Same range written twice → no change
+    #[test]
+    fn sparse_idempotent_write() {
+        let mut sw = SparseWriteState::new("h".into(), 100);
+        sw.track_write(10, 10);
+        sw.track_write(10, 10);
+        assert_eq!(sw.dirty_ranges, vec![(10, 20)]);
+    }
+
+    //  0    10   20   30   40   50   60
+    //  |    [AA]      [CC]      [EE]      3 disjoint
+    //  |       [BBBBBBBBBBBBBBBBBB]        bridges all → single [10, 60)
+    #[test]
+    fn sparse_bridge_many_ranges() {
+        let mut sw = SparseWriteState::new("h".into(), 100);
+        sw.track_write(10, 10);
+        sw.track_write(30, 10);
+        sw.track_write(50, 10);
+        assert_eq!(sw.dirty_ranges, vec![(10, 20), (30, 40), (50, 60)]);
+        sw.track_write(15, 40); // bridges all three
+        assert_eq!(sw.dirty_ranges, vec![(10, 60)]);
+    }
+
+    //  clip_to_size(0) → empties everything
+    #[test]
+    fn sparse_clip_to_zero() {
+        let mut sw = SparseWriteState::new("h".into(), 100);
+        sw.track_write(10, 10);
+        sw.track_write(50, 10);
+        sw.clip_to_size(0);
+        assert_eq!(sw.original_size, 0);
+        assert!(sw.dirty_ranges.is_empty());
+    }
+
+    //  Write at exact boundary of existing range end
+    //  0    10   20
+    //  |    [AAA]       existing
+    //  |         [B]    write at exact end → adjacent merge → [10, 21)
+    #[test]
+    fn sparse_write_at_exact_end() {
+        let mut sw = SparseWriteState::new("h".into(), 100);
+        sw.track_write(10, 10);
+        sw.track_write(20, 1);
+        assert_eq!(sw.dirty_ranges, vec![(10, 21)]);
+    }
+
+    //  Write at exact boundary of existing range start
+    //  0  9 10   20
+    //  |  [B]           write just before
+    //  |    [AAA]       existing → adjacent merge → [9, 20)
+    #[test]
+    fn sparse_write_just_before_start() {
+        let mut sw = SparseWriteState::new("h".into(), 100);
+        sw.track_write(10, 10);
+        sw.track_write(9, 1);
+        assert_eq!(sw.dirty_ranges, vec![(9, 20)]);
     }
 }
