@@ -11,7 +11,7 @@ from transformers import AutoModelForCausalLM
 model = AutoModelForCausalLM.from_pretrained("/mnt/gpt2")  # reads on demand, no download step
 ```
 
-hf-mount exposes [Hugging Face Hub](https://huggingface.co) repos and [Buckets](https://huggingface.co/docs/hub/buckets) as a local filesystem via FUSE or NFS. Files are fetched lazily on first read, so only the bytes your code actually touches ever leave the network.
+hf-mount exposes [Hugging Face Hub](https://huggingface.co) repos and [Buckets](https://huggingface.co/docs/huggingface_hub/guides/buckets) as a local filesystem via FUSE or NFS. Files are fetched lazily on first read, so only the bytes your code actually touches ever leave the network.
 
 ## Install
 
@@ -75,7 +75,7 @@ fusermount -u /tmp/gpt2   # Linux
 umount /tmp/gpt2           # macOS
 ```
 
-For private repos or [Buckets](https://huggingface.co/docs/hub/buckets), pass `--hf-token` or set the `HF_TOKEN` env var.
+For private repos or [Buckets](https://huggingface.co/docs/huggingface_hub/guides/buckets), pass `--hf-token` or set the `HF_TOKEN` env var.
 
 ## Best for / Not for
 
@@ -116,7 +116,7 @@ hf-mount-fuse repo openai-community/gpt2/onnx /mnt/onnx
 
 ### Mount a Bucket (read-write)
 
-[Buckets](https://huggingface.co/docs/hub/buckets) are HF Hub's object storage for arbitrary data (checkpoints, logs, artifacts).
+[Buckets](https://huggingface.co/docs/huggingface_hub/guides/buckets) are S3-like object storage on the Hub, designed for large-scale mutable data (training checkpoints, logs, artifacts) without git version control.
 
 ```bash
 hf-mount-fuse --hf-token $HF_TOKEN bucket myuser/my-bucket /mnt/data
