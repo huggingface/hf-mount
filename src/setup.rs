@@ -62,9 +62,9 @@ pub struct MountOptions {
     pub hf_token: Option<String>,
 
     /// Path to a file containing the API token. The file is re-read before
-    /// each Hub request, allowing the CSI driver to refresh credentials
-    /// without remounting. Takes precedence over --hf-token when the file
-    /// exists and is non-empty.
+    /// each Hub request, allowing external credential managers to refresh
+    /// tokens without remounting. Takes precedence over --hf-token when
+    /// the file exists and is non-empty.
     #[arg(long)]
     pub token_file: Option<PathBuf>,
 
@@ -72,7 +72,7 @@ pub struct MountOptions {
     #[arg(long, default_value = "https://huggingface.co")]
     pub hub_endpoint: String,
 
-    /// Directory for on-disk caches (xorb chunks, staging files)
+    /// Directory for on-disk caches (file chunks, staging files)
     #[arg(long, default_value = "/tmp/hf-mount-cache")]
     pub cache_dir: PathBuf,
 
@@ -97,12 +97,12 @@ pub struct MountOptions {
     #[arg(long, default_value_t = 30)]
     pub poll_interval_secs: u64,
 
-    /// Maximum size in bytes for the on-disk xorb chunk cache.
+    /// Maximum size in bytes for the on-disk chunk cache.
     #[arg(long, default_value_t = 10_000_000_000)]
     pub cache_size: u64,
 
-    /// Disable the on-disk xorb chunk cache. Every read fetches chunks from
-    /// the CAS network (no local disk storage between reads). Useful for
+    /// Disable the on-disk chunk cache. Every read fetches data from
+    /// HF storage (no local disk caching between reads). Useful for
     /// benchmarking without cache effects.
     #[arg(long, default_value_t = false)]
     pub no_disk_cache: bool,
@@ -212,7 +212,7 @@ pub fn init_tracing(daemon: bool) {
 
 // ── Build runtime + VFS (spawns threads) ─────────────────────────────
 
-/// Build tokio runtime, CAS client, Hub client, and VFS.
+/// Build tokio runtime, storage client, Hub client, and VFS.
 /// `is_nfs` controls whether advanced writes are forced (NFS has no open/close).
 pub fn build(source: Source, options: MountOptions, is_nfs: bool) -> MountSetup {
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -279,7 +279,7 @@ pub fn build(source: Source, options: MountOptions, is_nfs: bool) -> MountSetup 
     let refresher = hub_client.token_refresher(read_only);
     let cas_config = build_cas_config(&runtime, &refresher);
 
-    // Ensure cache directory exists and is writable (needed for staging even without xorb cache).
+    // Ensure cache directory exists and is writable (needed for staging even without chunk cache).
     std::fs::create_dir_all(&options.cache_dir)
         .unwrap_or_else(|e| panic!("Failed to create cache dir {:?}: {e}", options.cache_dir));
 
@@ -293,7 +293,7 @@ pub fn build(source: Source, options: MountOptions, is_nfs: bool) -> MountSetup 
             cache_directory: xorbs_dir,
             cache_size: options.cache_size,
         };
-        Some(get_cache(&config).expect("Failed to create xorb cache"))
+        Some(get_cache(&config).expect("Failed to create chunk cache"))
     };
 
     let raw_client = runtime
@@ -302,7 +302,7 @@ pub fn build(source: Source, options: MountOptions, is_nfs: bool) -> MountSetup 
             &uuid::Uuid::new_v4().to_string(),
             false,
         ))
-        .expect("Failed to create CAS client");
+        .expect("Failed to create storage client");
     let cached_client = CachedXetClient::new(raw_client);
     let download_session = FileDownloadSession::from_client(cached_client.clone(), None, xorb_cache);
     let upload_config = if read_only { None } else { Some(cas_config) };
@@ -411,8 +411,8 @@ pub fn setup(is_nfs: bool) -> MountSetup {
 fn build_cas_config(runtime: &tokio::runtime::Runtime, refresher: &Arc<HubTokenRefresher>) -> Arc<TranslatorConfig> {
     let jwt = runtime
         .block_on(refresher.fetch_initial())
-        .unwrap_or_else(|e| panic!("Failed to get CAS token: {e}"));
-    info!("Got CAS token for endpoint: {}", jwt.cas_url);
+        .unwrap_or_else(|e| panic!("Failed to get storage token: {e}"));
+    info!("Got storage token for endpoint: {}", jwt.cas_url);
     Arc::new(
         default_config(
             jwt.cas_url,
