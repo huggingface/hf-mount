@@ -43,8 +43,14 @@ jobs:
       - name: Format check
         run: cargo +nightly fmt --check
 
-      - name: Clippy
+      - name: Clippy (all features)
         run: cargo clippy -- -D warnings
+
+      - name: Clippy (NFS only)
+        run: cargo clippy --no-default-features --features nfs -- -D warnings
+
+      - name: Clippy (FUSE only)
+        run: cargo clippy --no-default-features --features fuse -- -D warnings
 
       - name: Unit tests
         run: cargo test --lib

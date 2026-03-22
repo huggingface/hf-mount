@@ -50,9 +50,13 @@ The NFS backend has no system dependencies. For FUSE:
 Requires Rust 1.85+.
 
 ```bash
+# NFS only (no system deps)
+cargo build --release --no-default-features --features nfs
+
+# All backends (requires FUSE libs)
+# Linux: sudo apt-get install -y fuse3 libfuse3-dev
+# macOS: brew install macfuse (requires reboot on first install)
 cargo build --release
-# FUSE on Linux: sudo apt-get install -y fuse3 libfuse3-dev
-# FUSE on macOS: brew install macfuse
 ```
 
 Binaries: `target/release/hf-mount-nfs`, `target/release/hf-mount-fuse`, `target/release/hf-mount-daemon`
