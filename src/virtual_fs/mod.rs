@@ -830,7 +830,7 @@ impl VirtualFs {
             libc::EIO
         })?;
 
-        let (tx, rx) = tokio::sync::mpsc::channel::<WriteMsg>(4);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<WriteMsg>();
         let error: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
         self.runtime
             .spawn(streaming_worker(streaming_writer, rx, error.clone()));
@@ -1616,9 +1616,8 @@ impl VirtualFs {
                     return Err(libc::EINVAL);
                 }
 
-                // Enqueue data to the background worker (blocks if channel buffer is full = backpressure)
                 let len = data.len();
-                channel.tx.blocking_send(WriteMsg::Data(data.to_vec())).map_err(|_| {
+                channel.tx.send(WriteMsg::Data(data.to_vec())).map_err(|_| {
                     error!("streaming channel closed for ino={}", handle_ino);
                     libc::EIO
                 })?;
@@ -1855,7 +1854,7 @@ impl VirtualFs {
                 info
             } else {
                 let (result_tx, result_rx) = tokio::sync::oneshot::channel();
-                if channel.tx.send(WriteMsg::Finish(result_tx)).await.is_err() {
+                if channel.tx.send(WriteMsg::Finish(result_tx)).is_err() {
                     // Channel closed: only treat as success if already committed.
                     // If the worker died from an error, this is a real failure.
                     let already_committed = matches!(&*channel.state.lock().unwrap(), CommitState::Committed);
@@ -2372,7 +2371,13 @@ impl VirtualFs {
             }
         }
 
-        // Phase 2: sync to remote (add + delete ops)
+        // Phase 2: sync to remote (add + delete ops).
+        // TOCTOU note: between this remote commit and the local apply below, a
+        // concurrent unlink/create can change local state. If that happens,
+        // rename_apply_local re-validates and returns ENOENT (source gone) or
+        // EEXIST (destination appeared). The remote state may then have a
+        // stale add+delete, but the next poll cycle or flush corrects it.
+        // A true fix would require a transactional rename API on the Hub.
         self.rename_remote(&info).await?;
 
         // Phase 3: apply to local inode table under write lock
@@ -2854,10 +2859,11 @@ enum CommitState {
 }
 
 /// Channel-based streaming handle. Decouples the sync write() caller from the
-/// async add_data() pipeline: writes enqueue data into a bounded channel, a background
-/// tokio task drains it and feeds the CAS cleaner.
+/// async add_data() pipeline: writes enqueue data into an unbounded channel
+/// (avoids deadlock when tokio worker threads are saturated by FUSE block_on calls),
+/// a background tokio task drains it and feeds the CAS cleaner.
 struct StreamingChannel {
-    tx: tokio::sync::mpsc::Sender<WriteMsg>,
+    tx: tokio::sync::mpsc::UnboundedSender<WriteMsg>,
     bytes_written: AtomicU64,
     /// Set by the background worker if add_data() fails. Shared with worker via Arc.
     error: Arc<std::sync::Mutex<Option<String>>>,
@@ -2924,7 +2930,7 @@ fn same_process(pid_a: u32, pid_b: u32) -> bool {
 /// Runs until a Finish message is received or the channel is dropped.
 async fn streaming_worker(
     mut writer: Box<dyn StreamingWriterOps>,
-    mut rx: tokio::sync::mpsc::Receiver<WriteMsg>,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<WriteMsg>,
     error: Arc<std::sync::Mutex<Option<String>>>,
 ) {
     let mut failed = false;

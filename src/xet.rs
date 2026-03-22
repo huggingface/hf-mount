@@ -188,8 +188,7 @@ pub struct StagingDir {
 impl StagingDir {
     pub fn new(cache_dir: &Path) -> Self {
         let dir = cache_dir.join("staging");
-        std::fs::create_dir_all(&dir)
-            .unwrap_or_else(|e| panic!("Failed to create staging dir {:?}: {e}", dir));
+        std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("Failed to create staging dir {:?}: {e}", dir));
         Self {
             dir,
             session_key: rand_u64(),
