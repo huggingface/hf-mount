@@ -46,7 +46,11 @@ pub struct InodeEntry {
     pub xet_hash: Option<String>,
     /// ETag from the last HEAD revalidation (used for non-xet plain git/LFS files).
     pub etag: Option<String>,
-    pub dirty: bool,
+    /// Dirty generation counter. 0 = clean. Each mutation increments the counter.
+    /// `flush_batch` snapshots the generation before upload; after commit it only
+    /// clears dirty (resets to 0) if the generation hasn't advanced, preventing
+    /// concurrent writers from silently losing their data.
+    pub dirty_generation: u64,
     pub children_loaded: bool,
     pub children: Vec<DirChild>,
     /// Old remote paths that should be deleted on next flush (set by rename of dirty files).
@@ -54,6 +58,30 @@ pub struct InodeEntry {
     /// When this inode's metadata was last validated against the remote (via HEAD).
     /// Used to avoid redundant HEAD requests within the revalidation TTL.
     pub last_revalidated: Option<Instant>,
+}
+
+impl InodeEntry {
+    /// Returns true if this inode has uncommitted changes.
+    pub fn is_dirty(&self) -> bool {
+        self.dirty_generation > 0
+    }
+
+    /// Mark the inode as dirty, incrementing the generation counter.
+    pub fn set_dirty(&mut self) {
+        self.dirty_generation += 1;
+    }
+
+    /// Clear the dirty flag, but only if the generation matches the snapshot
+    /// taken before the flush. Returns true if cleared, false if a concurrent
+    /// writer advanced the generation (meaning the inode is still dirty).
+    pub fn clear_dirty_if(&mut self, snapshot_generation: u64) -> bool {
+        if self.dirty_generation == snapshot_generation {
+            self.dirty_generation = 0;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 pub struct InodeTable {
@@ -94,7 +122,7 @@ impl InodeTable {
             symlink_target: None,
             xet_hash: None,
             etag: None,
-            dirty: false,
+            dirty_generation: 0,
             children_loaded: false,
             children: Vec::new(),
             pending_deletes: Vec::new(),
@@ -193,7 +221,7 @@ impl InodeTable {
             symlink_target: None,
             xet_hash,
             etag: None,
-            dirty: false,
+            dirty_generation: 0,
             children_loaded: kind != InodeKind::Directory, // only dirs have children to load
             children: Vec::new(),
             pending_deletes: Vec::new(),
@@ -232,12 +260,12 @@ impl InodeTable {
     pub fn dirty_inos(&self) -> Vec<u64> {
         self.inodes
             .values()
-            .filter(|e| e.kind == InodeKind::File && e.dirty && e.nlink > 0)
+            .filter(|e| e.kind == InodeKind::File && e.is_dirty() && e.nlink > 0)
             .map(|e| e.inode)
             .collect()
     }
 
-    /// Snapshot of all file entries: (ino, full_path, xet_hash, etag, size, dirty)
+    /// Snapshot of all file entries: (ino, full_path, xet_hash, etag, size, is_dirty)
     #[allow(clippy::type_complexity)]
     pub fn file_snapshot(&self) -> Vec<(u64, String, Option<String>, Option<String>, u64, bool)> {
         self.inodes
@@ -250,7 +278,7 @@ impl InodeTable {
                     e.xet_hash.clone(),
                     e.etag.clone(),
                     e.size,
-                    e.dirty,
+                    e.is_dirty(),
                 )
             })
             .collect()
@@ -266,7 +294,7 @@ impl InodeTable {
         new_mtime: SystemTime,
     ) -> bool {
         if let Some(entry) = self.inodes.get_mut(&ino) {
-            if entry.dirty {
+            if entry.is_dirty() {
                 return false;
             }
             entry.xet_hash = new_hash;
@@ -499,15 +527,24 @@ mod tests {
         );
 
         // Newly inserted inodes are not dirty
-        assert!(!table.get(ino).unwrap().dirty);
+        assert!(!table.get(ino).unwrap().is_dirty());
 
-        // Set dirty
-        table.get_mut(ino).unwrap().dirty = true;
-        assert!(table.get(ino).unwrap().dirty);
+        // Set dirty (advances generation)
+        table.get_mut(ino).unwrap().set_dirty();
+        assert!(table.get(ino).unwrap().is_dirty());
+        let dirty_gen = table.get(ino).unwrap().dirty_generation;
+        assert_eq!(dirty_gen, 1);
 
-        // Clear dirty
-        table.get_mut(ino).unwrap().dirty = false;
-        assert!(!table.get(ino).unwrap().dirty);
+        // Clear dirty with matching generation
+        assert!(table.get_mut(ino).unwrap().clear_dirty_if(dirty_gen));
+        assert!(!table.get(ino).unwrap().is_dirty());
+
+        // Set dirty twice, clear with stale generation fails
+        table.get_mut(ino).unwrap().set_dirty(); // gen=1
+        table.get_mut(ino).unwrap().set_dirty(); // gen=2
+        assert_eq!(table.get(ino).unwrap().dirty_generation, 2);
+        assert!(!table.get_mut(ino).unwrap().clear_dirty_if(1)); // stale snapshot
+        assert!(table.get(ino).unwrap().is_dirty()); // still dirty
     }
 
     #[test]
@@ -767,7 +804,7 @@ mod tests {
             0,
             0,
         );
-        table.get_mut(ino1).unwrap().dirty = true;
+        table.get_mut(ino1).unwrap().set_dirty();
 
         let ino2 = table.insert(
             ROOT_INODE,
@@ -838,7 +875,7 @@ mod tests {
         assert_eq!(entry.mtime, new_mtime);
 
         // Mark dirty — update should fail
-        table.get_mut(ino).unwrap().dirty = true;
+        table.get_mut(ino).unwrap().set_dirty();
         assert!(!table.update_remote_file(ino, Some("ignored".to_string()), None, 999, UNIX_EPOCH));
         assert_eq!(table.get(ino).unwrap().size, 200, "dirty file should not be updated");
 
@@ -1061,8 +1098,8 @@ mod tests {
             0,
             0,
         );
-        table.get_mut(file_ino).unwrap().dirty = true;
-        table.get_mut(dir_ino).unwrap().dirty = true;
+        table.get_mut(file_ino).unwrap().set_dirty();
+        table.get_mut(dir_ino).unwrap().set_dirty();
 
         let dirty = table.dirty_inos();
         assert_eq!(dirty, vec![file_ino]);

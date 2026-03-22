@@ -97,7 +97,7 @@ fn streaming_write_happy_path() {
 
         let inodes = vfs.inode_table.read().unwrap();
         let entry = inodes.get(ino).unwrap();
-        assert!(!entry.dirty);
+        assert!(!entry.is_dirty());
         assert!(entry.xet_hash.is_some());
     });
 
@@ -205,7 +205,7 @@ fn hub_commit_fail_retry_in_release() {
 
         let inodes = vfs.inode_table.read().unwrap();
         let entry = inodes.get(ino).unwrap();
-        assert!(!entry.dirty);
+        assert!(!entry.is_dirty());
         assert!(entry.xet_hash.is_some());
     });
 }
@@ -257,7 +257,7 @@ fn revert_inode_overwrite_restored() {
 
         let inodes = vfs.inode_table.read().unwrap();
         let entry = inodes.get(ino).unwrap();
-        assert!(!entry.dirty);
+        assert!(!entry.is_dirty());
         assert_eq!(entry.xet_hash.as_deref(), Some("original_hash"));
         assert_eq!(entry.size, 100);
     });
@@ -338,7 +338,7 @@ fn release_commits_without_flush() {
 
         let inodes = vfs.inode_table.read().unwrap();
         let entry = inodes.get(ino).unwrap();
-        assert!(!entry.dirty);
+        assert!(!entry.is_dirty());
     });
 }
 
@@ -811,7 +811,7 @@ fn poll_dirty_files_skipped() {
 
         {
             let mut inodes = vfs.inode_table.write().unwrap();
-            inodes.get_mut(ino).unwrap().dirty = true;
+            inodes.get_mut(ino).unwrap().set_dirty();
         }
 
         let mut inodes = vfs.inode_table.write().unwrap();
@@ -1022,7 +1022,7 @@ fn setattr_advanced_truncate_zero() {
 
         let inodes = vfs.inode_table.read().unwrap();
         let entry = inodes.get(ino).unwrap();
-        assert!(entry.dirty);
+        assert!(entry.is_dirty());
         assert!(entry.xet_hash.is_none());
     });
 }
@@ -1212,7 +1212,7 @@ fn create_and_write_advanced_mode() {
 
         let inodes = vfs.inode_table.read().unwrap();
         let entry = inodes.get(ino).unwrap();
-        assert!(entry.dirty);
+        assert!(entry.is_dirty());
     });
 }
 
@@ -1578,7 +1578,7 @@ fn open_advanced_write_truncate() {
         {
             let inodes = vfs.inode_table.read().unwrap();
             assert_eq!(inodes.get(ino).unwrap().size, 0);
-            assert!(inodes.get(ino).unwrap().dirty);
+            assert!(inodes.get(ino).unwrap().is_dirty());
         }
         vfs.release(fh).await.unwrap();
     });
@@ -1629,7 +1629,7 @@ fn setattr_truncate_nonzero() {
 
         let inodes = vfs.inode_table.read().unwrap();
         let entry = inodes.get(ino).unwrap();
-        assert!(entry.dirty);
+        assert!(entry.is_dirty());
     });
 }
 
@@ -2016,7 +2016,7 @@ fn revalidation_skips_dirty_files() {
         let attr2 = vfs.lookup(ROOT_INODE, "file.txt").await.unwrap();
         let inodes = vfs.inode_table.read().unwrap();
         let entry = inodes.get(attr2.ino).unwrap();
-        assert!(entry.dirty);
+        assert!(entry.is_dirty());
         // Hash and size must remain unchanged (not overwritten by remote)
         assert_eq!(entry.xet_hash.as_deref(), Some("hash1"));
         assert_ne!(entry.size, 500, "dirty file size should not be updated from remote");

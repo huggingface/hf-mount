@@ -817,6 +817,7 @@ impl VirtualFs {
         _ino: u64,
         pid: Option<u32>,
         snapshot: InodeSnapshot,
+        dirty_generation_at_open: u64,
     ) -> VirtualFsResult<(u64, Arc<StreamingChannel>)> {
         let streaming_writer = self.xet_sessions.create_streaming_writer().await.map_err(|e| {
             error!("Failed to create streaming writer: {}", e);
@@ -836,6 +837,7 @@ impl VirtualFs {
             pending_info: std::sync::Mutex::new(None),
             open_pid: pid,
             snapshot,
+            dirty_generation_at_open,
             commit_hook: std::sync::Mutex::new(None),
         });
 
@@ -922,7 +924,7 @@ impl VirtualFs {
             if parent_entry.children_loaded {
                 if let Some(entry) = inodes.lookup_child(parent, name) {
                     // Revalidate remote files via HEAD (xet-backed and plain git/LFS).
-                    if entry.kind == InodeKind::File && !entry.dirty {
+                    if entry.kind == InodeKind::File && !entry.is_dirty() {
                         FastResult::NeedsRevalidation {
                             ino: entry.inode,
                             full_path: entry.full_path.clone(),
@@ -1106,7 +1108,7 @@ impl VirtualFs {
             .expect("inodes poisoned")
             .get(ino)
             .ok_or(libc::ENOENT)?
-            .dirty;
+            .is_dirty();
 
         // Reuse existing dirty staging file (unless truncating)
         if !(is_dirty && staging_path.exists() && !truncate) {
@@ -1141,7 +1143,7 @@ impl VirtualFs {
         {
             let mut inodes = self.inode_table.write().expect("inodes poisoned");
             let entry = inodes.get_mut(ino).ok_or(libc::ENOENT)?;
-            entry.dirty = true;
+            entry.set_dirty();
             if truncate {
                 entry.size = 0;
                 // POSIX: O_TRUNC must update mtime and ctime
@@ -1184,16 +1186,18 @@ impl VirtualFs {
             }
         };
 
-        let (file_handle, channel) = self.setup_streaming_writer(ino, pid, snapshot).await?;
-
-        // Mark inode as dirty with size 0 (truncated)
-        {
+        // Mark inode as dirty with size 0 (truncated) and capture the generation
+        // for the streaming channel, so streaming_commit can use clear_dirty_if.
+        let dirty_gen = {
             let mut inodes = self.inode_table.write().expect("inodes poisoned");
             let entry = inodes.get_mut(ino).ok_or(libc::ENOENT)?;
-            entry.dirty = true;
+            entry.set_dirty();
             entry.size = 0;
             entry.xet_hash = None;
-        }
+            entry.dirty_generation
+        };
+
+        let (file_handle, channel) = self.setup_streaming_writer(ino, pid, snapshot, dirty_gen).await?;
 
         self.open_files
             .write()
@@ -1204,7 +1208,7 @@ impl VirtualFs {
 
     /// Open a file for reading. Dispatches based on where the content lives.
     async fn open_readonly(&self, ino: u64, fe: FileEntry, staging_path: Option<PathBuf>) -> VirtualFsResult<u64> {
-        match (fe.dirty, &staging_path) {
+        match (fe.is_dirty, &staging_path) {
             // Advanced write in progress — read from local staging file.
             (true, Some(path)) if path.exists() => self.open_local_readonly(ino, path),
 
@@ -1582,7 +1586,7 @@ impl VirtualFs {
                         if new_end > entry.size {
                             entry.size = new_end;
                         }
-                        entry.dirty = true;
+                        entry.set_dirty();
                     }
                     Ok(written)
                 }
@@ -1816,7 +1820,7 @@ impl VirtualFs {
             entry.size = snapshot.size;
             entry.mtime = snapshot.mtime;
             entry.pending_deletes = snapshot.pending_deletes.clone();
-            entry.dirty = false;
+            entry.dirty_generation = 0;
             info!(
                 "Reverted ino={}: restored (hash={:?}, size={})",
                 ino, snapshot.xet_hash, snapshot.size
@@ -1899,12 +1903,13 @@ impl VirtualFs {
             return Err(libc::EIO);
         }
 
-        // Update inode: clean, with hash
+        // Update inode: clean, with hash. Use clear_dirty_if to avoid clobbering
+        // a concurrent writer that advanced the generation since we opened.
         let mut inodes = self.inode_table.write().expect("inodes poisoned");
         if let Some(entry) = inodes.get_mut(ino) {
             entry.xet_hash = Some(file_info.hash().to_string());
             entry.size = file_info.file_size();
-            entry.dirty = false;
+            entry.clear_dirty_if(channel.dirty_generation_at_open);
             let now = SystemTime::now();
             entry.mtime = now;
             entry.ctime = now;
@@ -1945,7 +1950,7 @@ impl VirtualFs {
 
         let now = SystemTime::now();
         // Re-check parent + EEXIST + insert under one write lock (TOCTOU guard)
-        let (ino, full_path) = {
+        let (ino, full_path, dirty_gen) = {
             let mut inodes = self.inode_table.write().expect("inodes poisoned");
             let parent_entry = match inodes.get(parent) {
                 Some(e) if e.kind == InodeKind::Directory => e,
@@ -1969,11 +1974,14 @@ impl VirtualFs {
                 caller_uid,
                 caller_gid,
             );
-            if let Some(entry) = inodes.get_mut(ino) {
-                entry.dirty = true;
-            }
+            let dirty_gen = if let Some(entry) = inodes.get_mut(ino) {
+                entry.set_dirty();
+                entry.dirty_generation
+            } else {
+                0
+            };
             inodes.touch_parent(parent, now);
-            (ino, full_path)
+            (ino, full_path, dirty_gen)
         };
 
         self.negative_cache_remove(&full_path);
@@ -2025,7 +2033,7 @@ impl VirtualFs {
                 pending_deletes: Vec::new(),
                 existed_before: false,
             };
-            let (file_handle, channel) = match self.setup_streaming_writer(ino, pid, snapshot).await {
+            let (file_handle, channel) = match self.setup_streaming_writer(ino, pid, snapshot, dirty_gen).await {
                 Ok(r) => r,
                 Err(e) => {
                     self.inode_table.write().expect("inodes poisoned").remove(ino);
@@ -2420,7 +2428,7 @@ impl VirtualFs {
                     for child_ref in &entry.children {
                         if let Some(child) = inodes.get(child_ref.ino) {
                             match child.kind {
-                                InodeKind::File if !child.dirty && child.xet_hash.is_some() => {
+                                InodeKind::File if !child.is_dirty() && child.xet_hash.is_some() => {
                                     files.push((child.full_path.clone(), child.xet_hash.clone().unwrap()));
                                 }
                                 InodeKind::Directory => stack.push(child_ref.ino),
@@ -2440,7 +2448,7 @@ impl VirtualFs {
             old_path: src.full_path.clone(),
             kind: src.kind,
             xet_hash: src.xet_hash.clone(),
-            is_dirty: src.dirty,
+            is_dirty: src.is_dirty(),
             new_full_path,
             descendant_files,
         })
@@ -2581,7 +2589,7 @@ impl VirtualFs {
                 for child_ref in children {
                     if let Some(child) = inodes.get(child_ref.ino) {
                         match child.kind {
-                            InodeKind::File if child.dirty && child.xet_hash.is_some() => {
+                            InodeKind::File if child.is_dirty() && child.xet_hash.is_some() => {
                                 let old_path = child.full_path.clone();
                                 if let Some(child_mut) = inodes.get_mut(child_ref.ino) {
                                     child_mut.pending_deletes.push(old_path);
@@ -2700,7 +2708,7 @@ impl VirtualFs {
                     entry.size = new_size;
                     entry.mtime = SystemTime::now();
                     entry.ctime = entry.mtime;
-                    entry.dirty = true;
+                    entry.set_dirty();
                     if new_size == 0 {
                         entry.xet_hash = None;
                     }
@@ -2754,7 +2762,7 @@ impl VirtualFs {
         Ok(FileEntry {
             xet_hash: entry.xet_hash.clone().unwrap_or_default(),
             size: entry.size,
-            dirty: entry.dirty,
+            is_dirty: entry.is_dirty(),
             full_path: entry.full_path.clone(),
         })
     }
@@ -2805,7 +2813,7 @@ struct RenameInfo {
 struct FileEntry {
     xet_hash: String,
     size: u64,
-    dirty: bool,
+    is_dirty: bool,
     full_path: String,
 }
 
@@ -2855,6 +2863,9 @@ struct StreamingChannel {
     open_pid: Option<u32>,
     /// Pre-write inode snapshot for revert on commit failure.
     snapshot: InodeSnapshot,
+    /// Dirty generation at open time, used by streaming_commit to avoid
+    /// clobbering concurrent writers via clear_dirty_if.
+    dirty_generation_at_open: u64,
     /// Watch sender for the pending commit hook. Created in flush() on deferral,
     /// fulfilled in release() when the commit completes (or fails).
     commit_hook: std::sync::Mutex<Option<CommitHookTx>>,
