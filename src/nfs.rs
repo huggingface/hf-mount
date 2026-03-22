@@ -55,23 +55,27 @@ impl NFSAdapter {
             .await
             .map_err(errno_to_nfs)?;
         // Insert into pool (evict LRU if full)
-        let (evicted, dup_handle) = {
+        let (result, dup_handle) = {
             let mut pool = self.handle_pool.lock().expect("handle_pool poisoned");
             // Double-check: another task may have opened it concurrently
             if let Some(existing) = pool.get(ino) {
                 (None, Some((existing, file_handle)))
             } else {
-                (pool.insert(ino, file_handle), None)
+                (Some(pool.insert(ino, file_handle)), None)
             }
         };
         // Release duplicate handle outside the lock (release is async).
-        // This is a freshly-opened read-only handle, so errors are non-critical.
         if let Some((existing, dup)) = dup_handle {
             let _ = self.virtual_fs.release(dup).await;
             return Ok(existing);
         }
-        if let Some((evicted_ino, evicted_handle)) = evicted {
-            self.evict_handle(evicted_ino, evicted_handle).await;
+        if let Some(result) = result {
+            if let Some((evicted_ino, evicted_handle)) = result.evicted {
+                self.evict_handle(evicted_ino, evicted_handle).await;
+            }
+            if let Some(replaced_handle) = result.replaced {
+                let _ = self.virtual_fs.release(replaced_handle).await;
+            }
         }
         Ok(file_handle)
     }
@@ -99,12 +103,15 @@ impl NFSAdapter {
 
     /// Insert a writable handle into the pool (used after create).
     async fn insert_handle(&self, ino: u64, file_handle: u64) {
-        let evicted = {
+        let result = {
             let mut pool = self.handle_pool.lock().expect("handle_pool poisoned");
             pool.insert(ino, file_handle)
         };
-        if let Some((evicted_ino, evicted_handle)) = evicted {
+        if let Some((evicted_ino, evicted_handle)) = result.evicted {
             self.evict_handle(evicted_ino, evicted_handle).await;
+        }
+        if let Some(replaced_handle) = result.replaced {
+            self.evict_handle(ino, replaced_handle).await;
         }
     }
 }
@@ -519,6 +526,13 @@ pub async fn mount_nfs(
 
 const HANDLE_POOL_CAPACITY: usize = 64;
 
+struct InsertResult {
+    /// LRU eviction of a different ino (pool was full).
+    evicted: Option<(u64, u64)>,
+    /// Replaced handle for the same ino (e.g. read -> write upgrade).
+    replaced: Option<u64>,
+}
+
 struct HandlePool {
     handles: HashMap<u64, u64>, // ino -> file_handle
     order: VecDeque<u64>,       // ino access order (front = oldest)
@@ -560,13 +574,16 @@ impl HandlePool {
         }
     }
 
-    /// Insert a handle, returning the evicted (ino, file_handle) if pool was full.
-    fn insert(&mut self, ino: u64, file_handle: u64) -> Option<(u64, u64)> {
-        // If this ino is already in the pool (e.g. replacing read with write handle),
-        // remove the old order entry to prevent duplicates.
-        if self.handles.contains_key(&ino) {
+    /// Insert a handle. Returns evicted entries that the caller must release:
+    /// - `evicted`: LRU eviction if pool was full (different ino)
+    /// - `replaced`: old handle for the same ino (e.g. replacing read with write)
+    fn insert(&mut self, ino: u64, file_handle: u64) -> InsertResult {
+        let replaced = if self.handles.contains_key(&ino) {
             self.order_remove(ino);
-        }
+            self.handles.remove(&ino)
+        } else {
+            None
+        };
         let evicted = if self.handles.len() >= HANDLE_POOL_CAPACITY {
             self.order
                 .pop_front()
@@ -576,7 +593,7 @@ impl HandlePool {
         };
         self.handles.insert(ino, file_handle);
         self.order.push_back(ino);
-        evicted
+        InsertResult { evicted, replaced }
     }
 }
 
@@ -720,7 +737,9 @@ mod tests {
         let mut pool = HandlePool::new();
         assert!(pool.get(1).is_none());
 
-        assert!(pool.insert(1, 100).is_none());
+        let result = pool.insert(1, 100);
+        assert!(result.evicted.is_none());
+        assert!(result.replaced.is_none());
         assert_eq!(pool.get(1), Some(100));
     }
 
@@ -740,11 +759,12 @@ mod tests {
 
         // Insert one more -> evicts LRU. ino=0 was accessed last (by get above),
         // so ino=1 (oldest untouched) should be evicted.
-        let evicted = pool.insert(999, 9999);
-        assert!(evicted.is_some());
-        let (evicted_ino, evicted_fh) = evicted.unwrap();
+        let result = pool.insert(999, 9999);
+        assert!(result.evicted.is_some());
+        let (evicted_ino, evicted_fh) = result.evicted.unwrap();
         assert_eq!(evicted_ino, 1);
         assert_eq!(evicted_fh, 1001);
+        assert!(result.replaced.is_none());
 
         // ino=1 is gone
         assert!(pool.get(1).is_none());
@@ -758,7 +778,9 @@ mod tests {
         pool.insert(1, 100);
         pool.insert(2, 200);
         // Re-insert ino=1 with new handle (e.g. replacing read with write)
-        pool.insert(1, 101);
+        let result = pool.insert(1, 101);
+        assert_eq!(result.replaced, Some(100), "old handle should be returned for release");
+        assert!(result.evicted.is_none());
 
         assert_eq!(pool.get(1), Some(101));
         // order should have exactly 2 entries, not 3
@@ -779,9 +801,9 @@ mod tests {
         for i in 4..=HANDLE_POOL_CAPACITY as u64 {
             pool.insert(i, i * 100);
         }
-        let evicted = pool.insert(999, 9999);
+        let result = pool.insert(999, 9999);
         // ino=2 should be evicted (oldest after ino=1 was promoted)
-        assert_eq!(evicted, Some((2, 200)));
+        assert_eq!(result.evicted, Some((2, 200)));
     }
 
     #[test]

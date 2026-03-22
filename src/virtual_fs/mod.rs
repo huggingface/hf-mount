@@ -872,6 +872,9 @@ impl VirtualFs {
             }
         }
         // Advanced-writes: flush staging file to Hub immediately.
+        // Note: if the flush_loop is concurrently processing this inode, both may
+        // upload the same content. This is benign (idempotent commit, generation-aware
+        // clear ensures only one clears dirty).
         let staging_dir = match &self.staging_dir {
             Some(sd) => sd,
             None => return Ok(()),
