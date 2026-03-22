@@ -170,18 +170,11 @@ pub struct MountSetup {
     pub metadata_ttl_ms: u64,
 }
 
-/// Guard: panics if init_tracing is called after the tokio runtime is up.
-static TRACING_INITIALIZED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-
 // ── Tracing + env vars (no threads) ──────────────────────────────────
 
 /// Initialize tracing and xet-core env vars.
 /// No threads are spawned. Safe to fork() after this returns.
-/// Panics if called more than once (prevents unsafe set_var after threads exist).
 pub fn init_tracing(daemon: bool) {
-    if TRACING_INITIALIZED.set(()).is_err() {
-        panic!("init_tracing called more than once");
-    }
     // Use RUST_LOG if set, otherwise default to hf_mount=info.
     let filter = if std::env::var("RUST_LOG").is_ok() {
         tracing_subscriber::EnvFilter::from_default_env()
