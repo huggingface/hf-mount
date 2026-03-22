@@ -2388,3 +2388,36 @@ fn fsync_advanced_writes_commits() {
         vfs.release(fh).await.unwrap();
     });
 }
+
+/// After fsync commits, a subsequent write re-dirties the inode.
+#[test]
+fn fsync_then_write_redirties() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_advanced(&hub, &xet);
+
+    rt.block_on(async {
+        let (_, fh) = vfs.create(ROOT_INODE, "redirty", 0o644, 0, 0, None).await.unwrap();
+        let ino = ROOT_INODE + 1;
+
+        // Write + fsync -> clean
+        write_blocking(&vfs, ino, fh, 0, b"initial");
+        assert!(vfs.inode_table.read().unwrap().get(ino).unwrap().is_dirty());
+
+        vfs.fsync(ino, fh, None).await.unwrap();
+        assert!(
+            !vfs.inode_table.read().unwrap().get(ino).unwrap().is_dirty(),
+            "should be clean after fsync"
+        );
+
+        // Write again -> must re-dirty
+        let result = vfs.write(ino, fh, 0, b"more");
+        assert!(result.is_ok(), "write after fsync should succeed");
+        assert!(
+            vfs.inode_table.read().unwrap().get(ino).unwrap().is_dirty(),
+            "should be dirty again after write"
+        );
+
+        vfs.release(fh).await.unwrap();
+    });
+}
