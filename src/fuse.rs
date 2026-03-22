@@ -261,6 +261,13 @@ impl Filesystem for FuseAdapter {
         }
     }
 
+    fn fsync(&self, _req: &Request, ino: INodeNo, _fh: FileHandle, _datasync: bool, reply: ReplyEmpty) {
+        match self.runtime.block_on(self.virtual_fs.fsync(ino.0)) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(Errno::from_i32(e)),
+        }
+    }
+
     /// Called when all references to a file handle are closed. Triggers async flush to Hub.
     fn release(
         &self,

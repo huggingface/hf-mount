@@ -842,6 +842,79 @@ impl VirtualFs {
         }
     }
 
+    /// Synchronous fsync for advanced-writes mode: upload the staging file
+    /// and commit to Hub immediately (bypasses the debounced flush queue).
+    /// No-op for streaming writes (handled by flush/release) and clean files.
+    pub async fn fsync(&self, ino: u64) -> VirtualFsResult<()> {
+        let staging_dir = match &self.staging_dir {
+            Some(sd) => sd,
+            None => return Ok(()),
+        };
+
+        let (full_path, dirty_gen, pending_deletes) = {
+            let inodes = self.inode_table.read().expect("inodes poisoned");
+            let entry = match inodes.get(ino) {
+                Some(e) if e.is_dirty() => e,
+                _ => return Ok(()),
+            };
+            (
+                entry.full_path.clone(),
+                entry.dirty_generation,
+                entry.pending_deletes.clone(),
+            )
+        };
+
+        let staging_path = staging_dir.path(ino);
+        if !staging_path.exists() {
+            return Ok(());
+        }
+
+        // Upload staging file
+        let upload_results = self
+            .xet_sessions
+            .upload_files(&[staging_path.as_path()])
+            .await
+            .map_err(|e| {
+                error!("fsync upload failed for ino={}: {}", ino, e);
+                libc::EIO
+            })?;
+        let file_info = &upload_results[0];
+
+        // Commit to Hub
+        let mtime_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let mut ops = vec![BatchOp::AddFile {
+            path: full_path.clone(),
+            xet_hash: file_info.hash().to_string(),
+            mtime: mtime_ms,
+            content_type: None,
+        }];
+        for old_path in &pending_deletes {
+            ops.push(BatchOp::DeleteFile { path: old_path.clone() });
+        }
+        self.hub_client.batch_operations(&ops).await.map_err(|e| {
+            error!("fsync commit failed for {}: {}", full_path, e);
+            libc::EIO
+        })?;
+
+        // Update inode (generation-aware clear)
+        let mut inodes = self.inode_table.write().expect("inodes poisoned");
+        if let Some(entry) = inodes.get_mut(ino) {
+            entry.xet_hash = Some(file_info.hash().to_string());
+            entry.size = file_info.file_size();
+            entry.clear_dirty_if(dirty_gen);
+            let now = SystemTime::now();
+            entry.mtime = now;
+            entry.ctime = now;
+            entry.pending_deletes.clear();
+        }
+
+        info!("fsync: committed ino={} path={}", ino, full_path);
+        Ok(())
+    }
+
     pub fn getattr(&self, ino: u64) -> VirtualFsResult<VirtualFsAttr> {
         debug!("getattr: ino={}", ino);
 
