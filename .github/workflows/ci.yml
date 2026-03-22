@@ -113,7 +113,7 @@ jobs:
   xfstests:
     name: xfstests (filesystem exerciser)
     runs-on:
-      group: hf-mount-ci
+      group: hf-mount-ci-m5dn-24xlarge
     needs: lint-test
     env:
       HF_TOKEN: ${{ secrets.HF_TOKEN_HUB_CI }}
