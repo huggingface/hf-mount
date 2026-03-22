@@ -375,7 +375,6 @@ pub async fn mount_nfs(
     let vfs_for_shutdown = virtual_fs.clone();
     let adapter = NFSAdapter::new(virtual_fs, read_only);
     let pool_for_shutdown = adapter.handle_pool.clone();
-    let vfs_for_drain = vfs_for_shutdown.clone();
     let mut listener = NFSTcpListener::bind("127.0.0.1:0", adapter).await?;
     let port = listener.get_listen_port();
     info!("NFS server listening on 127.0.0.1:{}", port);
@@ -493,13 +492,10 @@ pub async fn mount_nfs(
     }
 
     // Drain handle pool: flush and release all cached handles before VFS shutdown.
-    let entries: Vec<(u64, u64)> = {
-        let mut pool = pool_for_shutdown.lock().expect("handle_pool poisoned");
-        pool.handles.drain().collect()
-    };
+    let entries = pool_for_shutdown.lock().expect("handle_pool poisoned").drain();
     for (ino, file_handle) in entries {
-        let _ = vfs_for_drain.flush(ino, file_handle, None).await;
-        let _ = vfs_for_drain.release(file_handle).await;
+        let _ = vfs_for_shutdown.flush(ino, file_handle, None).await;
+        let _ = vfs_for_shutdown.release(file_handle).await;
     }
 
     vfs_for_shutdown.shutdown();
@@ -538,11 +534,7 @@ impl HandlePool {
 
     fn get(&mut self, ino: u64) -> Option<u64> {
         if let Some(&file_handle) = self.handles.get(&ino) {
-            // Move to back (MRU). Find position and rotate instead of retain (O(n) either way
-            // for VecDeque, but avoids reallocating and handles duplicates correctly).
-            if let Some(pos) = self.order.iter().position(|&i| i == ino) {
-                self.order.remove(pos);
-            }
+            self.order_remove(ino);
             self.order.push_back(ino);
             Some(file_handle)
         } else {
@@ -553,6 +545,16 @@ impl HandlePool {
     /// Remove an entry from the pool (both handles map and order deque).
     fn remove(&mut self, ino: u64) {
         self.handles.remove(&ino);
+        self.order_remove(ino);
+    }
+
+    /// Drain all entries, returning (ino, file_handle) pairs.
+    fn drain(&mut self) -> Vec<(u64, u64)> {
+        self.order.clear();
+        self.handles.drain().collect()
+    }
+
+    fn order_remove(&mut self, ino: u64) {
         if let Some(pos) = self.order.iter().position(|&i| i == ino) {
             self.order.remove(pos);
         }
@@ -562,10 +564,8 @@ impl HandlePool {
     fn insert(&mut self, ino: u64, file_handle: u64) -> Option<(u64, u64)> {
         // If this ino is already in the pool (e.g. replacing read with write handle),
         // remove the old order entry to prevent duplicates.
-        if self.handles.contains_key(&ino)
-            && let Some(pos) = self.order.iter().position(|&i| i == ino)
-        {
-            self.order.remove(pos);
+        if self.handles.contains_key(&ino) {
+            self.order_remove(ino);
         }
         let evicted = if self.handles.len() >= HANDLE_POOL_CAPACITY {
             self.order

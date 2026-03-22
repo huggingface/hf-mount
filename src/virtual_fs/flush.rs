@@ -308,14 +308,7 @@ pub(crate) async fn flush_one(
 
     let mut inode_table = inodes.write().expect("inodes poisoned");
     if let Some(entry) = inode_table.get_mut(ino) {
-        entry.xet_hash = Some(file_info.hash().to_string());
-        entry.size = file_info.file_size();
-        if entry.clear_dirty_if(item.dirty_generation) {
-            entry.pending_deletes.clear();
-        }
-        let now = SystemTime::now();
-        entry.mtime = now;
-        entry.ctime = now;
+        entry.apply_commit(file_info.hash(), file_info.file_size(), item.dirty_generation);
     }
 
     info!("flush_one: committed ino={} path={}", ino, item.full_path);
@@ -455,24 +448,10 @@ async fn flush_batch(
         info!("Batch commit retry succeeded");
     }
 
-    // Update inodes. Only clear dirty if the generation hasn't advanced since
-    // our snapshot, preventing concurrent writers from losing their data.
     let mut inode_table = inodes.write().expect("inodes poisoned");
-    let now = SystemTime::now();
     for (item, file_info) in to_flush.iter().zip(upload_results.iter()) {
         if let Some(entry) = inode_table.get_mut(item.ino) {
-            entry.xet_hash = Some(file_info.hash().to_string());
-            entry.size = file_info.file_size();
-            if entry.clear_dirty_if(item.dirty_generation) {
-                entry.pending_deletes.clear();
-            } else {
-                debug!(
-                    "flush: ino={} dirty generation advanced ({} -> {}), keeping dirty",
-                    item.ino, item.dirty_generation, entry.dirty_generation
-                );
-            }
-            entry.mtime = now;
-            entry.ctime = now;
+            entry.apply_commit(file_info.hash(), file_info.file_size(), item.dirty_generation);
         }
     }
 

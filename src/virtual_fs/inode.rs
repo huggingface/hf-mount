@@ -82,6 +82,19 @@ impl InodeEntry {
             false
         }
     }
+
+    /// Apply a successful commit: update hash, size, timestamps, and
+    /// conditionally clear dirty + pending_deletes if the generation matches.
+    pub fn apply_commit(&mut self, hash: &str, size: u64, dirty_generation: u64) {
+        self.xet_hash = Some(hash.to_string());
+        self.size = size;
+        if self.clear_dirty_if(dirty_generation) {
+            self.pending_deletes.clear();
+        }
+        let now = SystemTime::now();
+        self.mtime = now;
+        self.ctime = now;
+    }
 }
 
 pub struct InodeTable {

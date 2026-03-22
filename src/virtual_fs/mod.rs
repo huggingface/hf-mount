@@ -1060,8 +1060,6 @@ impl VirtualFs {
             }
         };
 
-        // Mark inode as dirty with size 0 (truncated) and capture the generation
-        // for the streaming channel, so streaming_commit can use clear_dirty_if.
         let dirty_gen = {
             let mut inodes = self.inode_table.write().expect("inodes poisoned");
             let entry = inodes.get_mut(ino).ok_or(libc::ENOENT)?;
@@ -1776,18 +1774,13 @@ impl VirtualFs {
             return Err(libc::EIO);
         }
 
-        // Update inode: clean, with hash. Use clear_dirty_if to avoid clobbering
-        // a concurrent writer that advanced the generation since we opened.
         let mut inodes = self.inode_table.write().expect("inodes poisoned");
         if let Some(entry) = inodes.get_mut(ino) {
-            entry.xet_hash = Some(file_info.hash().to_string());
-            entry.size = file_info.file_size();
-            if entry.clear_dirty_if(channel.dirty_generation_at_open) {
-                entry.pending_deletes.clear();
-            }
-            let now = SystemTime::now();
-            entry.mtime = now;
-            entry.ctime = now;
+            entry.apply_commit(
+                file_info.hash(),
+                file_info.file_size(),
+                channel.dirty_generation_at_open,
+            );
         }
 
         info!(
