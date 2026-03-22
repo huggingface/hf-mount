@@ -87,6 +87,14 @@ jobs:
           HF_ENDPOINT: https://huggingface.co
         run: unset HF_TOKEN && cargo test --release --test repo_ops -- --test-threads=1 --nocapture
 
+      - name: fsx (data integrity)
+        timeout-minutes: 10
+        run: cargo test --release --test fsx -- --test-threads=1 --nocapture
+
+      - name: xfstests (filesystem exerciser)
+        timeout-minutes: 10
+        run: cargo test --release --test xfstests -- --test-threads=1 --nocapture
+
   pjdfstest:
     name: POSIX Compliance (pjdfstest)
     runs-on:
