@@ -362,6 +362,8 @@ pub async fn mount_nfs(
 ) -> std::io::Result<()> {
     let vfs_for_shutdown = virtual_fs.clone();
     let adapter = NFSAdapter::new(virtual_fs, read_only);
+    let pool_for_shutdown = adapter.handle_pool.clone();
+    let vfs_for_drain = vfs_for_shutdown.clone();
     let mut listener = NFSTcpListener::bind("127.0.0.1:0", adapter).await?;
     let port = listener.get_listen_port();
     info!("NFS server listening on 127.0.0.1:{}", port);
@@ -476,6 +478,16 @@ pub async fn mount_nfs(
                 }
             }
         }
+    }
+
+    // Drain handle pool: flush and release all cached handles before VFS shutdown.
+    let entries: Vec<(u64, u64)> = {
+        let mut pool = pool_for_shutdown.lock().expect("handle_pool poisoned");
+        pool.handles.drain().collect()
+    };
+    for (ino, file_handle) in entries {
+        let _ = vfs_for_drain.flush(ino, file_handle, None).await;
+        let _ = vfs_for_drain.release(file_handle).await;
     }
 
     vfs_for_shutdown.shutdown();

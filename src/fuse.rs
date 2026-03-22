@@ -517,16 +517,20 @@ pub fn mount_fuse(
     if read_only {
         config.mount_options.push(fuser::MountOption::RO);
     }
-    // macFUSE: show the volume in Finder sidebar
+    // macFUSE: show the volume in Finder sidebar.
+    // Skip volname if the mount path basename contains a comma (would corrupt
+    // the comma-separated FUSE -o option list).
     #[cfg(target_os = "macos")]
     {
         let volname = mount_point
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "hf-mount".to_string());
-        config
-            .mount_options
-            .push(fuser::MountOption::CUSTOM(format!("volname={volname}")));
+        if !volname.contains(',') {
+            config
+                .mount_options
+                .push(fuser::MountOption::CUSTOM(format!("volname={volname}")));
+        }
         config
             .mount_options
             .push(fuser::MountOption::CUSTOM("local".to_string()));
