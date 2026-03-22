@@ -87,12 +87,50 @@ jobs:
           HF_ENDPOINT: https://huggingface.co
         run: unset HF_TOKEN && cargo test --release --test repo_ops -- --test-threads=1 --nocapture
 
-      - name: fsx (data integrity)
+  fsx:
+    name: fsx (data integrity)
+    runs-on:
+      group: hf-mount-ci
+    needs: lint-test
+    env:
+      HF_TOKEN: ${{ secrets.HF_TOKEN_HUB_CI }}
+      HF_ENDPOINT: https://hub-ci.huggingface.co
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fuse3 libfuse3-dev
+          echo 'user_allow_other' | sudo tee -a /etc/fuse.conf
+      - name: Build
+        run: cargo build --release
+      - name: fsx
         timeout-minutes: 10
         run: cargo test --release --test fsx -- --test-threads=1 --nocapture
 
-      - name: xfstests (filesystem exerciser)
-        timeout-minutes: 10
+  xfstests:
+    name: xfstests (filesystem exerciser)
+    runs-on:
+      group: hf-mount-ci
+    needs: lint-test
+    env:
+      HF_TOKEN: ${{ secrets.HF_TOKEN_HUB_CI }}
+      HF_ENDPOINT: https://hub-ci.huggingface.co
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fuse3 libfuse3-dev
+          echo 'user_allow_other' | sudo tee -a /etc/fuse.conf
+      - name: Build
+        run: cargo build --release
+      - name: xfstests
+        timeout-minutes: 15
         run: cargo test --release --test xfstests -- --test-threads=1 --nocapture
 
   pjdfstest:
