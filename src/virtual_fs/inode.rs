@@ -1503,8 +1503,10 @@ mod tests {
         let entry = table.get(file_ino).unwrap();
         assert_eq!(entry.nlink, 0);
 
-        // remove_orphan should clean it up
+        // remove_orphan should clean up both inodes map and path_to_inode
+        let path = entry.full_path.clone();
         table.remove_orphan(file_ino);
         assert!(table.get(file_ino).is_none());
+        assert!(table.get_by_path(&path).is_none(), "path_to_inode should be cleaned up");
     }
 }
