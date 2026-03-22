@@ -2328,3 +2328,63 @@ fn stream_calls_record_bounded_end_for_seek_reads() {
         vfs.release(fh).await.unwrap();
     });
 }
+
+/// fsync on a streaming handle is a no-op (doesn't tear down the writer).
+/// Writes after fsync must still succeed.
+#[test]
+fn fsync_streaming_noop() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let (_, fh) = vfs.create(ROOT_INODE, "fsync_test", 0o644, 0, 0, None).await.unwrap();
+        let ino = ROOT_INODE + 1;
+
+        // Write some data
+        write_blocking(&vfs, ino, fh, 0, b"hello");
+
+        // fsync should succeed (no-op for streaming)
+        vfs.fsync(ino, fh, None).await.unwrap();
+
+        // Write more data after fsync -- must not fail
+        write_blocking(&vfs, ino, fh, 5, b" world");
+
+        // flush + release commit the full data
+        vfs.flush(ino, fh, None).await.unwrap();
+        vfs.release(fh).await.unwrap();
+
+        let entry = vfs.inode_table.read().unwrap().get(ino).unwrap().clone();
+        assert!(!entry.is_dirty());
+        assert!(entry.xet_hash.is_some());
+    });
+}
+
+/// fsync on an advanced-writes handle triggers a synchronous flush to Hub.
+#[test]
+fn fsync_advanced_writes_commits() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_advanced(&hub, &xet);
+
+    rt.block_on(async {
+        let (_, fh) = vfs.create(ROOT_INODE, "fsync_adv", 0o644, 0, 0, None).await.unwrap();
+        let ino = ROOT_INODE + 1;
+
+        // Write data (goes to staging file)
+        write_blocking(&vfs, ino, fh, 0, b"advanced data");
+
+        // Before fsync: inode is dirty
+        assert!(vfs.inode_table.read().unwrap().get(ino).unwrap().is_dirty());
+
+        // fsync triggers synchronous flush
+        vfs.fsync(ino, fh, None).await.unwrap();
+
+        // After fsync: inode is clean, hash is set
+        let entry = vfs.inode_table.read().unwrap().get(ino).unwrap().clone();
+        assert!(!entry.is_dirty());
+        assert!(entry.xet_hash.is_some());
+
+        vfs.release(fh).await.unwrap();
+    });
+}

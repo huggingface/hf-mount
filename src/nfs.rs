@@ -783,4 +783,46 @@ mod tests {
         // ino=2 should be evicted (oldest after ino=1 was promoted)
         assert_eq!(evicted, Some((2, 200)));
     }
+
+    #[test]
+    fn handle_pool_remove() {
+        let mut pool = HandlePool::new();
+        pool.insert(1, 100);
+        pool.insert(2, 200);
+        pool.insert(3, 300);
+
+        pool.remove(2);
+        assert!(pool.get(2).is_none());
+        assert_eq!(pool.order.len(), 2);
+        assert_eq!(pool.handles.len(), 2);
+        // Remaining entries still work
+        assert_eq!(pool.get(1), Some(100));
+        assert_eq!(pool.get(3), Some(300));
+    }
+
+    #[test]
+    fn handle_pool_drain() {
+        let mut pool = HandlePool::new();
+        pool.insert(1, 100);
+        pool.insert(2, 200);
+        pool.insert(3, 300);
+
+        let entries = pool.drain();
+        assert_eq!(entries.len(), 3);
+        assert!(pool.handles.is_empty());
+        assert!(pool.order.is_empty());
+        // Entries contain all inserted pairs
+        assert!(entries.contains(&(1, 100)));
+        assert!(entries.contains(&(2, 200)));
+        assert!(entries.contains(&(3, 300)));
+    }
+
+    #[test]
+    fn handle_pool_remove_nonexistent() {
+        let mut pool = HandlePool::new();
+        pool.insert(1, 100);
+        pool.remove(999); // no-op
+        assert_eq!(pool.get(1), Some(100));
+        assert_eq!(pool.order.len(), 1);
+    }
 }

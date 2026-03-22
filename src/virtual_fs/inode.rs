@@ -565,6 +565,86 @@ mod tests {
     }
 
     #[test]
+    fn apply_commit_clears_dirty_and_updates_metadata() {
+        let mut table = InodeTable::new();
+        let ino = table.insert(
+            ROOT_INODE,
+            "test".to_string(),
+            "test".to_string(),
+            InodeKind::File,
+            100,
+            UNIX_EPOCH,
+            Some("old_hash".to_string()),
+            0o644,
+            0,
+            0,
+        );
+        let entry = table.get_mut(ino).unwrap();
+        entry.set_dirty();
+        entry.pending_deletes.push("old_path".to_string());
+        let snap = entry.dirty_generation;
+
+        entry.apply_commit("new_hash", 200, snap);
+
+        assert!(!entry.is_dirty());
+        assert_eq!(entry.xet_hash.as_deref(), Some("new_hash"));
+        assert_eq!(entry.size, 200);
+        assert!(entry.pending_deletes.is_empty());
+        assert!(entry.mtime > UNIX_EPOCH);
+    }
+
+    #[test]
+    fn apply_commit_keeps_dirty_on_generation_mismatch() {
+        let mut table = InodeTable::new();
+        let ino = table.insert(
+            ROOT_INODE,
+            "test".to_string(),
+            "test".to_string(),
+            InodeKind::File,
+            100,
+            UNIX_EPOCH,
+            Some("old_hash".to_string()),
+            0o644,
+            0,
+            0,
+        );
+        let entry = table.get_mut(ino).unwrap();
+        entry.set_dirty(); // gen=1
+        entry.pending_deletes.push("old_path".to_string());
+        entry.set_dirty(); // gen=2 (simulates concurrent writer)
+
+        entry.apply_commit("new_hash", 200, 1); // stale snapshot
+
+        // Hash and size updated, but dirty NOT cleared and pending_deletes preserved
+        assert!(entry.is_dirty());
+        assert_eq!(entry.xet_hash.as_deref(), Some("new_hash"));
+        assert_eq!(entry.size, 200);
+        assert_eq!(entry.pending_deletes.len(), 1);
+    }
+
+    #[test]
+    fn set_dirty_saturates() {
+        let mut table = InodeTable::new();
+        let ino = table.insert(
+            ROOT_INODE,
+            "test".to_string(),
+            "test".to_string(),
+            InodeKind::File,
+            0,
+            UNIX_EPOCH,
+            None,
+            0o644,
+            0,
+            0,
+        );
+        let entry = table.get_mut(ino).unwrap();
+        entry.dirty_generation = u64::MAX;
+        entry.set_dirty();
+        assert_eq!(entry.dirty_generation, u64::MAX); // saturated, not wrapped to 0
+        assert!(entry.is_dirty());
+    }
+
+    #[test]
     fn test_remove() {
         let mut table = InodeTable::new();
 
