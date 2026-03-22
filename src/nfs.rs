@@ -144,15 +144,11 @@ impl NFSFileSystem for NFSAdapter {
         match self.virtual_fs.read(file_handle, offset, count).await {
             Ok((bytes, eof)) => Ok((bytes.to_vec(), eof)),
             Err(libc::EBADF) => {
-                // Handle was evicted by a concurrent operation. Remove stale
-                // pool entry (both handles and order), re-open, and retry once.
+                // Handle was evicted by a concurrent operation between
+                // get_or_open_handle and read. Purge stale pool entry so the
+                // next call re-opens cleanly. Return STALE so the NFS client retries.
                 self.handle_pool.lock().expect("handle_pool poisoned").remove(id);
-                let file_handle = self.get_or_open_handle(id).await?;
-                self.virtual_fs
-                    .read(file_handle, offset, count)
-                    .await
-                    .map(|(b, eof)| (b.to_vec(), eof))
-                    .map_err(errno_to_nfs)
+                Err(nfsstat3::NFS3ERR_STALE)
             }
             Err(e) => Err(errno_to_nfs(e)),
         }
