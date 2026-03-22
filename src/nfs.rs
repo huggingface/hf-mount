@@ -704,3 +704,77 @@ fn nfstime_to_system_time(t: nfstime3) -> SystemTime {
     let nsec = t.nseconds.min(999_999_999);
     UNIX_EPOCH + std::time::Duration::new(t.seconds as u64, nsec)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn handle_pool_basic() {
+        let mut pool = HandlePool::new();
+        assert!(pool.get(1).is_none());
+
+        assert!(pool.insert(1, 100).is_none());
+        assert_eq!(pool.get(1), Some(100));
+    }
+
+    #[test]
+    fn handle_pool_lru_eviction() {
+        let mut pool = HandlePool::new();
+        // Fill pool to capacity
+        for i in 0..HANDLE_POOL_CAPACITY as u64 {
+            pool.insert(i, i + 1000);
+        }
+        // All entries present
+        assert_eq!(pool.get(0), Some(1000));
+        assert_eq!(
+            pool.get(HANDLE_POOL_CAPACITY as u64 - 1),
+            Some(1000 + HANDLE_POOL_CAPACITY as u64 - 1)
+        );
+
+        // Insert one more -> evicts LRU. ino=0 was accessed last (by get above),
+        // so ino=1 (oldest untouched) should be evicted.
+        let evicted = pool.insert(999, 9999);
+        assert!(evicted.is_some());
+        let (evicted_ino, evicted_fh) = evicted.unwrap();
+        assert_eq!(evicted_ino, 1);
+        assert_eq!(evicted_fh, 1001);
+
+        // ino=1 is gone
+        assert!(pool.get(1).is_none());
+        // ino=999 is present
+        assert_eq!(pool.get(999), Some(9999));
+    }
+
+    #[test]
+    fn handle_pool_no_duplicate_on_reinsert() {
+        let mut pool = HandlePool::new();
+        pool.insert(1, 100);
+        pool.insert(2, 200);
+        // Re-insert ino=1 with new handle (e.g. replacing read with write)
+        pool.insert(1, 101);
+
+        assert_eq!(pool.get(1), Some(101));
+        // order should have exactly 2 entries, not 3
+        assert_eq!(pool.order.len(), 2);
+    }
+
+    #[test]
+    fn handle_pool_get_promotes_to_mru() {
+        let mut pool = HandlePool::new();
+        pool.insert(1, 100);
+        pool.insert(2, 200);
+        pool.insert(3, 300);
+
+        // Access ino=1 (oldest), promoting it to MRU
+        pool.get(1);
+
+        // Fill pool to capacity, then insert one more
+        for i in 4..=HANDLE_POOL_CAPACITY as u64 {
+            pool.insert(i, i * 100);
+        }
+        let evicted = pool.insert(999, 9999);
+        // ino=2 should be evicted (oldest after ino=1 was promoted)
+        assert_eq!(evicted, Some((2, 200)));
+    }
+}

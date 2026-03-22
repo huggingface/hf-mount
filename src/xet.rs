@@ -208,11 +208,14 @@ impl StagingDir {
 }
 
 fn rand_u64() -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    std::time::Instant::now().hash(&mut hasher);
-    std::process::id().hash(&mut hasher);
-    hasher.finish()
+    // Read 8 bytes from the OS CSPRNG for staging file path unpredictability.
+    let mut buf = [0u8; 8];
+    std::io::Read::read_exact(
+        &mut std::fs::File::open("/dev/urandom").expect("/dev/urandom"),
+        &mut buf,
+    )
+    .expect("read /dev/urandom");
+    u64::from_ne_bytes(buf)
 }
 
 // ── StreamingWriter ────────────────────────────────────────────────────
