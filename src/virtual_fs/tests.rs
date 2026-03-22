@@ -2389,6 +2389,55 @@ fn fsync_advanced_writes_commits() {
     });
 }
 
+/// Race test: a concurrent writer advances dirty_generation while fsync is
+/// mid-flight (between upload and Hub commit). The inode must stay dirty
+/// because the concurrent writer's data hasn't been flushed yet.
+#[test]
+fn dirty_generation_race_with_concurrent_writer() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_advanced(&hub, &xet);
+
+    rt.block_on(async {
+        let (_, fh) = vfs.create(ROOT_INODE, "race", 0o644, 0, 0, None).await.unwrap();
+        let ino = ROOT_INODE + 1;
+        write_blocking(&vfs, ino, fh, 0, b"writer A");
+
+        // Set a barrier on batch_operations: fsync will pause after upload,
+        // before commit. We inject a concurrent write at that point.
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+        hub.set_batch_barrier(barrier.clone());
+
+        // Launch fsync in background — it will block at the barrier inside batch_operations
+        let vfs2 = vfs.clone();
+        let fsync_handle = tokio::spawn(async move { vfs2.fsync(ino, fh, None).await });
+
+        // Wait for fsync to reach the barrier (upload done, about to commit)
+        barrier.wait().await;
+
+        // Concurrent writer B advances the generation while fsync is mid-commit
+        vfs.inode_table.write().unwrap().get_mut(ino).unwrap().set_dirty();
+
+        // Clear barrier so future batch_operations don't block
+        hub.set_batch_barrier(std::sync::Arc::new(tokio::sync::Barrier::new(1)));
+
+        // fsync completes (batch_operations proceeds after barrier)
+        fsync_handle.await.unwrap().unwrap();
+
+        // Inode must STILL be dirty: writer B advanced the generation,
+        // so clear_dirty_if(snapshot) returned false.
+        let entry = vfs.inode_table.read().unwrap().get(ino).unwrap().clone();
+        assert!(
+            entry.is_dirty(),
+            "inode must stay dirty when concurrent writer advanced generation during flush"
+        );
+        // But the hash WAS updated (the upload+commit succeeded)
+        assert!(entry.xet_hash.is_some());
+
+        vfs.release(fh).await.unwrap();
+    });
+}
+
 /// After fsync commits, a subsequent write re-dirties the inode.
 #[test]
 fn fsync_then_write_redirties() {
