@@ -145,12 +145,8 @@ impl NFSFileSystem for NFSAdapter {
             Ok((bytes, eof)) => Ok((bytes.to_vec(), eof)),
             Err(libc::EBADF) => {
                 // Handle was evicted by a concurrent operation. Remove stale
-                // pool entry, re-open, and retry once.
-                self.handle_pool
-                    .lock()
-                    .expect("handle_pool poisoned")
-                    .handles
-                    .remove(&id);
+                // pool entry (both handles and order), re-open, and retry once.
+                self.handle_pool.lock().expect("handle_pool poisoned").remove(id);
                 let file_handle = self.get_or_open_handle(id).await?;
                 self.virtual_fs
                     .read(file_handle, offset, count)
@@ -549,6 +545,14 @@ impl HandlePool {
             Some(file_handle)
         } else {
             None
+        }
+    }
+
+    /// Remove an entry from the pool (both handles map and order deque).
+    fn remove(&mut self, ino: u64) {
+        self.handles.remove(&ino);
+        if let Some(pos) = self.order.iter().position(|&i| i == ino) {
+            self.order.remove(pos);
         }
     }
 

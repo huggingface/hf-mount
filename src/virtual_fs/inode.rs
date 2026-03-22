@@ -68,7 +68,7 @@ impl InodeEntry {
 
     /// Mark the inode as dirty, incrementing the generation counter.
     pub fn set_dirty(&mut self) {
-        self.dirty_generation += 1;
+        self.dirty_generation = self.dirty_generation.saturating_add(1);
     }
 
     /// Clear the dirty flag, but only if the generation matches the snapshot

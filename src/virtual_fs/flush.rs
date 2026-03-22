@@ -391,7 +391,9 @@ async fn flush_batch(
         if let Some(entry) = inode_table.get_mut(item.ino) {
             entry.xet_hash = Some(file_info.hash().to_string());
             entry.size = file_info.file_size();
-            if !entry.clear_dirty_if(item.dirty_generation) {
+            if entry.clear_dirty_if(item.dirty_generation) {
+                entry.pending_deletes.clear();
+            } else {
                 debug!(
                     "flush: ino={} dirty generation advanced ({} -> {}), keeping dirty",
                     item.ino, item.dirty_generation, entry.dirty_generation
@@ -399,7 +401,6 @@ async fn flush_batch(
             }
             entry.mtime = now;
             entry.ctime = now;
-            entry.pending_deletes.clear();
         }
     }
 

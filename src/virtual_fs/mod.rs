@@ -918,11 +918,12 @@ impl VirtualFs {
         if let Some(entry) = inodes.get_mut(ino) {
             entry.xet_hash = Some(file_info.hash().to_string());
             entry.size = file_info.file_size();
-            entry.clear_dirty_if(dirty_gen);
+            if entry.clear_dirty_if(dirty_gen) {
+                entry.pending_deletes.clear();
+            }
             let now = SystemTime::now();
             entry.mtime = now;
             entry.ctime = now;
-            entry.pending_deletes.clear();
         }
 
         info!("fsync: committed ino={} path={}", ino, full_path);
@@ -1822,11 +1823,12 @@ impl VirtualFs {
         if let Some(entry) = inodes.get_mut(ino) {
             entry.xet_hash = Some(file_info.hash().to_string());
             entry.size = file_info.file_size();
-            entry.clear_dirty_if(channel.dirty_generation_at_open);
+            if entry.clear_dirty_if(channel.dirty_generation_at_open) {
+                entry.pending_deletes.clear();
+            }
             let now = SystemTime::now();
             entry.mtime = now;
             entry.ctime = now;
-            entry.pending_deletes.clear();
         }
 
         info!(
