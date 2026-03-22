@@ -462,8 +462,12 @@ impl InodeTable {
     /// Remove an orphan inode (nlink == 0, no remaining file handles).
     /// Called from release() after the last open handle is closed.
     pub fn remove_orphan(&mut self, ino: u64) {
-        if self.inodes.get(&ino).is_some_and(|e| e.nlink == 0) {
+        if let Some(entry) = self.inodes.get(&ino)
+            && entry.nlink == 0
+        {
+            let path = entry.full_path.clone();
             self.inodes.remove(&ino);
+            self.path_to_inode.remove(&path);
         }
     }
 }

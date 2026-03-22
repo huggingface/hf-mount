@@ -540,7 +540,11 @@ impl HandlePool {
 
     fn get(&mut self, ino: u64) -> Option<u64> {
         if let Some(&file_handle) = self.handles.get(&ino) {
-            self.order.retain(|&i| i != ino);
+            // Move to back (MRU). Find position and rotate instead of retain (O(n) either way
+            // for VecDeque, but avoids reallocating and handles duplicates correctly).
+            if let Some(pos) = self.order.iter().position(|&i| i == ino) {
+                self.order.remove(pos);
+            }
             self.order.push_back(ino);
             Some(file_handle)
         } else {
@@ -550,6 +554,13 @@ impl HandlePool {
 
     /// Insert a handle, returning the evicted (ino, file_handle) if pool was full.
     fn insert(&mut self, ino: u64, file_handle: u64) -> Option<(u64, u64)> {
+        // If this ino is already in the pool (e.g. replacing read with write handle),
+        // remove the old order entry to prevent duplicates.
+        if self.handles.contains_key(&ino)
+            && let Some(pos) = self.order.iter().position(|&i| i == ino)
+        {
+            self.order.remove(pos);
+        }
         let evicted = if self.handles.len() >= HANDLE_POOL_CAPACITY {
             self.order
                 .pop_front()
@@ -589,7 +600,7 @@ fn errno_to_nfs(e: i32) -> nfsstat3 {
 fn system_time_to_nfstime(t: SystemTime) -> nfstime3 {
     let d = t.duration_since(UNIX_EPOCH).unwrap_or_default();
     nfstime3 {
-        seconds: d.as_secs() as u32,
+        seconds: d.as_secs().min(u32::MAX as u64) as u32,
         nseconds: d.subsec_nanos(),
     }
 }
@@ -616,16 +627,21 @@ fn unmount_nfs(mount_point: &str) {
 
     // Fallback: external command.
     #[cfg(target_os = "macos")]
-    let _ = std::process::Command::new("umount").arg(mount_point).status();
+    if let Err(e) = std::process::Command::new("umount").arg(mount_point).status() {
+        tracing::warn!("NFS unmount fallback failed for {}: {}", mount_point, e);
+    }
     #[cfg(target_os = "linux")]
     {
-        let _ = if unsafe { libc::getuid() } == 0 {
+        let result = if unsafe { libc::getuid() } == 0 {
             std::process::Command::new("umount").arg(mount_point).status()
         } else {
             std::process::Command::new("sudo")
                 .args(["-n", "umount", mount_point])
                 .status()
         };
+        if let Err(e) = result {
+            tracing::warn!("NFS unmount fallback failed for {}: {}", mount_point, e);
+        }
     }
 }
 

@@ -131,10 +131,11 @@ impl DaemonGuard {
     /// Signal the parent that the mount is active and it can exit.
     pub fn notify_ready(&mut self) {
         if !self.notified {
-            unsafe {
-                libc::write(self.write_fd, b"R".as_ptr() as *const _, 1);
-                libc::close(self.write_fd);
+            let ret = unsafe { libc::write(self.write_fd, b"R".as_ptr() as *const _, 1) };
+            if ret < 0 {
+                eprintln!("daemon: failed to notify parent (write_fd={})", self.write_fd);
             }
+            unsafe { libc::close(self.write_fd) };
             self.notified = true;
         }
     }
@@ -143,10 +144,9 @@ impl DaemonGuard {
 impl Drop for DaemonGuard {
     fn drop(&mut self) {
         if !self.notified {
-            unsafe {
-                libc::write(self.write_fd, b"E".as_ptr() as *const _, 1);
-                libc::close(self.write_fd);
-            }
+            // Best-effort: parent may already be gone (broken pipe).
+            let _ = unsafe { libc::write(self.write_fd, b"E".as_ptr() as *const _, 1) };
+            unsafe { libc::close(self.write_fd) };
         }
         let _ = std::fs::remove_file(&self.pid_file);
     }
