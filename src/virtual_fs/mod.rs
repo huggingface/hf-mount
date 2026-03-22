@@ -651,7 +651,10 @@ impl VirtualFs {
             libc::EIO
         })?;
 
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<WriteMsg>();
+        // Bounded channel provides backpressure so a fast writer doesn't queue
+        // unbounded memory. 32 slots × ~128KB FUSE write = ~4MB max in-flight.
+        // blocking_send is safe here: FUSE threads are not tokio workers.
+        let (tx, rx) = tokio::sync::mpsc::channel::<WriteMsg>(32);
         let error: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
         self.runtime
             .spawn(streaming_worker(streaming_writer, rx, error.clone()));
@@ -856,10 +859,22 @@ impl VirtualFs {
         }
     }
 
-    /// Synchronous fsync for advanced-writes mode: upload the staging file
-    /// and commit to Hub immediately (bypasses the debounced flush queue).
-    /// No-op for streaming writes (handled by flush/release) and clean files.
-    pub async fn fsync(&self, ino: u64) -> VirtualFsResult<()> {
+    /// Synchronous fsync: ensures data is committed to Hub before returning.
+    /// - Streaming handles: delegates to flush() which does the synchronous commit.
+    /// - Advanced-writes handles: uploads staging file and commits immediately.
+    /// - Read-only / lazy handles: no-op.
+    pub async fn fsync(&self, ino: u64, file_handle: u64, pid: Option<u32>) -> VirtualFsResult<()> {
+        // Streaming handle -> delegate to flush (synchronous commit).
+        let is_streaming = self
+            .open_files
+            .read()
+            .expect("open_files poisoned")
+            .get(&file_handle)
+            .is_some_and(|f| matches!(f, OpenFile::Streaming { .. }));
+        if is_streaming {
+            return self.flush(ino, file_handle, pid).await;
+        }
+        // Advanced-writes: flush staging file to Hub immediately.
         let staging_dir = match &self.staging_dir {
             Some(sd) => sd,
             None => return Ok(()),
@@ -1470,7 +1485,7 @@ impl VirtualFs {
                 }
 
                 let len = data.len();
-                channel.tx.send(WriteMsg::Data(data.to_vec())).map_err(|_| {
+                channel.tx.blocking_send(WriteMsg::Data(data.to_vec())).map_err(|_| {
                     error!("streaming channel closed for ino={}", handle_ino);
                     libc::EIO
                 })?;
@@ -1707,7 +1722,7 @@ impl VirtualFs {
                 info
             } else {
                 let (result_tx, result_rx) = tokio::sync::oneshot::channel();
-                if channel.tx.send(WriteMsg::Finish(result_tx)).is_err() {
+                if channel.tx.send(WriteMsg::Finish(result_tx)).await.is_err() {
                     // Channel closed: only treat as success if already committed.
                     // If the worker died from an error, this is a real failure.
                     let already_committed = matches!(&*channel.state.lock().unwrap(), CommitState::Committed);
@@ -2713,11 +2728,11 @@ enum CommitState {
 }
 
 /// Channel-based streaming handle. Decouples the sync write() caller from the
-/// async add_data() pipeline: writes enqueue data into an unbounded channel
+/// async add_data() pipeline: writes enqueue data into a bounded channel
 /// (avoids deadlock when tokio worker threads are saturated by FUSE block_on calls),
 /// a background tokio task drains it and feeds the CAS cleaner.
 struct StreamingChannel {
-    tx: tokio::sync::mpsc::UnboundedSender<WriteMsg>,
+    tx: tokio::sync::mpsc::Sender<WriteMsg>,
     bytes_written: AtomicU64,
     /// Set by the background worker if add_data() fails. Shared with worker via Arc.
     error: Arc<std::sync::Mutex<Option<String>>>,
@@ -2784,7 +2799,7 @@ fn same_process(pid_a: u32, pid_b: u32) -> bool {
 /// Runs until a Finish message is received or the channel is dropped.
 async fn streaming_worker(
     mut writer: Box<dyn StreamingWriterOps>,
-    mut rx: tokio::sync::mpsc::UnboundedReceiver<WriteMsg>,
+    mut rx: tokio::sync::mpsc::Receiver<WriteMsg>,
     error: Arc<std::sync::Mutex<Option<String>>>,
 ) {
     let mut failed = false;

@@ -263,7 +263,7 @@ pub(crate) async fn flush_one(
     let item = {
         let inode_table = inodes.read().expect("inodes poisoned");
         let entry = match inode_table.get(ino) {
-            Some(e) if e.is_dirty() => e,
+            Some(e) if e.is_dirty() && e.nlink > 0 => e,
             _ => return Ok(()),
         };
         let staging_path = staging_dir.path(ino);

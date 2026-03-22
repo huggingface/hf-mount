@@ -261,8 +261,11 @@ impl Filesystem for FuseAdapter {
         }
     }
 
-    fn fsync(&self, _req: &Request, ino: INodeNo, _fh: FileHandle, _datasync: bool, reply: ReplyEmpty) {
-        match self.runtime.block_on(self.virtual_fs.fsync(ino.0)) {
+    fn fsync(&self, req: &Request, ino: INodeNo, fh: FileHandle, _datasync: bool, reply: ReplyEmpty) {
+        match self
+            .runtime
+            .block_on(self.virtual_fs.fsync(ino.0, fh.0, Some(req.pid())))
+        {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(Errno::from_i32(e)),
         }
