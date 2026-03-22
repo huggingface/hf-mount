@@ -250,6 +250,78 @@ async fn flush_pending_deletes(queue: &Mutex<Vec<String>>, hub_client: &dyn HubO
     }
 }
 
+/// Flush a single dirty inode synchronously: upload staging file, commit to Hub,
+/// update inode table with generation-aware dirty clear. Returns Ok(()) on success
+/// or if the inode is not dirty / doesn't exist / has no staging file.
+pub(crate) async fn flush_one(
+    ino: u64,
+    xet_sessions: &dyn XetOps,
+    staging_dir: &StagingDir,
+    hub_client: &dyn HubOps,
+    inodes: &RwLock<InodeTable>,
+) -> Result<(), i32> {
+    let item = {
+        let inode_table = inodes.read().expect("inodes poisoned");
+        let entry = match inode_table.get(ino) {
+            Some(e) if e.is_dirty() => e,
+            _ => return Ok(()),
+        };
+        let staging_path = staging_dir.path(ino);
+        if !staging_path.exists() {
+            return Ok(());
+        }
+        FlushItem {
+            ino,
+            full_path: entry.full_path.clone(),
+            staging_path,
+            pending_deletes: entry.pending_deletes.clone(),
+            dirty_generation: entry.dirty_generation,
+        }
+    };
+
+    let upload_results = xet_sessions
+        .upload_files(&[item.staging_path.as_path()])
+        .await
+        .map_err(|e| {
+            error!("flush_one upload failed for ino={}: {}", ino, e);
+            libc::EIO
+        })?;
+    let file_info = &upload_results[0];
+
+    let mtime_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let mut ops = vec![BatchOp::AddFile {
+        path: item.full_path.clone(),
+        xet_hash: file_info.hash().to_string(),
+        mtime: mtime_ms,
+        content_type: None,
+    }];
+    for old_path in &item.pending_deletes {
+        ops.push(BatchOp::DeleteFile { path: old_path.clone() });
+    }
+    hub_client.batch_operations(&ops).await.map_err(|e| {
+        error!("flush_one commit failed for {}: {}", item.full_path, e);
+        libc::EIO
+    })?;
+
+    let mut inode_table = inodes.write().expect("inodes poisoned");
+    if let Some(entry) = inode_table.get_mut(ino) {
+        entry.xet_hash = Some(file_info.hash().to_string());
+        entry.size = file_info.file_size();
+        if entry.clear_dirty_if(item.dirty_generation) {
+            entry.pending_deletes.clear();
+        }
+        let now = SystemTime::now();
+        entry.mtime = now;
+        entry.ctime = now;
+    }
+
+    info!("flush_one: committed ino={} path={}", ino, item.full_path);
+    Ok(())
+}
+
 struct FlushItem {
     ino: u64,
     full_path: String,
