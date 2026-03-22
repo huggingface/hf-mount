@@ -141,11 +141,25 @@ impl NFSFileSystem for NFSAdapter {
 
     async fn read(&self, id: fileid3, offset: u64, count: u32) -> Result<(Vec<u8>, bool), nfsstat3> {
         let file_handle = self.get_or_open_handle(id).await?;
-        self.virtual_fs
-            .read(file_handle, offset, count)
-            .await
-            .map(|(b, eof)| (b.to_vec(), eof))
-            .map_err(errno_to_nfs)
+        match self.virtual_fs.read(file_handle, offset, count).await {
+            Ok((bytes, eof)) => Ok((bytes.to_vec(), eof)),
+            Err(libc::EBADF) => {
+                // Handle was evicted by a concurrent operation. Remove stale
+                // pool entry, re-open, and retry once.
+                self.handle_pool
+                    .lock()
+                    .expect("handle_pool poisoned")
+                    .handles
+                    .remove(&id);
+                let file_handle = self.get_or_open_handle(id).await?;
+                self.virtual_fs
+                    .read(file_handle, offset, count)
+                    .await
+                    .map(|(b, eof)| (b.to_vec(), eof))
+                    .map_err(errno_to_nfs)
+            }
+            Err(e) => Err(errno_to_nfs(e)),
+        }
     }
 
     async fn readdir(
