@@ -2470,3 +2470,33 @@ fn fsync_then_write_redirties() {
         vfs.release(fh).await.unwrap();
     });
 }
+
+/// If streaming writer creation fails on open(O_TRUNC), the inode must NOT
+/// be truncated. Before the fix, the inode was mutated before writer setup,
+/// leaving it stuck at size=0 with no handle to recover.
+#[test]
+fn failed_writer_create_preserves_inode() {
+    let hub = MockHub::new();
+    hub.add_file("existing.txt", 1000, Some("original_hash"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let attr = vfs.lookup(ROOT_INODE, "existing.txt").await.unwrap();
+        let ino = attr.ino;
+        assert_eq!(attr.size, 1000);
+
+        // Make the next streaming writer creation fail
+        xet.fail_next_writer_create();
+
+        // Open with O_TRUNC should fail (writer creation error -> EIO)
+        let result = vfs.open(ino, true, true, None).await;
+        assert_eq!(result.unwrap_err(), libc::EIO);
+
+        // Inode must be preserved: original hash, original size, NOT dirty
+        let entry = vfs.inode_table.read().unwrap().get(ino).unwrap().clone();
+        assert_eq!(entry.xet_hash.as_deref(), Some("original_hash"));
+        assert_eq!(entry.size, 1000);
+        assert!(!entry.is_dirty(), "inode should not be dirty after failed open");
+    });
+}
