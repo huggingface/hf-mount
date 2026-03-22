@@ -706,15 +706,29 @@ impl VirtualFs {
     }
 
     /// Insert a path into the negative cache, evicting if at capacity.
+    /// Eviction is amortized: instead of scanning all entries, we sample a
+    /// bounded batch to keep the write lock duration constant regardless of cache size.
     fn negative_cache_insert(&self, path: String) {
         let mut cache = self.negative_cache.write().expect("neg_cache poisoned");
         let now = Instant::now();
         if cache.len() >= NEG_CACHE_CAPACITY {
-            // Evict expired entries first
-            cache.retain(|_, ts| ts.elapsed() < NEG_CACHE_TTL);
-            // If still full, evict the oldest entry
+            // Evict up to 128 expired entries (bounded scan, not full retain).
+            let expired: Vec<String> = cache
+                .iter()
+                .filter(|(_, ts)| ts.elapsed() >= NEG_CACHE_TTL)
+                .take(128)
+                .map(|(k, _)| k.clone())
+                .collect();
+            for key in &expired {
+                cache.remove(key);
+            }
+            // If still full after evicting expired, drop the oldest sampled entry.
             if cache.len() >= NEG_CACHE_CAPACITY
-                && let Some(oldest_key) = cache.iter().min_by_key(|(_, ts)| **ts).map(|(k, _)| k.clone())
+                && let Some(oldest_key) = cache
+                    .iter()
+                    .take(128)
+                    .min_by_key(|(_, ts)| **ts)
+                    .map(|(k, _)| k.clone())
             {
                 cache.remove(&oldest_key);
             }
