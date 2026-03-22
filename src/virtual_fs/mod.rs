@@ -667,7 +667,7 @@ impl VirtualFs {
             pending_info: std::sync::Mutex::new(None),
             open_pid: pid,
             snapshot,
-            dirty_generation_at_open,
+            dirty_generation_at_open: AtomicU64::new(dirty_generation_at_open),
             commit_hook: std::sync::Mutex::new(None),
         });
 
@@ -860,19 +860,16 @@ impl VirtualFs {
     }
 
     /// Synchronous fsync: ensures data is committed to Hub before returning.
-    /// - Streaming handles: delegates to flush() which does the synchronous commit.
+    /// - Streaming handles: no-op (data is committed synchronously on close).
+    ///   Cannot delegate to flush() because it sends Finish which tears down the writer.
     /// - Advanced-writes handles: uploads staging file and commits immediately.
     /// - Read-only / lazy handles: no-op.
-    pub async fn fsync(&self, ino: u64, file_handle: u64, pid: Option<u32>) -> VirtualFsResult<()> {
-        // Streaming handle -> delegate to flush (synchronous commit).
-        let is_streaming = self
-            .open_files
-            .read()
-            .expect("open_files poisoned")
-            .get(&file_handle)
-            .is_some_and(|f| matches!(f, OpenFile::Streaming { .. }));
-        if is_streaming {
-            return self.flush(ino, file_handle, pid).await;
+    pub async fn fsync(&self, ino: u64, file_handle: u64, _pid: Option<u32>) -> VirtualFsResult<()> {
+        {
+            let files = self.open_files.read().expect("open_files poisoned");
+            if matches!(files.get(&file_handle), Some(OpenFile::Streaming { .. })) {
+                return Ok(());
+            }
         }
         // Advanced-writes: flush staging file to Hub immediately.
         let staging_dir = match &self.staging_dir {
@@ -1060,16 +1057,23 @@ impl VirtualFs {
             }
         };
 
-        let dirty_gen = {
-            let mut inodes = self.inode_table.write().expect("inodes poisoned");
-            let entry = inodes.get_mut(ino).ok_or(libc::ENOENT)?;
-            entry.set_dirty();
-            entry.size = 0;
-            entry.xet_hash = None;
-            entry.dirty_generation
-        };
+        // Set up the streaming writer before mutating the inode. If writer
+        // creation fails (auth/network), the inode stays unmodified so the
+        // caller gets EIO without a locally-truncated file stuck dirty.
+        let (file_handle, channel) = self.setup_streaming_writer(ino, pid, snapshot, 0).await?;
 
-        let (file_handle, channel) = self.setup_streaming_writer(ino, pid, snapshot, dirty_gen).await?;
+        // Now that the writer is ready, truncate the inode and patch the generation.
+        {
+            let mut inodes = self.inode_table.write().expect("inodes poisoned");
+            if let Some(entry) = inodes.get_mut(ino) {
+                entry.set_dirty();
+                entry.size = 0;
+                entry.xet_hash = None;
+                channel
+                    .dirty_generation_at_open
+                    .store(entry.dirty_generation, Ordering::Relaxed);
+            }
+        }
 
         self.open_files
             .write()
@@ -1779,7 +1783,7 @@ impl VirtualFs {
             entry.apply_commit(
                 file_info.hash(),
                 file_info.file_size(),
-                channel.dirty_generation_at_open,
+                channel.dirty_generation_at_open.load(Ordering::Relaxed),
             );
         }
 
@@ -2738,8 +2742,9 @@ struct StreamingChannel {
     /// Pre-write inode snapshot for revert on commit failure.
     snapshot: InodeSnapshot,
     /// Dirty generation at open time, used by streaming_commit to avoid
-    /// clobbering concurrent writers via clear_dirty_if.
-    dirty_generation_at_open: u64,
+    /// clobbering concurrent writers via clear_dirty_if. AtomicU64 so it
+    /// can be updated after Arc construction (set after inode mutation).
+    dirty_generation_at_open: AtomicU64,
     /// Watch sender for the pending commit hook. Created in flush() on deferral,
     /// fulfilled in release() when the commit completes (or fails).
     commit_hook: std::sync::Mutex<Option<CommitHookTx>>,
