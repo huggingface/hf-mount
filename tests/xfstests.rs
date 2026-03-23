@@ -16,8 +16,8 @@ const XFSTESTS_DIR: &str = "/tmp/xfstests";
 const XFSTESTS_REV: &str = "v2025.03.30";
 
 /// Minimum expected pass count. Varies by kernel (some tests are "not run"
-/// depending on available features). 580 is a safe lower bound across environments.
-const EXPECTED_PASS: usize = 580;
+/// depending on available features). Set to 585 to allow minor kernel variation.
+const EXPECTED_PASS: usize = 585;
 
 fn ensure_xfstests() -> bool {
     let check_script = format!("{}/check", XFSTESTS_DIR);
@@ -229,7 +229,7 @@ async fn test_xfstests_generic() {
             // Known failures (unsupported FUSE features):
             // generic/003: setattr uid/gid with exec
             // generic/035: rename_overwrite fstat race
-            // generic/080,215,263: mmap write (FUSE MAPWRITE limitation)
+            // generic/075,080,215,263,759: mmap write (FUSE MAPWRITE limitation)
             // generic/120,294,604: file locking
             // generic/184: splice/sendfile
             // generic/306: concurrent append timing
@@ -240,10 +240,11 @@ async fn test_xfstests_generic() {
             // generic/645: idmapped mounts / nested user namespaces
             // generic/732: renameat2 RENAME_EXCHANGE
             // generic/755: hard links not supported
-            "generic/003 generic/035 generic/080 generic/113 generic/120 generic/184 \
-             generic/215 generic/263 generic/294 generic/306 generic/308 generic/426 \
-             generic/434 generic/467 generic/477 generic/519 generic/604 \
-             generic/632 generic/633 generic/645 generic/732 generic/755 generic/756",
+            "generic/003 generic/035 generic/075 generic/080 generic/113 generic/120 \
+             generic/184 generic/215 generic/263 generic/294 generic/306 generic/308 \
+             generic/426 generic/434 generic/467 generic/477 generic/519 generic/604 \
+             generic/632 generic/633 generic/645 generic/732 generic/755 generic/756 \
+             generic/759",
         ])
         .current_dir(XFSTESTS_DIR)
         .output()
