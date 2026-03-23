@@ -224,6 +224,7 @@ pub struct MockXet {
     range_empty_count: AtomicU32,
     /// Log of (offset, end) pairs passed to download_stream_boxed.
     pub stream_calls: Mutex<Vec<(u64, Option<u64>)>>,
+    upload_call_count: AtomicU32,
 }
 
 impl MockXet {
@@ -238,6 +239,7 @@ impl MockXet {
             range_fail_count: AtomicU32::new(0),
             range_empty_count: AtomicU32::new(0),
             stream_calls: Mutex::new(Vec::new()),
+            upload_call_count: AtomicU32::new(0),
         })
     }
 
@@ -270,6 +272,10 @@ impl MockXet {
     fn next_hash_string(&self) -> String {
         format!("mock_hash_{}", self.next_hash.fetch_add(1, Ordering::SeqCst))
     }
+
+    pub fn upload_count(&self) -> u32 {
+        self.upload_call_count.load(Ordering::SeqCst)
+    }
 }
 
 #[async_trait::async_trait]
@@ -301,6 +307,7 @@ impl XetOps for MockXet {
     }
 
     async fn upload_files(&self, paths: &[&Path]) -> Result<Vec<XetFileInfo>> {
+        self.upload_call_count.fetch_add(1, Ordering::SeqCst);
         if self.upload_fail.swap(false, Ordering::SeqCst) {
             return Err(Error::Xet("mock upload failure".into()));
         }

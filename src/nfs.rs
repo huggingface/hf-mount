@@ -311,9 +311,7 @@ impl NFSFileSystem for NFSAdapter {
 
     async fn remove(&self, dirid: fileid3, filename: &filename3) -> Result<(), nfsstat3> {
         let name = nfs_name(filename)?;
-        // Check whether this is a file or directory.
-        let child_ino = self.virtual_fs.lookup(dirid, name).await.map_err(errno_to_nfs)?.ino;
-        let attr = self.virtual_fs.getattr(child_ino).map_err(errno_to_nfs)?;
+        let attr = self.virtual_fs.lookup(dirid, name).await.map_err(errno_to_nfs)?;
         match attr.kind {
             InodeKind::Directory => self.virtual_fs.rmdir(dirid, name).await.map_err(errno_to_nfs),
             _ => self.virtual_fs.unlink(dirid, name).await.map_err(errno_to_nfs),

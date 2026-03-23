@@ -641,7 +641,6 @@ impl VirtualFs {
     /// Used by both create() and open(O_TRUNC) in simple mode.
     async fn setup_streaming_writer(
         &self,
-        _ino: u64,
         pid: Option<u32>,
         snapshot: InodeSnapshot,
         dirty_generation_at_open: u64,
@@ -1060,12 +1059,8 @@ impl VirtualFs {
             }
         };
 
-        // Set up the streaming writer before mutating the inode. If writer
-        // creation fails (auth/network), the inode stays unmodified so the
-        // caller gets EIO without a locally-truncated file stuck dirty.
-        let (file_handle, channel) = self.setup_streaming_writer(ino, pid, snapshot, 0).await?;
+        let (file_handle, channel) = self.setup_streaming_writer(pid, snapshot, 0).await?;
 
-        // Now that the writer is ready, truncate the inode and patch the generation.
         {
             let mut inodes = self.inode_table.write().expect("inodes poisoned");
             if let Some(entry) = inodes.get_mut(ino) {
@@ -1907,7 +1902,7 @@ impl VirtualFs {
                 pending_deletes: Vec::new(),
                 existed_before: false,
             };
-            let (file_handle, channel) = match self.setup_streaming_writer(ino, pid, snapshot, dirty_gen).await {
+            let (file_handle, channel) = match self.setup_streaming_writer(pid, snapshot, dirty_gen).await {
                 Ok(r) => r,
                 Err(e) => {
                     self.inode_table.write().expect("inodes poisoned").remove(ino);

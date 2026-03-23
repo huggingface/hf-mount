@@ -2342,13 +2342,13 @@ fn fsync_streaming_noop() {
         let ino = ROOT_INODE + 1;
 
         // Write some data
-        write_blocking(&vfs, ino, fh, 0, b"hello");
+        write_blocking(&vfs, ino, fh, 0, b"hello").await.unwrap();
 
         // fsync should succeed (no-op for streaming)
         vfs.fsync(ino, fh, None).await.unwrap();
 
         // Write more data after fsync -- must not fail
-        write_blocking(&vfs, ino, fh, 5, b" world");
+        write_blocking(&vfs, ino, fh, 5, b" world").await.unwrap();
 
         // flush + release commit the full data
         vfs.flush(ino, fh, None).await.unwrap();
@@ -2372,7 +2372,7 @@ fn fsync_advanced_writes_commits() {
         let ino = ROOT_INODE + 1;
 
         // Write data (goes to staging file)
-        write_blocking(&vfs, ino, fh, 0, b"advanced data");
+        write_blocking(&vfs, ino, fh, 0, b"advanced data").await.unwrap();
 
         // Before fsync: inode is dirty
         assert!(vfs.inode_table.read().unwrap().get(ino).unwrap().is_dirty());
@@ -2384,6 +2384,37 @@ fn fsync_advanced_writes_commits() {
         let entry = vfs.inode_table.read().unwrap().get(ino).unwrap().clone();
         assert!(!entry.is_dirty());
         assert!(entry.xet_hash.is_some());
+
+        vfs.release(fh).await.unwrap();
+    });
+}
+
+/// fsync on an empty file (0 bytes) goes through CAS upload + Hub commit
+/// like any other file. The inode should be clean after fsync.
+#[test]
+fn fsync_empty_file_commits() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_advanced(&hub, &xet);
+
+    rt.block_on(async {
+        let (_, fh) = vfs.create(ROOT_INODE, "empty", 0o644, 0, 0, None).await.unwrap();
+        let ino = ROOT_INODE + 1;
+
+        // No write — staging file stays empty (0 bytes)
+        assert!(vfs.inode_table.read().unwrap().get(ino).unwrap().is_dirty());
+
+        vfs.fsync(ino, fh, None).await.unwrap();
+
+        // After fsync: inode is clean, hash is set (CAS returns a hash even for empty files)
+        let entry = vfs.inode_table.read().unwrap().get(ino).unwrap().clone();
+        assert!(!entry.is_dirty(), "empty file should be clean after fsync");
+        assert!(entry.xet_hash.is_some(), "empty file should have xet_hash from CAS");
+        assert_eq!(entry.size, 0);
+
+        // Hub should have received a batch commit
+        let logs = hub.take_batch_log();
+        assert!(!logs.is_empty(), "empty file should be committed to Hub");
 
         vfs.release(fh).await.unwrap();
     });
@@ -2401,7 +2432,7 @@ fn dirty_generation_race_with_concurrent_writer() {
     rt.block_on(async {
         let (_, fh) = vfs.create(ROOT_INODE, "race", 0o644, 0, 0, None).await.unwrap();
         let ino = ROOT_INODE + 1;
-        write_blocking(&vfs, ino, fh, 0, b"writer A");
+        write_blocking(&vfs, ino, fh, 0, b"writer A").await.unwrap();
 
         // Set a barrier on batch_operations: fsync will pause after upload,
         // before commit. We inject a concurrent write at that point.
@@ -2450,7 +2481,7 @@ fn fsync_then_write_redirties() {
         let ino = ROOT_INODE + 1;
 
         // Write + fsync -> clean
-        write_blocking(&vfs, ino, fh, 0, b"initial");
+        write_blocking(&vfs, ino, fh, 0, b"initial").await.unwrap();
         assert!(vfs.inode_table.read().unwrap().get(ino).unwrap().is_dirty());
 
         vfs.fsync(ino, fh, None).await.unwrap();

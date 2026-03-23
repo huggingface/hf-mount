@@ -123,16 +123,16 @@ fn apply_fuse_patches() {
     eprintln!("Applied {} FUSE patches to common/rc", patches.len());
 }
 
-fn create_mount_wrapper(token: &str, binary: &std::path::Path) {
+fn create_mount_wrapper(binary: &std::path::Path) {
+    // Use $HF_TOKEN env var (inherited) instead of baking the token into the script.
     let wrapper = format!(
         "#!/bin/bash\nMOUNTPOINT=\"$1\"\nmkdir -p \"$MOUNTPOINT\"\n\
          export RUST_LOG=${{RUST_LOG:-hf_mount=warn}}\n\
-         exec {} --hf-token {} --hub-endpoint {} \
+         exec {} --hf-token \"$HF_TOKEN\" --hub-endpoint {} \
          --poll-interval-secs 0 --advanced-writes \
          --cache-dir /tmp/xfstests-cache \
          bucket \"$HF_XFSTESTS_BUCKET\" \"$MOUNTPOINT\"",
         binary.display(),
-        token,
         common::endpoint()
     );
     std::fs::write("/usr/local/bin/hf-mount", &wrapper).ok();
@@ -207,7 +207,7 @@ async fn test_xfstests_generic() {
         .join("hf-mount-fuse");
     // SAFETY: single-threaded test, no concurrent env access
     unsafe { std::env::set_var("HF_XFSTESTS_BUCKET", &bucket_id) };
-    create_mount_wrapper(&token, &binary);
+    create_mount_wrapper(&binary);
 
     // Write xfstests config
     write_config(&test_dir, &scratch_dir);

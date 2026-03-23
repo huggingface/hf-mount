@@ -298,7 +298,6 @@ pub(crate) async fn flush_one(
             .is_some_and(|e| e.xet_hash.as_deref() == Some(file_info.hash()))
     };
     if same_content && item.pending_deletes.is_empty() {
-        // Content unchanged, just clear dirty.
         let mut inode_table = inodes.write().expect("inodes poisoned");
         if let Some(entry) = inode_table.get_mut(ino) {
             entry.apply_commit(file_info.hash(), file_info.file_size(), item.dirty_generation);
@@ -350,16 +349,11 @@ async fn flush_batch(
     inodes: &RwLock<InodeTable>,
     flush_errors: &Mutex<HashMap<u64, String>>,
 ) {
-    // Dedup by inode (keep last request per ino)
+    // Dedup by inode (keep last request per ino).
+    // Walk backwards so last occurrence wins, then reverse in-place.
     let mut seen = HashSet::new();
-    let deduped: Vec<u64> = pending
-        .into_iter()
-        .rev()
-        .filter(|ino| seen.insert(*ino))
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
+    let mut deduped: Vec<u64> = pending.into_iter().rev().filter(|ino| seen.insert(*ino)).collect();
+    deduped.reverse();
 
     debug!("flush_batch: deduped inos = {:?}", deduped);
 
@@ -377,8 +371,11 @@ async fn flush_batch(
                         return None;
                     }
                 };
-                if !entry.is_dirty() {
-                    debug!("flush: ino={} path={} not dirty, skipping", ino, entry.full_path);
+                if !entry.is_dirty() || entry.nlink == 0 {
+                    debug!(
+                        "flush: ino={} path={} not dirty or unlinked, skipping",
+                        ino, entry.full_path
+                    );
                     return None;
                 }
                 let staging_path = staging_dir.path(ino);

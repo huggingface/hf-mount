@@ -77,8 +77,15 @@ model = AutoModelForCausalLM.from_pretrained('/tmp/gpt2')
 print(tok.decode(model.generate(**tok('Hello', return_tensors='pt'), max_new_tokens=20)[0]))
 "
 
+# Mount a dataset and explore it
+mkdir /tmp/hn
+hf-mount-nfs repo datasets/open-index/hacker-news /tmp/hn
+ls /tmp/hn
+du -sh /tmp/hn/*.parquet
+
 # Unmount
 umount /tmp/gpt2
+umount /tmp/hn
 ```
 
 For private repos or [Buckets](https://huggingface.co/docs/huggingface_hub/guides/buckets), pass `--hf-token` or set the `HF_TOKEN` env var.
@@ -113,7 +120,7 @@ hf-mount-nfs repo gpt2 /tmp/gpt2
 hf-mount-nfs --hf-token $HF_TOKEN repo myorg/my-private-model /tmp/model
 
 # Dataset
-hf-mount-nfs repo datasets/squad /tmp/squad
+hf-mount-nfs repo datasets/open-index/hacker-news /tmp/hn
 
 # Specific revision
 hf-mount-nfs repo openai-community/gpt2 /tmp/gpt2 --revision v1.0
