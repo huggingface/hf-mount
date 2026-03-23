@@ -191,6 +191,10 @@ pub fn mount_bucket(bucket_id: &str, mount_point: &str, cache_dir: &str, extra_a
 
     let ep = endpoint();
     let child = Command::new(binary)
+        .env(
+            "RUST_LOG",
+            std::env::var("RUST_LOG").unwrap_or_else(|_| "hf_mount=warn".to_string()),
+        )
         .args([
             "--hf-token",
             &token,
@@ -293,6 +297,10 @@ pub fn mount_bucket_nfs(bucket_id: &str, mount_point: &str, cache_dir: &str, ext
 
     let ep = endpoint();
     let child = Command::new(binary)
+        .env(
+            "RUST_LOG",
+            std::env::var("RUST_LOG").unwrap_or_else(|_| "hf_mount=warn".to_string()),
+        )
         .args([
             "--hf-token",
             &token,
