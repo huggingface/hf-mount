@@ -3,13 +3,13 @@
 Mount [Hugging Face Buckets](https://huggingface.co/docs/hub/storage-buckets) and repos as a local filesystem. No download, no copy, no waiting.
 
 ```bash
-hf-mount-nfs --hf-token $HF_TOKEN bucket myuser/my-bucket /tmp/data
+hf-mount start --hf-token $HF_TOKEN bucket myuser/my-bucket /tmp/data
 ```
 
 Also works with any model or dataset repo:
 
 ```bash
-hf-mount-nfs repo gpt2 /tmp/gpt2
+hf-mount start repo gpt2 /tmp/gpt2
 ```
 
 ```python
@@ -70,9 +70,8 @@ Binaries: `target/release/hf-mount`, `target/release/hf-mount-nfs`, `target/rele
 ## Quick start
 
 ```bash
-# Mount a public model (no token needed)
-mkdir /tmp/gpt2
-hf-mount-nfs repo gpt2 /tmp/gpt2
+# Mount a public model as a background daemon (no token needed)
+hf-mount start repo gpt2 /tmp/gpt2
 ls /tmp/gpt2
 
 # Use it from Python
@@ -83,15 +82,16 @@ model = AutoModelForCausalLM.from_pretrained('/tmp/gpt2')
 print(tok.decode(model.generate(**tok('Hello', return_tensors='pt'), max_new_tokens=20)[0]))
 "
 
-# Mount a dataset and explore it
-mkdir /tmp/hn
-hf-mount-nfs repo datasets/open-index/hacker-news /tmp/hn
-ls /tmp/hn
+# Mount a dataset
+hf-mount start repo datasets/open-index/hacker-news /tmp/hn
 du -sh /tmp/hn/*.parquet
 
-# Unmount
-umount /tmp/gpt2
-umount /tmp/hn
+# List running mounts
+hf-mount status
+
+# Stop
+hf-mount stop /tmp/gpt2
+hf-mount stop /tmp/hn
 ```
 
 For private repos or [Buckets](https://huggingface.co/docs/huggingface_hub/guides/buckets), pass `--hf-token` or set the `HF_TOKEN` env var.
