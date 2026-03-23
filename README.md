@@ -1,6 +1,6 @@
 # hf-mount
 
-Mount [Hugging Face Buckets](https://huggingface.co/docs/hub/buckets) and repos as a local filesystem using FUSE or NFS.
+Mount [Hugging Face Buckets](https://huggingface.co/docs/hub/storage-buckets) and repos as a local filesystem using FUSE or NFS.
 
 ## Quick start
 
