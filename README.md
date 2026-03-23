@@ -1,6 +1,12 @@
 # hf-mount
 
-Use any Hugging Face model or dataset as if it were a local directory. No download, no copy, no waiting.
+Mount [Hugging Face Buckets](https://huggingface.co/docs/hub/storage-buckets) and repos as a local filesystem. No download, no copy, no waiting.
+
+```bash
+hf-mount-nfs --hf-token $HF_TOKEN bucket myuser/my-bucket /tmp/data
+```
+
+Also works with any model or dataset repo:
 
 ```bash
 hf-mount-nfs repo gpt2 /tmp/gpt2
@@ -11,7 +17,7 @@ from transformers import AutoModelForCausalLM
 model = AutoModelForCausalLM.from_pretrained("/tmp/gpt2")  # reads on demand, no download step
 ```
 
-hf-mount exposes [Hugging Face Hub](https://huggingface.co) repos and [Buckets](https://huggingface.co/docs/huggingface_hub/guides/buckets) as a local filesystem. Files are fetched lazily on first read, so only the bytes your code actually touches ever leave the network.
+hf-mount exposes [Hugging Face Buckets](https://huggingface.co/docs/hub/storage-buckets) and [Hub repos](https://huggingface.co) as a local filesystem via FUSE or NFS. Files are fetched lazily on first read, so only the bytes your code actually touches ever leave the network.
 
 Two backends are available:
 - **NFS** (recommended) -- works everywhere, no root, no kernel extension
