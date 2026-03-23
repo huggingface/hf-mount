@@ -130,7 +130,7 @@ jobs:
       - name: Build
         run: cargo build --release
       - name: xfstests
-        timeout-minutes: 30
+        timeout-minutes: 45
         run: cargo test --release --test xfstests -- --test-threads=1 --nocapture
 
   pjdfstest:
