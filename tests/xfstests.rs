@@ -218,7 +218,10 @@ async fn test_xfstests_generic() {
     eprintln!("Running xfstests generic/quick...");
     let output = Command::new("sudo")
         .args([
-            "./check", "-g", "generic/quick", "-e",
+            "./check",
+            "-g",
+            "generic/quick",
+            "-e",
             // Too slow for remote-backed FUSE:
             // generic/113: aio-stress 20 threads x 20 files
             // generic/308: writes at 16TB offset (sparse staging)
