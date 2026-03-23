@@ -32,6 +32,8 @@ Two backends are available:
 - **NFS** (recommended) -- works everywhere, no root, no kernel extension
 - **FUSE** -- tighter kernel integration, requires root or [macFUSE](https://osxfuse.github.io/) on macOS
 
+Agentic storage: Agents don't require complex APIs or SDKs, they thrive on the filesystem: ls, cat, find, grep, and the power of composable UNIX pipelines.
+
 ![hf-mount demo gif](https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/hf-mount/demo.gif)
 
 ## Install
