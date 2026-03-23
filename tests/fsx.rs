@@ -429,3 +429,79 @@ async fn test_fsx_paranoid_cas_roundtrip() {
     std::fs::remove_dir_all(&mount_point).ok();
     std::fs::remove_dir_all(&cache_dir).ok();
 }
+
+/// Run the real xfstests fsx (C binary) on hf-mount with mmap disabled.
+/// This is the gold standard filesystem exerciser from the Linux kernel test suite.
+/// mmap writes are skipped (-R -W) because FUSE MAPWRITE goes through the kernel
+/// page cache without notifying the FUSE handler.
+#[tokio::test]
+async fn test_fsx_real_xfstests() {
+    use std::process::Command;
+
+    let fsx_bin = "/tmp/xfstests/ltp/fsx";
+    if !std::path::Path::new(fsx_bin).exists() {
+        eprintln!("Building xfstests fsx...");
+        let _ = Command::new("bash")
+            .args([
+                "-c",
+                "cd /tmp && \
+                 git clone --depth 1 https://git.kernel.org/pub/scm/fs/xfs/xfstests-dev.git xfstests 2>&1 && \
+                 cd xfstests && make -j$(nproc) 2>&1 | tail -5",
+            ])
+            .status();
+        if !std::path::Path::new(fsx_bin).exists() {
+            eprintln!("Skipping: failed to build xfstests fsx");
+            return;
+        }
+    }
+
+    let (token, bucket_id, _hub) = match common::setup_bucket("fsx-real").await {
+        Some(cfg) => cfg,
+        None => return,
+    };
+
+    let pid = std::process::id();
+    let mount_point = format!("/tmp/hf-fsx-real-{}", pid);
+    let cache_dir = format!("/tmp/hf-fsx-real-cache-{}", pid);
+
+    let child = common::mount_bucket(&bucket_id, &mount_point, &cache_dir, &["--advanced-writes"]);
+
+    let num_ops = std::env::var("FSX_REAL_OPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(50_000u64);
+
+    let test_file = format!("{}/fsx_real_{}", mount_point, pid);
+    eprintln!("fsx-real: {} ops, file={}", num_ops, test_file);
+
+    let output = Command::new(fsx_bin)
+        .args([
+            "-N",
+            &num_ops.to_string(),
+            "-l",
+            "1048576",
+            "-S",
+            "42",
+            "-R", // skip mmap reads (FUSE limitation)
+            "-W", // skip mmap writes (FUSE limitation)
+            &test_file,
+        ])
+        .output()
+        .expect("Failed to run fsx");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    eprintln!("{}{}", stdout, stderr);
+
+    assert!(
+        output.status.success(),
+        "real fsx failed with exit {}",
+        output.status.code().unwrap_or(-1)
+    );
+
+    std::fs::remove_file(&test_file).ok();
+    common::unmount(&mount_point, child, 10);
+    common::delete_bucket(&common::endpoint(), &token, &bucket_id).await;
+    std::fs::remove_dir_all(&mount_point).ok();
+    std::fs::remove_dir_all(&cache_dir).ok();
+}
