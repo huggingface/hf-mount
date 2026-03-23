@@ -1,27 +1,36 @@
 # hf-mount
 
-Mount [Hugging Face Buckets](https://huggingface.co/docs/hub/storage-buckets) and repos as a local filesystem. No download, no copy, no waiting.
+Mount [Hugging Face Buckets](https://huggingface.co/docs/hub/storage-buckets) and repos as local filesystems. No download, no copy, no waiting.
 
 ```bash
-hf-mount start --hf-token $HF_TOKEN bucket myuser/my-bucket /tmp/data
+hf-mount start bucket myuser/my-bucket /tmp/data
 ```
 
-Also works with any model or dataset repo:
+Also works with any model or dataset repo (read-only):
 
 ```bash
-hf-mount start repo gpt2 /tmp/gpt2
+hf-mount start repo openai/gpt-oss-20b /tmp/gpt-oss-20b
 ```
 
+Commands will pick up your HF_TOKEN from env if present, or you can pass it explicitly:
+
+```bash
+hf-mount --hf-token $HF_TOKEN 
+```
+
+Then use your local folders as usual
 ```python
 from transformers import AutoModelForCausalLM
-model = AutoModelForCausalLM.from_pretrained("/tmp/gpt2")  # reads on demand, no download step
+model = AutoModelForCausalLM.from_pretrained("/tmp/gpt-oss-20b")  # reads on demand, no download step
 ```
 
-hf-mount exposes [Hugging Face Buckets](https://huggingface.co/docs/hub/storage-buckets) and [Hub repos](https://huggingface.co) as a local filesystem via FUSE or NFS. Files are fetched lazily on first read, so only the bytes your code actually touches ever leave the network.
+hf-mount exposes [Hugging Face Buckets](https://huggingface.co/docs/hub/storage-buckets) and [Hub repos](https://huggingface.co) as a local filesystem via FUSE or NFS. Files are fetched lazily on first read, so only the bytes your code actually touches ever hit the network.
 
 Two backends are available:
 - **NFS** (recommended) -- works everywhere, no root, no kernel extension
 - **FUSE** -- tighter kernel integration, requires root or [macFUSE](https://osxfuse.github.io/) on macOS
+
+![hf-mount thumbnail](https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/hf-mount/hf-mount.png)
 
 ## Install
 
@@ -31,7 +40,7 @@ Two backends are available:
 curl -fsSL https://raw.githubusercontent.com/huggingface/hf-mount/main/install.sh | sh
 ```
 
-Installs `hf-mount-nfs` to `~/.local/bin/`. Set `INSTALL_DIR` to change the location. Supports Linux (x86_64, aarch64) and macOS (Apple Silicon, Intel).
+Installs `hf-mount` to `~/.local/bin/`. Set `INSTALL_DIR` to change the location. Supports Linux (x86_64, aarch64) and macOS (Apple Silicon, Intel).
 
 ### Manual download
 
@@ -71,14 +80,14 @@ Binaries: `target/release/hf-mount`, `target/release/hf-mount-nfs`, `target/rele
 
 ```bash
 # Mount a public model as a background daemon (no token needed)
-hf-mount start repo gpt2 /tmp/gpt2
-ls /tmp/gpt2
+hf-mount start repo openai/gpt-oss-20b /tmp/gpt-oss-20b
+ls /tmp/gpt-oss-20b
 
 # Use it from Python
 python -c "
 from transformers import AutoTokenizer, AutoModelForCausalLM
-tok = AutoTokenizer.from_pretrained('/tmp/gpt2')
-model = AutoModelForCausalLM.from_pretrained('/tmp/gpt2')
+tok = AutoTokenizer.from_pretrained('/tmp/gpt-oss-20b')
+model = AutoModelForCausalLM.from_pretrained('/tmp/gpt-oss-20b')
 print(tok.decode(model.generate(**tok('Hello', return_tensors='pt'), max_new_tokens=20)[0]))
 "
 
@@ -90,7 +99,7 @@ du -sh /tmp/hn/*.parquet
 hf-mount status
 
 # Stop
-hf-mount stop /tmp/gpt2
+hf-mount stop /tmp/gpt-oss-20b
 hf-mount stop /tmp/hn
 ```
 
@@ -120,7 +129,7 @@ All examples use `hf-mount-nfs`. Replace with `hf-mount-fuse` if you prefer the 
 
 ```bash
 # Public model (no token needed)
-hf-mount-nfs repo gpt2 /tmp/gpt2
+hf-mount-nfs repo openai/gpt-oss-20b /tmp/gpt-oss-20b
 
 # Private model
 hf-mount-nfs --hf-token $HF_TOKEN repo myorg/my-private-model /tmp/model
@@ -195,8 +204,8 @@ cat > ~/Library/LaunchAgents/$label.plist <<EOF
     <array>
         <string>$HOME/.local/bin/hf-mount-nfs</string>
         <string>repo</string>
-        <string>gpt2</string>
-        <string>/tmp/gpt2</string>
+        <string>openai/gpt-oss-20b</string>
+        <string>/tmp/gpt-oss-20b</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
