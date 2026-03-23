@@ -127,6 +127,7 @@ fn apply_fuse_patches() {
 fn create_mount_wrapper(token: &str, binary: &std::path::Path) {
     let wrapper = format!(
         "#!/bin/bash\nMOUNTPOINT=\"$1\"\nmkdir -p \"$MOUNTPOINT\"\n\
+         export RUST_LOG=${{RUST_LOG:-hf_mount=warn}}\n\
          exec {} --hf-token {} --hub-endpoint {} \
          --poll-interval-secs 0 --advanced-writes \
          --cache-dir /tmp/xfstests-cache \
