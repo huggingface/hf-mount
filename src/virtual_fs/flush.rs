@@ -9,7 +9,7 @@ use tracing::{debug, error, info, warn};
 use crate::hub_api::{BatchOp, HubOps};
 use crate::xet::{StagingDir, XetOps};
 
-use super::inode::InodeTable;
+use super::inode::{InodeTable, SparseWriteState};
 
 enum FlushSignal {
     /// Flush a dirty inode.
@@ -250,6 +250,20 @@ async fn flush_pending_deletes(queue: &Mutex<Vec<String>>, hub_client: &dyn HubO
     }
 }
 
+/// Info extracted from inode table for a single dirty file to flush.
+struct FlushEntry {
+    ino: u64,
+    full_path: String,
+    staging_path: PathBuf,
+    pending_deletes: Vec<String>,
+    /// If set, the file was opened for write without downloading the original (sparse staging).
+    sparse_write: Option<Arc<SparseWriteState>>,
+    /// Current file size from the inode (avoids a stat syscall during upload).
+    file_size: u64,
+    /// Snapshot of flush_generation at the time we read the inode.
+    flush_generation: u64,
+}
+
 async fn flush_batch(
     pending: Vec<u64>,
     xet_sessions: &dyn XetOps,
@@ -272,7 +286,7 @@ async fn flush_batch(
     debug!("flush_batch: deduped inos = {:?}", deduped);
 
     // Resolve paths from inode table, skip deleted/non-dirty/unlinked inodes
-    let to_flush: Vec<(u64, String, PathBuf, Vec<String>)> = {
+    let to_flush: Vec<FlushEntry> = {
         let inode_table = inodes.read().expect("inodes poisoned");
         deduped
             .into_iter()
@@ -295,12 +309,15 @@ async fn flush_batch(
                     flush_errors.lock().expect("flush_errors poisoned").insert(ino, msg);
                     return None;
                 }
-                Some((
+                Some(FlushEntry {
                     ino,
-                    entry.full_path.clone(),
+                    full_path: entry.full_path.clone(),
                     staging_path,
-                    entry.pending_deletes.clone(),
-                ))
+                    pending_deletes: entry.pending_deletes.clone(),
+                    sparse_write: entry.sparse_write.clone(),
+                    file_size: entry.size,
+                    flush_generation: entry.flush_generation,
+                })
             })
             .collect()
     };
@@ -309,20 +326,79 @@ async fn flush_batch(
         return;
     }
 
-    // Upload all files through a single upload session
-    let staging_paths: Vec<&std::path::Path> = to_flush.iter().map(|(_, _, p, _)| p.as_path()).collect();
-    let upload_results = match xet_sessions.upload_files(&staging_paths).await {
-        Ok(results) => results,
-        Err(e) => {
-            error!("Batch upload failed: {}", e);
-            let msg = format!("upload failed: {e}");
-            let mut errs = flush_errors.lock().expect("flush_errors poisoned");
-            for (ino, _, _, _) in &to_flush {
-                errs.insert(*ino, msg.clone());
+    // Partition into sparse files (can use range_upload) and regular files (full upload).
+    let (sparse_files, regular_files): (Vec<&FlushEntry>, Vec<&FlushEntry>) =
+        to_flush.iter().partition(|e| e.sparse_write.is_some());
+
+    // Upload results: (ino, full_path, pending_deletes, file_info)
+    let mut upload_results: Vec<(&FlushEntry, xet_data::processing::XetFileInfo)> = Vec::new();
+
+    // Process sparse files individually (range_upload)
+    for entry in &sparse_files {
+        let sw = entry.sparse_write.as_ref().unwrap();
+        match xet_sessions
+            .range_upload(sw, &entry.staging_path, entry.file_size)
+            .await
+        {
+            Ok(file_info) => {
+                info!(
+                    "Range-uploaded file ino={} path={} xet_hash={} size={}",
+                    entry.ino,
+                    entry.full_path,
+                    file_info.hash(),
+                    file_info.file_size()
+                );
+                upload_results.push((entry, file_info));
             }
-            return;
+            Err(e) => {
+                // Don't fall back to download_to_file: that would overwrite the staging
+                // file (which contains the user's dirty writes) with the original CAS
+                // content, silently losing data. Let the error propagate so the flush
+                // can be retried.
+                let msg = format!("range_upload failed: {e}");
+                error!("flush: ino={} path={} {}", entry.ino, entry.full_path, msg);
+                flush_errors
+                    .lock()
+                    .expect("flush_errors poisoned")
+                    .insert(entry.ino, msg);
+            }
         }
-    };
+    }
+
+    // Batch upload regular files
+    if !regular_files.is_empty() {
+        let staging_paths: Vec<&std::path::Path> = regular_files.iter().map(|e| e.staging_path.as_path()).collect();
+        match xet_sessions.upload_files(&staging_paths).await {
+            Ok(results) => {
+                for (entry, file_info) in regular_files.iter().zip(results.into_iter()) {
+                    info!(
+                        "Uploaded file ino={} path={} xet_hash={} size={}",
+                        entry.ino,
+                        entry.full_path,
+                        file_info.hash(),
+                        file_info.file_size()
+                    );
+                    upload_results.push((entry, file_info));
+                }
+            }
+            Err(e) => {
+                error!("Batch upload failed: {}", e);
+                let msg = format!("upload failed: {e}");
+                let mut errs = flush_errors.lock().expect("flush_errors poisoned");
+                for entry in &regular_files {
+                    errs.insert(entry.ino, msg.clone());
+                }
+                // If append uploads succeeded, we still commit those below
+                if upload_results.is_empty() {
+                    return;
+                }
+            }
+        }
+    }
+
+    if upload_results.is_empty() {
+        return;
+    }
 
     let mtime_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -330,32 +406,37 @@ async fn flush_batch(
         .as_millis() as u64;
 
     // Build batch operations — Hub API requires all adds before all deletes
-    let mut ops = Vec::with_capacity(to_flush.len());
+    let mut ops = Vec::with_capacity(upload_results.len());
     let mut delete_ops = Vec::new();
-    let mut successes: Vec<(u64, String, u64)> = Vec::new();
+    struct FlushSuccess {
+        ino: u64,
+        xet_hash: String,
+        size: u64,
+        flush_generation: u64,
+        flushed_path: String,
+    }
+    let mut successes: Vec<FlushSuccess> = Vec::new();
 
-    for ((ino, full_path, _, pending_deletes), file_info) in to_flush.iter().zip(upload_results.iter()) {
-        info!(
-            "Uploaded file ino={} path={} xet_hash={} size={}",
-            ino,
-            full_path,
-            file_info.hash(),
-            file_info.file_size()
-        );
-
+    for (entry, file_info) in &upload_results {
         ops.push(BatchOp::AddFile {
-            path: full_path.clone(),
+            path: entry.full_path.clone(),
             xet_hash: file_info.hash().to_string(),
             mtime: mtime_ms,
             content_type: None,
         });
 
         // Delete old remote paths left behind by rename of dirty files
-        for old_path in pending_deletes {
+        for old_path in &entry.pending_deletes {
             delete_ops.push(BatchOp::DeleteFile { path: old_path.clone() });
         }
 
-        successes.push((*ino, file_info.hash().to_string(), file_info.file_size()));
+        successes.push(FlushSuccess {
+            ino: entry.ino,
+            xet_hash: file_info.hash().to_string(),
+            size: file_info.file_size(),
+            flush_generation: entry.flush_generation,
+            flushed_path: entry.full_path.clone(),
+        });
     }
 
     ops.append(&mut delete_ops);
@@ -372,8 +453,8 @@ async fn flush_batch(
             error!("Batch commit retry failed: {}", e2);
             let msg = format!("commit failed after retry: {e2}");
             let mut errs = flush_errors.lock().expect("flush_errors poisoned");
-            for (ino, _, _, _) in &to_flush {
-                errs.insert(*ino, msg.clone());
+            for (entry, _) in &upload_results {
+                errs.insert(entry.ino, msg.clone());
             }
             // Files remain dirty -- will be re-uploaded on next flush or shutdown
             return;
@@ -381,23 +462,43 @@ async fn flush_batch(
         info!("Batch commit retry succeeded");
     }
 
-    // Update inodes.
-    // BUG: setting dirty=false unconditionally can lose writes from a concurrent
-    // writable handle on the same inode. If handle A flushes and clears dirty,
-    // handle B's subsequent release sees !dirty and skips the flush. Fix requires
-    // a dirty generation counter instead of a bool.
+    // Update inodes. Only clear dirty/sparse_write if no writes happened since
+    // the snapshot (flush_generation matches). Otherwise leave the file dirty
+    // so the next flush picks up the concurrent writes.
     let mut inode_table = inodes.write().expect("inodes poisoned");
     let now = SystemTime::now();
-    for (ino, xet_hash, size) in successes {
-        if let Some(entry) = inode_table.get_mut(ino) {
-            entry.xet_hash = Some(xet_hash);
-            entry.size = size;
-            entry.dirty = false;
-            entry.mtime = now;
-            entry.ctime = now;
-            entry.pending_deletes.clear();
+    for success in successes {
+        if let Some(entry) = inode_table.get_mut(success.ino) {
+            if entry.flush_generation == success.flush_generation {
+                // No concurrent writes since we snapshotted the inode: the remote
+                // now matches the staging file, so clear the dirty flag and update
+                // the xet_hash to point to the newly uploaded CAS object.
+                entry.xet_hash = Some(success.xet_hash);
+                entry.size = success.size;
+                entry.dirty = false;
+                entry.mtime = now;
+                entry.ctime = now;
+                entry.pending_deletes.clear();
+                entry.sparse_write = None;
+            } else {
+                // A concurrent write (or rename/truncate) bumped flush_generation
+                // after our snapshot. The remote now has the version we uploaded,
+                // but the local staging file has newer data. Keep the inode dirty
+                // so the next flush cycle picks up the concurrent changes.
+                //
+                // If the file was also renamed, the batch committed at the old path.
+                // Queue a delete for that stale remote entry so the next flush
+                // (which will use the new path) cleans it up.
+                if entry.full_path != success.flushed_path {
+                    entry.pending_deletes.push(success.flushed_path);
+                }
+                debug!(
+                    "flush: ino={} generation mismatch (flushed={}, current={}), keeping dirty",
+                    success.ino, success.flush_generation, entry.flush_generation
+                );
+            }
         }
     }
 
-    info!("Batch flush completed: {} file(s) committed", to_flush.len());
+    info!("Batch flush completed: {} file(s) committed", upload_results.len());
 }

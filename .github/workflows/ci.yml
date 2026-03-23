@@ -215,3 +215,59 @@ jobs:
             gh pr comment "$PR" --body "$BODY"
             echo "Created new comment"
           fi
+
+  fsx:
+    name: Data Integrity (fsx)
+    runs-on:
+      group: hf-mount-ci
+    needs: lint-test
+    env:
+      HF_TOKEN: ${{ secrets.HF_TOKEN_HUB_CI }}
+      HF_ENDPOINT: https://hub-ci.huggingface.co
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fuse3 libfuse3-dev
+          echo 'user_allow_other' | sudo tee -a /etc/fuse.conf
+
+      - name: Build release binaries
+        run: cargo build --release
+
+      - name: Run fsx (50k random ops)
+        timeout-minutes: 10
+        run: cargo test --release --test fsx -- --nocapture
+
+  xfstests:
+    name: xfstests generic
+    runs-on:
+      group: hf-mount-ci
+    needs: lint-test
+    env:
+      HF_TOKEN: ${{ secrets.HF_TOKEN_HUB_CI }}
+      HF_ENDPOINT: https://hub-ci.huggingface.co
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fuse3 libfuse3-dev libtool autoconf automake libaio-dev libacl1-dev uuid-dev xfsprogs xfslibs-dev attr acl bc
+          echo 'user_allow_other' | sudo tee -a /etc/fuse.conf
+
+      - name: Build release binaries
+        run: cargo build --release
+
+      - name: Run xfstests generic/quick
+        timeout-minutes: 15
+        run: cargo test --release --test xfstests -- --nocapture

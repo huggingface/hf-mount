@@ -1111,14 +1111,18 @@ impl VirtualFs {
         // Reuse existing dirty staging file (unless truncating)
         if !(is_dirty && staging_path.exists() && !truncate) {
             if !truncate && !xet_hash.is_empty() && size > 0 {
-                // Download remote content for read-modify-write
-                self.xet_sessions
-                    .download_to_file(xet_hash, size, &staging_path)
-                    .await
-                    .map_err(|e| {
-                        error!("Failed to download file for write: {}", e);
-                        libc::EIO
-                    })?;
+                // Create a sparse staging file instead of downloading.
+                // The original bytes live as a hole; appended bytes go to real blocks.
+                // If a write below original_size occurs, the lazy download fallback
+                // in write() will fill the hole from CAS.
+                let file = File::create(&staging_path).map_err(|e| {
+                    error!("Failed to create staging file: {}", e);
+                    libc::EIO
+                })?;
+                file.set_len(size).map_err(|e| {
+                    error!("Failed to set sparse staging file length: {}", e);
+                    libc::EIO
+                })?;
             } else {
                 // Truncate, new file, or empty remote → empty staging file
                 File::create(&staging_path).map_err(|e| {
@@ -1142,12 +1146,17 @@ impl VirtualFs {
             let mut inodes = self.inode_table.write().expect("inodes poisoned");
             let entry = inodes.get_mut(ino).ok_or(libc::ENOENT)?;
             entry.dirty = true;
+            entry.flush_generation += 1;
             if truncate {
                 entry.size = 0;
                 // POSIX: O_TRUNC must update mtime and ctime
                 let now = SystemTime::now();
                 entry.mtime = now;
                 entry.ctime = now;
+                entry.sparse_write = None;
+            } else if !xet_hash.is_empty() && size > 0 && !is_dirty {
+                // Track the original CAS file so flush can use range_upload
+                entry.sparse_write = Some(Arc::new(inode::SparseWriteState::new(xet_hash.to_string(), size)));
             }
         }
 
@@ -1191,6 +1200,7 @@ impl VirtualFs {
             let mut inodes = self.inode_table.write().expect("inodes poisoned");
             let entry = inodes.get_mut(ino).ok_or(libc::ENOENT)?;
             entry.dirty = true;
+            entry.flush_generation += 1;
             entry.size = 0;
             entry.xet_hash = None;
         }
@@ -1298,18 +1308,22 @@ impl VirtualFs {
         for attempt in 0..MAX_ATTEMPTS {
             let stream = match first_stream.take() {
                 Some(s) => Some(s),
-                None => match self.xet_sessions.download_stream_boxed(
-                    &file_info,
-                    cursor,
-                    // For range downloads (random reads / seeks), bound the request
-                    // so CAS only returns terms covering the needed bytes.
-                    // For streaming, leave unbounded so the stream can continue.
-                    if plan.strategy == prefetch::FetchStrategy::RangeDownload {
-                        Some(cursor + plan.fetch_size)
-                    } else {
-                        None
-                    },
-                ) {
+                None => match self
+                    .xet_sessions
+                    .download_stream_boxed(
+                        &file_info,
+                        cursor,
+                        // For range downloads (random reads / seeks), bound the request
+                        // so CAS only returns terms covering the needed bytes.
+                        // For streaming, leave unbounded so the stream can continue.
+                        if plan.strategy == prefetch::FetchStrategy::RangeDownload {
+                            Some(cursor + plan.fetch_size)
+                        } else {
+                            None
+                        },
+                    )
+                    .await
+                {
                     Ok(s) => Some(s),
                     Err(e) => {
                         warn!(
@@ -1401,6 +1415,108 @@ impl VirtualFs {
         Err(libc::EIO)
     }
 
+    /// Fill sparse holes in `buf` by downloading original bytes from CAS.
+    ///
+    /// For a sparse staging file, bytes in `[0, original_size)` that fall outside
+    /// dirty ranges are zeros (holes). This method downloads those regions from CAS
+    /// and overlays them onto `buf`, leaving dirty bytes untouched.
+    ///
+    /// NOTE: we intentionally do NOT backfill the staging file with the downloaded
+    /// CAS bytes. That would avoid repeated downloads on re-reads, but it would
+    /// require a separate `fetched_ranges` tracker (can't reuse `dirty_ranges` or
+    /// `range_upload` would re-upload unmodified data). The reconstruction cache in
+    /// `CachedXetClient` already amortizes repeated CAS fetches, so the simpler
+    /// approach wins for now. Revisit if profiling shows re-downloads are a bottleneck.
+    async fn fill_sparse_holes(
+        &self,
+        sparse_write_state: &inode::SparseWriteState,
+        buffer: &mut BytesMut,
+        offset: u64,
+    ) -> Result<(), i32> {
+        let read_end = offset + buffer.len() as u64;
+        let orig_end = sparse_write_state.original_size.min(read_end);
+        if offset >= orig_end {
+            return Ok(());
+        }
+
+        // Skip the CAS download if the read region is fully covered by dirty ranges
+        // (the staging file already has the right data, no sparse holes to fill).
+        // Binary search to the first range whose end > offset, then sweep from there.
+        let ranges = &sparse_write_state.dirty_ranges;
+        let start_idx = ranges.partition_point(|&(_, e)| e <= offset);
+        let mut covered_up_to = offset;
+        for &(start, end) in &ranges[start_idx..] {
+            if start > covered_up_to {
+                break; // gap before this range → hole found
+            }
+            covered_up_to = covered_up_to.max(end);
+            if covered_up_to >= orig_end {
+                break; // read region fully covered
+            }
+        }
+        if covered_up_to >= orig_end {
+            return Ok(());
+        }
+
+        // Download original bytes from CAS for the region [offset, orig_end)
+        let file_info = XetFileInfo::new(
+            sparse_write_state.original_hash.clone(),
+            sparse_write_state.original_size,
+        );
+        let mut stream = self
+            .xet_sessions
+            .download_stream_boxed(&file_info, offset, Some(orig_end))
+            .await
+            .map_err(|e| {
+                error!("sparse read CAS download failed: {}", e);
+                libc::EIO
+            })?;
+        let mut cas_data = Vec::with_capacity((orig_end - offset) as usize);
+        while let Some(chunk) = stream.next().await.map_err(|e| {
+            error!("sparse read CAS stream error: {}", e);
+            libc::EIO
+        })? {
+            cas_data.extend_from_slice(&chunk);
+        }
+
+        // Copy CAS bytes into the buffer for gaps between dirty ranges.
+        // Dirty ranges are skipped (staging file already has the right bytes there).
+        //
+        //   cas_data:  [=== CAS bytes for [offset, orig_end) ===]
+        //   dirty:          [##D1##]         [##D2##]
+        //   copy:     [CAS]         [CAS CAS]        [CAS CAS CAS]
+        //              ^^^           ^^^^^^^^         ^^^^^^^^^^^
+        //              gap before    gap between      trailing gap
+        //              D1            D1 and D2        after D2
+        let cas_start = offset;
+        let cas_end = orig_end;
+        let mut cursor = cas_start;
+        // start_idx already points to the first overlapping range (computed above)
+        for &(ds, de) in &ranges[start_idx..] {
+            if ds >= cas_end {
+                break; // past read region
+            }
+            // Copy the clean gap before this dirty range
+            let gap_end = ds.max(cas_start).min(cas_end);
+            if cursor < gap_end {
+                let src_off = (cursor - cas_start) as usize;
+                let dst_off = (cursor - offset) as usize;
+                let len = (gap_end - cursor) as usize;
+                buffer[dst_off..dst_off + len].copy_from_slice(&cas_data[src_off..src_off + len]);
+            }
+            cursor = de.min(cas_end); // skip past the dirty range
+        }
+        // Copy trailing clean gap after the last dirty range
+        if cursor < cas_end {
+            let src_off = (cursor - cas_start) as usize;
+            let dst_off = (cursor - offset) as usize;
+            let len = (cas_end - cursor) as usize;
+            buffer[dst_off..dst_off + len].copy_from_slice(&cas_data[src_off..src_off + len]);
+        }
+
+        Ok(())
+    }
+
     /// Read data from an open file. Returns `(data, eof)`.
     pub async fn read(&self, file_handle: u64, offset: u64, size: u32) -> VirtualFsResult<(Bytes, bool)> {
         debug!("read: fh={}, offset={}, size={}", file_handle, offset, size);
@@ -1410,7 +1526,10 @@ impl VirtualFs {
         let read_target = {
             let files = self.open_files.read().expect("open_files poisoned");
             match files.get(&file_handle) {
-                Some(OpenFile::Local { file, .. }) => ReadTarget::LocalFd(file.clone()),
+                Some(OpenFile::Local { file, ino, .. }) => ReadTarget::LocalFd {
+                    file: file.clone(),
+                    ino: *ino,
+                },
                 Some(OpenFile::Lazy { prefetch }) => ReadTarget::Remote {
                     prefetch: prefetch.clone(),
                 },
@@ -1421,7 +1540,7 @@ impl VirtualFs {
         };
 
         match read_target {
-            ReadTarget::LocalFd(file) => {
+            ReadTarget::LocalFd { file, ino } => {
                 let file_descriptor = file.as_raw_fd();
                 let mut buf = BytesMut::zeroed(size as usize);
                 // SAFETY: fd is valid (Arc<File> keeps it alive), buf is correctly sized.
@@ -1435,12 +1554,23 @@ impl VirtualFs {
                     )
                 };
                 if n < 0 {
-                    Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO))
-                } else {
-                    buf.truncate(n as usize);
-                    let eof = (n as u32) < size;
-                    Ok((buf.freeze(), eof))
+                    return Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO));
                 }
+                buf.truncate(n as usize);
+
+                // Fill sparse holes from CAS: if this inode has sparse_write state,
+                // any read bytes that fall in [0, original_size) but OUTSIDE the dirty
+                // ranges are sparse zeros that should be filled with original CAS data.
+                let sparse_write = {
+                    let inodes = self.inode_table.read().expect("inodes poisoned");
+                    inodes.get(ino).and_then(|e| e.sparse_write.clone())
+                };
+                if let Some(ref sw) = sparse_write {
+                    self.fill_sparse_holes(sw, &mut buf, offset).await?;
+                }
+
+                let eof = (n as u32) < size;
+                Ok((buf.freeze(), eof))
             }
             ReadTarget::Remote { prefetch } => {
                 let mut prefetch_state = prefetch.lock().await;
@@ -1577,12 +1707,33 @@ impl VirtualFs {
                 } else {
                     let written = n as u32;
                     let new_end = offset + written as u64;
+
+                    // Verify the staging file's actual size to guard against a
+                    // concurrent setattr(truncate) that shrank the file between
+                    // our pwrite and this inode update. Without this, entry.size
+                    // could exceed the staging file length, causing range_upload
+                    // to hit EOF on the now-smaller file.
+                    let actual_size = file.metadata().map(|m| m.len()).unwrap_or(new_end);
+                    let effective_end = new_end.min(actual_size);
+
                     let mut inodes = self.inode_table.write().expect("inodes poisoned");
                     if let Some(entry) = inodes.get_mut(handle_ino) {
-                        if new_end > entry.size {
-                            entry.size = new_end;
+                        // Update sparse write tracking
+                        if let Some(ref mut sw) = entry.sparse_write {
+                            Arc::make_mut(sw).track_write(offset, written as u64);
+                        } else if !entry.dirty {
+                            // Clean->dirty transition (NFS handle reuse): set up sparse tracking
+                            if let Some(ref hash) = entry.xet_hash {
+                                let mut sw = inode::SparseWriteState::new(hash.clone(), entry.size);
+                                sw.track_write(offset, written as u64);
+                                entry.sparse_write = Some(Arc::new(sw));
+                            }
+                        }
+                        if effective_end > entry.size {
+                            entry.size = effective_end;
                         }
                         entry.dirty = true;
+                        entry.flush_generation += 1;
                     }
                     Ok(written)
                 }
@@ -1971,6 +2122,7 @@ impl VirtualFs {
             );
             if let Some(entry) = inodes.get_mut(ino) {
                 entry.dirty = true;
+                entry.flush_generation += 1;
             }
             inodes.touch_parent(parent, now);
             (ino, full_path)
@@ -2362,7 +2514,18 @@ impl VirtualFs {
         self.rename_remote(&info).await?;
 
         // Phase 3: apply to local inode table under write lock
-        self.rename_apply_local(info, parent, name, newparent, newname, no_replace)
+        let dirty_inos = self.rename_apply_local(info, parent, name, newparent, newname, no_replace)?;
+
+        // Re-enqueue dirty files whose flush_generation was bumped by the rename.
+        // Without this, an in-flight flush that hits a generation mismatch would leave
+        // the file dirty with no pending flush until the next write or shutdown.
+        if let Some(fm) = &self.flush_manager {
+            for ino in dirty_inos {
+                fm.enqueue(ino);
+            }
+        }
+
+        Ok(())
     }
 
     /// Phase 1: validate rename under inode read lock, return all info needed for phases 2+3.
@@ -2499,6 +2662,8 @@ impl VirtualFs {
     }
 
     /// Phase 3: apply rename to local inode table under write lock.
+    /// Returns the list of dirty file inodes whose flush_generation was bumped
+    /// (so the caller can re-enqueue them for flush).
     fn rename_apply_local(
         &self,
         info: RenameInfo,
@@ -2507,7 +2672,7 @@ impl VirtualFs {
         newparent: u64,
         newname: &str,
         no_replace: bool,
-    ) -> VirtualFsResult<()> {
+    ) -> VirtualFsResult<Vec<u64>> {
         self.negative_cache_remove(&info.new_full_path);
         // Cancel any queued remote delete for the destination path (e.g. rm a && mv b a).
         // For directories, also cancel descendant deletes (e.g. rm -rf dir && mv newdir dir).
@@ -2530,7 +2695,7 @@ impl VirtualFs {
         let replace_target = if let Some(existing) = inodes.lookup_child(newparent, newname) {
             // POSIX: rename(a, b) where a and b are hard links to the same inode is a no-op
             if existing.inode == info.ino {
-                return Ok(());
+                return Ok(Vec::new());
             }
             if no_replace {
                 return Err(libc::EEXIST);
@@ -2562,17 +2727,24 @@ impl VirtualFs {
             }
         }
 
-        // Dirty file with a remote presence: record old path for deletion at flush time.
+        // Dirty file rename: bump generation so an in-flight flush won't clear dirty
+        // state with the stale path. Also record old path for deletion if it has a
+        // remote presence (xet_hash).
+        let mut dirty_inos_to_reenqueue = Vec::new();
+
         if info.is_dirty
             && info.kind == InodeKind::File
-            && info.xet_hash.is_some()
             && let Some(entry) = inodes.get_mut(info.ino)
         {
-            entry.pending_deletes.push(info.old_path.clone());
+            entry.flush_generation += 1;
+            if info.xet_hash.is_some() {
+                entry.pending_deletes.push(info.old_path.clone());
+            }
+            dirty_inos_to_reenqueue.push(info.ino);
         }
 
-        // Dirty descendants of a renamed directory: record their old remote paths
-        // for deletion at flush time (clean descendants are handled in rename_remote).
+        // Dirty descendants of a renamed directory: bump generation and record old
+        // paths for deletion at flush time (clean descendants are handled in rename_remote).
         if info.kind == InodeKind::Directory {
             let mut stack = vec![info.ino];
             while let Some(dir_ino) = stack.pop() {
@@ -2581,11 +2753,16 @@ impl VirtualFs {
                 for child_ref in children {
                     if let Some(child) = inodes.get(child_ref.ino) {
                         match child.kind {
-                            InodeKind::File if child.dirty && child.xet_hash.is_some() => {
+                            InodeKind::File if child.dirty => {
+                                let has_remote = child.xet_hash.is_some();
                                 let old_path = child.full_path.clone();
                                 if let Some(child_mut) = inodes.get_mut(child_ref.ino) {
-                                    child_mut.pending_deletes.push(old_path);
+                                    child_mut.flush_generation += 1;
+                                    if has_remote {
+                                        child_mut.pending_deletes.push(old_path);
+                                    }
                                 }
+                                dirty_inos_to_reenqueue.push(child_ref.ino);
                             }
                             InodeKind::Directory => stack.push(child_ref.ino),
                             _ => {}
@@ -2612,7 +2789,7 @@ impl VirtualFs {
             e.ctime = now;
         }
 
-        Ok(())
+        Ok(dirty_inos_to_reenqueue)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2658,51 +2835,64 @@ impl VirtualFs {
                     .expect("staging_dir required for advanced writes")
                     .path(ino);
 
+                // No materialization needed: upload_ranges in xet-core handles
+                // truncation/extension boundaries by reading from CAS directly.
+                // We just ensure sparse_write is set up so flush uses range_upload.
+
                 if new_size == 0 {
                     if let Err(e) = File::create(&staging_path) {
                         error!("Failed to truncate staging file: {}", e);
                         return Err(libc::EIO);
                     }
                 } else {
-                    // If staging file doesn't exist, download from remote first
-                    if !staging_path.exists() {
-                        let (xet_hash, file_size) = {
-                            let inodes = self.inode_table.read().expect("inodes poisoned");
-                            let entry = inodes.get(ino).ok_or(libc::ENOENT)?;
-                            (entry.xet_hash.clone().unwrap_or_default(), entry.size)
-                        };
-                        if !xet_hash.is_empty() && file_size > 0 {
-                            if let Err(e) = self
-                                .xet_sessions
-                                .download_to_file(&xet_hash, file_size, &staging_path)
-                                .await
-                            {
-                                error!("Failed to download file for truncate: {}", e);
-                                return Err(libc::EIO);
-                            }
-                        } else if let Err(e) = File::create(&staging_path) {
-                            error!("Failed to create staging file for truncate: {}", e);
-                            return Err(libc::EIO);
-                        }
+                    // Create staging file if it doesn't exist, then resize.
+                    // No CAS download needed: reads fill sparse holes on demand
+                    // via fill_sparse_holes, and range_upload composes the correct
+                    // file at flush time from CAS prefix + staging data.
+                    if !staging_path.exists()
+                        && let Err(e) = File::create(&staging_path)
+                    {
+                        error!("Failed to create staging file for truncate: {}", e);
+                        return Err(libc::EIO);
                     }
                     if let Err(e) = OpenOptions::new()
                         .write(true)
                         .open(&staging_path)
                         .and_then(|f| f.set_len(new_size))
                     {
-                        error!("Failed to set staging file length: {}", e);
+                        error!("Failed to resize staging file: {}", e);
                         return Err(libc::EIO);
                     }
                 }
 
                 let mut inodes = self.inode_table.write().expect("inodes poisoned");
                 if let Some(entry) = inodes.get_mut(ino) {
+                    let entry_orig_size = entry.size;
                     entry.size = new_size;
                     entry.mtime = SystemTime::now();
                     entry.ctime = entry.mtime;
                     entry.dirty = true;
+                    entry.flush_generation += 1;
                     if new_size == 0 {
                         entry.xet_hash = None;
+                        entry.sparse_write = None;
+                    } else if let Some(ref mut sw) = entry.sparse_write {
+                        let sw = Arc::make_mut(sw);
+                        if new_size < entry_orig_size {
+                            // Shrink: trim dirty ranges and clip original_size.
+                            // upload_ranges handles the truncation boundary from CAS.
+                            sw.clip_to_size(new_size);
+                        } else if new_size > entry_orig_size {
+                            // Grow: track the extension as dirty. track_write handles
+                            // the gap [original_size, new_size) automatically.
+                            sw.track_write(entry_orig_size, new_size - entry_orig_size);
+                        }
+                    } else if let Some(ref hash) = entry.xet_hash {
+                        // Clean file (never opened for write): set up sparse_write
+                        // so flush uses range_upload instead of regular upload
+                        // (which would read zeros from the empty staging file).
+                        entry.sparse_write =
+                            Some(Arc::new(inode::SparseWriteState::new(hash.clone(), entry_orig_size)));
                     }
                 }
 
@@ -2939,7 +3129,7 @@ async fn streaming_worker(
 /// What to do in read() after releasing the open_files lock.
 enum ReadTarget {
     /// Hold an Arc<File> so the FD stays alive even if release() runs concurrently.
-    LocalFd(Arc<File>),
+    LocalFd { file: Arc<File>, ino: u64 },
     Remote {
         prefetch: Arc<tokio::sync::Mutex<PrefetchState>>,
     },
