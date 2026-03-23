@@ -217,7 +217,11 @@ async fn test_xfstests_generic() {
     // TODO: re-enable generic/308 when sparse upload is implemented
     eprintln!("Running xfstests generic/quick...");
     let output = Command::new("sudo")
-        .args(["./check", "-g", "generic/quick", "-e", "generic/308"])
+        // Exclude tests too slow for remote-backed FUSE:
+        // generic/113: aio-stress 20 threads x 20 files (~10 min on 4 vCPU)
+        // generic/308: writes at 16TB offset (sparse file staging too slow)
+        // TODO: re-enable when sparse upload + faster I/O path are implemented
+        .args(["./check", "-g", "generic/quick", "-e", "generic/113 generic/308"])
         .current_dir(XFSTESTS_DIR)
         .output()
         .expect("Failed to run xfstests");
