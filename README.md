@@ -285,6 +285,16 @@ Reads go through an adaptive prefetch buffer that starts small and grows with se
 
 Built on [xet-core](https://github.com/huggingface/xet-core) for content-addressed storage and efficient file transfers, and [fuser](https://github.com/cberner/fuser) for the FUSE implementation.
 
+## Kubernetes
+
+Use the [hf-csi-driver](https://github.com/huggingface/hf-csi-driver) to mount Buckets and repos as Kubernetes volumes. The CSI driver runs hf-mount inside a DaemonSet and exposes mounts to pods via the Container Storage Interface.
+
+```bash
+helm install hf-csi oci://ghcr.io/huggingface/charts/hf-csi-driver
+```
+
+See the [hf-csi-driver README](https://github.com/huggingface/hf-csi-driver#readme) for setup and examples.
+
 ## Testing
 
 ```bash
