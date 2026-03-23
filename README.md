@@ -193,7 +193,7 @@ cat > ~/Library/LaunchAgents/$label.plist <<EOF
     <string>$label</string>
     <key>ProgramArguments</key>
     <array>
-        <string>$HOME/.local/bin/hf-mount-nfs</string>
+        <string>$HOME/.local/bin/hf-mount</string>
         <string>repo</string>
         <string>gpt2</string>
         <string>/tmp/gpt2</string>
