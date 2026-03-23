@@ -93,8 +93,7 @@ jobs:
       group: hf-mount-ci
     needs: lint-test
     env:
-      HF_TOKEN: ${{ secrets.HF_TOKEN_HUB_CI }}
-      HF_ENDPOINT: https://hub-ci.huggingface.co
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -116,8 +115,7 @@ jobs:
       group: hf-mount-ci-m5dn-24xlarge
     needs: lint-test
     env:
-      HF_TOKEN: ${{ secrets.HF_TOKEN_HUB_CI }}
-      HF_ENDPOINT: https://hub-ci.huggingface.co
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
