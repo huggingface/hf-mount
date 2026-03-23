@@ -125,7 +125,7 @@ jobs:
       - name: Install system deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y fuse3 libfuse3-dev
+          sudo apt-get install -y fuse3 libfuse3-dev xfsprogs xfsdump attr libaio-dev uuid-dev acl bc
           echo 'user_allow_other' | sudo tee -a /etc/fuse.conf
       - name: Build
         run: cargo build --release
