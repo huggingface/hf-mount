@@ -588,7 +588,7 @@ impl VirtualFs {
     /// No-op if a hook is already installed (prevents replacing a receiver that
     /// an open() caller may already be awaiting).
     fn install_commit_hook(&self, ino: u64, channel: &StreamingChannel) {
-        let mut hook = channel.commit_hook.lock().unwrap();
+        let mut hook = channel.commit_hook.lock().expect("commit_hook poisoned");
         if hook.is_some() {
             return; // already installed — don't replace
         }
@@ -602,7 +602,7 @@ impl VirtualFs {
 
     /// Fulfill the pending commit hook with a result, then clean up the map.
     fn fulfill_commit_hook(&self, ino: u64, channel: &StreamingChannel, result: Result<(), i32>) {
-        if let Some(tx) = channel.commit_hook.lock().unwrap().take() {
+        if let Some(tx) = channel.commit_hook.lock().expect("commit_hook poisoned").take() {
             let _ = tx.send(Some(result));
         }
         self.pending_commits
@@ -1470,7 +1470,7 @@ impl VirtualFs {
                 channel,
             } => {
                 // Check for previous worker error
-                if channel.error.lock().unwrap().is_some() {
+                if channel.error.lock().expect("error poisoned").is_some() {
                     return Err(libc::EIO);
                 }
 
@@ -1516,13 +1516,13 @@ impl VirtualFs {
 
         if let Some(channel) = streaming_channel {
             // Check for worker errors first.
-            if channel.error.lock().unwrap().is_some() {
+            if channel.error.lock().expect("error poisoned").is_some() {
                 return Err(libc::EIO);
             }
 
             // Check current commit state.
             {
-                let state = channel.state.lock().unwrap();
+                let state = channel.state.lock().expect("state poisoned");
                 match &*state {
                     CommitState::Committed => return Ok(()),
                     CommitState::Failed(msg) => {
@@ -1543,7 +1543,7 @@ impl VirtualFs {
                     ino, open_pid, flush_pid
                 );
                 self.install_commit_hook(ino, &channel);
-                *channel.state.lock().unwrap() = CommitState::Deferred;
+                *channel.state.lock().expect("state poisoned") = CommitState::Deferred;
                 return Ok(());
             }
 
@@ -1551,7 +1551,7 @@ impl VirtualFs {
             // and zero-write cases like `touch`). release() will handle it.
             if channel.bytes_written.load(Ordering::Relaxed) == 0 {
                 self.install_commit_hook(ino, &channel);
-                *channel.state.lock().unwrap() = CommitState::Deferred;
+                *channel.state.lock().expect("state poisoned") = CommitState::Deferred;
                 return Ok(());
             }
 
@@ -1560,7 +1560,7 @@ impl VirtualFs {
 
             match self.streaming_commit(ino, &channel).await {
                 Ok(()) => {
-                    *channel.state.lock().unwrap() = CommitState::Committed;
+                    *channel.state.lock().expect("state poisoned") = CommitState::Committed;
                     self.fulfill_commit_hook(ino, &channel, Ok(()));
                 }
                 Err(e) => {
@@ -1619,13 +1619,13 @@ impl VirtualFs {
             }
             Some(OpenFile::Streaming { ino, channel }) => {
                 let needs_commit = {
-                    let state = channel.state.lock().unwrap();
+                    let state = channel.state.lock().expect("state poisoned");
                     matches!(&*state, CommitState::Writing | CommitState::Deferred)
                 };
                 if needs_commit {
                     // If flush() didn't defer (e.g. Writing state from a direct
                     // release without flush), install the hook now.
-                    if channel.commit_hook.lock().unwrap().is_none() {
+                    if channel.commit_hook.lock().expect("commit_hook poisoned").is_none() {
                         self.install_commit_hook(ino, &channel);
                     }
 
@@ -1635,7 +1635,7 @@ impl VirtualFs {
                             // Retry only if CAS upload succeeded but Hub commit failed
                             // (pending_info is preserved). If the worker itself died,
                             // there's nothing to retry -- the data is gone.
-                            if channel.pending_info.lock().unwrap().is_some() {
+                            if channel.pending_info.lock().expect("pending_info poisoned").is_some() {
                                 tokio::time::sleep(Duration::from_secs(1)).await;
                                 self.streaming_commit(ino, &channel).await
                             } else {
@@ -1646,12 +1646,13 @@ impl VirtualFs {
 
                     match &result {
                         Ok(()) => {
-                            *channel.state.lock().unwrap() = CommitState::Committed;
+                            *channel.state.lock().expect("state poisoned") = CommitState::Committed;
                         }
                         Err(e) => {
                             error!("DATA LOSS: streaming commit failed for ino={}: errno={}", ino, e);
                             self.revert_inode(ino, &channel.snapshot);
-                            *channel.state.lock().unwrap() = CommitState::Failed("commit failed".into());
+                            *channel.state.lock().expect("state poisoned") =
+                                CommitState::Failed("commit failed".into());
                             release_error = Some(*e);
                         }
                     }
@@ -1717,7 +1718,7 @@ impl VirtualFs {
         }
 
         let file_info = {
-            let pending = channel.pending_info.lock().unwrap().take();
+            let pending = channel.pending_info.lock().expect("pending_info poisoned").take();
             if let Some(info) = pending {
                 info
             } else {
@@ -1725,7 +1726,8 @@ impl VirtualFs {
                 if channel.tx.send(WriteMsg::Finish(result_tx)).await.is_err() {
                     // Channel closed: only treat as success if already committed.
                     // If the worker died from an error, this is a real failure.
-                    let already_committed = matches!(&*channel.state.lock().unwrap(), CommitState::Committed);
+                    let already_committed =
+                        matches!(&*channel.state.lock().expect("state poisoned"), CommitState::Committed);
                     if already_committed {
                         debug!("streaming_commit: channel closed but already committed for ino={}", ino);
                         return Ok(());
@@ -1772,7 +1774,7 @@ impl VirtualFs {
         if let Err(e) = self.hub_client.batch_operations(&ops).await {
             error!("Failed to commit file {}: {}", full_path, e);
             // CAS upload succeeded — preserve file_info for retry in release()
-            *channel.pending_info.lock().unwrap() = Some(file_info);
+            *channel.pending_info.lock().expect("pending_info poisoned") = Some(file_info);
             return Err(libc::EIO);
         }
 
@@ -2304,7 +2306,10 @@ impl VirtualFs {
                         if let Some(child) = inodes.get(child_ref.ino) {
                             match child.kind {
                                 InodeKind::File if !child.is_dirty() && child.xet_hash.is_some() => {
-                                    files.push((child.full_path.clone(), child.xet_hash.clone().unwrap()));
+                                    files.push((
+                                        child.full_path.clone(),
+                                        child.xet_hash.clone().expect("checked is_some above"),
+                                    ));
                                 }
                                 InodeKind::Directory => stack.push(child_ref.ino),
                                 _ => {}

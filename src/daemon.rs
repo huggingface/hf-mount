@@ -358,8 +358,8 @@ pub fn daemonize(mount_point: &Path, source_label: &str) -> std::io::Result<Daem
     let pid_file = pid_path(mount_point);
     let canonical = canonical_mount_point(mount_point);
 
-    std::fs::create_dir_all(log_file.parent().unwrap())?;
-    std::fs::create_dir_all(pid_file.parent().unwrap())?;
+    std::fs::create_dir_all(log_file.parent().expect("log_file has parent"))?;
+    std::fs::create_dir_all(pid_file.parent().expect("pid_file has parent"))?;
 
     // Refuse to start if a daemon is already running for this mount point.
     if let Some(existing) = read_pid_file(&pid_file) {
