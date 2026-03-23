@@ -59,6 +59,19 @@ pub struct VfsConfig {
     pub flush_max_batch_window: Duration,
 }
 
+/// Lock ordering (acquire in this order to prevent deadlocks):
+///
+///   staging_locks[ino]          (tokio::sync::Mutex, per-inode)
+///     → inode_table             (RwLock, read or write)
+///         → open_files          (RwLock, read only — via has_open_handles)
+///         → negative_cache      (RwLock, write — in poll_remote_changes)
+///
+///   StreamingChannel.commit_hook (Mutex)
+///     → pending_commits          (Mutex)
+///
+/// General discipline: locks are held briefly and never across await points
+/// (except tokio::sync::Mutex in staging_locks). Most paths acquire a lock,
+/// extract data, drop the lock, perform async I/O, then re-acquire to apply.
 pub struct VirtualFs {
     runtime: tokio::runtime::Handle,
     hub_client: Arc<dyn HubOps>,
