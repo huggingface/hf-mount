@@ -345,7 +345,7 @@ pub fn daemonize(mount_point: &Path, source_label: &str) -> std::io::Result<Daem
             return Err(std::io::Error::new(
                 std::io::ErrorKind::AlreadyExists,
                 format!(
-                    "daemon already running (pid={}) for {:?}. Stop it first with: hf-mount-daemon stop {}",
+                    "daemon already running (pid={}) for {:?}. Stop it first with: hf-mount stop {}",
                     existing.pid,
                     mount_point,
                     mount_point.display()
@@ -450,7 +450,7 @@ pub fn daemonize(mount_point: &Path, source_label: &str) -> std::io::Result<Daem
             if n == 1 && buf[0] == b'R' {
                 eprintln!(" ready");
                 eprintln!("  logs: {}", log_file.display());
-                eprintln!("  stop: hf-mount-daemon stop {}", canonical.display());
+                eprintln!("  stop: hf-mount stop {}", canonical.display());
                 std::process::exit(0);
             } else {
                 eprintln!(" failed");

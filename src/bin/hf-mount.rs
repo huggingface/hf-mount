@@ -6,7 +6,7 @@ use tracing::{error, info};
 use hf_mount::setup::{MountOptions, Source};
 
 #[derive(Parser)]
-#[command(about = "Manage hf-mount background daemons")]
+#[command(about = "Mount Hugging Face Buckets and repos as a local filesystem")]
 struct Cli {
     #[command(subcommand)]
     command: Command,

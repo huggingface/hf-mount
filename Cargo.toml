@@ -54,6 +54,6 @@ path = "src/bin/hf-mount-nfs.rs"
 required-features = ["nfs"]
 
 [[bin]]
-name = "hf-mount-daemon"
-path = "src/bin/hf-mount-daemon.rs"
+name = "hf-mount"
+path = "src/bin/hf-mount.rs"
 required-features = ["fuse", "nfs"]

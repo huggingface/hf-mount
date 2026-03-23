@@ -57,9 +57,9 @@ jobs:
           mkdir -p dist
           # aarch64 cross-build only produces NFS (no libfuse3 sysroot for cross)
           if [ "${{ matrix.arch }}" = "aarch64" ]; then
-            bins="hf-mount-nfs hf-mount-daemon"
+            bins="hf-mount-nfs hf-mount"
           else
-            bins="hf-mount-fuse hf-mount-nfs hf-mount-daemon"
+            bins="hf-mount-fuse hf-mount-nfs hf-mount"
           fi
           for bin in $bins; do
             cp target/${{ matrix.target }}/release/$bin dist/${bin}-${{ matrix.arch }}-linux
@@ -100,7 +100,7 @@ jobs:
       - name: Package
         run: |
           mkdir -p dist
-          for bin in hf-mount-fuse hf-mount-nfs hf-mount-daemon; do
+          for bin in hf-mount-fuse hf-mount-nfs hf-mount; do
             cp target/${{ matrix.target }}/release/$bin dist/${bin}-${{ matrix.arch }}-apple-darwin
           done
           chmod +x dist/*
