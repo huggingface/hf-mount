@@ -49,14 +49,20 @@ jobs:
         if: matrix.arch == 'x86_64'
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Build (cross, vendored OpenSSL)
+      - name: Build (cross, NFS only + vendored OpenSSL)
         if: matrix.arch == 'aarch64'
-        run: cargo build --release --target ${{ matrix.target }} --features vendored-openssl
+        run: cargo build --release --target ${{ matrix.target }} --no-default-features --features nfs,vendored-openssl
 
       - name: Package
         run: |
           mkdir -p dist
-          for bin in hf-mount-fuse hf-mount-nfs hf-mount-daemon; do
+          # aarch64 cross-build only produces NFS (no libfuse3 sysroot for cross)
+          if [ "${{ matrix.arch }}" = "aarch64" ]; then
+            bins="hf-mount-nfs hf-mount-daemon"
+          else
+            bins="hf-mount-fuse hf-mount-nfs hf-mount-daemon"
+          fi
+          for bin in $bins; do
             cp target/${{ matrix.target }}/release/$bin dist/${bin}-${{ matrix.arch }}-linux
           done
           chmod +x dist/*
