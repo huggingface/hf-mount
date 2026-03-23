@@ -42,7 +42,11 @@ jobs:
           echo 'linker = "aarch64-linux-gnu-gcc"' >> ~/.cargo/config.toml
 
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }} --features vendored-openssl
+        run: |
+          T="${{ matrix.target }}"
+          cargo build --release --target $T --no-default-features --features fuse,vendored-openssl --bin hf-mount-fuse
+          cargo build --release --target $T --no-default-features --features nfs,vendored-openssl --bin hf-mount-nfs
+          cargo build --release --target $T --no-default-features --features vendored-openssl --bin hf-mount
 
       - name: Package
         run: |
@@ -80,11 +84,12 @@ jobs:
       - name: Install macFUSE
         run: brew install macfuse
 
-      - name: Build backends (FUSE + NFS)
-        run: cargo build --release --target ${{ matrix.target }} --features vendored-openssl
-
-      - name: Build daemon (no macFUSE link)
-        run: cargo build --release --target ${{ matrix.target }} --no-default-features --features vendored-openssl --bin hf-mount
+      - name: Build
+        run: |
+          T="${{ matrix.target }}"
+          cargo build --release --target $T --no-default-features --features fuse,vendored-openssl --bin hf-mount-fuse
+          cargo build --release --target $T --no-default-features --features nfs,vendored-openssl --bin hf-mount-nfs
+          cargo build --release --target $T --no-default-features --features vendored-openssl --bin hf-mount
 
       - name: Package
         run: |
