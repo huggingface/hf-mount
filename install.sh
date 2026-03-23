@@ -25,14 +25,14 @@ esac
 BASE_URL="https://github.com/${REPO}/releases/latest/download"
 mkdir -p "$INSTALL_DIR"
 
-for bin in hf-mount hf-mount-nfs; do
+for bin in hf-mount hf-mount-nfs hf-mount-fuse; do
   BINARY="${bin}-${ARCH_TAG}-${PLATFORM}"
   echo "Downloading ${BINARY}..."
   curl -fSL "${BASE_URL}/${BINARY}" -o "${INSTALL_DIR}/${bin}"
   chmod +x "${INSTALL_DIR}/${bin}"
 done
 
-echo "Installed hf-mount and hf-mount-nfs to ${INSTALL_DIR}/"
+echo "Installed hf-mount, hf-mount-nfs, and hf-mount-fuse to ${INSTALL_DIR}/"
 
 # Check if install dir is in PATH
 case ":$PATH:" in
