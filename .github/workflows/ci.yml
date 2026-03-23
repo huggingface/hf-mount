@@ -43,17 +43,20 @@ jobs:
       - name: Format check
         run: cargo +nightly fmt --check
 
-      - name: Clippy (all features)
+      - name: Clippy (no features)
         run: cargo clippy -- -D warnings
 
-      - name: Clippy (NFS only)
-        run: cargo clippy --no-default-features --features nfs -- -D warnings
+      - name: Clippy (NFS)
+        run: cargo clippy --features nfs -- -D warnings
 
-      - name: Clippy (FUSE only)
-        run: cargo clippy --no-default-features --features fuse -- -D warnings
+      - name: Clippy (FUSE)
+        run: cargo clippy --features fuse -- -D warnings
+
+      - name: Clippy (all)
+        run: cargo clippy --features fuse,nfs -- -D warnings
 
       - name: Unit tests
-        run: cargo test --lib
+        run: cargo test --lib --features fuse,nfs
 
   smoke-test:
     name: Smoke Tests (FUSE + NFS)
@@ -77,7 +80,7 @@ jobs:
           echo 'user_allow_other' | sudo tee -a /etc/fuse.conf
 
       - name: Build release binaries
-        run: cargo build --release
+        run: cargo build --release --features fuse,nfs
 
       - name: Integration tests (buckets)
         run: cargo test --release --test fuse_ops --test nfs_ops -- --test-threads=1 --nocapture
@@ -104,7 +107,7 @@ jobs:
           sudo apt-get install -y fuse3 libfuse3-dev
           echo 'user_allow_other' | sudo tee -a /etc/fuse.conf
       - name: Build
-        run: cargo build --release
+        run: cargo build --release --features fuse,nfs
       - name: fsx
         timeout-minutes: 10
         run: cargo test --release --test fsx -- --test-threads=1 --nocapture
@@ -126,7 +129,7 @@ jobs:
           sudo apt-get install -y fuse3 libfuse3-dev xfsprogs xfsdump attr libaio-dev uuid-dev acl bc
           echo 'user_allow_other' | sudo tee -a /etc/fuse.conf
       - name: Build
-        run: cargo build --release
+        run: cargo build --release --features fuse,nfs
       - name: xfstests
         timeout-minutes: 45
         run: cargo test --release --test xfstests -- --test-threads=1 --nocapture
@@ -153,7 +156,7 @@ jobs:
           echo 'user_allow_other' | sudo tee -a /etc/fuse.conf
 
       - name: Build release binaries
-        run: cargo build --release
+        run: cargo build --release --features fuse,nfs
 
       - name: Run pjdfstest
         timeout-minutes: 10
@@ -219,7 +222,7 @@ jobs:
           echo 'user_allow_other' | sudo tee -a /etc/fuse.conf
 
       - name: Build release binaries
-        run: cargo build --release
+        run: cargo build --release --features fuse,nfs
 
       - name: Install fio
         run: sudo apt-get install -y fio

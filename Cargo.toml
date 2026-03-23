@@ -34,7 +34,7 @@ ulid = "1"
 uuid = { version = "1", features = ["v4"] }
 
 [features]
-default = ["fuse", "nfs"]
+default = []
 fuse = ["dep:fuser"]
 nfs = ["dep:nfsserve"]
 vendored-openssl = ["openssl-sys/vendored"]

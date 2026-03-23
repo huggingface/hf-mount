@@ -48,11 +48,11 @@ Installs `hf-mount` to `~/.local/bin/`. Set `INSTALL_DIR` to change the location
 
 Binaries are available on [GitHub Releases](https://github.com/huggingface/hf-mount/releases):
 
-| Platform | NFS | FUSE |
-| --- | --- | --- |
-| Linux x86_64 | `hf-mount-nfs-x86_64-linux` | `hf-mount-fuse-x86_64-linux` |
-| Linux aarch64 | `hf-mount-nfs-aarch64-linux` | `hf-mount-fuse-aarch64-linux` |
-| macOS Apple Silicon | `hf-mount-nfs-arm64-apple-darwin` | `hf-mount-fuse-arm64-apple-darwin` |
+| Platform | Daemon | NFS | FUSE |
+| --- | --- | --- | --- |
+| Linux x86_64 | `hf-mount-x86_64-linux` | `hf-mount-nfs-x86_64-linux` | `hf-mount-fuse-x86_64-linux` |
+| Linux aarch64 | `hf-mount-aarch64-linux` | `hf-mount-nfs-aarch64-linux` | `hf-mount-fuse-aarch64-linux` |
+| macOS Apple Silicon | `hf-mount-arm64-apple-darwin` | `hf-mount-nfs-arm64-apple-darwin` | `hf-mount-fuse-arm64-apple-darwin` |
 
 ### System dependencies (FUSE only)
 
@@ -67,45 +67,17 @@ The NFS backend has no system dependencies. For FUSE:
 Requires Rust 1.85+.
 
 ```bash
-# NFS only (no system deps)
-cargo build --release --no-default-features --features nfs
+# NFS only (no system deps, works everywhere)
+cargo build --release --features nfs
 
-# All backends (requires FUSE libs)
-# Linux: sudo apt-get install -y fuse3 libfuse3-dev
-# macOS: brew install macfuse (requires reboot on first install)
-cargo build --release
+# FUSE (requires macFUSE on macOS, fuse3 on Linux)
+cargo build --release --features fuse
+
+# All backends
+cargo build --release --features fuse,nfs
 ```
 
 Binaries: `target/release/hf-mount`, `target/release/hf-mount-nfs`, `target/release/hf-mount-fuse`
-
-## Quick start
-
-```bash
-# Mount a public model as a background daemon (no token needed)
-hf-mount start repo openai/gpt-oss-20b /tmp/gpt-oss
-ls /tmp/gpt-oss
-
-# Use it from Python
-python -c "
-from transformers import AutoTokenizer, AutoModelForCausalLM
-tok = AutoTokenizer.from_pretrained('/tmp/gpt-oss')
-model = AutoModelForCausalLM.from_pretrained('/tmp/gpt-oss')
-print(tok.decode(model.generate(**tok('Hello', return_tensors='pt'), max_new_tokens=20)[0]))
-"
-
-# Mount a dataset
-hf-mount start repo datasets/open-index/hacker-news /tmp/hn
-du -sh /tmp/hn/*.parquet
-
-# List running mounts
-hf-mount status
-
-# Stop
-hf-mount stop /tmp/gpt-oss
-hf-mount stop /tmp/hn
-```
-
-For private repos or [Buckets](https://huggingface.co/docs/huggingface_hub/guides/buckets), pass `--hf-token` or set the `HF_TOKEN` env var.
 
 ## Best for / Not for
 
@@ -127,64 +99,62 @@ See [Consistency model](#consistency-model) for details.
 
 ### Mount a repo (read-only)
 
-All examples use `hf-mount-nfs`. Replace with `hf-mount-fuse` if you prefer the FUSE backend.
-
 ```bash
 # Public model (no token needed)
-hf-mount-nfs repo openai/gpt-oss-20b /tmp/gpt-oss
+hf-mount start repo openai/gpt-oss-20b /tmp/model
 
 # Private model
-hf-mount-nfs --hf-token $HF_TOKEN repo myorg/my-private-model /tmp/model
+hf-mount start --hf-token $HF_TOKEN repo myorg/my-private-model /tmp/model
 
 # Dataset
-hf-mount-nfs repo datasets/open-index/hacker-news /tmp/hn
+hf-mount start repo datasets/open-index/hacker-news /tmp/hn
 
 # Specific revision
-hf-mount-nfs repo openai-community/gpt2 /tmp/gpt2 --revision v1.0
+hf-mount start repo openai-community/gpt2 /tmp/gpt2 --revision v1.0
 
 # Subfolder only
-hf-mount-nfs repo openai-community/gpt2/onnx /tmp/onnx
+hf-mount start repo openai-community/gpt2/onnx /tmp/onnx
 ```
 
 ### Mount a Bucket (read-write)
 
-[Buckets](https://huggingface.co/docs/huggingface_hub/guides/buckets) are S3-like object storage on the Hub, designed for large-scale mutable data (training checkpoints, logs, artifacts) without git version control.
+[Buckets](https://huggingface.co/docs/hub/storage-buckets) are S3-like object storage on the Hub, designed for large-scale mutable data (training checkpoints, logs, artifacts) without git version control.
 
 ```bash
-hf-mount-nfs --hf-token $HF_TOKEN bucket myuser/my-bucket /tmp/data
+hf-mount start --hf-token $HF_TOKEN bucket myuser/my-bucket /tmp/data
 
 # Read-only
-hf-mount-nfs --hf-token $HF_TOKEN --read-only bucket myuser/my-bucket /tmp/data
+hf-mount start --hf-token $HF_TOKEN --read-only bucket myuser/my-bucket /tmp/data
 
 # Subfolder only
-hf-mount-nfs --hf-token $HF_TOKEN bucket myuser/my-bucket/checkpoints /tmp/ckpts
+hf-mount start --hf-token $HF_TOKEN bucket myuser/my-bucket/checkpoints /tmp/ckpts
 ```
 
-### FUSE backend
-
-Use `hf-mount-fuse` for tighter kernel integration (page cache invalidation, per-file metadata revalidation). Requires `fuse3` on Linux or [macFUSE](https://osxfuse.github.io/) on macOS.
+### Manage mounts
 
 ```bash
-hf-mount-fuse --hf-token $HF_TOKEN bucket myuser/my-bucket /mnt/data
-```
-
-### Background daemon
-
-`hf-mount` is the main entry point. It runs the mount in the background with automatic PID tracking and log management:
-
-```bash
-# Start (NFS by default, --fuse for FUSE)
-hf-mount start --hf-token $HF_TOKEN bucket myuser/my-bucket /mnt/data
-hf-mount start --fuse repo gpt2 /mnt/gpt2
-
-# List running mounts
-hf-mount status
-
-# Stop (unmounts and waits for flush)
-hf-mount stop /mnt/data
+hf-mount status                  # list running mounts
+hf-mount stop /tmp/data          # stop and unmount
 ```
 
 Logs are written to `~/.hf-mount/logs/`. PID files are stored in `~/.hf-mount/pids/`.
+
+### FUSE backend
+
+By default, `hf-mount` uses NFS. Pass `--fuse` for tighter kernel integration (page cache invalidation, per-file metadata revalidation). Requires `fuse3` on Linux or [macFUSE](https://osxfuse.github.io/) on macOS.
+
+```bash
+hf-mount start --fuse --hf-token $HF_TOKEN bucket myuser/my-bucket /mnt/data
+```
+
+### Foreground mode
+
+For scripts, containers, or debugging, use the backend binaries directly (they run in the foreground):
+
+```bash
+hf-mount-nfs repo gpt2 /tmp/gpt2
+hf-mount-fuse --hf-token $HF_TOKEN bucket myuser/my-bucket /mnt/data
+```
 
 #### macOS: launch as a daemon with launchd
 
@@ -317,18 +287,17 @@ Built on [xet-core](https://github.com/huggingface/xet-core) for content-address
 
 ```bash
 # Unit tests (no network, no token)
-cargo test --lib
+cargo test --lib --features fuse,nfs
 
 # Integration tests (require HF_TOKEN and FUSE)
-HF_TOKEN=... cargo test --release --test fuse_ops -- --test-threads=1 --nocapture
-HF_TOKEN=... cargo test --release --test nfs_ops -- --test-threads=1 --nocapture
+HF_TOKEN=... cargo test --release --features fuse,nfs --test fuse_ops -- --test-threads=1 --nocapture
+HF_TOKEN=... cargo test --release --features fuse,nfs --test nfs_ops -- --test-threads=1 --nocapture
 
 # Repo mount test (public repo, no token needed)
-cargo test --release --test repo_ops -- --test-threads=1 --nocapture
+cargo test --release --features nfs --test repo_ops -- --test-threads=1 --nocapture
 
 # Benchmarks
-HF_TOKEN=... cargo test --release --test bench -- --nocapture
-HF_TOKEN=... cargo test --release --test fio_bench -- --nocapture
+HF_TOKEN=... cargo test --release --features fuse,nfs --test bench -- --nocapture
 ```
 
 ## License
