@@ -288,6 +288,25 @@ pub(crate) async fn flush_one(
         })?;
     let file_info = &upload_results[0];
 
+    // Skip Hub commit if content hasn't changed (same hash as last commit).
+    // This avoids redundant round-trips when fsync is called repeatedly
+    // without new writes (e.g. xfstests write+fsync loops).
+    let same_content = {
+        let inode_table = inodes.read().expect("inodes poisoned");
+        inode_table
+            .get(ino)
+            .is_some_and(|e| e.xet_hash.as_deref() == Some(file_info.hash()))
+    };
+    if same_content && item.pending_deletes.is_empty() {
+        // Content unchanged, just clear dirty.
+        let mut inode_table = inodes.write().expect("inodes poisoned");
+        if let Some(entry) = inode_table.get_mut(ino) {
+            entry.apply_commit(file_info.hash(), file_info.file_size(), item.dirty_generation);
+        }
+        debug!("flush_one: skipped commit for ino={} (same hash)", ino);
+        return Ok(());
+    }
+
     let mtime_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
