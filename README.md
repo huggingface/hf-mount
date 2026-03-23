@@ -40,7 +40,7 @@ Binaries are available on [GitHub Releases](https://github.com/huggingface/hf-mo
 | Platform | NFS | FUSE |
 | --- | --- | --- |
 | Linux x86_64 | `hf-mount-nfs-x86_64-linux` | `hf-mount-fuse-x86_64-linux` |
-| Linux aarch64 | `hf-mount-nfs-aarch64-linux` | -- |
+| Linux aarch64 | `hf-mount-nfs-aarch64-linux` | `hf-mount-fuse-aarch64-linux` |
 | macOS Apple Silicon | `hf-mount-nfs-arm64-apple-darwin` | `hf-mount-fuse-arm64-apple-darwin` |
 
 ### System dependencies (FUSE only)
