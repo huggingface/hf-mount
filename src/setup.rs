@@ -10,7 +10,7 @@ use xet_data::processing::{CacheConfig, FileDownloadSession, create_remote_clien
 
 use crate::cached_xet_client::CachedXetClient;
 use crate::hub_api::{HubApiClient, HubTokenRefresher, SourceKind, parse_repo_id, split_path_prefix};
-use crate::virtual_fs::VirtualFs;
+use crate::virtual_fs::{VfsConfig, VirtualFs};
 use crate::xet::{StagingDir, XetSessions};
 
 #[derive(clap::Subcommand)]
@@ -372,17 +372,19 @@ pub fn build(source: Source, options: MountOptions, is_nfs: bool) -> MountSetup 
         hub_client,
         xet_sessions,
         staging_dir,
-        read_only,
-        advanced_writes,
-        uid,
-        gid,
-        options.poll_interval_secs,
-        metadata_ttl,
-        !options.metadata_ttl_minimal,
-        !options.no_filter_os_files,
-        options.direct_io && !is_nfs,
-        std::time::Duration::from_millis(options.flush_debounce_ms),
-        std::time::Duration::from_millis(options.flush_max_batch_window_ms),
+        VfsConfig {
+            read_only,
+            advanced_writes,
+            uid,
+            gid,
+            poll_interval_secs: options.poll_interval_secs,
+            metadata_ttl,
+            serve_lookup_from_cache: !options.metadata_ttl_minimal,
+            filter_os_files: !options.no_filter_os_files,
+            direct_io: options.direct_io && !is_nfs,
+            flush_debounce: std::time::Duration::from_millis(options.flush_debounce_ms),
+            flush_max_batch_window: std::time::Duration::from_millis(options.flush_max_batch_window_ms),
+        },
     );
 
     MountSetup {

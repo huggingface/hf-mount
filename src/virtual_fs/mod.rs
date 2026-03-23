@@ -44,6 +44,21 @@ fn is_os_junk(name: &str) -> bool {
 
 // ── VirtualFs ──────────────────────────────────────────────────────────
 
+/// Configuration for [`VirtualFs`], grouping all tunable options.
+pub struct VfsConfig {
+    pub read_only: bool,
+    pub advanced_writes: bool,
+    pub uid: u32,
+    pub gid: u32,
+    pub poll_interval_secs: u64,
+    pub metadata_ttl: Duration,
+    pub serve_lookup_from_cache: bool,
+    pub filter_os_files: bool,
+    pub direct_io: bool,
+    pub flush_debounce: Duration,
+    pub flush_max_batch_window: Duration,
+}
+
 pub struct VirtualFs {
     runtime: tokio::runtime::Handle,
     hub_client: Arc<dyn HubOps>,
@@ -88,28 +103,17 @@ pub struct VirtualFs {
 
 /// Where to read file content from when opening read-only.
 impl VirtualFs {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         runtime: tokio::runtime::Handle,
         hub_client: Arc<dyn HubOps>,
         xet_sessions: Arc<dyn XetOps>,
         staging_dir: Option<StagingDir>,
-        read_only: bool,
-        advanced_writes: bool,
-        uid: u32,
-        gid: u32,
-        poll_interval_secs: u64,
-        metadata_ttl: Duration,
-        serve_lookup_from_cache: bool,
-        filter_os_files: bool,
-        direct_io: bool,
-        flush_debounce: Duration,
-        flush_max_batch_window: Duration,
+        config: VfsConfig,
     ) -> Arc<Self> {
         let inodes = Arc::new(RwLock::new(InodeTable::new()));
         let negative_cache = Arc::new(RwLock::new(HashMap::new()));
 
-        let flush_manager = if !read_only && advanced_writes {
+        let flush_manager = if !config.read_only && config.advanced_writes {
             let sd = staging_dir
                 .as_ref()
                 .expect("--advanced-writes requires a staging directory");
@@ -119,8 +123,8 @@ impl VirtualFs {
                 hub_client.clone(),
                 inodes.clone(),
                 &runtime,
-                flush_debounce,
-                flush_max_batch_window,
+                config.flush_debounce,
+                config.flush_max_batch_window,
             ))
         } else {
             None
@@ -128,12 +132,12 @@ impl VirtualFs {
 
         // Spawn remote change polling task (if interval > 0)
         let invalidator: Invalidator = Arc::new(Mutex::new(None));
-        let poll_handle = if poll_interval_secs > 0 {
+        let poll_handle = if config.poll_interval_secs > 0 {
             let bg_hub = hub_client.clone();
             let bg_inodes = inodes.clone();
             let bg_neg_cache = negative_cache.clone();
             let bg_invalidator = invalidator.clone();
-            let interval = Duration::from_secs(poll_interval_secs);
+            let interval = Duration::from_secs(config.poll_interval_secs);
 
             Some(runtime.spawn(Self::poll_remote_changes(
                 bg_hub,
@@ -151,23 +155,23 @@ impl VirtualFs {
             hub_client,
             xet_sessions,
             staging_dir,
-            read_only,
-            advanced_writes,
+            read_only: config.read_only,
+            advanced_writes: config.advanced_writes,
             inode_table: inodes,
             open_files: RwLock::new(HashMap::new()),
             next_file_handle: AtomicU64::new(1),
-            uid,
-            gid,
+            uid: config.uid,
+            gid: config.gid,
             negative_cache,
             staging_locks: Mutex::new(HashMap::new()),
             pending_commits: Mutex::new(HashMap::new()),
             flush_manager,
             poll_handle: Mutex::new(poll_handle),
             invalidator,
-            metadata_ttl,
-            serve_lookup_from_cache,
-            filter_os_files,
-            direct_io,
+            metadata_ttl: config.metadata_ttl,
+            serve_lookup_from_cache: config.serve_lookup_from_cache,
+            filter_os_files: config.filter_os_files,
+            direct_io: config.direct_io,
         });
 
         // Set root inode mtime and ownership (repos use the last commit date).
@@ -176,8 +180,8 @@ impl VirtualFs {
             if let Some(root) = inodes.get_mut(inode::ROOT_INODE) {
                 root.mtime = vfs.hub_client.default_mtime();
                 root.atime = root.mtime;
-                root.uid = uid;
-                root.gid = gid;
+                root.uid = vfs.uid;
+                root.gid = vfs.gid;
             }
         }
 

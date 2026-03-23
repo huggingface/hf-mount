@@ -461,16 +461,18 @@ pub fn make_test_vfs(
         hub,
         xet,
         staging_dir,
-        opts.read_only,
-        opts.advanced_writes,
-        1000, // uid
-        1000, // gid
-        0,    // poll_interval_secs = 0 (disabled)
-        opts.metadata_ttl,
-        opts.serve_lookup_from_cache,
-        true,                       // filter_os_files
-        false,                      // direct_io
-        Duration::from_millis(100), // fast debounce for tests
-        Duration::from_secs(1),     // fast batch window for tests
+        crate::virtual_fs::VfsConfig {
+            read_only: opts.read_only,
+            advanced_writes: opts.advanced_writes,
+            uid: 1000,
+            gid: 1000,
+            poll_interval_secs: 0,
+            metadata_ttl: opts.metadata_ttl,
+            serve_lookup_from_cache: opts.serve_lookup_from_cache,
+            filter_os_files: true,
+            direct_io: false,
+            flush_debounce: Duration::from_millis(100),
+            flush_max_batch_window: Duration::from_secs(1),
+        },
     )
 }
