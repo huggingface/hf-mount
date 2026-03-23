@@ -25,23 +25,24 @@ Two backends are available:
 
 ## Install
 
-### Pre-built binaries
+### Quick install
 
-Download the latest release for your platform from [GitHub Releases](https://github.com/huggingface/hf-mount/releases):
+```bash
+curl -fsSL https://raw.githubusercontent.com/huggingface/hf-mount/main/install.sh | sh
+```
+
+Installs `hf-mount-nfs` to `~/.local/bin/`. Set `INSTALL_DIR` to change the location. Supports Linux (x86_64, aarch64) and macOS (Apple Silicon, Intel).
+
+### Manual download
+
+Binaries are available on [GitHub Releases](https://github.com/huggingface/hf-mount/releases):
 
 | Platform | NFS | FUSE |
 | --- | --- | --- |
 | Linux x86_64 | `hf-mount-nfs-x86_64-linux` | `hf-mount-fuse-x86_64-linux` |
-| Linux aarch64 | `hf-mount-nfs-aarch64-linux` | `hf-mount-fuse-aarch64-linux` |
+| Linux aarch64 | `hf-mount-nfs-aarch64-linux` | -- |
 | macOS Apple Silicon | `hf-mount-nfs-arm64-apple-darwin` | `hf-mount-fuse-arm64-apple-darwin` |
 | macOS Intel | `hf-mount-nfs-x86_64-apple-darwin` | `hf-mount-fuse-x86_64-apple-darwin` |
-
-```bash
-# Example: Linux x86_64 (NFS, no root needed)
-curl -L -o hf-mount-nfs https://github.com/huggingface/hf-mount/releases/latest/download/hf-mount-nfs-x86_64-linux
-chmod +x hf-mount-nfs
-mv hf-mount-nfs ~/.local/bin/
-```
 
 ### System dependencies (FUSE only)
 
