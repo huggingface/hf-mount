@@ -40,6 +40,44 @@ mkdir /tmp/gpt2
 ls /tmp/gpt2
 ```
 
+### macOS: launch as a daemon with launchd
+
+To have `hf-mount` start automatically on login, create a LaunchAgent:
+
+```bash
+label=co.huggingface.hf-mount
+
+mkdir -p ~/Library/LaunchAgents
+
+cat > ~/Library/LaunchAgents/$label.plist <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>$label</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/path/to/hf-mount-daemon</string>
+    <string>start</string>
+    <string>bucket</string>
+    <string>myuser/my-bucket</string>
+    <string>/tmp/my-bucket</string>
+  </array>
+
+  <key>RunAtLoad</key>
+  <true/>
+</dict>
+</plist>
+EOF
+
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/$label.plist
+```
+
+Replace `/path/to/hf-mount-daemon` with the actual binary path (e.g. `./target/release/hf-mount-daemon`) and adjust the bucket/repo and mount point to your needs.
+
 ### Load a model directly from the mount
 
 No download step -- the model is read on demand from CAS:
