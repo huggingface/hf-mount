@@ -1,5 +1,7 @@
 # hf-mount
 
+![hf-mount thumbnail](https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/hf-mount/hf-mount.png)
+
 Mount [Hugging Face Buckets](https://huggingface.co/docs/hub/storage-buckets) and repos as local filesystems. No download, no copy, no waiting.
 
 ```bash
@@ -18,7 +20,7 @@ Commands will pick up your HF_TOKEN from env if present, or you can pass it expl
 hf-mount --hf-token $HF_TOKEN 
 ```
 
-Then use your local folders as usual
+Then use your local folders as usual:
 ```python
 from transformers import AutoModelForCausalLM
 model = AutoModelForCausalLM.from_pretrained("/tmp/gpt-oss-20b")  # reads on demand, no download step
@@ -29,8 +31,6 @@ hf-mount exposes [Hugging Face Buckets](https://huggingface.co/docs/hub/storage-
 Two backends are available:
 - **NFS** (recommended) -- works everywhere, no root, no kernel extension
 - **FUSE** -- tighter kernel integration, requires root or [macFUSE](https://osxfuse.github.io/) on macOS
-
-![hf-mount thumbnail](https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/hf-mount/hf-mount.png)
 
 ## Install
 
