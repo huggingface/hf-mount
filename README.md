@@ -3,13 +3,13 @@
 Mount [Hugging Face Buckets](https://huggingface.co/docs/hub/storage-buckets) and repos as a local filesystem. No download, no copy, no waiting.
 
 ```bash
-hf-mount-nfs --hf-token $HF_TOKEN bucket myuser/my-bucket /tmp/data
+hf-mount start --hf-token $HF_TOKEN bucket myuser/my-bucket /tmp/data
 ```
 
 Also works with any model or dataset repo:
 
 ```bash
-hf-mount-nfs repo gpt2 /tmp/gpt2
+hf-mount start repo gpt2 /tmp/gpt2
 ```
 
 ```python
@@ -40,7 +40,7 @@ Binaries are available on [GitHub Releases](https://github.com/huggingface/hf-mo
 | Platform | NFS | FUSE |
 | --- | --- | --- |
 | Linux x86_64 | `hf-mount-nfs-x86_64-linux` | `hf-mount-fuse-x86_64-linux` |
-| Linux aarch64 | `hf-mount-nfs-aarch64-linux` | -- |
+| Linux aarch64 | `hf-mount-nfs-aarch64-linux` | `hf-mount-fuse-aarch64-linux` |
 | macOS Apple Silicon | `hf-mount-nfs-arm64-apple-darwin` | `hf-mount-fuse-arm64-apple-darwin` |
 
 ### System dependencies (FUSE only)
@@ -65,14 +65,13 @@ cargo build --release --no-default-features --features nfs
 cargo build --release
 ```
 
-Binaries: `target/release/hf-mount-nfs`, `target/release/hf-mount-fuse`, `target/release/hf-mount-daemon`
+Binaries: `target/release/hf-mount`, `target/release/hf-mount-nfs`, `target/release/hf-mount-fuse`
 
 ## Quick start
 
 ```bash
-# Mount a public model (no token needed)
-mkdir /tmp/gpt2
-hf-mount-nfs repo gpt2 /tmp/gpt2
+# Mount a public model as a background daemon (no token needed)
+hf-mount start repo gpt2 /tmp/gpt2
 ls /tmp/gpt2
 
 # Use it from Python
@@ -83,15 +82,16 @@ model = AutoModelForCausalLM.from_pretrained('/tmp/gpt2')
 print(tok.decode(model.generate(**tok('Hello', return_tensors='pt'), max_new_tokens=20)[0]))
 "
 
-# Mount a dataset and explore it
-mkdir /tmp/hn
-hf-mount-nfs repo datasets/open-index/hacker-news /tmp/hn
-ls /tmp/hn
+# Mount a dataset
+hf-mount start repo datasets/open-index/hacker-news /tmp/hn
 du -sh /tmp/hn/*.parquet
 
-# Unmount
-umount /tmp/gpt2
-umount /tmp/hn
+# List running mounts
+hf-mount status
+
+# Stop
+hf-mount stop /tmp/gpt2
+hf-mount stop /tmp/hn
 ```
 
 For private repos or [Buckets](https://huggingface.co/docs/huggingface_hub/guides/buckets), pass `--hf-token` or set the `HF_TOKEN` env var.
@@ -159,28 +159,68 @@ hf-mount-fuse --hf-token $HF_TOKEN bucket myuser/my-bucket /mnt/data
 
 ### Background daemon
 
-`hf-mount-daemon` runs the mount in the background, with automatic PID tracking and log management:
+`hf-mount` is the main entry point. It runs the mount in the background with automatic PID tracking and log management:
 
 ```bash
-# Start a daemon (NFS by default, --fuse for FUSE)
-hf-mount-daemon start --hf-token $HF_TOKEN bucket myuser/my-bucket /mnt/data
-hf-mount-daemon start --fuse repo gpt2 /mnt/gpt2
+# Start (NFS by default, --fuse for FUSE)
+hf-mount start --hf-token $HF_TOKEN bucket myuser/my-bucket /mnt/data
+hf-mount start --fuse repo gpt2 /mnt/gpt2
 
-# List running daemons
-hf-mount-daemon status
+# List running mounts
+hf-mount status
 
-# Stop a daemon (unmounts and waits for flush)
-hf-mount-daemon stop /mnt/data
+# Stop (unmounts and waits for flush)
+hf-mount stop /mnt/data
 ```
 
 Logs are written to `~/.hf-mount/logs/`. PID files are stored in `~/.hf-mount/pids/`.
+
+#### macOS: launch as a daemon with launchd
+
+To have `hf-mount` start automatically on login, create a LaunchAgent:
+
+```bash
+label=co.huggingface.hf-mount
+
+mkdir -p ~/Library/LaunchAgents
+
+cat > ~/Library/LaunchAgents/$label.plist <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>$label</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>$HOME/.local/bin/hf-mount-nfs</string>
+        <string>repo</string>
+        <string>gpt2</string>
+        <string>/tmp/gpt2</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/tmp/hf-mount.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/hf-mount.log</string>
+</dict>
+</plist>
+EOF
+
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/$label.plist
+```
+
+To stop: `launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/$label.plist`
 
 ### Unmount
 
 ```bash
 umount /tmp/data                 # NFS or FUSE (macOS)
 fusermount -u /tmp/data          # FUSE (Linux)
-hf-mount-daemon stop /tmp/data   # daemon mounts
+hf-mount stop /tmp/data          # daemon mounts
 ```
 
 ### Options
