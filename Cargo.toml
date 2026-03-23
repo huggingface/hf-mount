@@ -56,4 +56,3 @@ required-features = ["nfs"]
 [[bin]]
 name = "hf-mount"
 path = "src/bin/hf-mount.rs"
-required-features = ["fuse", "nfs"]

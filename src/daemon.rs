@@ -128,6 +128,11 @@ impl DaemonGuard {
         &self.pid_file
     }
 
+    /// The write end of the ready-notification pipe.
+    pub fn write_fd(&self) -> i32 {
+        self.write_fd
+    }
+
     /// Signal the parent that the mount is active and it can exit.
     pub fn notify_ready(&mut self) {
         if !self.notified {
@@ -138,6 +143,23 @@ impl DaemonGuard {
             unsafe { libc::close(self.write_fd) };
             self.notified = true;
         }
+    }
+
+    /// Create a DaemonGuard from env vars set by the `hf-mount` daemon.
+    /// Returns None if not running as a daemon subprocess.
+    pub fn from_env() -> Option<Self> {
+        let fd: i32 = std::env::var("HF_MOUNT_DAEMON_FD").ok()?.parse().ok()?;
+        let pid_file = std::env::var("HF_MOUNT_DAEMON_PID_FILE").ok().map(PathBuf::from)?;
+        // SAFETY: called at startup before any threads are spawned.
+        unsafe {
+            std::env::remove_var("HF_MOUNT_DAEMON_FD");
+            std::env::remove_var("HF_MOUNT_DAEMON_PID_FILE");
+        }
+        Some(Self {
+            write_fd: fd,
+            pid_file,
+            notified: false,
+        })
     }
 }
 

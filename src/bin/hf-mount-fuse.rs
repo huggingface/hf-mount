@@ -5,6 +5,7 @@ use hf_mount::setup::setup;
 
 fn main() {
     let s = setup(false);
+    let mut daemon_guard = hf_mount::daemon::DaemonGuard::from_env();
 
     if !mount_fuse(
         s.virtual_fs,
@@ -15,7 +16,7 @@ fn main() {
         s.direct_io,
         s.max_threads,
         &s.runtime,
-        None,
+        daemon_guard.as_mut(),
     ) {
         std::process::exit(1);
     }

@@ -80,8 +80,11 @@ jobs:
       - name: Install macFUSE
         run: brew install macfuse
 
-      - name: Build
+      - name: Build backends (FUSE + NFS)
         run: cargo build --release --target ${{ matrix.target }} --features vendored-openssl
+
+      - name: Build daemon (no macFUSE link)
+        run: cargo build --release --target ${{ matrix.target }} --no-default-features --features vendored-openssl --bin hf-mount
 
       - name: Package
         run: |
