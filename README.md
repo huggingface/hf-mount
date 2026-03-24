@@ -1,6 +1,6 @@
 # hf-mount
 
-![hf-mount thumbnail](https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/hf-mount/hf-mount.png)
+<img width="1400" height="386" alt="image" src="https://github.com/user-attachments/assets/d68eac8c-4e28-4d2d-93b2-b049da846397" />
 
 Mount [Hugging Face Buckets](https://huggingface.co/docs/hub/storage-buckets) and repos as local filesystems. No download, no copy, no waiting.
 
