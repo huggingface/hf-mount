@@ -3,6 +3,26 @@ use std::sync::Arc;
 
 type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
+/// List all files on the Hub, descending into subdirectories.
+/// Needed because list_tree is non-recursive (single directory level).
+async fn list_tree_all(hub: &hf_mount::hub_api::HubApiClient) -> Result<Vec<hf_mount::hub_api::TreeEntry>, String> {
+    let mut entries = Vec::new();
+    let mut dirs_to_visit = vec!["".to_string()];
+    while let Some(dir) = dirs_to_visit.pop() {
+        let children = hub
+            .list_tree(&dir)
+            .await
+            .map_err(|e| format!("list_tree({dir}): {e}"))?;
+        for entry in &children {
+            if entry.entry_type == "directory" {
+                dirs_to_visit.push(entry.path.clone());
+            }
+        }
+        entries.extend(children);
+    }
+    Ok(entries)
+}
+
 /// Read-only tests: readdir, full read, range read, tail read, stat.
 /// Works on any backend (FUSE or NFS) — only requires a mounted filesystem
 /// with a known remote file.
@@ -365,7 +385,7 @@ pub async fn verify_hub_state(
 ) -> Result<(), String> {
     eprintln!("=== Verifying Hub state after flush ===");
 
-    let entries = hub.list_tree("", false).await.map_err(|e| format!("list_tree: {e}"))?;
+    let entries = list_tree_all(hub).await?;
     let paths: Vec<&str> = entries.iter().map(|e| e.path.as_str()).collect();
     eprintln!("  Hub files: {:?}", paths);
 
@@ -732,7 +752,7 @@ pub async fn verify_simple_hub_state(
 ) -> Result<(), String> {
     eprintln!("=== Verifying Hub state (simple mode) ===");
 
-    let entries = hub.list_tree("", false).await.map_err(|e| format!("list_tree: {e}"))?;
+    let entries = list_tree_all(hub).await?;
     let paths: Vec<&str> = entries.iter().map(|e| e.path.as_str()).collect();
     eprintln!("  Hub files: {:?}", paths);
 

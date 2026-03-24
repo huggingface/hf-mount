@@ -1341,9 +1341,9 @@ fn same_process_cases() {
     assert!(!super::same_process(pid, 4_000_000_000));
 }
 
-// ── preload_tree_recursive ──────────────────────────────────────────
+// ── repo lazy tree loading ─────────────────────────────────────────
 
-/// Build a VFS backed by a repo MockHub (triggers preload_tree_recursive in new()).
+/// Build a VFS backed by a repo MockHub (lazy-loads directories on access).
 fn vfs_repo(
     hub: &std::sync::Arc<MockHub>,
     xet: &std::sync::Arc<MockXet>,
@@ -1361,9 +1361,9 @@ fn vfs_repo(
     (rt, vfs)
 }
 
-/// Repo mode preloads the full tree: deeply nested files create implicit dirs.
+/// Repo mode lazy-loads nested dirs: lookup triggers ensure_children_loaded.
 #[test]
-fn preload_tree_nested_dirs() {
+fn repo_lazy_load_nested_dirs() {
     let hub = MockHub::new_repo();
     hub.add_file("a/b/c/file.txt", 42, Some("h1"), None);
     hub.add_file("a/b/other.txt", 10, Some("h2"), None);
@@ -1389,9 +1389,9 @@ fn preload_tree_nested_dirs() {
     });
 }
 
-/// Repo mode preloads flat files at root level.
+/// Repo mode loads root files on startup.
 #[test]
-fn preload_tree_flat_root() {
+fn repo_root_files_loaded() {
     let hub = MockHub::new_repo();
     hub.add_file("README.md", 100, Some("h1"), None);
     hub.add_file("config.json", 50, Some("h2"), None);
@@ -1407,9 +1407,9 @@ fn preload_tree_flat_root() {
     });
 }
 
-/// Repo mode marks all directories as children_loaded (no lazy fetches needed).
+/// Repo mode lazy-loads subdirectory children on readdir.
 #[test]
-fn preload_tree_dirs_children_loaded() {
+fn repo_lazy_load_subdirs() {
     let hub = MockHub::new_repo();
     hub.add_file("models/bert/config.json", 10, Some("h1"), None);
     let xet = MockXet::new();
@@ -1424,9 +1424,9 @@ fn preload_tree_dirs_children_loaded() {
     });
 }
 
-/// Repo mode preserves oid as etag on file inodes.
+/// Repo mode preserves oid as etag on file inodes (loaded via lookup).
 #[test]
-fn preload_tree_preserves_oid() {
+fn repo_preserves_oid() {
     let hub = MockHub::new_repo();
     hub.add_file("file.txt", 100, Some("xet_h"), Some("oid_123"));
     let xet = MockXet::new();
@@ -2048,6 +2048,312 @@ fn revalidation_skips_dirty_files() {
         // Hash and size must remain unchanged (not overwritten by remote)
         assert_eq!(entry.xet_hash.as_deref(), Some("hash1"));
         assert_ne!(entry.size, 500, "dirty file size should not be updated from remote");
+    });
+}
+
+/// Poll skips unloaded directories: files under unexplored dirs don't trigger invalidation.
+#[test]
+fn poll_skips_unloaded_directories() {
+    let hub = MockHub::new_repo();
+    hub.add_file("root.txt", 10, Some("h1"), None);
+    hub.add_file("a/deep/file.txt", 20, Some("h2"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_repo(&hub, &xet);
+
+    rt.block_on(async {
+        // Only explore root — dir "a" is known but "a/deep" is NOT loaded.
+        let _ = vfs.lookup(ROOT_INODE, "root.txt").await.unwrap();
+        let a = vfs.lookup(ROOT_INODE, "a").await.unwrap();
+
+        // Confirm "a" children are NOT loaded (never did readdir/lookup inside "a").
+        {
+            let inodes = vfs.inode_table.read().unwrap();
+            assert!(!inodes.is_children_loaded(a.ino), "dir 'a' should not be loaded yet");
+            assert!(inodes.is_children_loaded(ROOT_INODE), "root should be loaded");
+        }
+
+        // Simulate a poll cycle (same as poll_remote_changes: list each loaded prefix).
+        let prefixes = vfs.inode_table.read().unwrap().loaded_dir_prefixes();
+        let mut remote = Vec::new();
+        for prefix in &prefixes {
+            remote.extend(hub.list_tree(prefix).await.unwrap());
+        }
+        let polled: std::collections::HashSet<String> = prefixes.into_iter().collect();
+        VirtualFs::apply_poll_diff(remote, &polled, &vfs.inode_table, &vfs.negative_cache, &vfs.invalidator);
+
+        // Dir "a" should still NOT have children_loaded set (unchanged).
+        // Root should still be loaded (not invalidated).
+        {
+            let inodes = vfs.inode_table.read().unwrap();
+            assert!(
+                !inodes.is_children_loaded(a.ino),
+                "dir 'a' should still be unloaded after poll"
+            );
+            assert!(
+                inodes.is_children_loaded(ROOT_INODE),
+                "root should still be loaded (no new root-level files)"
+            );
+        }
+    });
+}
+
+/// Poll detects new files in loaded directories and invalidates them.
+#[test]
+fn poll_invalidates_loaded_dir_with_new_file() {
+    let hub = MockHub::new_repo();
+    hub.add_file("file.txt", 10, Some("h1"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_repo(&hub, &xet);
+
+    rt.block_on(async {
+        // Load root fully.
+        let _ = vfs.lookup(ROOT_INODE, "file.txt").await.unwrap();
+        assert!(vfs.inode_table.read().unwrap().is_children_loaded(ROOT_INODE));
+
+        // Add a new file remotely.
+        hub.add_file("new.txt", 50, Some("h2"), None);
+
+        let prefixes = vfs.inode_table.read().unwrap().loaded_dir_prefixes();
+        let mut remote = Vec::new();
+        for prefix in &prefixes {
+            remote.extend(hub.list_tree(prefix).await.unwrap());
+        }
+        let polled: std::collections::HashSet<String> = prefixes.into_iter().collect();
+        VirtualFs::apply_poll_diff(remote, &polled, &vfs.inode_table, &vfs.negative_cache, &vfs.invalidator);
+
+        // Root should be invalidated because it's loaded and has a new file.
+        assert!(
+            !vfs.inode_table.read().unwrap().is_children_loaded(ROOT_INODE),
+            "root should be invalidated after new file detected"
+        );
+    });
+}
+
+/// Poll detects a remote file update (hash change) in a loaded directory.
+#[test]
+fn poll_detects_file_update_in_loaded_dir() {
+    let hub = MockHub::new_repo();
+    hub.add_file("data.txt", 10, Some("old_hash"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_repo(&hub, &xet);
+
+    rt.block_on(async {
+        let attr = vfs.lookup(ROOT_INODE, "data.txt").await.unwrap();
+        let ino = attr.ino;
+        assert_eq!(attr.size, 10);
+
+        // Simulate remote update: same path, new hash and size.
+        hub.add_file("data.txt", 99, Some("new_hash"), None);
+
+        let prefixes = vfs.inode_table.read().unwrap().loaded_dir_prefixes();
+        let mut remote = Vec::new();
+        for prefix in &prefixes {
+            remote.extend(hub.list_tree(prefix).await.unwrap());
+        }
+        let polled: std::collections::HashSet<String> = prefixes.into_iter().collect();
+        VirtualFs::apply_poll_diff(remote, &polled, &vfs.inode_table, &vfs.negative_cache, &vfs.invalidator);
+
+        let inodes = vfs.inode_table.read().unwrap();
+        let entry = inodes.get(ino).unwrap();
+        assert_eq!(entry.size, 99, "poll should update size");
+        assert_eq!(entry.xet_hash.as_deref(), Some("new_hash"), "poll should update hash");
+    });
+}
+
+/// Poll detects a remote file deletion in a loaded directory.
+#[test]
+fn poll_detects_file_deletion_in_loaded_dir() {
+    let hub = MockHub::new_repo();
+    hub.add_file("ephemeral.txt", 10, Some("h1"), None);
+    hub.add_file("keeper.txt", 20, Some("h2"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_repo(&hub, &xet);
+
+    rt.block_on(async {
+        let _ = vfs.lookup(ROOT_INODE, "ephemeral.txt").await.unwrap();
+        let _ = vfs.lookup(ROOT_INODE, "keeper.txt").await.unwrap();
+
+        // Remove the file remotely.
+        hub.remove_file("ephemeral.txt");
+
+        let prefixes = vfs.inode_table.read().unwrap().loaded_dir_prefixes();
+        let mut remote = Vec::new();
+        for prefix in &prefixes {
+            remote.extend(hub.list_tree(prefix).await.unwrap());
+        }
+        let polled: std::collections::HashSet<String> = prefixes.into_iter().collect();
+        VirtualFs::apply_poll_diff(remote, &polled, &vfs.inode_table, &vfs.negative_cache, &vfs.invalidator);
+
+        // ephemeral.txt should be gone, keeper.txt should remain.
+        assert_eq!(vfs.lookup(ROOT_INODE, "ephemeral.txt").await.unwrap_err(), libc::ENOENT);
+        vfs.lookup(ROOT_INODE, "keeper.txt").await.unwrap();
+    });
+}
+
+/// Poll with multiple loaded directories fetches each independently.
+#[test]
+fn poll_multiple_loaded_dirs() {
+    let hub = MockHub::new_repo();
+    hub.add_file("root.txt", 10, Some("h1"), None);
+    hub.add_file("sub/nested.txt", 20, Some("h2"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_repo(&hub, &xet);
+
+    rt.block_on(async {
+        // Load both root and sub directory.
+        let _ = vfs.lookup(ROOT_INODE, "root.txt").await.unwrap();
+        let sub = vfs.lookup(ROOT_INODE, "sub").await.unwrap();
+        let _ = vfs.lookup(sub.ino, "nested.txt").await.unwrap();
+
+        // Both dirs should be loaded.
+        {
+            let inodes = vfs.inode_table.read().unwrap();
+            assert!(inodes.is_children_loaded(ROOT_INODE));
+            assert!(inodes.is_children_loaded(sub.ino));
+        }
+
+        // Update file in sub, add file in root.
+        hub.add_file("sub/nested.txt", 99, Some("h2_new"), None);
+        hub.add_file("new_root.txt", 5, Some("h3"), None);
+
+        let prefixes = vfs.inode_table.read().unwrap().loaded_dir_prefixes();
+        assert!(prefixes.len() >= 2, "should poll at least 2 dirs");
+
+        let mut remote = Vec::new();
+        for prefix in &prefixes {
+            remote.extend(hub.list_tree(prefix).await.unwrap());
+        }
+        let polled: std::collections::HashSet<String> = prefixes.into_iter().collect();
+        VirtualFs::apply_poll_diff(remote, &polled, &vfs.inode_table, &vfs.negative_cache, &vfs.invalidator);
+
+        // sub/nested.txt should be updated.
+        let nested_ino = vfs.lookup(sub.ino, "nested.txt").await.unwrap().ino;
+        let inodes = vfs.inode_table.read().unwrap();
+        let entry = inodes.get(nested_ino).unwrap();
+        assert_eq!(entry.size, 99);
+        assert_eq!(entry.xet_hash.as_deref(), Some("h2_new"));
+    });
+}
+
+/// Poll with a failed prefix fetch does not spuriously delete files in that dir.
+#[test]
+fn poll_failed_prefix_no_spurious_deletion() {
+    let hub = MockHub::new_repo();
+    hub.add_file("root.txt", 10, Some("h1"), None);
+    hub.add_file("sub/file.txt", 20, Some("h2"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_repo(&hub, &xet);
+
+    rt.block_on(async {
+        // Load both dirs
+        let _ = vfs.lookup(ROOT_INODE, "root.txt").await.unwrap();
+        let sub = vfs.lookup(ROOT_INODE, "sub").await.unwrap();
+        let _ = vfs.lookup(sub.ino, "file.txt").await.unwrap();
+
+        // Simulate poll where "sub" prefix failed (only root succeeded)
+        let root_entries = hub.list_tree("").await.unwrap();
+        let polled: std::collections::HashSet<String> = ["".to_string()].into_iter().collect();
+        VirtualFs::apply_poll_diff(
+            root_entries,
+            &polled,
+            &vfs.inode_table,
+            &vfs.negative_cache,
+            &vfs.invalidator,
+        );
+
+        // sub/file.txt must NOT be deleted (its prefix wasn't polled)
+        vfs.lookup(sub.ino, "file.txt").await.unwrap();
+    });
+}
+
+/// Poll after invalidation does not delete files from invalidated dirs.
+#[test]
+fn poll_after_invalidation_no_spurious_deletion() {
+    let hub = MockHub::new_repo();
+    hub.add_file("a.txt", 10, Some("h1"), None);
+    hub.add_file("b.txt", 20, Some("h2"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_repo(&hub, &xet);
+
+    rt.block_on(async {
+        let _ = vfs.lookup(ROOT_INODE, "a.txt").await.unwrap();
+        let _ = vfs.lookup(ROOT_INODE, "b.txt").await.unwrap();
+
+        // First poll: add a new file → root gets invalidated
+        hub.add_file("new.txt", 5, Some("h3"), None);
+        let prefixes = vfs.inode_table.read().unwrap().loaded_dir_prefixes();
+        let mut remote = Vec::new();
+        for prefix in &prefixes {
+            remote.extend(hub.list_tree(prefix).await.unwrap());
+        }
+        let polled: std::collections::HashSet<String> = prefixes.into_iter().collect();
+        VirtualFs::apply_poll_diff(remote, &polled, &vfs.inode_table, &vfs.negative_cache, &vfs.invalidator);
+
+        // Root is now invalidated (children_loaded=false).
+        // Second poll: root is NOT in loaded_dir_prefixes anymore.
+        let prefixes2 = vfs.inode_table.read().unwrap().loaded_dir_prefixes();
+        let mut remote2 = Vec::new();
+        for prefix in &prefixes2 {
+            remote2.extend(hub.list_tree(prefix).await.unwrap());
+        }
+        let polled2: std::collections::HashSet<String> = prefixes2.into_iter().collect();
+        VirtualFs::apply_poll_diff(
+            remote2,
+            &polled2,
+            &vfs.inode_table,
+            &vfs.negative_cache,
+            &vfs.invalidator,
+        );
+
+        // a.txt and b.txt must still exist (not spuriously deleted)
+        let inodes = vfs.inode_table.read().unwrap();
+        assert!(inodes.get_by_path("a.txt").is_some(), "a.txt must survive invalidation");
+        assert!(inodes.get_by_path("b.txt").is_some(), "b.txt must survive invalidation");
+    });
+}
+
+/// When a subdirectory is deleted remotely, its files are cleaned up.
+/// The parent listing no longer shows the dir, so its prefix is marked
+/// as polled (deleted dir) and its files are removed.
+#[test]
+fn poll_detects_deleted_subdirectory() {
+    let hub = MockHub::new_repo();
+    hub.add_file("root.txt", 10, Some("h1"), None);
+    hub.add_file("sub/child.txt", 20, Some("h2"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_repo(&hub, &xet);
+
+    rt.block_on(async {
+        // Load both dirs
+        let _ = vfs.lookup(ROOT_INODE, "root.txt").await.unwrap();
+        let sub = vfs.lookup(ROOT_INODE, "sub").await.unwrap();
+        let _ = vfs.lookup(sub.ino, "child.txt").await.unwrap();
+
+        // Delete the subdir remotely
+        hub.remove_file("sub/child.txt");
+
+        // Simulate poll: root succeeds, "sub" fails (404 → removed from Hub).
+        // The parent listing (root) no longer shows "sub" as a directory.
+        let root_entries = hub.list_tree("").await.unwrap();
+        // "sub" is not in root_entries anymore (no files under "sub/" means no dir entry).
+        // Mark "sub" as polled since its parent confirmed it's gone.
+        let polled: std::collections::HashSet<String> = ["".to_string(), "sub".to_string()].into_iter().collect();
+
+        // Also include root entries
+        VirtualFs::apply_poll_diff(
+            root_entries,
+            &polled,
+            &vfs.inode_table,
+            &vfs.negative_cache,
+            &vfs.invalidator,
+        );
+
+        // sub/child.txt should be deleted
+        let inodes = vfs.inode_table.read().unwrap();
+        assert!(
+            inodes.get_by_path("sub/child.txt").is_none(),
+            "deleted dir's files must be removed"
+        );
     });
 }
 

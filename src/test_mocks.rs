@@ -128,28 +128,48 @@ impl MockHub {
 
 #[async_trait::async_trait]
 impl HubOps for MockHub {
-    async fn list_tree(&self, prefix: &str, recursive: bool) -> Result<Vec<TreeEntry>> {
+    async fn list_tree(&self, prefix: &str) -> Result<Vec<TreeEntry>> {
         let tree = self.tree.lock().unwrap();
-        Ok(tree
-            .iter()
-            .filter(|e| {
-                if recursive {
-                    prefix.is_empty() || e.path.starts_with(&format!("{}/", prefix))
-                } else if prefix.is_empty() {
-                    !e.path.contains('/')
+        let prefix_slash = if prefix.is_empty() {
+            String::new()
+        } else {
+            format!("{}/", prefix)
+        };
+
+        // Non-recursive: return direct children only, synthesizing directory entries
+        // for intermediate paths (mirrors real Hub API behavior).
+        let mut result = Vec::new();
+        let mut seen_dirs = std::collections::HashSet::new();
+        for entry in tree.iter() {
+            let relative = if prefix.is_empty() {
+                entry.path.as_str()
+            } else if let Some(rest) = entry.path.strip_prefix(&prefix_slash) {
+                rest
+            } else {
+                continue;
+            };
+            if let Some(slash) = relative.find('/') {
+                let dir_name = &relative[..slash];
+                let dir_path = if prefix.is_empty() {
+                    dir_name.to_string()
                 } else {
-                    e.path.starts_with(&format!("{}/", prefix)) && !e.path[prefix.len() + 1..].contains('/')
+                    format!("{prefix}/{dir_name}")
+                };
+                if seen_dirs.insert(dir_path.clone()) {
+                    result.push(TreeEntry {
+                        path: dir_path,
+                        entry_type: "directory".to_string(),
+                        size: None,
+                        xet_hash: None,
+                        oid: None,
+                        mtime: None,
+                    });
                 }
-            })
-            .map(|e| TreeEntry {
-                path: e.path.clone(),
-                entry_type: e.entry_type.clone(),
-                size: e.size,
-                xet_hash: e.xet_hash.clone(),
-                oid: e.oid.clone(),
-                mtime: e.mtime.clone(),
-            })
-            .collect())
+            } else {
+                result.push(entry.clone());
+            }
+        }
+        Ok(result)
     }
 
     async fn head_file(&self, path: &str) -> Result<Option<HeadFileInfo>> {

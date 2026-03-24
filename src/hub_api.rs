@@ -16,7 +16,7 @@ use crate::error::{Error, Result};
 /// Production code uses `HubApiClient`; tests inject mocks.
 #[async_trait::async_trait]
 pub trait HubOps: Send + Sync {
-    async fn list_tree(&self, prefix: &str, recursive: bool) -> Result<Vec<TreeEntry>>;
+    async fn list_tree(&self, prefix: &str) -> Result<Vec<TreeEntry>>;
     async fn head_file(&self, path: &str) -> Result<Option<HeadFileInfo>>;
     async fn batch_operations(&self, ops: &[BatchOp]) -> Result<()>;
     async fn download_file_http(&self, path: &str, dest: &Path) -> Result<()>;
@@ -123,7 +123,7 @@ pub enum BatchOp {
 }
 
 /// Unified tree entry exposed to the rest of the codebase.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TreeEntry {
     pub path: String,
@@ -451,12 +451,12 @@ impl HubApiClient {
     }
 
     /// Validate that the path prefix exists on the remote.
-    /// Calls list_tree("", false) which internally prepends the prefix.
+    /// Calls list_tree("") which internally prepends the prefix.
     pub async fn validate_path_prefix(&self) -> Result<()> {
         if self.path_prefix.is_empty() {
             return Ok(());
         }
-        let entries = self.list_tree("", false).await.map_err(|e| {
+        let entries = self.list_tree("").await.map_err(|e| {
             Error::Hub(format!(
                 "Subfolder '{}' not found in {}: {e}",
                 self.path_prefix, self.source,
@@ -471,10 +471,10 @@ impl HubApiClient {
         Ok(())
     }
 
-    /// List tree entries at the given prefix (follows `Link` header pagination).
-    /// When `recursive` is true, returns all entries under the prefix;
-    /// otherwise returns a single directory level.
-    pub async fn list_tree(&self, prefix: &str, recursive: bool) -> Result<Vec<TreeEntry>> {
+    /// List tree entries at the given prefix (single directory level).
+    /// Follows `Link` header pagination. For repos, includes `expand=true`
+    /// to get per-file lastCommit (mtime). For buckets, passes `recursive=false`.
+    pub async fn list_tree(&self, prefix: &str) -> Result<Vec<TreeEntry>> {
         let api_prefix = self.prefixed_path(prefix);
         let mut entries = match &self.source {
             SourceKind::Bucket { bucket_id } => self.list_tree_bucket(bucket_id, &api_prefix).await?,
@@ -482,10 +482,7 @@ impl HubApiClient {
                 repo_id,
                 repo_type,
                 revision,
-            } => {
-                self.list_tree_repo(repo_id, *repo_type, revision, &api_prefix, recursive)
-                    .await?
-            }
+            } => self.list_tree_repo(repo_id, *repo_type, revision, &api_prefix).await?,
         };
 
         // Strip path prefix from returned entries and filter out the prefix dir itself.
@@ -506,10 +503,14 @@ impl HubApiClient {
 
     async fn list_tree_bucket(&self, bucket_id: &str, prefix: &str) -> Result<Vec<TreeEntry>> {
         let mut all_entries = Vec::new();
+        let recursive_param = "?recursive=false";
         let mut url = if prefix.is_empty() {
-            format!("{}/api/buckets/{}/tree", self.endpoint, bucket_id)
+            format!("{}/api/buckets/{}/tree{recursive_param}", self.endpoint, bucket_id)
         } else {
-            format!("{}/api/buckets/{}/tree/{}", self.endpoint, bucket_id, prefix)
+            format!(
+                "{}/api/buckets/{}/tree/{}{recursive_param}",
+                self.endpoint, bucket_id, prefix
+            )
         };
 
         loop {
@@ -547,17 +548,14 @@ impl HubApiClient {
         repo_type: RepoType,
         revision: &str,
         prefix: &str,
-        recursive: bool,
     ) -> Result<Vec<TreeEntry>> {
         let mut all_entries = Vec::new();
-        // /api/{type}/{id}/tree/{revision}[/{prefix}]?expand=true[&recursive=true]
-        // expand=true fetches per-file lastCommit (date, id, title) from Gitaly.
-        // recursive=true returns all files in the subtree (used by poll loop).
-        // TODO: monitor if expand=true adds too much latency on large repos.
-        let recursive_param = if recursive { "&recursive=true" } else { "" };
+        // expand=true fetches per-file lastCommit (mtime) from Gitaly.
+        // Acceptable for non-recursive listings where entry count is small.
+        let params = "?expand=true";
         let mut url = if prefix.is_empty() {
             format!(
-                "{}/api/{}/{}/tree/{}?expand=true{recursive_param}",
+                "{}/api/{}/{}/tree/{}{params}",
                 self.endpoint,
                 repo_type.api_prefix(),
                 repo_id,
@@ -565,7 +563,7 @@ impl HubApiClient {
             )
         } else {
             format!(
-                "{}/api/{}/{}/tree/{}/{}?expand=true{recursive_param}",
+                "{}/api/{}/{}/tree/{}/{}{params}",
                 self.endpoint,
                 repo_type.api_prefix(),
                 repo_id,
@@ -920,8 +918,8 @@ pub fn mtime_from_http_date(s: &str) -> SystemTime {
 
 #[async_trait::async_trait]
 impl HubOps for HubApiClient {
-    async fn list_tree(&self, prefix: &str, recursive: bool) -> Result<Vec<TreeEntry>> {
-        self.list_tree(prefix, recursive).await
+    async fn list_tree(&self, prefix: &str) -> Result<Vec<TreeEntry>> {
+        self.list_tree(prefix).await
     }
     async fn head_file(&self, path: &str) -> Result<Option<HeadFileInfo>> {
         self.head_file(path).await

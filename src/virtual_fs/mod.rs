@@ -61,6 +61,9 @@ pub struct VfsConfig {
 
 /// Lock ordering (acquire in this order to prevent deadlocks):
 ///
+///   dir_loading_locks[ino]      (tokio::sync::Mutex, per-directory)
+///     → inode_table             (RwLock, read or write)
+///
 ///   staging_locks[ino]          (tokio::sync::Mutex, per-inode)
 ///     → inode_table             (RwLock, read or write)
 ///         → open_files          (RwLock, read only — via has_open_handles)
@@ -89,6 +92,10 @@ pub struct VirtualFs {
     negative_cache: Arc<RwLock<HashMap<String, Instant>>>,
     /// Per-inode locks for staging file preparation (prevents concurrent open races).
     staging_locks: Mutex<HashMap<u64, Arc<tokio::sync::Mutex<()>>>>,
+    /// Per-directory loading locks: serializes concurrent ensure_children_loaded() calls
+    /// for the same directory so only one HTTP request is made (prevents thundering herd
+    /// when Finder/Spotlight send many lookups on mount).
+    dir_loading_locks: Mutex<HashMap<u64, Arc<tokio::sync::Mutex<()>>>>,
     /// Per-inode pending commit receivers. release() publishes the commit result here;
     /// open() awaits it instead of blindly blocking on staging_lock.
     pending_commits: Mutex<HashMap<u64, CommitHookRx>>,
@@ -177,6 +184,7 @@ impl VirtualFs {
             gid: config.gid,
             negative_cache,
             staging_locks: Mutex::new(HashMap::new()),
+            dir_loading_locks: Mutex::new(HashMap::new()),
             pending_commits: Mutex::new(HashMap::new()),
             flush_manager,
             poll_handle: Mutex::new(poll_handle),
@@ -198,14 +206,9 @@ impl VirtualFs {
             }
         }
 
-        // Pre-load directory listing so the first traversal is instant.
-        // For repos, load the entire tree in one API call.
-        // For buckets, only load the root directory (bucket trees can be huge).
-        if vfs.hub_client.is_repo() {
-            if let Err(e) = vfs.runtime.block_on(vfs.preload_tree_recursive()) {
-                error!("Failed to preload repo tree: errno={}", e);
-            }
-        } else if let Err(e) = vfs.runtime.block_on(vfs.ensure_children_loaded(inode::ROOT_INODE)) {
+        // Pre-load root directory so `ls /mount` is instant.
+        // Subdirectories are lazy-loaded on first access.
+        if let Err(e) = vfs.runtime.block_on(vfs.ensure_children_loaded(inode::ROOT_INODE)) {
             error!("Failed to pre-load root directory: errno={}", e);
         }
 
@@ -357,8 +360,26 @@ impl VirtualFs {
 
     /// Ensure children of a directory inode are loaded from the Hub API.
     /// Fetch remote children for `parent_ino` if not already loaded.
+    /// Uses a per-directory lock to prevent thundering herd: concurrent callers
+    /// for the same directory wait on the lock rather than making duplicate HTTP calls.
     /// Returns ENOENT if the inode doesn't exist, ENOTDIR if it's not a directory.
     async fn ensure_children_loaded(&self, parent_ino: u64) -> VirtualFsResult<()> {
+        // Fast path: already loaded (no lock needed).
+        {
+            let inodes = self.inode_table.read().expect("inodes poisoned");
+            match inodes.get(parent_ino) {
+                Some(e) if e.kind != InodeKind::Directory => return Err(libc::ENOTDIR),
+                Some(e) if e.children_loaded => return Ok(()),
+                None => return Err(libc::ENOENT),
+                _ => {}
+            }
+        }
+
+        // Serialize concurrent loads for the same directory.
+        let dir_lock = self.dir_loading_lock(parent_ino);
+        let _guard = dir_lock.lock().await;
+
+        // Re-check: another task may have loaded while we waited.
         let prefix = {
             let inodes = self.inode_table.read().expect("inodes poisoned");
             match inodes.get(parent_ino) {
@@ -369,7 +390,7 @@ impl VirtualFs {
             }
         };
 
-        let entries = match self.hub_client.list_tree(&prefix, false).await {
+        let entries = match self.hub_client.list_tree(&prefix).await {
             Ok(entries) => entries,
             Err(e) => {
                 error!("Failed to list tree for prefix '{}': {}", prefix, e);
@@ -378,7 +399,6 @@ impl VirtualFs {
         };
 
         let mut inodes = self.inode_table.write().expect("inodes poisoned");
-        // Re-check: another task may have loaded children while we were fetching.
         match inodes.get(parent_ino) {
             Some(e) if e.children_loaded => return Ok(()),
             Some(e) if e.kind != InodeKind::Directory => return Err(libc::ENOTDIR),
@@ -386,18 +406,20 @@ impl VirtualFs {
             _ => {}
         }
         let mut seen_dirs: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut seen_names: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         for entry in entries {
             // Convert absolute bucket path to path relative to current directory.
             // e.g. prefix="models" → "models/bert/config.json" → "bert/config.json"
             let rel_path = if prefix.is_empty() {
-                entry.path.as_str()
+                entry.path.clone()
             } else {
                 entry
                     .path
                     .strip_prefix(&prefix)
                     .and_then(|p| p.strip_prefix('/'))
                     .unwrap_or(&entry.path)
+                    .to_string()
             };
 
             if let Some(slash_pos) = rel_path.find('/') {
@@ -448,6 +470,8 @@ impl VirtualFs {
                     self.uid,
                     self.gid,
                 );
+                let rel_name = rel_path.to_string();
+                seen_names.insert(rel_name);
                 if let Some(oid) = entry.oid
                     && let Some(e) = inodes.get_mut(ino)
                 {
@@ -456,98 +480,34 @@ impl VirtualFs {
             }
         }
 
-        if let Some(parent) = inodes.get_mut(parent_ino) {
-            parent.children_loaded = true;
-        }
-        Ok(())
-    }
-
-    /// Preload the entire tree in a single recursive API call.
-    /// For repos this avoids N per-directory API calls during traversal.
-    async fn preload_tree_recursive(&self) -> VirtualFsResult<()> {
-        let entries = match self.hub_client.list_tree("", true).await {
-            Ok(entries) => entries,
-            Err(e) => {
-                error!("Failed to preload recursive tree: {}", e);
-                return Err(libc::EIO);
-            }
-        };
-
-        let mut inodes = self.inode_table.write().expect("inodes poisoned");
-        // Track which directories we've seen so we can mark them children_loaded.
-        let mut dirs_seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
-        dirs_seen.insert(inode::ROOT_INODE);
-
-        for entry in entries {
-            // Walk the path components, creating intermediate directories as needed.
-            let parts: Vec<&str> = entry.path.split('/').collect();
-            let mut current_parent = inode::ROOT_INODE;
-
-            // Create/find intermediate directories (all but last component).
-            for (i, part) in parts.iter().enumerate() {
-                if i == parts.len() - 1 {
-                    // Last component: insert the actual entry.
-                    let kind = if entry.entry_type == "directory" {
-                        InodeKind::Directory
-                    } else {
-                        InodeKind::File
-                    };
-                    let size = entry.size.unwrap_or(0);
-                    let mtime = entry
-                        .mtime
-                        .as_deref()
-                        .map(crate::hub_api::mtime_from_str)
-                        .unwrap_or_else(|| self.hub_client.default_mtime());
-
-                    let default_mode = if kind == InodeKind::Directory { 0o755 } else { 0o644 };
-                    let ino = inodes.insert(
-                        current_parent,
-                        part.to_string(),
-                        entry.path.clone(),
-                        kind,
-                        size,
-                        mtime,
-                        entry.xet_hash.clone(),
-                        default_mode,
-                        self.uid,
-                        self.gid,
-                    );
-                    if let Some(oid) = &entry.oid
-                        && let Some(e) = inodes.get_mut(ino)
-                    {
-                        e.etag = Some(oid.clone());
+        // Remove stale children: entries that existed locally but are no longer
+        // in the Hub listing. Skip dirty files (local writes take precedence) and
+        // files with open handles (in-flight reads/writes).
+        if let Some(parent) = inodes.get(parent_ino) {
+            let stale: Vec<u64> = parent
+                .children
+                .iter()
+                .filter(|c| {
+                    let in_listing = seen_names.contains(&c.name) || seen_dirs.contains(&c.name);
+                    if in_listing {
+                        return false;
                     }
-                    if kind == InodeKind::Directory {
-                        dirs_seen.insert(ino);
-                    }
-                } else {
-                    // Intermediate directory.
-                    let dir_full_path = parts[..=i].join("/");
-                    let ino = inodes.insert(
-                        current_parent,
-                        part.to_string(),
-                        dir_full_path,
-                        InodeKind::Directory,
-                        0,
-                        self.hub_client.default_mtime(),
-                        None,
-                        0o755,
-                        self.uid,
-                        self.gid,
-                    );
-                    dirs_seen.insert(ino);
-                    current_parent = ino;
+                    inodes.get(c.ino).is_some_and(|e| !e.is_dirty())
+                })
+                .map(|c| c.ino)
+                .collect();
+            for ino in stale {
+                // Don't remove if the inode or any descendant is dirty or has open handles.
+                let has_dirty_or_open = inodes.has_dirty_descendants(ino) || self.has_open_handles(ino);
+                if !has_dirty_or_open {
+                    inodes.remove(ino);
                 }
             }
         }
 
-        // Mark all directories we touched as children_loaded.
-        for dir_ino in dirs_seen {
-            if let Some(d) = inodes.get_mut(dir_ino) {
-                d.children_loaded = true;
-            }
+        if let Some(parent) = inodes.get_mut(parent_ino) {
+            parent.children_loaded = true;
         }
-
         Ok(())
     }
 
@@ -589,6 +549,16 @@ impl VirtualFs {
                     *i == ino
                 }
             })
+    }
+
+    /// Get or create a per-directory lock for serializing ensure_children_loaded().
+    fn dir_loading_lock(&self, ino: u64) -> Arc<tokio::sync::Mutex<()>> {
+        self.dir_loading_locks
+            .lock()
+            .expect("dir_loading_locks poisoned")
+            .entry(ino)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
     }
 
     /// Get or create a per-inode lock for staging file preparation.
@@ -2339,10 +2309,23 @@ impl VirtualFs {
         let descendant_files = if src.kind == InodeKind::Directory {
             let mut files = Vec::new();
             let mut stack = vec![src.inode];
+            debug!(
+                "rename_validate: dir ino={} children_loaded={} children_count={}",
+                src.inode,
+                inodes.is_children_loaded(src.inode),
+                src.children.len(),
+            );
             while let Some(dir_ino) = stack.pop() {
                 if let Some(entry) = inodes.get(dir_ino) {
                     for child_ref in &entry.children {
                         if let Some(child) = inodes.get(child_ref.ino) {
+                            debug!(
+                                "rename_validate: child ino={} path={} dirty={} xet_hash={:?}",
+                                child_ref.ino,
+                                child.full_path,
+                                child.is_dirty(),
+                                child.xet_hash.as_deref()
+                            );
                             match child.kind {
                                 InodeKind::File if !child.is_dirty() && child.xet_hash.is_some() => {
                                     files.push((
@@ -2418,10 +2401,17 @@ impl VirtualFs {
             return Ok(());
         };
 
+        debug!(
+            "rename_remote: {} -> {} ops={}",
+            info.old_path,
+            info.new_full_path,
+            ops.len()
+        );
         if let Err(e) = self.hub_client.batch_operations(&ops).await {
             error!("Failed to rename {} -> {}: {}", info.old_path, info.new_full_path, e);
             return Err(libc::EIO);
         }
+        debug!("rename_remote: success");
         Ok(())
     }
 
