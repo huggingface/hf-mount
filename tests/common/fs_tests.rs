@@ -718,7 +718,6 @@ pub fn run_simple_write_tests(mp: &str, remote_file: &str) -> TestResult {
             content, "first\nhello\nlast\n",
             "file must NOT be empty after overwrite with prepend+append"
         );
-        assert!(!content.is_empty(), "file must not be empty");
     }
 
     // 23. Rename file across directories

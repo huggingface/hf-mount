@@ -156,32 +156,6 @@ fn streaming_overwrite_not_empty() {
     assert_eq!(logs.len(), 2);
 }
 
-/// Read on a streaming handle returns EOF (empty bytes), not EBADF.
-/// This is needed for O_RDWR opens with DIRECT_IO.
-#[test]
-fn streaming_handle_read_returns_eof() {
-    let hub = MockHub::new();
-    hub.add_file("rw.txt", 100, Some("hash1"), None);
-    let xet = MockXet::new();
-    let (rt, vfs) = vfs_simple(&hub, &xet);
-
-    rt.block_on(async {
-        let attr = vfs.lookup(ROOT_INODE, "rw.txt").await.unwrap();
-        let ino = attr.ino;
-        let fh = vfs.open(ino, true, true, Some(42)).await.unwrap();
-
-        // Read on streaming handle should return empty bytes (EOF), not error
-        let (data, eof) = vfs.read(fh, 0, 4096).await.unwrap();
-        assert!(data.is_empty(), "streaming read should return empty data");
-        assert!(eof, "streaming read should signal EOF");
-
-        // Write still works
-        write_blocking(&vfs, ino, fh, 0, b"data").await.unwrap();
-        vfs.flush(ino, fh, Some(42)).await.unwrap();
-        vfs.release(fh).await.unwrap();
-    });
-}
-
 /// flush() from a different PID (dup'd fd) defers commit; release() commits.
 #[test]
 fn flush_deferred_pid_mismatch() {
@@ -957,6 +931,9 @@ fn read_streaming_handle_eof() {
         assert!(data.is_empty());
         assert!(eof);
 
+        // Write still works after read
+        write_blocking(&vfs, attr.ino, fh, 0, b"data").await.unwrap();
+        vfs.flush(attr.ino, fh, Some(42)).await.unwrap();
         vfs.release(fh).await.unwrap();
     });
 }
