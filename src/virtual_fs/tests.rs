@@ -105,6 +105,83 @@ fn streaming_write_happy_path() {
     assert_eq!(logs.len(), 1);
 }
 
+/// Repro: create file → write "hello" → commit → reopen(O_TRUNC) → write
+/// "first\nhello\nlast\n" → commit.  The second save must NOT produce an
+/// empty file (regression: page-cache writeback could race with getattr
+/// returning size=0 right after O_TRUNC, truncating dirty pages).
+#[test]
+fn streaming_overwrite_not_empty() {
+    let hub = MockHub::new();
+    hub.add_file("hello.txt", 5, Some("old_hash"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let attr = vfs.lookup(ROOT_INODE, "hello.txt").await.unwrap();
+        let ino = attr.ino;
+
+        // ── First save: write "hello" ──
+        let fh1 = vfs.open(ino, true, true, Some(42)).await.unwrap();
+        write_blocking(&vfs, ino, fh1, 0, b"hello").await.unwrap();
+        vfs.flush(ino, fh1, Some(42)).await.unwrap();
+        vfs.release(fh1).await.unwrap();
+
+        {
+            let inodes = vfs.inode_table.read().unwrap();
+            let entry = inodes.get(ino).unwrap();
+            assert!(!entry.is_dirty());
+            assert_eq!(entry.size, 5);
+        }
+
+        // ── Second save: overwrite with content added at beginning + end ──
+        let fh2 = vfs.open(ino, true, true, Some(42)).await.unwrap();
+        let new_content = b"first\nhello\nlast\n";
+        write_blocking(&vfs, ino, fh2, 0, new_content).await.unwrap();
+        vfs.flush(ino, fh2, Some(42)).await.unwrap();
+        vfs.release(fh2).await.unwrap();
+
+        let inodes = vfs.inode_table.read().unwrap();
+        let entry = inodes.get(ino).unwrap();
+        assert!(!entry.is_dirty());
+        assert!(entry.xet_hash.is_some(), "hash must be set after second commit");
+        assert_eq!(
+            entry.size,
+            new_content.len() as u64,
+            "file must NOT be empty after overwrite"
+        );
+    });
+
+    // Two commits: one per save
+    let logs = hub.take_batch_log();
+    assert_eq!(logs.len(), 2);
+}
+
+/// Read on a streaming handle returns EOF (empty bytes), not EBADF.
+/// This is needed for O_RDWR opens with DIRECT_IO.
+#[test]
+fn streaming_handle_read_returns_eof() {
+    let hub = MockHub::new();
+    hub.add_file("rw.txt", 100, Some("hash1"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let attr = vfs.lookup(ROOT_INODE, "rw.txt").await.unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open(ino, true, true, Some(42)).await.unwrap();
+
+        // Read on streaming handle should return empty bytes (EOF), not error
+        let (data, eof) = vfs.read(fh, 0, 4096).await.unwrap();
+        assert!(data.is_empty(), "streaming read should return empty data");
+        assert!(eof, "streaming read should signal EOF");
+
+        // Write still works
+        write_blocking(&vfs, ino, fh, 0, b"data").await.unwrap();
+        vfs.flush(ino, fh, Some(42)).await.unwrap();
+        vfs.release(fh).await.unwrap();
+    });
+}
+
 /// flush() from a different PID (dup'd fd) defers commit; release() commits.
 #[test]
 fn flush_deferred_pid_mismatch() {
@@ -862,9 +939,11 @@ fn write_readonly_handle_ebadf() {
     });
 }
 
-/// read() from a streaming (write-only) handle returns EBADF.
+/// read() from a streaming (write-only) handle returns EOF (empty bytes).
+/// This changed from EBADF to EOF so that O_RDWR opens with DIRECT_IO
+/// see a consistent truncated-file view instead of an I/O error.
 #[test]
-fn read_streaming_handle_ebadf() {
+fn read_streaming_handle_eof() {
     let hub = MockHub::new();
     hub.add_file("file.txt", 100, Some("hash1"), None);
     let xet = MockXet::new();
@@ -874,8 +953,9 @@ fn read_streaming_handle_ebadf() {
         let attr = vfs.lookup(ROOT_INODE, "file.txt").await.unwrap();
         let fh = vfs.open(attr.ino, true, true, Some(42)).await.unwrap();
 
-        let result = vfs.read(fh, 0, 10).await;
-        assert_eq!(result.unwrap_err(), libc::EBADF);
+        let (data, eof) = vfs.read(fh, 0, 10).await.unwrap();
+        assert!(data.is_empty());
+        assert!(eof);
 
         vfs.release(fh).await.unwrap();
     });

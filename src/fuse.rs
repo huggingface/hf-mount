@@ -197,17 +197,13 @@ impl Filesystem for FuseAdapter {
             .block_on(self.virtual_fs.open(ino.0, writable, truncate, Some(req.pid())))
         {
             Ok(file_handle) => {
-                // Skip DIRECT_IO only for O_RDWR in simple streaming mode:
-                // streaming handles don't support read(), so DIRECT_IO would
-                // surface EBADF on any read attempt. O_WRONLY and read-only
-                // opens are fine.
-                let rdwr = accmode == libc::O_RDWR;
-                let flags = if rdwr && !self.advanced_writes {
-                    FopenFlags::empty()
-                } else {
-                    self.open_flags()
-                };
-                reply.opened(FileHandle(file_handle), flags);
+                // Always use DIRECT_IO for writable opens in simple streaming
+                // mode: without it, writes go through the kernel page cache
+                // and writeback can race with getattr (which reports size=0
+                // right after O_TRUNC), causing the kernel to truncate dirty
+                // pages and the file to end up empty.  Reads on the streaming
+                // handle return 0 bytes (correct for a just-truncated file).
+                reply.opened(FileHandle(file_handle), self.open_flags());
             }
             Err(e) => reply.error(Errno::from_i32(e)),
         }
@@ -310,14 +306,8 @@ impl Filesystem for FuseAdapter {
             Some(req.pid()),
         )) {
             Ok((attr, file_handle)) => {
-                // Same guard as open(): skip DIRECT_IO for O_RDWR in simple
-                // streaming mode (handle is write-only, reads would EBADF).
-                let rdwr = (flags & libc::O_ACCMODE) == libc::O_RDWR;
-                let oflags = if rdwr && !self.advanced_writes {
-                    FopenFlags::empty()
-                } else {
-                    self.open_flags()
-                };
+                // Always use DIRECT_IO for streaming handles (see open()).
+                let oflags = self.open_flags();
                 reply.created(
                     &self.metadata_ttl,
                     &vfs_attr_to_fuse(&attr),

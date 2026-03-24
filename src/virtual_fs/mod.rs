@@ -1309,8 +1309,10 @@ impl VirtualFs {
                 Some(OpenFile::Lazy { prefetch }) => ReadTarget::Remote {
                     prefetch: prefetch.clone(),
                 },
-                // write-only, not readable
-                Some(OpenFile::Streaming { .. }) => return Err(libc::EBADF), // write-only, not readable
+                // Streaming handles are write-only.  Return EOF (empty
+                // read) instead of EBADF so that O_RDWR opens with
+                // DIRECT_IO see a consistent truncated-file view.
+                Some(OpenFile::Streaming { .. }) => return Ok((Bytes::new(), true)),
                 None => return Err(libc::EBADF), // handle already closed (race with release)
             }
         };
