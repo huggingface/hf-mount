@@ -106,6 +106,7 @@ impl super::VirtualFs {
             etag: Option<String>,
             size: u64,
             mtime: SystemTime,
+            content_type: Option<String>,
         }
         let mut updates = Vec::new();
         let mut deletions = Vec::new();
@@ -139,6 +140,7 @@ impl super::VirtualFs {
                             etag: remote_oid.map(|s| s.to_string()),
                             size: remote_size,
                             mtime,
+                            content_type: remote.content_type.clone(),
                         });
                         info!("Remote update detected: {}", path);
                     }
@@ -169,6 +171,7 @@ impl super::VirtualFs {
                     update.etag.clone(),
                     update.size,
                     update.mtime,
+                    update.content_type.as_deref(),
                 );
                 inos_to_invalidate.push(update.ino);
             }

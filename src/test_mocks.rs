@@ -71,6 +71,7 @@ impl MockHub {
             xet_hash: xet_hash.map(|s| s.to_string()),
             oid: oid.map(|s| s.to_string()),
             mtime: None,
+            content_type: None,
         });
         if let Some(hash) = xet_hash {
             self.head_responses.lock().unwrap().insert(
@@ -85,6 +86,21 @@ impl MockHub {
         }
     }
 
+    pub fn add_file_with_content_type(
+        &self,
+        path: &str,
+        size: u64,
+        xet_hash: Option<&str>,
+        content_type: Option<String>,
+    ) {
+        self.add_file(path, size, xet_hash, None);
+        if let Some(ct) = content_type {
+            if let Some(last) = self.tree.lock().unwrap().last_mut() {
+                last.content_type = Some(ct);
+            }
+        }
+    }
+
     pub fn add_dir(&self, path: &str) {
         self.tree.lock().unwrap().push(TreeEntry {
             path: path.to_string(),
@@ -93,6 +109,7 @@ impl MockHub {
             xet_hash: None,
             oid: None,
             mtime: None,
+            content_type: None,
         });
     }
 
@@ -163,6 +180,7 @@ impl HubOps for MockHub {
                         xet_hash: None,
                         oid: None,
                         mtime: None,
+                        content_type: None,
                     });
                 }
             } else {
@@ -445,6 +463,8 @@ pub struct TestOpts {
     pub advanced_writes: bool,
     pub serve_lookup_from_cache: bool,
     pub metadata_ttl: Duration,
+    #[cfg(feature = "encrypt")]
+    pub encryption_config: Option<crate::crypto::EncryptionConfig>,
 }
 
 impl Default for TestOpts {
@@ -454,6 +474,8 @@ impl Default for TestOpts {
             advanced_writes: false,
             serve_lookup_from_cache: false,
             metadata_ttl: Duration::from_secs(1),
+            #[cfg(feature = "encrypt")]
+            encryption_config: None,
         }
     }
 }
@@ -468,7 +490,12 @@ pub fn make_test_vfs(
 ) -> Arc<crate::virtual_fs::VirtualFs> {
     // Repos need a staging dir for HTTP download cache (open_readonly),
     // even when advanced_writes is disabled (mirrors setup.rs logic).
-    let staging_dir = if opts.advanced_writes || hub.is_repo() {
+    #[cfg(feature = "encrypt")]
+    let effective_advanced_writes = opts.advanced_writes || opts.encryption_config.is_some();
+    #[cfg(not(feature = "encrypt"))]
+    let effective_advanced_writes = opts.advanced_writes;
+
+    let staging_dir = if effective_advanced_writes || hub.is_repo() {
         let path = std::env::temp_dir().join(format!("hf_mount_test_{}", std::process::id()));
         std::fs::create_dir_all(&path).expect("failed to create temp staging dir");
         Some(StagingDir::new(&path))
@@ -483,7 +510,7 @@ pub fn make_test_vfs(
         staging_dir,
         crate::virtual_fs::VfsConfig {
             read_only: opts.read_only,
-            advanced_writes: opts.advanced_writes,
+            advanced_writes: effective_advanced_writes,
             uid: 1000,
             gid: 1000,
             poll_interval_secs: 0,
@@ -493,6 +520,8 @@ pub fn make_test_vfs(
             direct_io: false,
             flush_debounce: Duration::from_millis(100),
             flush_max_batch_window: Duration::from_secs(1),
+            #[cfg(feature = "encrypt")]
+            encryption_config: opts.encryption_config,
         },
     )
 }
