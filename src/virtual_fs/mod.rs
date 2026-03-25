@@ -969,15 +969,12 @@ impl VirtualFs {
                 .await
         } else if writable && truncate {
             // Simple streaming write (append-only, synchronous commit on close)
-            self.open_streaming_write(ino, pid).await
+            self.open_streaming_write(ino, pid, true).await
         } else if writable {
-            // Writable open without O_TRUNC: set up a streaming writer but don't
-            // truncate the inode.  If the caller writes, the content is replaced
-            // and committed.  If they close without writing, release() skips the
-            // commit (because truncated_at_open is false) and the file is unchanged.
-            // This supports editors like vim that open(O_RDWR) before deciding
-            // whether to write.
-            self.open_streaming_write_no_trunc(ino, pid).await
+            // Writable open without O_TRUNC: editors like vim open(O_RDWR) to
+            // probe writability.  If they write, content is committed.  If not,
+            // release() skips the commit and the file is unchanged.
+            self.open_streaming_write(ino, pid, false).await
         } else {
             self.open_readonly(ino, file_entry, staging_path).await
         }
@@ -1062,53 +1059,11 @@ impl VirtualFs {
         Ok(file_handle)
     }
 
-    /// Simple streaming write: truncate existing file and set up a new streaming writer.
-    async fn open_streaming_write(&self, ino: u64, pid: Option<u32>) -> VirtualFsResult<u64> {
-        // Wait for any in-flight commit to complete before starting a new writer.
-        self.await_pending_commit(ino).await?;
-
-        let staging_mutex = self.staging_lock(ino);
-        let _staging_guard = staging_mutex.lock().await;
-
-        // Capture inode snapshot before mutation (for revert on commit failure)
-        let snapshot = {
-            let inodes = self.inode_table.read().expect("inodes poisoned");
-            let entry = inodes.get(ino).ok_or(libc::ENOENT)?;
-            InodeSnapshot {
-                xet_hash: entry.xet_hash.clone(),
-                size: entry.size,
-                mtime: entry.mtime,
-                pending_deletes: entry.pending_deletes.clone(),
-                existed_before: true,
-            }
-        };
-
-        let (file_handle, channel) = self.setup_streaming_writer(pid, snapshot, 0, true).await?;
-
-        {
-            let mut inodes = self.inode_table.write().expect("inodes poisoned");
-            if let Some(entry) = inodes.get_mut(ino) {
-                entry.set_dirty();
-                entry.size = 0;
-                entry.xet_hash = None;
-                channel
-                    .dirty_generation_at_open
-                    .store(entry.dirty_generation, Ordering::Relaxed);
-            }
-        }
-
-        self.open_files
-            .write()
-            .expect("open_files poisoned")
-            .insert(file_handle, OpenFile::Streaming { ino, channel });
-        Ok(file_handle)
-    }
-
-    /// Writable open without O_TRUNC: set up a streaming writer but keep the
-    /// inode's size and hash intact. If the caller writes, the new content
-    /// replaces the old on commit.  If they close without writing, release()
-    /// skips the commit (truncated_at_open=false) and the file is unchanged.
-    async fn open_streaming_write_no_trunc(&self, ino: u64, pid: Option<u32>) -> VirtualFsResult<u64> {
+    /// Set up a streaming writer for an existing file.  When `truncate` is true
+    /// (O_TRUNC), the inode's size and hash are cleared immediately.  When false
+    /// (O_RDWR without O_TRUNC), the inode is left intact — release() will skip
+    /// the commit if no data is written.
+    async fn open_streaming_write(&self, ino: u64, pid: Option<u32>, truncate: bool) -> VirtualFsResult<u64> {
         self.await_pending_commit(ino).await?;
 
         let staging_mutex = self.staging_lock(ino);
@@ -1126,14 +1081,16 @@ impl VirtualFs {
             }
         };
 
-        let (file_handle, channel) = self.setup_streaming_writer(pid, snapshot, 0, false).await?;
+        let (file_handle, channel) = self.setup_streaming_writer(pid, snapshot, 0, truncate).await?;
 
         {
             let mut inodes = self.inode_table.write().expect("inodes poisoned");
             if let Some(entry) = inodes.get_mut(ino) {
-                // Don't truncate: keep existing size and hash.
-                // The inode will be updated on commit if data is written.
                 entry.set_dirty();
+                if truncate {
+                    entry.size = 0;
+                    entry.xet_hash = None;
+                }
                 channel
                     .dirty_generation_at_open
                     .store(entry.dirty_generation, Ordering::Relaxed);
@@ -1699,13 +1656,17 @@ impl VirtualFs {
                 // Explicit truncates (`> file.txt`, O_TRUNC) still commit an
                 // empty file because truncated_at_open is true.
                 if needs_commit && channel.bytes_written.load(Ordering::Relaxed) == 0 && !channel.truncated_at_open {
-                    debug!("release: skipping commit for newly created ino={} with no writes", ino);
+                    debug!("release: skipping commit for ino={} (no writes, not truncated)", ino);
                     *channel.state.lock().expect("state poisoned") = CommitState::Committed;
                     if let Some(hook_tx) = channel.commit_hook.lock().expect("commit_hook poisoned").take() {
                         let _ = hook_tx.send(Some(Ok(())));
                     }
-                    // Don't revert — the inode entry stays so the file is visible
-                    // and can be opened for writing by the next handle.
+                    // Restore the inode to pre-open state if it existed before.
+                    // For newly created files (existed_before=false), keep the
+                    // inode so the file stays visible for subsequent writes.
+                    if channel.snapshot.existed_before {
+                        self.revert_inode(ino, &channel.snapshot);
+                    }
                 } else if needs_commit {
                     // If flush() didn't defer (e.g. Writing state from a direct
                     // release without flush), install the hook now.
