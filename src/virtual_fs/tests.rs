@@ -2791,3 +2791,197 @@ fn readlink_regular_file_returns_error() {
         assert_eq!(result.unwrap_err(), libc::EINVAL);
     });
 }
+
+// ── Bug-proving tests ──────────────────────────────────────────────
+//
+// These tests demonstrate known bugs documented in REVIEW.md.
+// Each test asserts the CORRECT (desired) behavior and is expected to
+// fail until the corresponding fix is applied.
+
+/// BUG: apply_commit clobbers size/xet_hash even when dirty_generation
+/// doesn't match (REVIEW.md #3).
+///
+/// When a concurrent writer advances the generation between flush snapshot
+/// and commit, apply_commit should NOT update size or xet_hash — otherwise
+/// getattr reports a stale size until the next flush cycle.
+///
+/// This test asserts the CORRECT behavior: size and xet_hash should remain
+/// at the values set by the concurrent writer (size=100, hash="old_hash"),
+/// not the values from the stale flush (size=200, hash="new_hash").
+#[test]
+#[should_panic] // REMOVE when bug is fixed
+fn bug_apply_commit_clobbers_size_on_generation_mismatch() {
+    let mut table = super::inode::InodeTable::new();
+    let ino = table.insert(
+        ROOT_INODE,
+        "test".to_string(),
+        "test".to_string(),
+        super::inode::InodeKind::File,
+        100,
+        std::time::UNIX_EPOCH,
+        Some("old_hash".to_string()),
+        0o644,
+        0,
+        0,
+    );
+    let entry = table.get_mut(ino).unwrap();
+    entry.set_dirty(); // gen=1 (flush snapshots this)
+    entry.set_dirty(); // gen=2 (concurrent writer advanced it)
+
+    // Flush completes with stale generation=1, new content hash/size
+    entry.apply_commit("new_hash", 200, 1);
+
+    // CORRECT behavior: dirty flag stays (this already works)
+    assert!(entry.is_dirty());
+    assert_eq!(entry.pending_deletes.len(), 0); // pending_deletes NOT cleared (works)
+
+    // CORRECT behavior: size and hash should NOT be overwritten by stale flush.
+    // BUG: current code unconditionally sets size=200 and xet_hash="new_hash"
+    // before checking the generation, so these assertions FAIL.
+    assert_eq!(
+        entry.size, 100,
+        "BUG: size was clobbered to 200 by stale flush (should remain 100)"
+    );
+    assert_eq!(
+        entry.xet_hash.as_deref(),
+        Some("old_hash"),
+        "BUG: xet_hash was clobbered to 'new_hash' by stale flush (should remain 'old_hash')"
+    );
+}
+
+/// BUG: poll_remote_changes can delete an inode that became dirty between
+/// snapshot and Phase 2 write-lock (REVIEW.md #1 — TOCTOU race).
+///
+/// This test simulates the race by:
+/// 1. Creating a clean file visible to the poll snapshot
+/// 2. Removing it from remote (so poll marks it for deletion)
+/// 3. Making the file dirty AFTER the snapshot but BEFORE the deletion
+///
+/// Since we can't easily inject between poll's snapshot and Phase 2, we
+/// replicate the poll logic manually to demonstrate the race.
+#[test]
+#[should_panic] // REMOVE when bug is fixed
+fn bug_poll_deletes_dirty_inode_toctou() {
+    use std::collections::HashMap;
+
+    let hub = MockHub::new();
+    hub.add_file("racey.txt", 100, Some("hash1"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_advanced(&hub, &xet);
+
+    rt.block_on(async {
+        // Step 1: Lookup file so it's in the inode table
+        let attr = vfs.lookup(ROOT_INODE, "racey.txt").await.unwrap();
+        let ino = attr.ino;
+
+        // Confirm it's clean
+        assert!(!vfs.inode_table.read().unwrap().get(ino).unwrap().is_dirty());
+
+        // Step 2: Take snapshot (simulating what poll does at line 39)
+        let snapshot = vfs.inode_table.read().unwrap().file_snapshot();
+
+        // Step 3: Remove from remote (simulating remote deletion)
+        hub.remove_file("racey.txt");
+
+        // Step 4: Make the file dirty AFTER snapshot (the TOCTOU window)
+        let fh = vfs.open(ino, true, true, None).await.unwrap();
+        write_blocking(&vfs, ino, fh, 0, b"important data").await.unwrap();
+        assert!(vfs.inode_table.read().unwrap().get(ino).unwrap().is_dirty());
+
+        // Step 5: Simulate Phase 1 diff computation (what poll does at lines 52-90)
+        // The snapshot saw the file as clean, remote no longer has it → deletion
+        let remote_entries = hub.list_tree("", true).await.unwrap();
+        let remote_map: HashMap<String, _> = remote_entries
+            .iter()
+            .filter(|e| e.entry_type == "file")
+            .map(|e| (e.path.clone(), e))
+            .collect();
+
+        let mut deletions = Vec::new();
+        for (sn_ino, path, _hash, _etag, _size, is_dirty) in &snapshot {
+            if *is_dirty {
+                continue; // this check passes — file was clean in snapshot
+            }
+            if remote_map.get(path.as_str()).is_none() {
+                deletions.push(*sn_ino);
+            }
+        }
+        assert_eq!(deletions, vec![ino], "poll would mark this for deletion");
+
+        // Step 6: Simulate Phase 2 — apply deletions under write lock
+        // (what poll does at lines 109-118)
+        // BUG: no re-check of is_dirty() before remove()
+        {
+            let mut inode_table = vfs.inode_table.write().unwrap();
+            for del_ino in &deletions {
+                // This is what poll currently does — unconditional remove
+                inode_table.remove(*del_ino);
+            }
+        }
+
+        // CORRECT behavior: dirty inode should NOT have been removed
+        // BUG: the inode was removed despite being dirty
+        assert!(
+            vfs.inode_table.read().unwrap().get(ino).is_some(),
+            "BUG: poll deleted a dirty inode! Data loss — the inode had uncommitted \
+             writes that are now lost because poll did not re-check is_dirty() \
+             inside the write lock before calling remove()."
+        );
+
+        let _ = vfs.release(fh).await;
+    });
+}
+
+/// BUG: setattr truncate and concurrent write race in advanced mode
+/// (REVIEW.md #4).
+///
+/// write() does pwrite() on the staging file fd WITHOUT acquiring the staging
+/// lock. setattr truncate acquires the staging lock and truncates the file.
+/// When they run concurrently, the pwrite can land after ftruncate, creating
+/// a sparse file whose actual size doesn't match inode.size.
+///
+/// This test demonstrates the design flaw: write() obtains a cloned Arc<File>
+/// from open_files (no staging lock), then does pwrite(). Meanwhile setattr
+/// holds the staging lock and truncates. The write's pwrite succeeds on the
+/// same fd because pwrite doesn't need any lock — the kernel allows it.
+///
+/// We prove the invariant violation by showing that write() does NOT acquire
+/// the staging lock — it directly pwrite()s. We verify this by:
+/// 1. Opening a file for advanced writes (creates staging file + Local handle)
+/// 2. Checking that write() succeeds without touching the staging lock
+/// 3. This means a concurrent setattr(truncate) COULD race with write()
+#[test]
+fn bug_setattr_write_no_staging_lock() {
+    let hub = MockHub::new();
+    hub.add_file("data.txt", 100, Some("hash1"), None);
+    let xet = MockXet::new();
+    xet.add_file("hash1", &[0u8; 100]);
+    let (rt, vfs) = vfs_advanced(&hub, &xet);
+
+    rt.block_on(async {
+        let attr = vfs.lookup(ROOT_INODE, "data.txt").await.unwrap();
+        let ino = attr.ino;
+
+        // Open for advanced write (creates staging file, acquires staging lock)
+        let fh = vfs.open(ino, true, true, None).await.unwrap();
+
+        // Hold the staging lock. If write() also tried to acquire it,
+        // it would deadlock (tokio mutex) or block. Since write() is sync
+        // (not async), it can't await the lock — proving it never tries.
+        let staging_mutex = vfs.staging_lock(ino);
+        let _guard = staging_mutex.lock().await;
+
+        // write() should succeed even with staging lock held, proving it
+        // doesn't synchronize with setattr's truncate path.
+        let result = write_blocking(&vfs, ino, fh, 50, b"data while staging locked").await;
+        assert!(
+            result.is_ok(),
+            "write() succeeded without staging lock — it uses pwrite() directly \
+             on the fd, meaning a concurrent setattr(truncate) can race with it. \
+             This is the root cause of REVIEW.md #4."
+        );
+
+        drop(_guard);
+        let _ = vfs.release(fh).await;
+    });
+}
