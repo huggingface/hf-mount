@@ -91,9 +91,6 @@ impl InodeEntry {
         if self.clear_dirty_if(dirty_generation) {
             self.pending_deletes.clear();
         }
-        // Don't update mtime here — it was already set during write().
-        // Resetting it would change the mtime between open and close,
-        // causing editors like vim to warn "File changed since reading it".
         self.ctime = SystemTime::now();
     }
 }

@@ -502,14 +502,16 @@ pub fn run_simple_write_tests(mp: &str, remote_file: &str) -> TestResult {
         std::fs::remove_dir(&dir)?;
     }
 
-    // 8. Open existing for write without truncate should fail (EPERM)
-    eprintln!("  [simple-write] open existing for write (no truncate) → EPERM");
+    // 8. Open existing for write without truncate, close without writing → file preserved
+    eprintln!("  [simple-write] open existing for write (no truncate), close without writing");
     {
         let path = format!("{}/data.txt", mp);
-        let result = std::fs::OpenOptions::new().write(true).open(&path);
-        assert!(
-            result.is_err(),
-            "opening existing file for write without truncate should fail in simple mode"
+        let file = std::fs::OpenOptions::new().write(true).open(&path)?;
+        drop(file);
+        let content = std::fs::read_to_string(&path)?;
+        assert_eq!(
+            content, "hello",
+            "file should be unchanged after open+close with no write"
         );
     }
 
