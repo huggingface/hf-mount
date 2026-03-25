@@ -91,9 +91,7 @@ impl InodeEntry {
         if self.clear_dirty_if(dirty_generation) {
             self.pending_deletes.clear();
         }
-        let now = SystemTime::now();
-        self.mtime = now;
-        self.ctime = now;
+        self.ctime = SystemTime::now();
     }
 }
 
@@ -590,7 +588,7 @@ mod tests {
         assert_eq!(entry.xet_hash.as_deref(), Some("new_hash"));
         assert_eq!(entry.size, 200);
         assert!(entry.pending_deletes.is_empty());
-        assert!(entry.mtime > UNIX_EPOCH);
+        assert_eq!(entry.mtime, UNIX_EPOCH);
     }
 
     #[test]
