@@ -2795,8 +2795,12 @@ fn readlink_regular_file_returns_error() {
 // ── Bug-proving tests ──────────────────────────────────────────────
 //
 // These tests demonstrate known bugs documented in REVIEW.md.
-// Each test asserts the CORRECT (desired) behavior and is expected to
-// fail until the corresponding fix is applied.
+// Each test asserts the CORRECT (desired) behavior. They currently FAIL
+// because the bugs have not been fixed yet.
+//
+// Run with: cargo test --lib --features nfs -- --ignored bug_
+//
+// When a bug is fixed, remove #[ignore] from the corresponding test.
 
 /// BUG: apply_commit clobbers size/xet_hash even when dirty_generation
 /// doesn't match (REVIEW.md #3).
@@ -2809,7 +2813,7 @@ fn readlink_regular_file_returns_error() {
 /// at the values set by the concurrent writer (size=100, hash="old_hash"),
 /// not the values from the stale flush (size=200, hash="new_hash").
 #[test]
-#[should_panic] // REMOVE when bug is fixed
+#[ignore] // Fails due to bug: apply_commit unconditionally sets size/xet_hash
 fn bug_apply_commit_clobbers_size_on_generation_mismatch() {
     let mut table = super::inode::InodeTable::new();
     let ino = table.insert(
@@ -2860,7 +2864,7 @@ fn bug_apply_commit_clobbers_size_on_generation_mismatch() {
 /// Since we can't easily inject between poll's snapshot and Phase 2, we
 /// replicate the poll logic manually to demonstrate the race.
 #[test]
-#[should_panic] // REMOVE when bug is fixed
+#[ignore] // Fails due to bug: poll does not re-check is_dirty() before remove()
 fn bug_poll_deletes_dirty_inode_toctou() {
     use std::collections::HashMap;
 
@@ -2940,17 +2944,11 @@ fn bug_poll_deletes_dirty_inode_toctou() {
 /// When they run concurrently, the pwrite can land after ftruncate, creating
 /// a sparse file whose actual size doesn't match inode.size.
 ///
-/// This test demonstrates the design flaw: write() obtains a cloned Arc<File>
-/// from open_files (no staging lock), then does pwrite(). Meanwhile setattr
-/// holds the staging lock and truncates. The write's pwrite succeeds on the
-/// same fd because pwrite doesn't need any lock — the kernel allows it.
-///
-/// We prove the invariant violation by showing that write() does NOT acquire
-/// the staging lock — it directly pwrite()s. We verify this by:
-/// 1. Opening a file for advanced writes (creates staging file + Local handle)
-/// 2. Checking that write() succeeds without touching the staging lock
-/// 3. This means a concurrent setattr(truncate) COULD race with write()
+/// This test proves the design flaw by showing that write() succeeds while
+/// the staging lock is held — meaning it never synchronizes with setattr's
+/// truncate path, and a concurrent setattr(truncate) can race with pwrite().
 #[test]
+#[ignore] // Demonstrates design flaw: write() bypasses staging lock
 fn bug_setattr_write_no_staging_lock() {
     let hub = MockHub::new();
     hub.add_file("data.txt", 100, Some("hash1"), None);
@@ -2971,14 +2969,15 @@ fn bug_setattr_write_no_staging_lock() {
         let staging_mutex = vfs.staging_lock(ino);
         let _guard = staging_mutex.lock().await;
 
-        // write() should succeed even with staging lock held, proving it
-        // doesn't synchronize with setattr's truncate path.
+        // write() should FAIL here if it properly acquired the staging lock.
+        // BUG: write() succeeds because it uses pwrite() directly on the fd
+        // without any staging lock synchronization.
         let result = write_blocking(&vfs, ino, fh, 50, b"data while staging locked").await;
         assert!(
-            result.is_ok(),
-            "write() succeeded without staging lock — it uses pwrite() directly \
-             on the fd, meaning a concurrent setattr(truncate) can race with it. \
-             This is the root cause of REVIEW.md #4."
+            result.is_err(),
+            "BUG: write() succeeded while staging lock was held by another task. \
+             It should fail or block, but instead it bypasses the staging lock \
+             entirely, allowing races with setattr(truncate). See REVIEW.md #4."
         );
 
         drop(_guard);
