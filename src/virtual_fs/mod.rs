@@ -585,8 +585,9 @@ impl VirtualFs {
             .expect("open_files poisoned")
             .values()
             .any(|of| match of {
-                OpenFile::Local { ino: i, .. } | OpenFile::Streaming { ino: i, .. } => *i == ino,
-                _ => false,
+                OpenFile::Local { ino: i, .. } | OpenFile::Lazy { ino: i, .. } | OpenFile::Streaming { ino: i, .. } => {
+                    *i == ino
+                }
             })
     }
 
@@ -1113,11 +1114,11 @@ impl VirtualFs {
             (true, None) if fe.xet_hash.is_empty() && fe.size > 0 => {
                 self.await_pending_commit(ino).await?;
                 let fe = self.get_file_entry(ino)?;
-                self.open_lazy(fe.xet_hash, fe.size)
+                self.open_lazy(ino, fe.xet_hash, fe.size)
             }
 
             // Remote xet-backed file — lazy CAS range reads.
-            _ if !fe.xet_hash.is_empty() => self.open_lazy(fe.xet_hash, fe.size),
+            _ if !fe.xet_hash.is_empty() => self.open_lazy(ino, fe.xet_hash, fe.size),
 
             // Plain LFS/git file without xet hash — HTTP download to staging cache.
             _ if fe.size > 0 => {
@@ -1150,12 +1151,12 @@ impl VirtualFs {
             }
 
             // Empty file (size=0, no hash).
-            _ => self.open_lazy(String::new(), 0),
+            _ => self.open_lazy(ino, String::new(), 0),
         }
     }
 
     /// Allocate a lazy file handle backed by a prefetch buffer.
-    fn open_lazy(&self, xet_hash: String, size: u64) -> VirtualFsResult<u64> {
+    fn open_lazy(&self, ino: u64, xet_hash: String, size: u64) -> VirtualFsResult<u64> {
         let prefetch = Arc::new(tokio::sync::Mutex::new(PrefetchState::new(
             xet_hash,
             size,
@@ -1165,7 +1166,7 @@ impl VirtualFs {
         self.open_files
             .write()
             .expect("open_files poisoned")
-            .insert(file_handle, OpenFile::Lazy { prefetch });
+            .insert(file_handle, OpenFile::Lazy { ino, prefetch });
         Ok(file_handle)
     }
 
@@ -1306,7 +1307,7 @@ impl VirtualFs {
             let files = self.open_files.read().expect("open_files poisoned");
             match files.get(&file_handle) {
                 Some(OpenFile::Local { file, .. }) => ReadTarget::LocalFd(file.clone()),
-                Some(OpenFile::Lazy { prefetch }) => ReadTarget::Remote {
+                Some(OpenFile::Lazy { prefetch, .. }) => ReadTarget::Remote {
                     prefetch: prefetch.clone(),
                 },
                 // write-only, not readable
@@ -1612,7 +1613,9 @@ impl VirtualFs {
             .remove(&file_handle);
 
         let released_ino = match &removed {
-            Some(OpenFile::Local { ino, .. }) | Some(OpenFile::Streaming { ino, .. }) => Some(*ino),
+            Some(OpenFile::Local { ino, .. })
+            | Some(OpenFile::Lazy { ino, .. })
+            | Some(OpenFile::Streaming { ino, .. }) => Some(*ino),
             _ => None,
         };
 
@@ -1666,7 +1669,17 @@ impl VirtualFs {
                             *channel.state.lock().expect("state poisoned") = CommitState::Committed;
                         }
                         Err(e) => {
-                            error!("DATA LOSS: streaming commit failed for ino={}: errno={}", ino, e);
+                            let is_unlinked = self
+                                .inode_table
+                                .read()
+                                .expect("inodes poisoned")
+                                .get(ino)
+                                .is_none_or(|entry| entry.nlink == 0);
+                            if is_unlinked {
+                                debug!("streaming commit failed for unlinked ino={} (expected)", ino);
+                            } else {
+                                error!("DATA LOSS: streaming commit failed for ino={}: errno={}", ino, e);
+                            }
                             self.revert_inode(ino, &channel.snapshot);
                             *channel.state.lock().expect("state poisoned") =
                                 CommitState::Failed("commit failed".into());
@@ -2021,6 +2034,15 @@ impl VirtualFs {
             let needs_remote = entry.xet_hash.is_some() && entry.nlink <= 1;
             (entry.inode, entry.full_path.clone(), needs_remote)
         };
+
+        // In streaming mode, block unlink while the file has any open handles.
+        // This prevents editors (vim) from deleting a file they can't rewrite
+        // (streaming mode returns EPERM for O_RDWR without O_TRUNC), which
+        // would cause silent data loss. Same approach as mountpoint-s3.
+        if !self.advanced_writes && self.has_open_handles(ino) {
+            debug!("unlink: blocked for ino={} (has open handles in streaming mode)", ino);
+            return Err(libc::EPERM);
+        }
 
         // Advanced writes: queue delete for batched flush in the flush_loop.
         // Simple mode: delete synchronously (one HTTP call per unlink).
@@ -2776,6 +2798,7 @@ enum OpenFile {
     Local { ino: u64, file: Arc<File>, writable: bool },
     /// Lazy remote — data fetched on-demand with adaptive prefetch buffer.
     Lazy {
+        ino: u64,
         prefetch: Arc<tokio::sync::Mutex<PrefetchState>>,
     },
     /// Streaming append-only writer (default write mode).

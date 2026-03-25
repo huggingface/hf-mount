@@ -105,6 +105,34 @@ fn streaming_write_happy_path() {
     assert_eq!(logs.len(), 1);
 }
 
+/// In streaming mode, unlink is blocked while the file has open handles.
+/// This prevents editors (vim) from deleting files they can't rewrite.
+#[test]
+fn unlink_blocked_with_open_handles_streaming() {
+    let hub = MockHub::new();
+    hub.add_file("guarded.txt", 100, Some("hash1"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let attr = vfs.lookup(ROOT_INODE, "guarded.txt").await.unwrap();
+        let ino = attr.ino;
+
+        // Open read-only (like vim does before trying to save)
+        let fh = vfs.open(ino, false, false, Some(42)).await.unwrap();
+
+        // Unlink should be blocked (has open handles in streaming mode)
+        let err = vfs.unlink(ROOT_INODE, "guarded.txt").await.unwrap_err();
+        assert_eq!(err, libc::EPERM, "unlink must be blocked with open handles");
+
+        // Close the handle
+        vfs.release(fh).await.unwrap();
+
+        // Now unlink should succeed
+        vfs.unlink(ROOT_INODE, "guarded.txt").await.unwrap();
+    });
+}
+
 /// flush() from a different PID (dup'd fd) defers commit; release() commits.
 #[test]
 fn flush_deferred_pid_mismatch() {
