@@ -3225,7 +3225,7 @@ fn bug_poll_deletes_dirty_inode_toctou() {
 
         // Step 5: Simulate Phase 1 diff computation (what poll does at lines 52-90)
         // The snapshot saw the file as clean, remote no longer has it → deletion
-        let remote_entries = hub.list_tree("", true).await.unwrap();
+        let remote_entries = hub.list_tree("").await.unwrap();
         let remote_map: HashMap<String, _> = remote_entries
             .iter()
             .filter(|e| e.entry_type == "file")
