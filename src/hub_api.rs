@@ -1308,4 +1308,182 @@ mod tests {
         let _ = client.auth(req);
         assert!(cached_token(&client).is_none());
     }
+
+    // ── retry / error helpers ─────────────────────────────────────────
+
+    #[test]
+    fn retry_delay_exponential_backoff() {
+        assert_eq!(retry_delay(1), std::time::Duration::from_millis(500));
+        assert_eq!(retry_delay(2), std::time::Duration::from_millis(1000));
+        assert_eq!(retry_delay(3), std::time::Duration::from_millis(2000));
+    }
+
+    #[test]
+    fn is_retryable_status_covers_expected_codes() {
+        use crate::error::is_retryable_status;
+        assert!(is_retryable_status(429));
+        assert!(is_retryable_status(500));
+        assert!(is_retryable_status(502));
+        assert!(is_retryable_status(503));
+        assert!(is_retryable_status(504));
+        assert!(!is_retryable_status(200));
+        assert!(!is_retryable_status(301));
+        assert!(!is_retryable_status(400));
+        assert!(!is_retryable_status(401));
+        assert!(!is_retryable_status(403));
+        assert!(!is_retryable_status(404));
+    }
+
+    #[test]
+    fn parse_retry_after_delta_seconds() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("retry-after", "5".parse().unwrap());
+        let duration = parse_retry_after(&headers).unwrap();
+        assert_eq!(duration, std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn parse_retry_after_delta_seconds_capped_at_30() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("retry-after", "120".parse().unwrap());
+        let duration = parse_retry_after(&headers).unwrap();
+        assert_eq!(duration, std::time::Duration::from_secs(30));
+    }
+
+    #[test]
+    fn parse_retry_after_missing_header() {
+        let headers = reqwest::header::HeaderMap::new();
+        assert!(parse_retry_after(&headers).is_none());
+    }
+
+    #[test]
+    fn parse_retry_after_invalid_value() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("retry-after", "not-a-number".parse().unwrap());
+        assert!(parse_retry_after(&headers).is_none());
+    }
+
+    #[test]
+    fn error_hub_constructors() {
+        let err = Error::hub("test error");
+        assert!(matches!(err, Error::Hub { status: None, .. }));
+        assert!(err.to_string().contains("test error"));
+
+        let err = Error::hub_status(404, "not found");
+        assert!(matches!(err, Error::Hub { status: Some(404), .. }));
+        assert!(err.to_string().contains("404"));
+        assert!(err.to_string().contains("not found"));
+    }
+
+    // ── send_with_retry integration tests ─────────────────────────────
+
+    /// Minimal HTTP server that responds with a given sequence of status codes.
+    async fn mock_server(responses: Vec<u16>) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://{addr}");
+
+        tokio::spawn(async move {
+            for status in responses {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut buf = vec![0u8; 4096];
+                let _ = stream.read(&mut buf).await;
+                let reason = match status {
+                    200 => "OK",
+                    304 => "Not Modified",
+                    404 => "Not Found",
+                    429 => "Too Many Requests",
+                    500 => "Internal Server Error",
+                    503 => "Service Unavailable",
+                    _ => "Unknown",
+                };
+                let body = format!("status {status}");
+                let response = format!(
+                    "HTTP/1.1 {status} {reason}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.ok();
+                stream.shutdown().await.ok();
+            }
+        });
+
+        url
+    }
+
+    #[tokio::test]
+    async fn send_with_retry_success_on_first_try() {
+        let url = mock_server(vec![200]).await;
+        let client = Client::new();
+        let resp = send_with_retry(|| client.get(&url), "test", false).await.unwrap();
+        assert_eq!(resp.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn send_with_retry_retries_on_503_then_succeeds() {
+        let url = mock_server(vec![503, 200]).await;
+        let client = Client::new();
+        let resp = send_with_retry(|| client.get(&url), "test", false).await.unwrap();
+        assert_eq!(resp.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn send_with_retry_retries_on_429_then_succeeds() {
+        let url = mock_server(vec![429, 200]).await;
+        let client = Client::new();
+        let resp = send_with_retry(|| client.get(&url), "test", false).await.unwrap();
+        assert_eq!(resp.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn send_with_retry_gives_up_after_max_retries() {
+        let url = mock_server(vec![503, 503, 503]).await;
+        let client = Client::new();
+        let result = send_with_retry(|| client.get(&url), "test", false).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, Error::Hub { status: Some(503), .. }));
+    }
+
+    #[tokio::test]
+    async fn send_with_retry_no_retry_on_404() {
+        let url = mock_server(vec![404]).await;
+        let client = Client::new();
+        let result = send_with_retry(|| client.get(&url), "test", false).await;
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), Error::Hub { status: Some(404), .. }));
+    }
+
+    #[tokio::test]
+    async fn send_with_retry_304_returned_as_error() {
+        let url = mock_server(vec![304]).await;
+        let client = Client::new();
+        let result = send_with_retry(|| client.get(&url), "test", false).await;
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), Error::Hub { status: Some(304), .. }));
+    }
+
+    #[tokio::test]
+    async fn send_with_retry_accepts_redirects_when_enabled() {
+        let url = mock_server(vec![302]).await;
+        let client = Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let resp = send_with_retry(|| client.get(&url), "test", true).await.unwrap();
+        assert_eq!(resp.status(), 302);
+    }
+
+    #[tokio::test]
+    async fn send_with_retry_rejects_redirects_when_disabled() {
+        let url = mock_server(vec![302]).await;
+        let client = Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let result = send_with_retry(|| client.get(&url), "test", false).await;
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), Error::Hub { status: Some(302), .. }));
+    }
 }
