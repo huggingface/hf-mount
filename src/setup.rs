@@ -149,7 +149,7 @@ pub struct MountOptions {
     /// By default all users can access the mount.
     /// When not set, requires `user_allow_other` in /etc/fuse.conf on Linux.
     #[arg(long, default_value_t = false)]
-    pub fuser_owner_only: bool,
+    pub fuse_owner_only: bool,
 }
 
 /// CLI args for the foreground FUSE/NFS binaries.
@@ -404,7 +404,7 @@ pub fn build(source: Source, options: MountOptions, is_nfs: bool) -> MountSetup 
         metadata_ttl,
         max_threads: options.max_threads,
         metadata_ttl_ms: options.metadata_ttl_ms,
-        allow_other: !options.fuser_owner_only,
+        allow_other: !options.fuse_owner_only,
     }
 }
 
