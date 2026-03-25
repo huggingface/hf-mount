@@ -165,9 +165,14 @@ impl super::VirtualFs {
             }
 
             for ino in &deletions {
-                // Invalidate the deleted inode and its parent dir so the
-                // kernel drops the dentry and page cache for this file.
+                // Re-check dirty status under the write lock: a local write
+                // may have dirtied this inode between the read-lock snapshot
+                // and now. Dirty inodes must not be removed, as that would
+                // discard uncommitted local data (TOCTOU race).
                 if let Some(entry) = inode_table.get(*ino) {
+                    if entry.is_dirty() {
+                        continue;
+                    }
                     let parent_ino = entry.parent;
                     inos_to_invalidate.push(parent_ino);
                 }
