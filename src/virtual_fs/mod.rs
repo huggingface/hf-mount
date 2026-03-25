@@ -2847,7 +2847,7 @@ async fn streaming_worker(
             }
             WriteMsg::Finish(reply) => {
                 let result = if failed {
-                    Err(crate::error::Error::Hub("streaming write failed".into()))
+                    Err(crate::error::Error::hub("streaming write failed"))
                 } else {
                     writer.finish_boxed().await
                 };

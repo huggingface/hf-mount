@@ -174,7 +174,7 @@ impl HubOps for MockHub {
 
     async fn head_file(&self, path: &str) -> Result<Option<HeadFileInfo>> {
         if self.head_fail.swap(false, Ordering::SeqCst) {
-            return Err(Error::Hub("mock head_file failure".into()));
+            return Err(Error::hub("mock head_file failure"));
         }
         let responses = self.head_responses.lock().unwrap();
         match responses.get(path) {
@@ -198,7 +198,7 @@ impl HubOps for MockHub {
         let prev = self.batch_fail_count.load(Ordering::SeqCst);
         if prev > 0 {
             self.batch_fail_count.fetch_sub(1, Ordering::SeqCst);
-            return Err(Error::Hub("mock batch_operations failure".into()));
+            return Err(Error::hub("mock batch_operations failure"));
         }
         self.batch_log.lock().unwrap().push(ops.to_vec());
         Ok(())
@@ -206,7 +206,7 @@ impl HubOps for MockHub {
 
     async fn download_file_http(&self, _path: &str, dest: &Path) -> Result<()> {
         if self.download_fail.swap(false, Ordering::SeqCst) {
-            return Err(Error::Hub("mock download failure".into()));
+            return Err(Error::hub("mock download failure"));
         }
         // Create an empty file at dest so open_local_readonly can open it.
         if let Some(parent) = dest.parent() {

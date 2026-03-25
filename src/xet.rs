@@ -103,7 +103,7 @@ impl XetOps for XetSessions {
         let config = self
             .upload_config
             .as_ref()
-            .ok_or_else(|| Error::Hub("no upload config (read-only mode)".into()))?;
+            .ok_or_else(|| Error::hub("no upload config (read-only mode)"))?;
         let session = FileUploadSession::new(config.clone(), None)
             .await
             .map_err(|e| Error::Xet(e.to_string()))?;
@@ -128,7 +128,7 @@ impl XetOps for XetSessions {
         let config = self
             .upload_config
             .as_ref()
-            .ok_or_else(|| Error::Hub("no upload config (read-only mode)".into()))?;
+            .ok_or_else(|| Error::hub("no upload config (read-only mode)"))?;
 
         let upload_session = FileUploadSession::new(config.clone(), None)
             .await

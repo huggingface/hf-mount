@@ -447,21 +447,15 @@ async fn flush_batch(
 
     ops.append(&mut delete_ops);
 
-    // Single batch commit (retry once on transient failure since CAS upload already succeeded).
+    // Single batch commit. Transient errors (429, 5xx) are retried by the hub layer.
     if let Err(e) = hub_client.batch_operations(&ops).await {
-        error!("Batch commit failed, retrying in 2s: {}", e);
-        tokio::time::sleep(Duration::from_secs(2)).await;
-
-        if let Err(e2) = hub_client.batch_operations(&ops).await {
-            error!("Batch commit retry failed: {}", e2);
-            let msg = format!("commit failed after retry: {e2}");
-            let mut errs = flush_errors.lock().expect("flush_errors poisoned");
-            for item in &to_flush {
-                errs.insert(item.ino, msg.clone());
-            }
-            return;
+        error!("Batch commit failed: {}", e);
+        let msg = format!("commit failed: {e}");
+        let mut errs = flush_errors.lock().expect("flush_errors poisoned");
+        for item in &to_flush {
+            errs.insert(item.ino, msg.clone());
         }
-        info!("Batch commit retry succeeded");
+        return;
     }
 
     let mut inode_table = inodes.write().expect("inodes poisoned");
