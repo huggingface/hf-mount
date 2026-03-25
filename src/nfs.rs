@@ -92,7 +92,7 @@ impl NFSAdapter {
         let name = nfs_name(filename)?;
         let (attr, file_handle) = self
             .virtual_fs
-            .create(dirid, name, mode, uid, gid, None, true)
+            .create(dirid, name, mode, uid, gid, None)
             .await
             .map_err(errno_to_nfs)?;
         let ino = attr.ino;

@@ -105,56 +105,61 @@ fn streaming_write_happy_path() {
     assert_eq!(logs.len(), 1);
 }
 
-/// create() + release() with no writes must NOT commit an empty file.
-/// Prevents data loss when tools create+close a handle without writing
-/// (e.g. vim's save flow), which would otherwise overwrite existing
-/// content on Hub with a 0-byte file.
+/// Editor pattern: unlink("file") + create("file") + close with no writes
+/// must NOT commit a 0-byte file (would overwrite Hub content).
 #[test]
-fn create_release_no_write_skips_commit() {
+fn unlink_then_create_no_write_skips_commit() {
     let hub = MockHub::new();
+    hub.add_file("target.txt", 100, Some("hash1"), None);
     let xet = MockXet::new();
     let (rt, vfs) = vfs_simple(&hub, &xet);
 
     rt.block_on(async {
+        // Load the file
+        vfs.lookup(ROOT_INODE, "target.txt").await.unwrap();
+
+        // Editor step 1: unlink the original
+        vfs.unlink(ROOT_INODE, "target.txt").await.unwrap();
+        hub.take_batch_log(); // consume the delete
+
+        // Editor step 2: create replacement (same name)
         let (attr, fh) = vfs
-            .create(ROOT_INODE, "probe.txt", 0o644, 1000, 1000, Some(42), false)
+            .create(ROOT_INODE, "target.txt", 0o644, 1000, 1000, Some(42))
             .await
             .unwrap();
         let ino = attr.ino;
 
-        // Close immediately without writing
+        // Editor step 3: close without writing
         vfs.flush(ino, fh, Some(42)).await.unwrap();
         vfs.release(fh).await.unwrap();
 
-        // No commit should have happened
+        // No empty-file commit should have happened
         let logs = hub.take_batch_log();
-        assert!(logs.is_empty(), "empty create must not commit to Hub");
-
-        // File still exists locally
-        vfs.lookup(ROOT_INODE, "probe.txt").await.unwrap();
+        assert!(logs.is_empty(), "replacing-unlinked create must not commit 0-byte file");
     });
 }
 
-/// create() + write + release() commits normally.
+/// Normal create (not replacing an unlink) commits even with 0 bytes (touch behavior).
 #[test]
-fn create_write_release_commits() {
+fn create_no_write_commits_normally() {
     let hub = MockHub::new();
     let xet = MockXet::new();
     let (rt, vfs) = vfs_simple(&hub, &xet);
 
     rt.block_on(async {
         let (attr, fh) = vfs
-            .create(ROOT_INODE, "real.txt", 0o644, 1000, 1000, Some(42), true)
+            .create(ROOT_INODE, "fresh.txt", 0o644, 1000, 1000, Some(42))
             .await
             .unwrap();
         let ino = attr.ino;
 
-        write_blocking(&vfs, ino, fh, 0, b"content").await.unwrap();
+        // Close without writing (like touch)
         vfs.flush(ino, fh, Some(42)).await.unwrap();
         vfs.release(fh).await.unwrap();
 
+        // Should commit the empty file
         let logs = hub.take_batch_log();
-        assert_eq!(logs.len(), 1, "write must commit");
+        assert_eq!(logs.len(), 1, "normal create must commit even with 0 bytes");
     });
 }
 
@@ -272,7 +277,7 @@ fn revert_inode_new_file_removed() {
 
     rt.block_on(async {
         let (attr, fh) = vfs
-            .create(ROOT_INODE, "new_file.txt", 0o644, 1000, 1000, Some(42), false)
+            .create(ROOT_INODE, "new_file.txt", 0o644, 1000, 1000, Some(42))
             .await
             .unwrap();
         let ino = attr.ino;
@@ -627,7 +632,7 @@ fn unlink_locally_created_file() {
 
     rt.block_on(async {
         let (attr, fh) = vfs
-            .create(ROOT_INODE, "local.txt", 0o644, 1000, 1000, Some(42), true)
+            .create(ROOT_INODE, "local.txt", 0o644, 1000, 1000, Some(42))
             .await
             .unwrap();
         let ino = attr.ino;
@@ -695,9 +700,7 @@ fn create_rollback_streaming_writer_fail() {
     let (rt, vfs) = vfs_simple(&hub, &xet);
 
     rt.block_on(async {
-        let result = vfs
-            .create(ROOT_INODE, "fail.txt", 0o644, 1000, 1000, Some(42), true)
-            .await;
+        let result = vfs.create(ROOT_INODE, "fail.txt", 0o644, 1000, 1000, Some(42)).await;
         assert_eq!(result.unwrap_err(), libc::EIO);
 
         let inodes = vfs.inode_table.read().unwrap();
@@ -715,9 +718,7 @@ fn create_eexist_duplicate() {
 
     rt.block_on(async {
         let _ = vfs.lookup(ROOT_INODE, "exist.txt").await.unwrap();
-        let result = vfs
-            .create(ROOT_INODE, "exist.txt", 0o644, 1000, 1000, Some(42), true)
-            .await;
+        let result = vfs.create(ROOT_INODE, "exist.txt", 0o644, 1000, 1000, Some(42)).await;
         assert_eq!(result.unwrap_err(), libc::EEXIST);
     });
 }
@@ -731,12 +732,10 @@ fn concurrent_create_eexist() {
 
     rt.block_on(async {
         let (_, fh1) = vfs
-            .create(ROOT_INODE, "race.txt", 0o644, 1000, 1000, Some(42), true)
+            .create(ROOT_INODE, "race.txt", 0o644, 1000, 1000, Some(42))
             .await
             .unwrap();
-        let result = vfs
-            .create(ROOT_INODE, "race.txt", 0o644, 1000, 1000, Some(43), true)
-            .await;
+        let result = vfs.create(ROOT_INODE, "race.txt", 0o644, 1000, 1000, Some(43)).await;
         assert_eq!(result.unwrap_err(), libc::EEXIST);
         vfs.release(fh1).await.unwrap();
     });
@@ -755,7 +754,7 @@ fn os_junk_files_rejected() {
     rt.block_on(async {
         for name in [".DS_Store", "._metadata", "Thumbs.db", "desktop.ini", "__MACOSX"] {
             assert_eq!(
-                vfs.create(ROOT_INODE, name, 0o644, 1000, 1000, Some(1), true)
+                vfs.create(ROOT_INODE, name, 0o644, 1000, 1000, Some(1))
                     .await
                     .unwrap_err(),
                 libc::EACCES,
@@ -1037,7 +1036,7 @@ fn setattr_simple_mode_empty_file_noop() {
 
     rt.block_on(async {
         let (attr, _fh) = vfs
-            .create(ROOT_INODE, "new.txt", 0o644, 1000, 1000, Some(1), true)
+            .create(ROOT_INODE, "new.txt", 0o644, 1000, 1000, Some(1))
             .await
             .unwrap();
         // ftruncate(fd, N) in simple mode succeeds but is a noop
@@ -1255,7 +1254,7 @@ fn create_and_write_advanced_mode() {
 
     rt.block_on(async {
         let (attr, fh) = vfs
-            .create(ROOT_INODE, "new.txt", 0o644, 1000, 1000, Some(42), true)
+            .create(ROOT_INODE, "new.txt", 0o644, 1000, 1000, Some(42))
             .await
             .unwrap();
         let ino = attr.ino;
@@ -2119,7 +2118,7 @@ fn negative_cache_cleared_on_create() {
 
         // Create the file
         let (attr, fh) = vfs
-            .create(ROOT_INODE, "new.txt", 0o644, 1000, 1000, Some(1), true)
+            .create(ROOT_INODE, "new.txt", 0o644, 1000, 1000, Some(1))
             .await
             .unwrap();
 
@@ -2317,7 +2316,7 @@ fn shutdown_flushes_dirty() {
 
     rt.block_on(async {
         let (attr, fh) = vfs
-            .create(ROOT_INODE, "dirty.txt", 0o644, 1000, 1000, None, true)
+            .create(ROOT_INODE, "dirty.txt", 0o644, 1000, 1000, None)
             .await
             .unwrap();
         write_blocking(&vfs, attr.ino, fh, 0, b"unflushed data").await.unwrap();
@@ -2397,10 +2396,7 @@ fn fsync_streaming_noop() {
     let (rt, vfs) = vfs_simple(&hub, &xet);
 
     rt.block_on(async {
-        let (_, fh) = vfs
-            .create(ROOT_INODE, "fsync_test", 0o644, 0, 0, None, true)
-            .await
-            .unwrap();
+        let (_, fh) = vfs.create(ROOT_INODE, "fsync_test", 0o644, 0, 0, None).await.unwrap();
         let ino = ROOT_INODE + 1;
 
         // Write some data
@@ -2430,10 +2426,7 @@ fn fsync_advanced_writes_commits() {
     let (rt, vfs) = vfs_advanced(&hub, &xet);
 
     rt.block_on(async {
-        let (_, fh) = vfs
-            .create(ROOT_INODE, "fsync_adv", 0o644, 0, 0, None, true)
-            .await
-            .unwrap();
+        let (_, fh) = vfs.create(ROOT_INODE, "fsync_adv", 0o644, 0, 0, None).await.unwrap();
         let ino = ROOT_INODE + 1;
 
         // Write data (goes to staging file)
@@ -2463,7 +2456,7 @@ fn fsync_empty_file_commits() {
     let (rt, vfs) = vfs_advanced(&hub, &xet);
 
     rt.block_on(async {
-        let (_, fh) = vfs.create(ROOT_INODE, "empty", 0o644, 0, 0, None, true).await.unwrap();
+        let (_, fh) = vfs.create(ROOT_INODE, "empty", 0o644, 0, 0, None).await.unwrap();
         let ino = ROOT_INODE + 1;
 
         // No write — staging file stays empty (0 bytes)
@@ -2495,7 +2488,7 @@ fn dirty_generation_race_with_concurrent_writer() {
     let (rt, vfs) = vfs_advanced(&hub, &xet);
 
     rt.block_on(async {
-        let (_, fh) = vfs.create(ROOT_INODE, "race", 0o644, 0, 0, None, true).await.unwrap();
+        let (_, fh) = vfs.create(ROOT_INODE, "race", 0o644, 0, 0, None).await.unwrap();
         let ino = ROOT_INODE + 1;
         write_blocking(&vfs, ino, fh, 0, b"writer A").await.unwrap();
 
@@ -2542,10 +2535,7 @@ fn fsync_then_write_redirties() {
     let (rt, vfs) = vfs_advanced(&hub, &xet);
 
     rt.block_on(async {
-        let (_, fh) = vfs
-            .create(ROOT_INODE, "redirty", 0o644, 0, 0, None, true)
-            .await
-            .unwrap();
+        let (_, fh) = vfs.create(ROOT_INODE, "redirty", 0o644, 0, 0, None).await.unwrap();
         let ino = ROOT_INODE + 1;
 
         // Write + fsync -> clean

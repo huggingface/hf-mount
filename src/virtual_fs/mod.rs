@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
@@ -95,6 +95,9 @@ pub struct VirtualFs {
     /// Batched flush pipeline: dirty file writes + remote delete queue.
     /// Only present in advanced_writes mode.
     flush_manager: Option<flush::FlushManager>,
+    /// Paths recently unlinked in this session. Used by create() to detect
+    /// editor save patterns (unlink + create) and skip the empty-file commit.
+    recently_unlinked: std::sync::Mutex<HashSet<String>>,
     /// Background poll task handle, aborted in shutdown().
     poll_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Kernel cache invalidation callback. Set via `set_invalidator()` after mount.
@@ -179,6 +182,7 @@ impl VirtualFs {
             staging_locks: Mutex::new(HashMap::new()),
             pending_commits: Mutex::new(HashMap::new()),
             flush_manager,
+            recently_unlinked: std::sync::Mutex::new(HashSet::new()),
             poll_handle: Mutex::new(poll_handle),
             invalidator,
             metadata_ttl: config.metadata_ttl,
@@ -661,6 +665,7 @@ impl VirtualFs {
         pid: Option<u32>,
         snapshot: InodeSnapshot,
         dirty_generation_at_open: u64,
+        replacing_unlinked: bool,
     ) -> VirtualFsResult<(u64, Arc<StreamingChannel>)> {
         let streaming_writer = self.xet_sessions.create_streaming_writer().await.map_err(|e| {
             error!("Failed to create streaming writer: {}", e);
@@ -685,6 +690,7 @@ impl VirtualFs {
             snapshot,
             dirty_generation_at_open: AtomicU64::new(dirty_generation_at_open),
             commit_hook: std::sync::Mutex::new(None),
+            replacing_unlinked,
         });
 
         let file_handle = self.alloc_file_handle();
@@ -1076,7 +1082,7 @@ impl VirtualFs {
             }
         };
 
-        let (file_handle, channel) = self.setup_streaming_writer(pid, snapshot, 0).await?;
+        let (file_handle, channel) = self.setup_streaming_writer(pid, snapshot, 0, false).await?;
 
         {
             let mut inodes = self.inode_table.write().expect("inodes poisoned");
@@ -1639,18 +1645,14 @@ impl VirtualFs {
                     let state = channel.state.lock().expect("state poisoned");
                     matches!(&*state, CommitState::Writing | CommitState::Deferred)
                 };
-                // Skip commit for newly created files (create()) that were never
-                // written to.  This prevents data loss when tools create+close a
-                // file handle without writing (e.g. vim's save flow creates a temp
-                // handle it immediately closes, which would otherwise commit a
-                // 0-byte file and overwrite existing content on the Hub).
-                // Explicit truncates via open(O_TRUNC) always commit because
-                // existed_before is true for those handles.
-                if needs_commit
-                    && channel.bytes_written.load(Ordering::Relaxed) == 0
-                    && !channel.snapshot.existed_before
-                {
-                    debug!("release: skipping commit for ino={} (created but never written)", ino);
+                // Skip commit when this handle replaced a just-unlinked file
+                // (editor save pattern) and no data was written. Committing
+                // would overwrite Hub content with a 0-byte file.
+                if needs_commit && channel.bytes_written.load(Ordering::Relaxed) == 0 && channel.replacing_unlinked {
+                    debug!(
+                        "release: skipping commit for ino={} (replacing unlinked, no writes)",
+                        ino
+                    );
                     *channel.state.lock().expect("state poisoned") = CommitState::Committed;
                     if let Some(hook_tx) = channel.commit_hook.lock().expect("commit_hook poisoned").take() {
                         let _ = hook_tx.send(Some(Ok(())));
@@ -1830,7 +1832,6 @@ impl VirtualFs {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub async fn create(
         &self,
         parent: u64,
@@ -1839,7 +1840,6 @@ impl VirtualFs {
         caller_uid: u32,
         caller_gid: u32,
         pid: Option<u32>,
-        truncate: bool,
     ) -> VirtualFsResult<(VirtualFsAttr, u64)> {
         if self.read_only {
             return Err(libc::EROFS);
@@ -1890,6 +1890,15 @@ impl VirtualFs {
             (ino, full_path, dirty_gen)
         };
 
+        // Check if this path was recently unlinked (editor save pattern:
+        // unlink original → create replacement). If so, skip the empty-file
+        // commit on release to prevent overwriting Hub content with 0 bytes.
+        let replacing_unlinked = self
+            .recently_unlinked
+            .lock()
+            .expect("recently_unlinked poisoned")
+            .remove(&full_path);
+
         self.negative_cache_remove(&full_path);
         if let Some(fm) = &self.flush_manager {
             fm.cancel_delete(&full_path);
@@ -1937,14 +1946,12 @@ impl VirtualFs {
                 size: 0,
                 mtime: now,
                 pending_deletes: Vec::new(),
-                // When O_TRUNC is set, the caller explicitly wants this file
-                // (possibly empty). Treat it like an existing file so release()
-                // commits even with 0 bytes written.  Without O_TRUNC (e.g. vim
-                // creating a temp handle), skip the commit on 0 bytes to prevent
-                // overwriting remote content with an empty file.
-                existed_before: truncate,
+                existed_before: false,
             };
-            let (file_handle, channel) = match self.setup_streaming_writer(pid, snapshot, dirty_gen).await {
+            let (file_handle, channel) = match self
+                .setup_streaming_writer(pid, snapshot, dirty_gen, replacing_unlinked)
+                .await
+            {
                 Ok(r) => r,
                 Err(e) => {
                     self.inode_table.write().expect("inodes poisoned").remove(ino);
@@ -2090,6 +2097,13 @@ impl VirtualFs {
                 warn!("Failed to remove staging file for ino={}: {}", ino, e);
             }
         }
+
+        // Track the path so create() can detect editor save patterns
+        // (unlink + create with same name) and skip the empty-file commit.
+        self.recently_unlinked
+            .lock()
+            .expect("recently_unlinked poisoned")
+            .insert(full_path.clone());
 
         info!("Deleted file: {}", full_path);
         Ok(())
@@ -2751,11 +2765,7 @@ struct InodeSnapshot {
     size: u64,
     mtime: SystemTime,
     pending_deletes: Vec<String>,
-    /// Dual role: (1) revert_inode uses this to decide remove vs restore on
-    /// commit failure. (2) release() skips commits when bytes_written==0 and
-    /// this is false (prevents editor temp handles from overwriting Hub content).
-    /// Set to true for open(O_TRUNC) and create(O_TRUNC), false for create()
-    /// without O_TRUNC (e.g. vim probe handles).
+    /// false for create() (new file), true for open(O_TRUNC) (overwrite).
     existed_before: bool,
 }
 
@@ -2795,6 +2805,10 @@ struct StreamingChannel {
     /// Watch sender for the pending commit hook. Created in flush() on deferral,
     /// fulfilled in release() when the commit completes (or fails).
     commit_hook: std::sync::Mutex<Option<CommitHookTx>>,
+    /// True when this file was created to replace a just-unlinked file (editor
+    /// save pattern). release() skips the commit if bytes_written is 0 to
+    /// prevent overwriting Hub content with an empty file.
+    replacing_unlinked: bool,
 }
 
 /// An open file handle — either a local fd, lazy remote reference, or streaming writer.
