@@ -1639,7 +1639,23 @@ impl VirtualFs {
                     let state = channel.state.lock().expect("state poisoned");
                     matches!(&*state, CommitState::Writing | CommitState::Deferred)
                 };
-                if needs_commit {
+                // Skip commit for newly created files (create()) that were never
+                // written to.  This prevents data loss when tools create+close a
+                // file handle without writing (e.g. vim's save flow creates a temp
+                // handle it immediately closes, which would otherwise commit a
+                // 0-byte file and overwrite existing content on the Hub).
+                // Explicit truncates via open(O_TRUNC) always commit because
+                // existed_before is true for those handles.
+                if needs_commit
+                    && channel.bytes_written.load(Ordering::Relaxed) == 0
+                    && !channel.snapshot.existed_before
+                {
+                    debug!("release: skipping commit for ino={} (created but never written)", ino);
+                    *channel.state.lock().expect("state poisoned") = CommitState::Committed;
+                    if let Some(hook_tx) = channel.commit_hook.lock().expect("commit_hook poisoned").take() {
+                        let _ = hook_tx.send(Some(Ok(())));
+                    }
+                } else if needs_commit {
                     // If flush() didn't defer (e.g. Writing state from a direct
                     // release without flush), install the hook now.
                     if channel.commit_hook.lock().expect("commit_hook poisoned").is_none() {

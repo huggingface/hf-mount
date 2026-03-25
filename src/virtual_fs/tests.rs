@@ -105,6 +105,59 @@ fn streaming_write_happy_path() {
     assert_eq!(logs.len(), 1);
 }
 
+/// create() + release() with no writes must NOT commit an empty file.
+/// Prevents data loss when tools create+close a handle without writing
+/// (e.g. vim's save flow), which would otherwise overwrite existing
+/// content on Hub with a 0-byte file.
+#[test]
+fn create_release_no_write_skips_commit() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let (attr, fh) = vfs
+            .create(ROOT_INODE, "probe.txt", 0o644, 1000, 1000, Some(42))
+            .await
+            .unwrap();
+        let ino = attr.ino;
+
+        // Close immediately without writing
+        vfs.flush(ino, fh, Some(42)).await.unwrap();
+        vfs.release(fh).await.unwrap();
+
+        // No commit should have happened
+        let logs = hub.take_batch_log();
+        assert!(logs.is_empty(), "empty create must not commit to Hub");
+
+        // File still exists locally
+        vfs.lookup(ROOT_INODE, "probe.txt").await.unwrap();
+    });
+}
+
+/// create() + write + release() commits normally.
+#[test]
+fn create_write_release_commits() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let (attr, fh) = vfs
+            .create(ROOT_INODE, "real.txt", 0o644, 1000, 1000, Some(42))
+            .await
+            .unwrap();
+        let ino = attr.ino;
+
+        write_blocking(&vfs, ino, fh, 0, b"content").await.unwrap();
+        vfs.flush(ino, fh, Some(42)).await.unwrap();
+        vfs.release(fh).await.unwrap();
+
+        let logs = hub.take_batch_log();
+        assert_eq!(logs.len(), 1, "write must commit");
+    });
+}
+
 /// flush() from a different PID (dup'd fd) defers commit; release() commits.
 #[test]
 fn flush_deferred_pid_mismatch() {
