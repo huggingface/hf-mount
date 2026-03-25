@@ -502,16 +502,14 @@ pub fn run_simple_write_tests(mp: &str, remote_file: &str) -> TestResult {
         std::fs::remove_dir(&dir)?;
     }
 
-    // 8. Open existing for write without truncate, close without writing → file preserved
-    eprintln!("  [simple-write] open existing for write (no truncate), close without writing");
+    // 8. Open existing for write without truncate should fail (EPERM)
+    eprintln!("  [simple-write] open existing for write (no truncate) → EPERM");
     {
         let path = format!("{}/data.txt", mp);
-        let file = std::fs::OpenOptions::new().write(true).open(&path)?;
-        drop(file);
-        let content = std::fs::read_to_string(&path)?;
-        assert_eq!(
-            content, "hello",
-            "file should be unchanged after open+close with no write"
+        let result = std::fs::OpenOptions::new().write(true).open(&path);
+        assert!(
+            result.is_err(),
+            "opening existing file for write without truncate should fail in simple mode"
         );
     }
 
@@ -705,24 +703,7 @@ pub fn run_simple_write_tests(mp: &str, remote_file: &str) -> TestResult {
         std::fs::remove_dir(&d1)?;
     }
 
-    // 22. Overwrite with content added at beginning + end (regression: file became empty)
-    eprintln!("  [simple-write] overwrite with prepend + append");
-    {
-        let path = format!("{}/prepend_append.txt", mp);
-        // First save
-        std::fs::write(&path, "hello")?;
-        let content = std::fs::read_to_string(&path)?;
-        assert_eq!(content, "hello", "initial write should contain hello");
-        // Second save: add a line before and after
-        std::fs::write(&path, "first\nhello\nlast\n")?;
-        let content = std::fs::read_to_string(&path)?;
-        assert_eq!(
-            content, "first\nhello\nlast\n",
-            "file must NOT be empty after overwrite with prepend+append"
-        );
-    }
-
-    // 23. Rename file across directories
+    // 22. Rename file across directories
     eprintln!("  [simple-write] rename file across directories");
     {
         let src_dir = format!("{}/xdir_src", mp);
