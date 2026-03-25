@@ -90,6 +90,7 @@ Binaries: `target/release/hf-mount`, `target/release/hf-mount-nfs`, `target/rele
 - Latency-sensitive random I/O (first reads require network round-trips)
 - Workloads that need strong consistency (files can be stale for up to 10 s)
 - Heavy concurrent writes from multiple mounts (last writer wins, no conflict detection)
+- Editing files with text editors in default (streaming) mode (use `--advanced-writes`)
 
 See [Consistency model](#consistency-model) for details.
 
@@ -261,6 +262,10 @@ Files can be stale for up to `--metadata-ttl-ms` (default 10 s) after a remote u
 | Disk space needed | None | Full file size per open file |
 
 **Streaming mode** buffers writes in memory and uploads on `close()`. A crash before close means data loss.
+
+> **Note:** Streaming mode does not support text editors (vim, nano, emacs). Editors that use
+> unlink+create save patterns will be blocked (`EPERM`) to prevent data loss.
+> Use `--advanced-writes` for interactive editing.
 
 **Advanced mode** downloads the full file to local disk before allowing edits. After `close()`, dirty files are flushed asynchronously. A crash before flush completes means data loss.
 
