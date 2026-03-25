@@ -545,7 +545,7 @@ pub fn mount_fuse(
             .mount_options
             .push(fuser::MountOption::CUSTOM("local".to_string()));
     }
-    config.acl = fuser::SessionACL::All;
+    config.acl = fuser::SessionACL::Owner;
     // clone_fd and multi-threading are only supported on Linux by fuser
     if cfg!(target_os = "linux") {
         config.clone_fd = true;
