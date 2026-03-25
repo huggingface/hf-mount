@@ -1041,9 +1041,10 @@ fn open_readonly_fs_erofs() {
     });
 }
 
-/// open(writable, !truncate) in simple mode returns EPERM (append-only semantics).
+/// open(writable, !truncate) in simple mode opens a streaming writer that
+/// skips the commit on release if no data was written (editor compat).
 #[test]
-fn open_simple_no_truncate_eperm() {
+fn open_simple_no_truncate_no_write_skips_commit() {
     let hub = MockHub::new();
     hub.add_file("file.txt", 100, Some("hash1"), None);
     let xet = MockXet::new();
@@ -1051,8 +1052,24 @@ fn open_simple_no_truncate_eperm() {
 
     rt.block_on(async {
         let attr = vfs.lookup(ROOT_INODE, "file.txt").await.unwrap();
-        let result = vfs.open(attr.ino, true, false, Some(42)).await;
-        assert_eq!(result.unwrap_err(), libc::EPERM);
+        let ino = attr.ino;
+
+        // Open writable without truncate (what vim does)
+        let fh = vfs.open(ino, true, false, Some(42)).await.unwrap();
+
+        // Close without writing
+        vfs.flush(ino, fh, Some(42)).await.unwrap();
+        vfs.release(fh).await.unwrap();
+
+        // No commit should have happened
+        let logs = hub.take_batch_log();
+        assert!(logs.is_empty(), "no-write open must not commit");
+
+        // File content preserved
+        let inodes = vfs.inode_table.read().unwrap();
+        let entry = inodes.get(ino).unwrap();
+        assert_eq!(entry.size, 100);
+        assert_eq!(entry.xet_hash.as_deref(), Some("hash1"));
     });
 }
 
