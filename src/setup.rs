@@ -144,6 +144,12 @@ pub struct MountOptions {
     /// By default these files are rejected on create/mkdir/rename.
     #[arg(long, default_value_t = false)]
     pub no_filter_os_files: bool,
+
+    /// Allow other users to access the mount (FUSE only).
+    /// By default only the user who mounted the filesystem can access it.
+    /// Requires `user_allow_other` in /etc/fuse.conf on Linux.
+    #[arg(long, default_value_t = false)]
+    pub allow_other: bool,
 }
 
 /// CLI args for the foreground FUSE/NFS binaries.
@@ -168,6 +174,7 @@ pub struct MountSetup {
     pub metadata_ttl: std::time::Duration,
     pub max_threads: usize,
     pub metadata_ttl_ms: u64,
+    pub allow_other: bool,
 }
 
 // ── Tracing + env vars (no threads) ──────────────────────────────────
@@ -397,6 +404,7 @@ pub fn build(source: Source, options: MountOptions, is_nfs: bool) -> MountSetup 
         metadata_ttl,
         max_threads: options.max_threads,
         metadata_ttl_ms: options.metadata_ttl_ms,
+        allow_other: options.allow_other,
     }
 }
 

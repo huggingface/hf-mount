@@ -222,6 +222,7 @@ hf-mount stop /tmp/data          # daemon mounts
 | `--no-disk-cache` | `false` | Disable local chunk cache (every read fetches from HF) |
 | `--no-filter-os-files` | `false` | Stop filtering OS junk files (.DS_Store, Thumbs.db, etc.) |
 | `--uid` / `--gid` | current user | Override UID/GID for mounted files |
+| `--allow-other` | `false` | Allow other users to access the mount (FUSE only, requires `user_allow_other` in /etc/fuse.conf) |
 | `--token-file` | | Path to a token file (re-read on each request for credential rotation) |
 
 ### Logging

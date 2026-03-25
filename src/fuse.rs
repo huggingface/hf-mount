@@ -509,6 +509,7 @@ pub fn mount_fuse(
     max_threads: usize,
     runtime: &tokio::runtime::Runtime,
     daemon_guard: Option<&mut DaemonGuard>,
+    allow_other: bool,
 ) -> bool {
     let adapter = FuseAdapter::new(
         runtime.handle().clone(),
@@ -545,7 +546,11 @@ pub fn mount_fuse(
             .mount_options
             .push(fuser::MountOption::CUSTOM("local".to_string()));
     }
-    config.acl = fuser::SessionACL::All;
+    config.acl = if allow_other {
+        fuser::SessionACL::All
+    } else {
+        fuser::SessionACL::Owner
+    };
     // clone_fd and multi-threading are only supported on Linux by fuser
     if cfg!(target_os = "linux") {
         config.clone_fd = true;

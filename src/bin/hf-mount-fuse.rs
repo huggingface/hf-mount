@@ -17,6 +17,7 @@ fn main() {
         s.max_threads,
         &s.runtime,
         daemon_guard.as_mut(),
+        s.allow_other,
     ) {
         std::process::exit(1);
     }
