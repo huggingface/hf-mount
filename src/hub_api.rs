@@ -260,37 +260,10 @@ fn retry_delay(attempt: u32) -> std::time::Duration {
     std::time::Duration::from_millis(500 * 2u64.pow(attempt - 1))
 }
 
-/// Extract a server-suggested retry delay from response headers, capped at 30s.
-/// Checks `Retry-After` first (delta-seconds or HTTP-date), then falls back to
-/// the `RateLimit` header's `t=` parameter (seconds until window reset, per IETF
-/// draft-ietf-httpapi-ratelimit-headers).
-fn parse_retry_delay(headers: &reqwest::header::HeaderMap) -> Option<std::time::Duration> {
-    if let Some(delay) = parse_retry_after(headers) {
-        return Some(delay);
-    }
-    parse_ratelimit_reset(headers)
-}
-
-fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<std::time::Duration> {
-    let value = headers.get("retry-after")?.to_str().ok()?;
-    if let Ok(secs) = value.parse::<u64>() {
-        return Some(std::time::Duration::from_secs(secs.min(30)));
-    }
-    if let Ok(dt) = chrono::DateTime::parse_from_rfc2822(value)
-        && let Ok(secs) = u64::try_from(dt.timestamp())
-    {
-        let target_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs);
-        let duration = target_time
-            .duration_since(std::time::SystemTime::now())
-            .unwrap_or(std::time::Duration::ZERO);
-        return Some(duration.min(std::time::Duration::from_secs(30)));
-    }
-    None
-}
-
-/// Parse the IETF `RateLimit` header for `t=<seconds>` (time until window reset).
+/// Parse the IETF `RateLimit` header for `t=<seconds>` (time until window reset), capped at 30s.
 /// Format: `"resource_type";r=<remaining>;t=<seconds_until_reset>`
-fn parse_ratelimit_reset(headers: &reqwest::header::HeaderMap) -> Option<std::time::Duration> {
+/// This is what moon-landing sends on 429 responses.
+fn parse_retry_delay(headers: &reqwest::header::HeaderMap) -> Option<std::time::Duration> {
     let value = headers.get("ratelimit")?.to_str().ok()?;
     for part in value.split(';') {
         let part = part.trim();
@@ -1358,78 +1331,32 @@ mod tests {
     }
 
     #[test]
-    fn parse_retry_after_delta_seconds() {
-        let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert("retry-after", "5".parse().unwrap());
-        let duration = parse_retry_after(&headers).unwrap();
-        assert_eq!(duration, std::time::Duration::from_secs(5));
-    }
-
-    #[test]
-    fn parse_retry_after_delta_seconds_capped_at_30() {
-        let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert("retry-after", "120".parse().unwrap());
-        let duration = parse_retry_after(&headers).unwrap();
-        assert_eq!(duration, std::time::Duration::from_secs(30));
-    }
-
-    #[test]
-    fn parse_retry_after_missing_header() {
-        let headers = reqwest::header::HeaderMap::new();
-        assert!(parse_retry_after(&headers).is_none());
-    }
-
-    #[test]
-    fn parse_retry_after_invalid_value() {
-        let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert("retry-after", "not-a-number".parse().unwrap());
-        assert!(parse_retry_after(&headers).is_none());
-    }
-
-    #[test]
-    fn parse_ratelimit_reset_extracts_t_value() {
+    fn parse_retry_delay_extracts_t_value() {
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert("ratelimit", r#""hub_api";r=0;t=45"#.parse().unwrap());
-        let duration = parse_ratelimit_reset(&headers).unwrap();
+        let duration = parse_retry_delay(&headers).unwrap();
         assert_eq!(duration, std::time::Duration::from_secs(30)); // capped
     }
 
     #[test]
-    fn parse_ratelimit_reset_small_value() {
+    fn parse_retry_delay_small_value() {
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert("ratelimit", r#""hub_api";r=0;t=5"#.parse().unwrap());
-        let duration = parse_ratelimit_reset(&headers).unwrap();
+        let duration = parse_retry_delay(&headers).unwrap();
         assert_eq!(duration, std::time::Duration::from_secs(5));
     }
 
     #[test]
-    fn parse_ratelimit_reset_missing_header() {
+    fn parse_retry_delay_missing_header() {
         let headers = reqwest::header::HeaderMap::new();
-        assert!(parse_ratelimit_reset(&headers).is_none());
+        assert!(parse_retry_delay(&headers).is_none());
     }
 
     #[test]
-    fn parse_ratelimit_reset_no_t_param() {
+    fn parse_retry_delay_no_t_param() {
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert("ratelimit", r#""hub_api";r=50"#.parse().unwrap());
-        assert!(parse_ratelimit_reset(&headers).is_none());
-    }
-
-    #[test]
-    fn parse_retry_delay_prefers_retry_after_over_ratelimit() {
-        let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert("retry-after", "3".parse().unwrap());
-        headers.insert("ratelimit", r#""hub_api";r=0;t=20"#.parse().unwrap());
-        let duration = parse_retry_delay(&headers).unwrap();
-        assert_eq!(duration, std::time::Duration::from_secs(3));
-    }
-
-    #[test]
-    fn parse_retry_delay_falls_back_to_ratelimit() {
-        let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert("ratelimit", r#""hub_api";r=0;t=10"#.parse().unwrap());
-        let duration = parse_retry_delay(&headers).unwrap();
-        assert_eq!(duration, std::time::Duration::from_secs(10));
+        assert!(parse_retry_delay(&headers).is_none());
     }
 
     #[test]
