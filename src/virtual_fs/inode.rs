@@ -91,7 +91,9 @@ impl InodeEntry {
         if self.clear_dirty_if(dirty_generation) {
             self.pending_deletes.clear();
         }
-        self.ctime = SystemTime::now();
+        let now = SystemTime::now();
+        self.mtime = now;
+        self.ctime = now;
     }
 }
 
@@ -588,10 +590,7 @@ mod tests {
         assert_eq!(entry.xet_hash.as_deref(), Some("new_hash"));
         assert_eq!(entry.size, 200);
         assert!(entry.pending_deletes.is_empty());
-        // mtime is NOT updated by apply_commit (set during write instead)
-        assert_eq!(entry.mtime, UNIX_EPOCH);
-        // ctime IS updated by apply_commit
-        assert!(entry.ctime > UNIX_EPOCH);
+        assert!(entry.mtime > UNIX_EPOCH);
     }
 
     #[test]
