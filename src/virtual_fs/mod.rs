@@ -1613,7 +1613,9 @@ impl VirtualFs {
             .remove(&file_handle);
 
         let released_ino = match &removed {
-            Some(OpenFile::Local { ino, .. }) | Some(OpenFile::Streaming { ino, .. }) => Some(*ino),
+            Some(OpenFile::Local { ino, .. })
+            | Some(OpenFile::Lazy { ino, .. })
+            | Some(OpenFile::Streaming { ino, .. }) => Some(*ino),
             _ => None,
         };
 
