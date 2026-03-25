@@ -156,6 +156,54 @@ fn streaming_overwrite_not_empty() {
     assert_eq!(logs.len(), 2);
 }
 
+/// Vim save pattern: create() + flush() + release() with no writes must NOT
+/// commit an empty file.  Vim creates a new file, closes it immediately, then
+/// opens another handle to write the actual content.  Committing the empty
+/// create would race with the real write and trigger E949 "File changed while
+/// writing" in vim.
+#[test]
+fn create_release_no_write_skips_commit() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        // Vim step 1: create new file (returns streaming handle)
+        let (attr, fh) = vfs
+            .create(ROOT_INODE, "vim-test.txt", 0o644, 1000, 1000, Some(42))
+            .await
+            .unwrap();
+        let ino = attr.ino;
+
+        // Vim step 2: close immediately without writing (flush + release)
+        vfs.flush(ino, fh, Some(42)).await.unwrap();
+        vfs.release(fh).await.unwrap();
+
+        // No commit should have happened
+        let logs = hub.take_batch_log();
+        assert!(logs.is_empty(), "empty create must not commit to Hub");
+
+        // File still exists in VFS (visible to ls)
+        let attr = vfs.lookup(ROOT_INODE, "vim-test.txt").await.unwrap();
+        assert_eq!(attr.size, 0);
+
+        // Vim step 3: open again and write actual content
+        let fh2 = vfs.open(ino, true, true, Some(42)).await.unwrap();
+        write_blocking(&vfs, ino, fh2, 0, b"real content\n").await.unwrap();
+        vfs.flush(ino, fh2, Some(42)).await.unwrap();
+        vfs.release(fh2).await.unwrap();
+
+        // NOW commit should have happened with real content
+        let logs = hub.take_batch_log();
+        assert_eq!(logs.len(), 1, "real write must commit");
+
+        let inodes = vfs.inode_table.read().unwrap();
+        let entry = inodes.get(ino).unwrap();
+        assert_eq!(entry.size, 13);
+        assert!(entry.xet_hash.is_some());
+    });
+}
+
 /// flush() from a different PID (dup'd fd) defers commit; release() commits.
 #[test]
 fn flush_deferred_pid_mismatch() {

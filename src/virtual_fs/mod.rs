@@ -1641,7 +1641,26 @@ impl VirtualFs {
                     let state = channel.state.lock().expect("state poisoned");
                     matches!(&*state, CommitState::Writing | CommitState::Deferred)
                 };
-                if needs_commit {
+
+                // Skip commit for newly created files that were never written to.
+                // Editors like vim create a file, close the handle immediately, then
+                // open a second handle to write the actual content.  Committing a
+                // 0-byte file here would race with the real write and trigger vim's
+                // E949 "File changed while writing" error.
+                // Explicit truncates of existing files (> file.txt) still commit
+                // because `existed_before` is true for those handles.
+                if needs_commit
+                    && channel.bytes_written.load(Ordering::Relaxed) == 0
+                    && !channel.snapshot.existed_before
+                {
+                    debug!("release: skipping commit for newly created ino={} with no writes", ino);
+                    *channel.state.lock().expect("state poisoned") = CommitState::Committed;
+                    if let Some(hook_tx) = channel.commit_hook.lock().expect("commit_hook poisoned").take() {
+                        let _ = hook_tx.send(Some(Ok(())));
+                    }
+                    // Don't revert — the inode entry stays so the file is visible
+                    // and can be opened for writing by the next handle.
+                } else if needs_commit {
                     // If flush() didn't defer (e.g. Writing state from a direct
                     // release without flush), install the hook now.
                     if channel.commit_hook.lock().expect("commit_hook poisoned").is_none() {

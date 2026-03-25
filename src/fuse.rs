@@ -292,7 +292,7 @@ impl Filesystem for FuseAdapter {
         name: &OsStr,
         mode: u32,
         umask: u32,
-        flags: i32,
+        _flags: i32,
         reply: fuser::ReplyCreate,
     ) {
         let name = os_to_str!(name, reply);
