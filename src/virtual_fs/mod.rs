@@ -1669,7 +1669,17 @@ impl VirtualFs {
                             *channel.state.lock().expect("state poisoned") = CommitState::Committed;
                         }
                         Err(e) => {
-                            error!("DATA LOSS: streaming commit failed for ino={}: errno={}", ino, e);
+                            let is_unlinked = self
+                                .inode_table
+                                .read()
+                                .expect("inodes poisoned")
+                                .get(ino)
+                                .is_none_or(|entry| entry.nlink == 0);
+                            if is_unlinked {
+                                debug!("streaming commit failed for unlinked ino={} (expected)", ino);
+                            } else {
+                                error!("DATA LOSS: streaming commit failed for ino={}: errno={}", ino, e);
+                            }
                             self.revert_inode(ino, &channel.snapshot);
                             *channel.state.lock().expect("state poisoned") =
                                 CommitState::Failed("commit failed".into());
