@@ -2895,7 +2895,11 @@ fn flush_dedup_same_inode() {
         tokio::time::sleep(Duration::from_millis(1500)).await;
 
         // Despite 3 enqueues, dedup should yield only 1 upload call
-        assert_eq!(xet.upload_count(), 1, "expected exactly 1 upload despite multiple enqueues");
+        assert_eq!(
+            xet.upload_count(),
+            1,
+            "expected exactly 1 upload despite multiple enqueues"
+        );
 
         vfs.release(fh).await.unwrap();
     });
@@ -3045,14 +3049,7 @@ fn poll_deletes_dirty_inode() {
         let poll_neg = vfs.negative_cache.clone();
         let poll_inv = vfs.invalidator.clone();
         let poll_task = tokio::spawn(async move {
-            VirtualFs::poll_remote_changes(
-                poll_hub,
-                poll_inodes,
-                poll_neg,
-                poll_inv,
-                Duration::from_millis(1),
-            )
-            .await;
+            VirtualFs::poll_remote_changes(poll_hub, poll_inodes, poll_neg, poll_inv, Duration::from_millis(1)).await;
         });
 
         // Give poll time to execute one iteration

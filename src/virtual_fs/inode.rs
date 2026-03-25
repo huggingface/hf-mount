@@ -1596,10 +1596,7 @@ mod tests {
 
         // remove_orphan should be a no-op when nlink > 0
         table.remove_orphan(ino);
-        assert!(
-            table.get(ino).is_some(),
-            "inode should still exist when nlink > 0"
-        );
+        assert!(table.get(ino).is_some(), "inode should still exist when nlink > 0");
         assert!(
             table.get_by_path("linked.txt").is_some(),
             "path mapping should still exist when nlink > 0"
