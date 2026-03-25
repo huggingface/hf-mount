@@ -969,8 +969,21 @@ impl VirtualFs {
             // Simple streaming write (append-only, synchronous commit on close)
             self.open_streaming_write(ino, pid).await
         } else if writable {
-            // Simple mode without O_TRUNC: random writes not supported
-            Err(libc::EPERM)
+            // Streaming mode doesn't support random writes on existing remote files.
+            // However, locally created files (dirty, size=0, no remote hash) can be
+            // reopened without O_TRUNC — editors like vim create+close a file then
+            // reopen it with O_RDWR to write the actual content.
+            let allow_reopen = {
+                let inodes = self.inode_table.read().expect("inodes poisoned");
+                inodes
+                    .get(ino)
+                    .is_some_and(|e| e.is_dirty() && e.size == 0 && e.xet_hash.is_none())
+            };
+            if allow_reopen {
+                self.open_streaming_write(ino, pid).await
+            } else {
+                Err(libc::EPERM)
+            }
         } else {
             self.open_readonly(ino, file_entry, staging_path).await
         }
