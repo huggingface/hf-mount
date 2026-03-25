@@ -174,7 +174,7 @@ pub struct MountSetup {
     pub metadata_ttl: std::time::Duration,
     pub max_threads: usize,
     pub metadata_ttl_ms: u64,
-    pub allow_other: bool,
+    pub fuse_owner_only: bool,
 }
 
 // ── Tracing + env vars (no threads) ──────────────────────────────────
@@ -404,7 +404,7 @@ pub fn build(source: Source, options: MountOptions, is_nfs: bool) -> MountSetup 
         metadata_ttl,
         max_threads: options.max_threads,
         metadata_ttl_ms: options.metadata_ttl_ms,
-        allow_other: !options.fuse_owner_only,
+        fuse_owner_only: options.fuse_owner_only,
     }
 }
 
