@@ -57,6 +57,8 @@ pub struct VfsConfig {
     pub direct_io: bool,
     pub flush_debounce: Duration,
     pub flush_max_batch_window: Duration,
+    #[cfg(feature = "encrypt")]
+    pub encryption_config: Option<crate::crypto::EncryptionConfig>,
 }
 
 /// Lock ordering (acquire in this order to prevent deadlocks):
@@ -123,6 +125,8 @@ pub struct VirtualFs {
     filter_os_files: bool,
     /// When true, prefetch buffers drain after serving (forward-only, no re-read cache).
     direct_io: bool,
+    #[cfg(feature = "encrypt")]
+    encryption_config: Option<crate::crypto::EncryptionConfig>,
 }
 
 /// Where to read file content from when opening read-only.
@@ -149,6 +153,8 @@ impl VirtualFs {
                 &runtime,
                 config.flush_debounce,
                 config.flush_max_batch_window,
+                #[cfg(feature = "encrypt")]
+                config.encryption_config.clone(),
             ))
         } else {
             None
@@ -202,6 +208,8 @@ impl VirtualFs {
             serve_lookup_from_cache: config.serve_lookup_from_cache,
             filter_os_files: config.filter_os_files,
             direct_io: config.direct_io,
+            #[cfg(feature = "encrypt")]
+            encryption_config: config.encryption_config,
         });
 
         // Set root inode mtime and ownership (repos use the last commit date).
@@ -346,6 +354,7 @@ impl VirtualFs {
                         remote_etag.map(|s| s.to_string()),
                         remote_size,
                         remote_mtime,
+                        None,
                     );
                     if let Some(invalidate) = self.invalidator.lock().expect("invalidator poisoned").as_ref() {
                         invalidate(ino);
@@ -485,6 +494,20 @@ impl VirtualFs {
                     && let Some(e) = inodes.get_mut(ino)
                 {
                     e.etag = Some(oid);
+                }
+                #[cfg(feature = "encrypt")]
+                if let Some(ref ct) = entry.content_type
+                    && let Some(e) = inodes.get_mut(ino)
+                {
+                    match crate::crypto::parse_content_type(ct) {
+                        Ok(Some(info)) => e.apply_encryption_metadata(&info, size),
+                        Ok(None) => {}
+                        Err(err) => {
+                            error!("corrupt encryption metadata on {}: {err}", e.full_path);
+                            e.encrypted = true;
+                            e.file_algorithm = None;
+                        }
+                    }
                 }
             }
         }
@@ -873,6 +896,8 @@ impl VirtualFs {
             staging_dir,
             &*self.hub_client,
             &self.inode_table,
+            #[cfg(feature = "encrypt")]
+            &self.encryption_config,
         )
         .await
     }
@@ -934,9 +959,14 @@ impl VirtualFs {
         let staging_path = self.staging_dir.as_ref().map(|sd| sd.path(ino));
 
         if writable && self.advanced_writes {
-            // Staging file + async flush (supports random writes and seek)
-            self.open_advanced_write(ino, &file_entry.xet_hash, file_entry.size, staging_path, truncate)
-                .await
+            self.open_advanced_write(
+                ino,
+                &file_entry.xet_hash,
+                file_entry.download_size,
+                staging_path,
+                truncate,
+            )
+            .await
         } else if writable && truncate {
             // Simple streaming write (append-only, synchronous commit on close)
             self.open_streaming_write(ino, pid).await
@@ -975,14 +1005,7 @@ impl VirtualFs {
         // Reuse existing dirty staging file (unless truncating)
         if !(is_dirty && staging_path.exists() && !truncate) {
             if !truncate && !xet_hash.is_empty() && size > 0 {
-                // Download remote content for read-modify-write
-                self.xet_sessions
-                    .download_to_file(xet_hash, size, &staging_path)
-                    .await
-                    .map_err(|e| {
-                        error!("Failed to download file for write: {}", e);
-                        libc::EIO
-                    })?;
+                self.download_to_staging(ino, xet_hash, size, &staging_path).await?;
             } else {
                 // Truncate, new file, or empty remote → empty staging file
                 File::create(&staging_path).map_err(|e| {
@@ -1088,6 +1111,10 @@ impl VirtualFs {
                 self.open_lazy(ino, fe.xet_hash, fe.size)
             }
 
+            // Encrypted xet-backed file — download, decrypt, serve locally.
+            #[cfg(feature = "encrypt")]
+            _ if !fe.xet_hash.is_empty() && fe.encrypted => self.open_encrypted_xet(ino, &fe).await,
+
             // Remote xet-backed file — lazy CAS range reads.
             _ if !fe.xet_hash.is_empty() => self.open_lazy(ino, fe.xet_hash, fe.size),
 
@@ -1118,12 +1145,117 @@ impl VirtualFs {
                             libc::EIO
                         })?;
                 }
+
+                #[cfg(feature = "encrypt")]
+                if fe.encrypted {
+                    return self.decrypt_and_open(ino, &dest, &fe);
+                }
+
                 self.open_local_readonly(ino, &dest)
             }
 
             // Empty file (size=0, no hash).
             _ => self.open_lazy(ino, String::new(), 0),
         }
+    }
+
+    #[cfg(feature = "encrypt")]
+    async fn open_encrypted_xet(&self, ino: u64, fe: &FileEntry) -> VirtualFsResult<u64> {
+        let staging = self.staging_dir.as_ref().ok_or_else(|| {
+            error!("No staging dir for encrypted download of ino={}", ino);
+            libc::EIO
+        })?;
+        let ct_path = staging.root().join(format!("enc_{:x}_{}", ino, std::process::id()));
+        let lock = self.staging_lock(ino);
+        let _guard = lock.lock().await;
+        self.xet_sessions
+            .download_to_file(&fe.xet_hash, fe.download_size, &ct_path)
+            .await
+            .map_err(|e| {
+                error!("Encrypted download failed for ino={}: {}", ino, e);
+                libc::EIO
+            })?;
+        let result = self.decrypt_and_open(ino, &ct_path, fe);
+        let _ = std::fs::remove_file(&ct_path);
+        result
+    }
+
+    #[cfg(feature = "encrypt")]
+    fn decrypt_to_file(&self, ino: u64, ct_path: &std::path::Path, pt_path: &std::path::Path) -> VirtualFsResult<()> {
+        let config = self.encryption_config.as_ref().ok_or_else(|| {
+            error!("Encrypted file ino={} but no encryption key configured", ino);
+            libc::EIO
+        })?;
+        let (algorithm, plaintext_size) = {
+            let inodes = self.inode_table.read().expect("inodes poisoned");
+            let e = inodes.get(ino).ok_or(libc::ENOENT)?;
+            let alg = e.file_algorithm.ok_or_else(|| {
+                error!("Encrypted file ino={} has no recorded algorithm", ino);
+                libc::EIO
+            })?;
+            (alg, e.size)
+        };
+        let ciphertext_size = std::fs::metadata(ct_path).map_err(|_| libc::EIO)?.len();
+        let info = crate::crypto::EncryptedFileInfo {
+            algorithm,
+            plaintext_size,
+            ciphertext_size,
+            chunk_size: config.chunk_size,
+        };
+        let derived_key = config.derive_key(algorithm);
+        crate::crypto::decrypt_file(ct_path, pt_path, &derived_key, &info)
+            .map(|_| ())
+            .map_err(|e| {
+                error!("Decryption failed for ino={}: {}", ino, e);
+                libc::EIO
+            })
+    }
+
+    #[cfg(feature = "encrypt")]
+    fn decrypt_and_open(&self, ino: u64, ciphertext_path: &std::path::Path, _fe: &FileEntry) -> VirtualFsResult<u64> {
+        let plaintext_path = ciphertext_path.with_extension("dec");
+        self.decrypt_to_file(ino, ciphertext_path, &plaintext_path)?;
+        let fh = self.open_local_readonly(ino, &plaintext_path)?;
+        let _ = std::fs::remove_file(&plaintext_path);
+        Ok(fh)
+    }
+
+    async fn download_to_staging(
+        &self,
+        ino: u64,
+        xet_hash: &str,
+        download_size: u64,
+        staging_path: &std::path::Path,
+    ) -> VirtualFsResult<()> {
+        #[cfg(feature = "encrypt")]
+        {
+            let is_encrypted = self
+                .inode_table
+                .read()
+                .expect("inodes poisoned")
+                .get(ino)
+                .is_some_and(|e| e.encrypted);
+            if is_encrypted {
+                let ct_path = staging_path.with_extension("enc_dl");
+                self.xet_sessions
+                    .download_to_file(xet_hash, download_size, &ct_path)
+                    .await
+                    .map_err(|e| {
+                        error!("Failed to download encrypted file ino={}: {}", ino, e);
+                        libc::EIO
+                    })?;
+                self.decrypt_to_file(ino, &ct_path, staging_path)?;
+                let _ = std::fs::remove_file(&ct_path);
+                return Ok(());
+            }
+        }
+        self.xet_sessions
+            .download_to_file(xet_hash, download_size, staging_path)
+            .await
+            .map_err(|e| {
+                error!("Failed to download file ino={}: {}", ino, e);
+                libc::EIO
+            })
     }
 
     /// Allocate a lazy file handle backed by a prefetch buffer.
@@ -1762,6 +1894,12 @@ impl VirtualFs {
             .unwrap_or_default()
             .as_millis() as u64;
 
+        #[cfg(feature = "encrypt")]
+        if self.encryption_config.is_some() {
+            error!("streaming_commit reached with encryption enabled — this is a bug");
+            return Err(libc::EIO);
+        }
+
         let mut ops: Vec<BatchOp> = vec![BatchOp::AddFile {
             path: full_path.clone(),
             xet_hash: file_info.hash().to_string(),
@@ -2272,6 +2410,19 @@ impl VirtualFs {
         }
     }
 
+    fn enc_content_type(&self, _entry: &InodeEntry) -> Option<String> {
+        #[cfg(feature = "encrypt")]
+        {
+            self.encryption_config
+                .as_ref()
+                .and_then(|config| _entry.content_type_string(config.chunk_size))
+        }
+        #[cfg(not(feature = "encrypt"))]
+        {
+            None
+        }
+    }
+
     /// Phase 1: validate rename under inode read lock, return all info needed for phases 2+3.
     fn rename_validate(
         &self,
@@ -2344,6 +2495,7 @@ impl VirtualFs {
                                     files.push((
                                         child.full_path.clone(),
                                         child.xet_hash.clone().expect("checked is_some above"),
+                                        self.enc_content_type(child),
                                     ));
                                 }
                                 InodeKind::Directory => stack.push(child_ref.ino),
@@ -2365,6 +2517,7 @@ impl VirtualFs {
             xet_hash: src.xet_hash.clone(),
             is_dirty: src.is_dirty(),
             new_full_path,
+            content_type: self.enc_content_type(src),
             descendant_files,
         })
     }
@@ -2387,7 +2540,7 @@ impl VirtualFs {
                     path: info.new_full_path.clone(),
                     xet_hash: hash.clone(),
                     mtime: mtime_ms,
-                    content_type: None,
+                    content_type: info.content_type.clone(),
                 },
                 BatchOp::DeleteFile {
                     path: info.old_path.clone(),
@@ -2397,14 +2550,14 @@ impl VirtualFs {
             // Hub batch API requires all adds before all deletes
             let mut ops = Vec::with_capacity(info.descendant_files.len() * 2);
             let mut deletes = Vec::with_capacity(info.descendant_files.len());
-            for (child_old_path, child_hash) in &info.descendant_files {
+            for (child_old_path, child_hash, ct) in &info.descendant_files {
                 let suffix = child_old_path.strip_prefix(&info.old_path).unwrap_or(child_old_path);
                 let child_new_path = format!("{}{}", info.new_full_path, suffix);
                 ops.push(BatchOp::AddFile {
                     path: child_new_path,
                     xet_hash: child_hash.clone(),
                     mtime: mtime_ms,
-                    content_type: None,
+                    content_type: ct.clone(),
                 });
                 deletes.push(BatchOp::DeleteFile {
                     path: child_old_path.clone(),
@@ -2612,6 +2765,23 @@ impl VirtualFs {
                     }
                 }
 
+                // If truncating to non-zero and staging file doesn't exist,
+                // download from remote first (before taking the write lock).
+                if new_size > 0 && !staging_path.exists() {
+                    let (xet_hash, download_size) = {
+                        let inodes = self.inode_table.read().expect("inodes poisoned");
+                        let entry = inodes.get(ino).ok_or(libc::ENOENT)?;
+                        (entry.xet_hash.clone().unwrap_or_default(), entry.download_size())
+                    };
+                    if !xet_hash.is_empty() && download_size > 0 {
+                        self.download_to_staging(ino, &xet_hash, download_size, &staging_path)
+                            .await?;
+                    } else if let Err(e) = File::create(&staging_path) {
+                        error!("Failed to create staging file for truncate: {}", e);
+                        return Err(libc::EIO);
+                    }
+                }
+
                 // Phase 2: truncate file + update inode under the same write lock.
                 // This prevents write()'s inode size update from interleaving
                 // between our truncation and metadata update.
@@ -2689,8 +2859,11 @@ impl VirtualFs {
         Ok(FileEntry {
             xet_hash: entry.xet_hash.clone().unwrap_or_default(),
             size: entry.size,
+            download_size: entry.download_size(),
             is_dirty: entry.is_dirty(),
             full_path: entry.full_path.clone(),
+            #[cfg(feature = "encrypt")]
+            encrypted: entry.encrypted,
         })
     }
 }
@@ -2730,8 +2903,9 @@ struct RenameInfo {
     xet_hash: Option<String>,
     is_dirty: bool,
     new_full_path: String,
+    content_type: Option<String>,
     /// Descendant clean files to rename on the remote (dir renames only).
-    descendant_files: Vec<(String, String)>,
+    descendant_files: Vec<(String, String, Option<String>)>,
 }
 
 // ── Internal types ─────────────────────────────────────────────────────
@@ -2740,8 +2914,11 @@ struct RenameInfo {
 struct FileEntry {
     xet_hash: String,
     size: u64,
+    download_size: u64,
     is_dirty: bool,
     full_path: String,
+    #[cfg(feature = "encrypt")]
+    encrypted: bool,
 }
 
 /// State machine for streaming writes.

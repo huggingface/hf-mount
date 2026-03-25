@@ -105,6 +105,15 @@ impl std::fmt::Display for SourceKind {
     }
 }
 
+impl SourceKind {
+    pub fn encryption_context(&self) -> String {
+        match self {
+            Self::Bucket { bucket_id } => format!("bucket/{bucket_id}"),
+            Self::Repo { repo_id, repo_type, .. } => format!("{repo_type}/{repo_id}"),
+        }
+    }
+}
+
 // ── Shared data types ─────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize)]
@@ -135,6 +144,9 @@ pub struct TreeEntry {
     #[serde(default)]
     pub oid: Option<String>,
     pub mtime: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub content_type: Option<String>,
 }
 
 /// Raw tree entry from the repo `/tree` API (different shape from bucket tree).
@@ -153,6 +165,8 @@ struct RepoTreeEntry {
     lfs: Option<LfsInfo>,
     #[serde(default)]
     last_commit: Option<CommitInfo>,
+    #[serde(default)]
+    content_type: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -646,6 +660,7 @@ impl HubApiClient {
                     xet_hash: raw.xet_hash,
                     oid: raw.oid,
                     mtime: raw.last_commit.and_then(|c| c.date),
+                    content_type: raw.content_type,
                 });
             }
 
@@ -1002,6 +1017,79 @@ impl TokenRefresher for HubTokenRefresher {
             .await
             .map_err(|e| AuthError::TokenRefreshFailure(e.to_string()))?;
         Ok((jwt.access_token, jwt.exp))
+    }
+}
+
+// ── Encrypted filename wrapper ────────────────────────────────────────
+
+#[cfg(feature = "encrypt")]
+pub struct EncryptedHubOps {
+    inner: Arc<dyn HubOps>,
+    filename_key: [u8; 16],
+}
+
+#[cfg(feature = "encrypt")]
+impl EncryptedHubOps {
+    pub fn new(inner: Arc<dyn HubOps>, filename_key: [u8; 16]) -> Self {
+        Self { inner, filename_key }
+    }
+}
+
+#[cfg(feature = "encrypt")]
+#[async_trait::async_trait]
+impl HubOps for EncryptedHubOps {
+    async fn list_tree(&self, prefix: &str) -> Result<Vec<TreeEntry>> {
+        let enc_prefix = crate::filename_crypto::encrypt_path(prefix, &self.filename_key)?;
+        let mut entries = self.inner.list_tree(&enc_prefix).await?;
+        for entry in &mut entries {
+            entry.path = crate::filename_crypto::decrypt_path(&entry.path, &self.filename_key)?;
+        }
+        Ok(entries)
+    }
+
+    async fn head_file(&self, path: &str) -> Result<Option<HeadFileInfo>> {
+        let enc_path = crate::filename_crypto::encrypt_path(path, &self.filename_key)?;
+        self.inner.head_file(&enc_path).await
+    }
+
+    async fn batch_operations(&self, ops: &[BatchOp]) -> Result<()> {
+        let enc_ops: Vec<BatchOp> = ops
+            .iter()
+            .map(|op| match op {
+                BatchOp::AddFile {
+                    path,
+                    xet_hash,
+                    mtime,
+                    content_type,
+                } => Ok(BatchOp::AddFile {
+                    path: crate::filename_crypto::encrypt_path(path, &self.filename_key)?,
+                    xet_hash: xet_hash.clone(),
+                    mtime: *mtime,
+                    content_type: content_type.clone(),
+                }),
+                BatchOp::DeleteFile { path } => Ok(BatchOp::DeleteFile {
+                    path: crate::filename_crypto::encrypt_path(path, &self.filename_key)?,
+                }),
+            })
+            .collect::<Result<_>>()?;
+        self.inner.batch_operations(&enc_ops).await
+    }
+
+    async fn download_file_http(&self, path: &str, dest: &Path) -> Result<()> {
+        let enc_path = crate::filename_crypto::encrypt_path(path, &self.filename_key)?;
+        self.inner.download_file_http(&enc_path, dest).await
+    }
+
+    fn default_mtime(&self) -> SystemTime {
+        self.inner.default_mtime()
+    }
+
+    fn source(&self) -> &SourceKind {
+        self.inner.source()
+    }
+
+    fn is_repo(&self) -> bool {
+        self.inner.is_repo()
     }
 }
 

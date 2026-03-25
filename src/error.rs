@@ -2,11 +2,16 @@ use std::fmt;
 
 #[derive(Debug)]
 pub enum Error {
-    Hub { message: String, status: Option<u16> },
+    Hub {
+        message: String,
+        status: Option<u16>,
+    },
     Xet(String),
     Io(std::io::Error),
     Json(serde_json::Error),
     Http(reqwest::Error),
+    #[cfg(feature = "encrypt")]
+    Encryption(String),
 }
 
 impl Error {
@@ -37,6 +42,8 @@ impl fmt::Display for Error {
             Self::Io(err) => write!(f, "IO error: {err}"),
             Self::Json(err) => write!(f, "JSON error: {err}"),
             Self::Http(err) => write!(f, "HTTP error: {err}"),
+            #[cfg(feature = "encrypt")]
+            Self::Encryption(msg) => write!(f, "Encryption error: {msg}"),
         }
     }
 }
