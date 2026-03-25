@@ -301,6 +301,7 @@ impl Filesystem for FuseAdapter {
     ) {
         let name = os_to_str!(name, reply);
         let effective_mode = (mode & !umask & 0o7777) as u16;
+        let truncate = (flags & libc::O_TRUNC) != 0;
         match self.runtime.block_on(self.virtual_fs.create(
             parent.0,
             name,
@@ -308,6 +309,7 @@ impl Filesystem for FuseAdapter {
             req.uid(),
             req.gid(),
             Some(req.pid()),
+            truncate,
         )) {
             Ok((attr, file_handle)) => {
                 // Same guard as open(): skip DIRECT_IO for O_RDWR in simple

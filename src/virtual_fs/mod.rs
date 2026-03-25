@@ -1830,6 +1830,7 @@ impl VirtualFs {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn create(
         &self,
         parent: u64,
@@ -1838,6 +1839,7 @@ impl VirtualFs {
         caller_uid: u32,
         caller_gid: u32,
         pid: Option<u32>,
+        truncate: bool,
     ) -> VirtualFsResult<(VirtualFsAttr, u64)> {
         if self.read_only {
             return Err(libc::EROFS);
@@ -1935,7 +1937,12 @@ impl VirtualFs {
                 size: 0,
                 mtime: now,
                 pending_deletes: Vec::new(),
-                existed_before: false,
+                // When O_TRUNC is set, the caller explicitly wants this file
+                // (possibly empty). Treat it like an existing file so release()
+                // commits even with 0 bytes written.  Without O_TRUNC (e.g. vim
+                // creating a temp handle), skip the commit on 0 bytes to prevent
+                // overwriting remote content with an empty file.
+                existed_before: truncate,
             };
             let (file_handle, channel) = match self.setup_streaming_writer(pid, snapshot, dirty_gen).await {
                 Ok(r) => r,
@@ -2744,7 +2751,11 @@ struct InodeSnapshot {
     size: u64,
     mtime: SystemTime,
     pending_deletes: Vec<String>,
-    /// false for create() (new file), true for open(O_TRUNC) (overwrite).
+    /// Dual role: (1) revert_inode uses this to decide remove vs restore on
+    /// commit failure. (2) release() skips commits when bytes_written==0 and
+    /// this is false (prevents editor temp handles from overwriting Hub content).
+    /// Set to true for open(O_TRUNC) and create(O_TRUNC), false for create()
+    /// without O_TRUNC (e.g. vim probe handles).
     existed_before: bool,
 }
 
