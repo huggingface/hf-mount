@@ -1509,4 +1509,69 @@ mod tests {
         assert!(table.get(file_ino).is_none());
         assert!(table.get_by_path(&path).is_none(), "path_to_inode should be cleaned up");
     }
+
+    #[test]
+    fn test_remove_orphan_nlink_zero() {
+        let mut table = InodeTable::new();
+
+        let ino = table.insert(
+            ROOT_INODE,
+            "orphan.txt".to_string(),
+            "orphan.txt".to_string(),
+            InodeKind::File,
+            50,
+            UNIX_EPOCH,
+            None,
+            0o644,
+            0,
+            0,
+        );
+
+        // Unlink to set nlink=0
+        let (last_link, _) = table.unlink_one(ROOT_INODE, "orphan.txt").unwrap();
+        assert!(last_link, "nlink should reach 0");
+
+        // Inode still present (kept for open file handles)
+        assert!(table.get(ino).is_some());
+
+        // remove_orphan should clean up the inode and path mapping
+        table.remove_orphan(ino);
+        assert!(table.get(ino).is_none(), "inode should be removed after remove_orphan");
+        assert!(
+            table.get_by_path("orphan.txt").is_none(),
+            "path mapping should be removed after remove_orphan"
+        );
+    }
+
+    #[test]
+    fn test_remove_orphan_nlink_nonzero_noop() {
+        let mut table = InodeTable::new();
+
+        let ino = table.insert(
+            ROOT_INODE,
+            "linked.txt".to_string(),
+            "linked.txt".to_string(),
+            InodeKind::File,
+            50,
+            UNIX_EPOCH,
+            None,
+            0o644,
+            0,
+            0,
+        );
+
+        // nlink is 1 (default for files), do NOT unlink
+        assert_eq!(table.get(ino).unwrap().nlink, 1);
+
+        // remove_orphan should be a no-op when nlink > 0
+        table.remove_orphan(ino);
+        assert!(
+            table.get(ino).is_some(),
+            "inode should still exist when nlink > 0"
+        );
+        assert!(
+            table.get_by_path("linked.txt").is_some(),
+            "path mapping should still exist when nlink > 0"
+        );
+    }
 }
