@@ -105,61 +105,31 @@ fn streaming_write_happy_path() {
     assert_eq!(logs.len(), 1);
 }
 
-/// Editor pattern: unlink("file") + create("file") + close with no writes
-/// must NOT commit a 0-byte file (would overwrite Hub content).
+/// In streaming mode, unlink is blocked while the file has open handles.
+/// This prevents editors (vim) from deleting files they can't rewrite.
 #[test]
-fn unlink_then_create_no_write_skips_commit() {
+fn unlink_blocked_with_open_handles_streaming() {
     let hub = MockHub::new();
-    hub.add_file("target.txt", 100, Some("hash1"), None);
+    hub.add_file("guarded.txt", 100, Some("hash1"), None);
     let xet = MockXet::new();
     let (rt, vfs) = vfs_simple(&hub, &xet);
 
     rt.block_on(async {
-        // Load the file
-        vfs.lookup(ROOT_INODE, "target.txt").await.unwrap();
-
-        // Editor step 1: unlink the original
-        vfs.unlink(ROOT_INODE, "target.txt").await.unwrap();
-        hub.take_batch_log(); // consume the delete
-
-        // Editor step 2: create replacement (same name)
-        let (attr, fh) = vfs
-            .create(ROOT_INODE, "target.txt", 0o644, 1000, 1000, Some(42))
-            .await
-            .unwrap();
+        let attr = vfs.lookup(ROOT_INODE, "guarded.txt").await.unwrap();
         let ino = attr.ino;
 
-        // Editor step 3: close without writing
-        vfs.flush(ino, fh, Some(42)).await.unwrap();
+        // Open read-only (like vim does before trying to save)
+        let fh = vfs.open(ino, false, false, Some(42)).await.unwrap();
+
+        // Unlink should be blocked (has open handles in streaming mode)
+        let err = vfs.unlink(ROOT_INODE, "guarded.txt").await.unwrap_err();
+        assert_eq!(err, libc::EPERM, "unlink must be blocked with open handles");
+
+        // Close the handle
         vfs.release(fh).await.unwrap();
 
-        // No empty-file commit should have happened
-        let logs = hub.take_batch_log();
-        assert!(logs.is_empty(), "replacing-unlinked create must not commit 0-byte file");
-    });
-}
-
-/// Normal create (not replacing an unlink) commits even with 0 bytes (touch behavior).
-#[test]
-fn create_no_write_commits_normally() {
-    let hub = MockHub::new();
-    let xet = MockXet::new();
-    let (rt, vfs) = vfs_simple(&hub, &xet);
-
-    rt.block_on(async {
-        let (attr, fh) = vfs
-            .create(ROOT_INODE, "fresh.txt", 0o644, 1000, 1000, Some(42))
-            .await
-            .unwrap();
-        let ino = attr.ino;
-
-        // Close without writing (like touch)
-        vfs.flush(ino, fh, Some(42)).await.unwrap();
-        vfs.release(fh).await.unwrap();
-
-        // Should commit the empty file
-        let logs = hub.take_batch_log();
-        assert_eq!(logs.len(), 1, "normal create must commit even with 0 bytes");
+        // Now unlink should succeed
+        vfs.unlink(ROOT_INODE, "guarded.txt").await.unwrap();
     });
 }
 

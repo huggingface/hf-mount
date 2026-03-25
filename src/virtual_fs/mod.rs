@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
@@ -95,9 +95,6 @@ pub struct VirtualFs {
     /// Batched flush pipeline: dirty file writes + remote delete queue.
     /// Only present in advanced_writes mode.
     flush_manager: Option<flush::FlushManager>,
-    /// Paths recently unlinked in this session. Used by create() to detect
-    /// editor save patterns (unlink + create) and skip the empty-file commit.
-    recently_unlinked: std::sync::Mutex<HashSet<String>>,
     /// Background poll task handle, aborted in shutdown().
     poll_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Kernel cache invalidation callback. Set via `set_invalidator()` after mount.
@@ -182,7 +179,6 @@ impl VirtualFs {
             staging_locks: Mutex::new(HashMap::new()),
             pending_commits: Mutex::new(HashMap::new()),
             flush_manager,
-            recently_unlinked: std::sync::Mutex::new(HashSet::new()),
             poll_handle: Mutex::new(poll_handle),
             invalidator,
             metadata_ttl: config.metadata_ttl,
@@ -589,8 +585,9 @@ impl VirtualFs {
             .expect("open_files poisoned")
             .values()
             .any(|of| match of {
-                OpenFile::Local { ino: i, .. } | OpenFile::Streaming { ino: i, .. } => *i == ino,
-                _ => false,
+                OpenFile::Local { ino: i, .. } | OpenFile::Lazy { ino: i, .. } | OpenFile::Streaming { ino: i, .. } => {
+                    *i == ino
+                }
             })
     }
 
@@ -665,7 +662,6 @@ impl VirtualFs {
         pid: Option<u32>,
         snapshot: InodeSnapshot,
         dirty_generation_at_open: u64,
-        replacing_unlinked: bool,
     ) -> VirtualFsResult<(u64, Arc<StreamingChannel>)> {
         let streaming_writer = self.xet_sessions.create_streaming_writer().await.map_err(|e| {
             error!("Failed to create streaming writer: {}", e);
@@ -690,7 +686,6 @@ impl VirtualFs {
             snapshot,
             dirty_generation_at_open: AtomicU64::new(dirty_generation_at_open),
             commit_hook: std::sync::Mutex::new(None),
-            replacing_unlinked,
         });
 
         let file_handle = self.alloc_file_handle();
@@ -1082,7 +1077,7 @@ impl VirtualFs {
             }
         };
 
-        let (file_handle, channel) = self.setup_streaming_writer(pid, snapshot, 0, false).await?;
+        let (file_handle, channel) = self.setup_streaming_writer(pid, snapshot, 0).await?;
 
         {
             let mut inodes = self.inode_table.write().expect("inodes poisoned");
@@ -1119,11 +1114,11 @@ impl VirtualFs {
             (true, None) if fe.xet_hash.is_empty() && fe.size > 0 => {
                 self.await_pending_commit(ino).await?;
                 let fe = self.get_file_entry(ino)?;
-                self.open_lazy(fe.xet_hash, fe.size)
+                self.open_lazy(ino, fe.xet_hash, fe.size)
             }
 
             // Remote xet-backed file — lazy CAS range reads.
-            _ if !fe.xet_hash.is_empty() => self.open_lazy(fe.xet_hash, fe.size),
+            _ if !fe.xet_hash.is_empty() => self.open_lazy(ino, fe.xet_hash, fe.size),
 
             // Plain LFS/git file without xet hash — HTTP download to staging cache.
             _ if fe.size > 0 => {
@@ -1156,12 +1151,12 @@ impl VirtualFs {
             }
 
             // Empty file (size=0, no hash).
-            _ => self.open_lazy(String::new(), 0),
+            _ => self.open_lazy(ino, String::new(), 0),
         }
     }
 
     /// Allocate a lazy file handle backed by a prefetch buffer.
-    fn open_lazy(&self, xet_hash: String, size: u64) -> VirtualFsResult<u64> {
+    fn open_lazy(&self, ino: u64, xet_hash: String, size: u64) -> VirtualFsResult<u64> {
         let prefetch = Arc::new(tokio::sync::Mutex::new(PrefetchState::new(
             xet_hash,
             size,
@@ -1171,7 +1166,7 @@ impl VirtualFs {
         self.open_files
             .write()
             .expect("open_files poisoned")
-            .insert(file_handle, OpenFile::Lazy { prefetch });
+            .insert(file_handle, OpenFile::Lazy { ino, prefetch });
         Ok(file_handle)
     }
 
@@ -1312,7 +1307,7 @@ impl VirtualFs {
             let files = self.open_files.read().expect("open_files poisoned");
             match files.get(&file_handle) {
                 Some(OpenFile::Local { file, .. }) => ReadTarget::LocalFd(file.clone()),
-                Some(OpenFile::Lazy { prefetch }) => ReadTarget::Remote {
+                Some(OpenFile::Lazy { prefetch, .. }) => ReadTarget::Remote {
                     prefetch: prefetch.clone(),
                 },
                 // write-only, not readable
@@ -1645,19 +1640,7 @@ impl VirtualFs {
                     let state = channel.state.lock().expect("state poisoned");
                     matches!(&*state, CommitState::Writing | CommitState::Deferred)
                 };
-                // Skip commit when this handle replaced a just-unlinked file
-                // (editor save pattern) and no data was written. Committing
-                // would overwrite Hub content with a 0-byte file.
-                if needs_commit && channel.bytes_written.load(Ordering::Relaxed) == 0 && channel.replacing_unlinked {
-                    debug!(
-                        "release: skipping commit for ino={} (replacing unlinked, no writes)",
-                        ino
-                    );
-                    *channel.state.lock().expect("state poisoned") = CommitState::Committed;
-                    if let Some(hook_tx) = channel.commit_hook.lock().expect("commit_hook poisoned").take() {
-                        let _ = hook_tx.send(Some(Ok(())));
-                    }
-                } else if needs_commit {
+                if needs_commit {
                     // If flush() didn't defer (e.g. Writing state from a direct
                     // release without flush), install the hook now.
                     if channel.commit_hook.lock().expect("commit_hook poisoned").is_none() {
@@ -1890,15 +1873,6 @@ impl VirtualFs {
             (ino, full_path, dirty_gen)
         };
 
-        // Check if this path was recently unlinked (editor save pattern:
-        // unlink original → create replacement). If so, skip the empty-file
-        // commit on release to prevent overwriting Hub content with 0 bytes.
-        let replacing_unlinked = self
-            .recently_unlinked
-            .lock()
-            .expect("recently_unlinked poisoned")
-            .remove(&full_path);
-
         self.negative_cache_remove(&full_path);
         if let Some(fm) = &self.flush_manager {
             fm.cancel_delete(&full_path);
@@ -1948,10 +1922,7 @@ impl VirtualFs {
                 pending_deletes: Vec::new(),
                 existed_before: false,
             };
-            let (file_handle, channel) = match self
-                .setup_streaming_writer(pid, snapshot, dirty_gen, replacing_unlinked)
-                .await
-            {
+            let (file_handle, channel) = match self.setup_streaming_writer(pid, snapshot, dirty_gen).await {
                 Ok(r) => r,
                 Err(e) => {
                     self.inode_table.write().expect("inodes poisoned").remove(ino);
@@ -2052,6 +2023,15 @@ impl VirtualFs {
             (entry.inode, entry.full_path.clone(), needs_remote)
         };
 
+        // In streaming mode, block unlink while the file has any open handles.
+        // This prevents editors (vim) from deleting a file they can't rewrite
+        // (streaming mode returns EPERM for O_RDWR without O_TRUNC), which
+        // would cause silent data loss. Same approach as mountpoint-s3.
+        if !self.advanced_writes && self.has_open_handles(ino) {
+            debug!("unlink: blocked for ino={} (has open handles in streaming mode)", ino);
+            return Err(libc::EPERM);
+        }
+
         // Advanced writes: queue delete for batched flush in the flush_loop.
         // Simple mode: delete synchronously (one HTTP call per unlink).
         if needs_remote_delete {
@@ -2097,13 +2077,6 @@ impl VirtualFs {
                 warn!("Failed to remove staging file for ino={}: {}", ino, e);
             }
         }
-
-        // Track the path so create() can detect editor save patterns
-        // (unlink + create with same name) and skip the empty-file commit.
-        self.recently_unlinked
-            .lock()
-            .expect("recently_unlinked poisoned")
-            .insert(full_path.clone());
 
         info!("Deleted file: {}", full_path);
         Ok(())
@@ -2805,10 +2778,6 @@ struct StreamingChannel {
     /// Watch sender for the pending commit hook. Created in flush() on deferral,
     /// fulfilled in release() when the commit completes (or fails).
     commit_hook: std::sync::Mutex<Option<CommitHookTx>>,
-    /// True when this file was created to replace a just-unlinked file (editor
-    /// save pattern). release() skips the commit if bytes_written is 0 to
-    /// prevent overwriting Hub content with an empty file.
-    replacing_unlinked: bool,
 }
 
 /// An open file handle — either a local fd, lazy remote reference, or streaming writer.
@@ -2817,6 +2786,7 @@ enum OpenFile {
     Local { ino: u64, file: Arc<File>, writable: bool },
     /// Lazy remote — data fetched on-demand with adaptive prefetch buffer.
     Lazy {
+        ino: u64,
         prefetch: Arc<tokio::sync::Mutex<PrefetchState>>,
     },
     /// Streaming append-only writer (default write mode).
