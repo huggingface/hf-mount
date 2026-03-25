@@ -105,6 +105,105 @@ fn streaming_write_happy_path() {
     assert_eq!(logs.len(), 1);
 }
 
+/// Repro: create file → write "hello" → commit → reopen(O_TRUNC) → write
+/// "first\nhello\nlast\n" → commit.  The second save must NOT produce an
+/// empty file (regression: page-cache writeback could race with getattr
+/// returning size=0 right after O_TRUNC, truncating dirty pages).
+#[test]
+fn streaming_overwrite_not_empty() {
+    let hub = MockHub::new();
+    hub.add_file("hello.txt", 5, Some("old_hash"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let attr = vfs.lookup(ROOT_INODE, "hello.txt").await.unwrap();
+        let ino = attr.ino;
+
+        // ── First save: write "hello" ──
+        let fh1 = vfs.open(ino, true, true, Some(42)).await.unwrap();
+        write_blocking(&vfs, ino, fh1, 0, b"hello").await.unwrap();
+        vfs.flush(ino, fh1, Some(42)).await.unwrap();
+        vfs.release(fh1).await.unwrap();
+
+        {
+            let inodes = vfs.inode_table.read().unwrap();
+            let entry = inodes.get(ino).unwrap();
+            assert!(!entry.is_dirty());
+            assert_eq!(entry.size, 5);
+        }
+
+        // ── Second save: overwrite with content added at beginning + end ──
+        let fh2 = vfs.open(ino, true, true, Some(42)).await.unwrap();
+        let new_content = b"first\nhello\nlast\n";
+        write_blocking(&vfs, ino, fh2, 0, new_content).await.unwrap();
+        vfs.flush(ino, fh2, Some(42)).await.unwrap();
+        vfs.release(fh2).await.unwrap();
+
+        let inodes = vfs.inode_table.read().unwrap();
+        let entry = inodes.get(ino).unwrap();
+        assert!(!entry.is_dirty());
+        assert!(entry.xet_hash.is_some(), "hash must be set after second commit");
+        assert_eq!(
+            entry.size,
+            new_content.len() as u64,
+            "file must NOT be empty after overwrite"
+        );
+    });
+
+    // Two commits: one per save
+    let logs = hub.take_batch_log();
+    assert_eq!(logs.len(), 2);
+}
+
+/// Vim save pattern: create() + flush() + release() with no writes must NOT
+/// commit an empty file.  Vim creates a new file, closes it immediately, then
+/// opens another handle to write the actual content.  Committing the empty
+/// create would race with the real write and trigger E949 "File changed while
+/// writing" in vim.
+#[test]
+fn create_release_no_write_skips_commit() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        // Vim step 1: create new file (returns streaming handle)
+        let (attr, fh) = vfs
+            .create(ROOT_INODE, "vim-test.txt", 0o644, 1000, 1000, Some(42))
+            .await
+            .unwrap();
+        let ino = attr.ino;
+
+        // Vim step 2: close immediately without writing (flush + release)
+        vfs.flush(ino, fh, Some(42)).await.unwrap();
+        vfs.release(fh).await.unwrap();
+
+        // No commit should have happened
+        let logs = hub.take_batch_log();
+        assert!(logs.is_empty(), "empty create must not commit to Hub");
+
+        // File still exists in VFS (visible to ls)
+        let attr = vfs.lookup(ROOT_INODE, "vim-test.txt").await.unwrap();
+        assert_eq!(attr.size, 0);
+
+        // Vim step 3: open again and write actual content
+        let fh2 = vfs.open(ino, true, true, Some(42)).await.unwrap();
+        write_blocking(&vfs, ino, fh2, 0, b"real content\n").await.unwrap();
+        vfs.flush(ino, fh2, Some(42)).await.unwrap();
+        vfs.release(fh2).await.unwrap();
+
+        // NOW commit should have happened with real content
+        let logs = hub.take_batch_log();
+        assert_eq!(logs.len(), 1, "real write must commit");
+
+        let inodes = vfs.inode_table.read().unwrap();
+        let entry = inodes.get(ino).unwrap();
+        assert_eq!(entry.size, 13);
+        assert!(entry.xet_hash.is_some());
+    });
+}
+
 /// flush() from a different PID (dup'd fd) defers commit; release() commits.
 #[test]
 fn flush_deferred_pid_mismatch() {
@@ -862,9 +961,11 @@ fn write_readonly_handle_ebadf() {
     });
 }
 
-/// read() from a streaming (write-only) handle returns EBADF.
+/// read() from a streaming (write-only) handle returns EOF (empty bytes).
+/// This changed from EBADF to EOF so that O_RDWR opens with DIRECT_IO
+/// see a consistent truncated-file view instead of an I/O error.
 #[test]
-fn read_streaming_handle_ebadf() {
+fn read_streaming_handle_eof() {
     let hub = MockHub::new();
     hub.add_file("file.txt", 100, Some("hash1"), None);
     let xet = MockXet::new();
@@ -874,9 +975,13 @@ fn read_streaming_handle_ebadf() {
         let attr = vfs.lookup(ROOT_INODE, "file.txt").await.unwrap();
         let fh = vfs.open(attr.ino, true, true, Some(42)).await.unwrap();
 
-        let result = vfs.read(fh, 0, 10).await;
-        assert_eq!(result.unwrap_err(), libc::EBADF);
+        let (data, eof) = vfs.read(fh, 0, 10).await.unwrap();
+        assert!(data.is_empty());
+        assert!(eof);
 
+        // Write still works after read
+        write_blocking(&vfs, attr.ino, fh, 0, b"data").await.unwrap();
+        vfs.flush(attr.ino, fh, Some(42)).await.unwrap();
         vfs.release(fh).await.unwrap();
     });
 }
@@ -936,9 +1041,10 @@ fn open_readonly_fs_erofs() {
     });
 }
 
-/// open(writable, !truncate) in simple mode returns EPERM (append-only semantics).
+/// open(writable, !truncate) in simple mode opens a streaming writer that
+/// skips the commit on release if no data was written (editor compat).
 #[test]
-fn open_simple_no_truncate_eperm() {
+fn open_simple_no_truncate_no_write_skips_commit() {
     let hub = MockHub::new();
     hub.add_file("file.txt", 100, Some("hash1"), None);
     let xet = MockXet::new();
@@ -946,8 +1052,24 @@ fn open_simple_no_truncate_eperm() {
 
     rt.block_on(async {
         let attr = vfs.lookup(ROOT_INODE, "file.txt").await.unwrap();
-        let result = vfs.open(attr.ino, true, false, Some(42)).await;
-        assert_eq!(result.unwrap_err(), libc::EPERM);
+        let ino = attr.ino;
+
+        // Open writable without truncate (what vim does)
+        let fh = vfs.open(ino, true, false, Some(42)).await.unwrap();
+
+        // Close without writing
+        vfs.flush(ino, fh, Some(42)).await.unwrap();
+        vfs.release(fh).await.unwrap();
+
+        // No commit should have happened
+        let logs = hub.take_batch_log();
+        assert!(logs.is_empty(), "no-write open must not commit");
+
+        // File content preserved
+        let inodes = vfs.inode_table.read().unwrap();
+        let entry = inodes.get(ino).unwrap();
+        assert_eq!(entry.size, 100);
+        assert_eq!(entry.xet_hash.as_deref(), Some("hash1"));
     });
 }
 

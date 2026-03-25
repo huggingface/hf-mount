@@ -655,12 +655,13 @@ impl VirtualFs {
     }
 
     /// Set up a new streaming writer + channel. Returns (file_handle, channel).
-    /// Used by both create() and open(O_TRUNC) in simple mode.
+    /// Used by both create() and open() in simple mode.
     async fn setup_streaming_writer(
         &self,
         pid: Option<u32>,
         snapshot: InodeSnapshot,
         dirty_generation_at_open: u64,
+        truncated_at_open: bool,
     ) -> VirtualFsResult<(u64, Arc<StreamingChannel>)> {
         let streaming_writer = self.xet_sessions.create_streaming_writer().await.map_err(|e| {
             error!("Failed to create streaming writer: {}", e);
@@ -685,6 +686,7 @@ impl VirtualFs {
             snapshot,
             dirty_generation_at_open: AtomicU64::new(dirty_generation_at_open),
             commit_hook: std::sync::Mutex::new(None),
+            truncated_at_open,
         });
 
         let file_handle = self.alloc_file_handle();
@@ -969,8 +971,13 @@ impl VirtualFs {
             // Simple streaming write (append-only, synchronous commit on close)
             self.open_streaming_write(ino, pid).await
         } else if writable {
-            // Simple mode without O_TRUNC: random writes not supported
-            Err(libc::EPERM)
+            // Writable open without O_TRUNC: set up a streaming writer but don't
+            // truncate the inode.  If the caller writes, the content is replaced
+            // and committed.  If they close without writing, release() skips the
+            // commit (because truncated_at_open is false) and the file is unchanged.
+            // This supports editors like vim that open(O_RDWR) before deciding
+            // whether to write.
+            self.open_streaming_write_no_trunc(ino, pid).await
         } else {
             self.open_readonly(ino, file_entry, staging_path).await
         }
@@ -1076,7 +1083,7 @@ impl VirtualFs {
             }
         };
 
-        let (file_handle, channel) = self.setup_streaming_writer(pid, snapshot, 0).await?;
+        let (file_handle, channel) = self.setup_streaming_writer(pid, snapshot, 0, true).await?;
 
         {
             let mut inodes = self.inode_table.write().expect("inodes poisoned");
@@ -1084,6 +1091,49 @@ impl VirtualFs {
                 entry.set_dirty();
                 entry.size = 0;
                 entry.xet_hash = None;
+                channel
+                    .dirty_generation_at_open
+                    .store(entry.dirty_generation, Ordering::Relaxed);
+            }
+        }
+
+        self.open_files
+            .write()
+            .expect("open_files poisoned")
+            .insert(file_handle, OpenFile::Streaming { ino, channel });
+        Ok(file_handle)
+    }
+
+    /// Writable open without O_TRUNC: set up a streaming writer but keep the
+    /// inode's size and hash intact. If the caller writes, the new content
+    /// replaces the old on commit.  If they close without writing, release()
+    /// skips the commit (truncated_at_open=false) and the file is unchanged.
+    async fn open_streaming_write_no_trunc(&self, ino: u64, pid: Option<u32>) -> VirtualFsResult<u64> {
+        self.await_pending_commit(ino).await?;
+
+        let staging_mutex = self.staging_lock(ino);
+        let _staging_guard = staging_mutex.lock().await;
+
+        let snapshot = {
+            let inodes = self.inode_table.read().expect("inodes poisoned");
+            let entry = inodes.get(ino).ok_or(libc::ENOENT)?;
+            InodeSnapshot {
+                xet_hash: entry.xet_hash.clone(),
+                size: entry.size,
+                mtime: entry.mtime,
+                pending_deletes: entry.pending_deletes.clone(),
+                existed_before: true,
+            }
+        };
+
+        let (file_handle, channel) = self.setup_streaming_writer(pid, snapshot, 0, false).await?;
+
+        {
+            let mut inodes = self.inode_table.write().expect("inodes poisoned");
+            if let Some(entry) = inodes.get_mut(ino) {
+                // Don't truncate: keep existing size and hash.
+                // The inode will be updated on commit if data is written.
+                entry.set_dirty();
                 channel
                     .dirty_generation_at_open
                     .store(entry.dirty_generation, Ordering::Relaxed);
@@ -1309,8 +1359,10 @@ impl VirtualFs {
                 Some(OpenFile::Lazy { prefetch }) => ReadTarget::Remote {
                     prefetch: prefetch.clone(),
                 },
-                // write-only, not readable
-                Some(OpenFile::Streaming { .. }) => return Err(libc::EBADF), // write-only, not readable
+                // Streaming handles are write-only.  Return EOF (empty
+                // read) instead of EBADF so that O_RDWR opens with
+                // DIRECT_IO see a consistent truncated-file view.
+                Some(OpenFile::Streaming { .. }) => return Ok((Bytes::new(), true)),
                 None => return Err(libc::EBADF), // handle already closed (race with release)
             }
         };
@@ -1639,7 +1691,22 @@ impl VirtualFs {
                     let state = channel.state.lock().expect("state poisoned");
                     matches!(&*state, CommitState::Writing | CommitState::Deferred)
                 };
-                if needs_commit {
+
+                // Skip commit when no data was written AND the file wasn't
+                // explicitly truncated.  This covers two editor patterns:
+                //  1. vim create+close (existed_before=false): empty create handle
+                //  2. vim open(O_RDWR, no trunc): writable probe then close
+                // Explicit truncates (`> file.txt`, O_TRUNC) still commit an
+                // empty file because truncated_at_open is true.
+                if needs_commit && channel.bytes_written.load(Ordering::Relaxed) == 0 && !channel.truncated_at_open {
+                    debug!("release: skipping commit for newly created ino={} with no writes", ino);
+                    *channel.state.lock().expect("state poisoned") = CommitState::Committed;
+                    if let Some(hook_tx) = channel.commit_hook.lock().expect("commit_hook poisoned").take() {
+                        let _ = hook_tx.send(Some(Ok(())));
+                    }
+                    // Don't revert — the inode entry stays so the file is visible
+                    // and can be opened for writing by the next handle.
+                } else if needs_commit {
                     // If flush() didn't defer (e.g. Writing state from a direct
                     // release without flush), install the hook now.
                     if channel.commit_hook.lock().expect("commit_hook poisoned").is_none() {
@@ -1921,7 +1988,7 @@ impl VirtualFs {
                 pending_deletes: Vec::new(),
                 existed_before: false,
             };
-            let (file_handle, channel) = match self.setup_streaming_writer(pid, snapshot, dirty_gen).await {
+            let (file_handle, channel) = match self.setup_streaming_writer(pid, snapshot, dirty_gen, false).await {
                 Ok(r) => r,
                 Err(e) => {
                     self.inode_table.write().expect("inodes poisoned").remove(ino);
@@ -2768,6 +2835,10 @@ struct StreamingChannel {
     /// Watch sender for the pending commit hook. Created in flush() on deferral,
     /// fulfilled in release() when the commit completes (or fails).
     commit_hook: std::sync::Mutex<Option<CommitHookTx>>,
+    /// Whether the file was explicitly opened with O_TRUNC.  Used by release()
+    /// to decide whether a 0-byte commit is intentional (`> file.txt`) or just
+    /// an open+close with no actual write (editor save flow).
+    truncated_at_open: bool,
 }
 
 /// An open file handle — either a local fd, lazy remote reference, or streaming writer.

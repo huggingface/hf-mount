@@ -703,7 +703,24 @@ pub fn run_simple_write_tests(mp: &str, remote_file: &str) -> TestResult {
         std::fs::remove_dir(&d1)?;
     }
 
-    // 22. Rename file across directories
+    // 22. Overwrite with content added at beginning + end (regression: file became empty)
+    eprintln!("  [simple-write] overwrite with prepend + append");
+    {
+        let path = format!("{}/prepend_append.txt", mp);
+        // First save
+        std::fs::write(&path, "hello")?;
+        let content = std::fs::read_to_string(&path)?;
+        assert_eq!(content, "hello", "initial write should contain hello");
+        // Second save: add a line before and after
+        std::fs::write(&path, "first\nhello\nlast\n")?;
+        let content = std::fs::read_to_string(&path)?;
+        assert_eq!(
+            content, "first\nhello\nlast\n",
+            "file must NOT be empty after overwrite with prepend+append"
+        );
+    }
+
+    // 23. Rename file across directories
     eprintln!("  [simple-write] rename file across directories");
     {
         let src_dir = format!("{}/xdir_src", mp);
