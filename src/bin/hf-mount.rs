@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use clap::Parser;
 
 #[derive(Parser)]
-#[command(about = "Mount Hugging Face Buckets and repos as local filesystems")]
+#[command(about = "Mount Hugging Face Buckets and repos as local filesystems", version)]
 struct Cli {
     #[command(subcommand)]
     command: Command,

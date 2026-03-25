@@ -148,7 +148,7 @@ pub struct MountOptions {
 
 /// CLI args for the foreground FUSE/NFS binaries.
 #[derive(Parser)]
-#[command(about = "Mount a HuggingFace bucket or repo as a filesystem")]
+#[command(about = "Mount a HuggingFace bucket or repo as a filesystem", version)]
 pub struct Args {
     #[command(subcommand)]
     pub source: Source,
