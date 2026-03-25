@@ -62,7 +62,7 @@ impl From<reqwest::Error> for Error {
 }
 
 pub fn is_retryable_status(status: u16) -> bool {
-    matches!(status, 429 | 500 | 502 | 503 | 504)
+    matches!(status, 408 | 429 | 500 | 502 | 503 | 504)
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

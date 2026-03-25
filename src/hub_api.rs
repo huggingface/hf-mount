@@ -299,8 +299,8 @@ fn init_auth_get(
     }
 }
 
-/// Send an HTTP request with automatic retry on transient errors (429, 5xx, timeouts).
-/// Honors Retry-After headers when present, falls back to exponential backoff (2 retries max).
+/// Send an HTTP request with automatic retry on transient errors (408, 429, 5xx, timeouts).
+/// Uses the IETF RateLimit header's t= parameter when present, falls back to exponential backoff (2 retries max).
 /// Set `accept_redirects` to treat 3xx as success (needed for HEAD on /resolve/ endpoints
 /// where the redirect response itself carries metadata headers).
 async fn send_with_retry(
@@ -1317,6 +1317,7 @@ mod tests {
     #[test]
     fn is_retryable_status_covers_expected_codes() {
         use crate::error::is_retryable_status;
+        assert!(is_retryable_status(408));
         assert!(is_retryable_status(429));
         assert!(is_retryable_status(500));
         assert!(is_retryable_status(502));
