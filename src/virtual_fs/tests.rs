@@ -3110,3 +3110,34 @@ fn setattr_truncate_then_write_size_consistent() {
         let _ = vfs.release(fh).await;
     });
 }
+
+// ── rename phase 2/3 divergence ───────────────────────────────────────
+
+/// Rename of a clean file sends remote batch ops (Phase 2) and applies locally
+/// (Phase 3). Verifies the happy path still works after the Phase 2/3 error
+/// handling refactor.
+#[test]
+fn rename_clean_file_remote_and_local() {
+    let hub = MockHub::new();
+    hub.add_file("src.txt", 100, Some("hash1"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let src_attr = vfs.lookup(ROOT_INODE, "src.txt").await.unwrap();
+        let src_ino = src_attr.ino;
+
+        vfs.rename(ROOT_INODE, "src.txt", ROOT_INODE, "dst.txt", false)
+            .await
+            .unwrap();
+
+        // Phase 2 should have sent batch ops
+        let logs = hub.take_batch_log();
+        assert_eq!(logs.len(), 1, "Phase 2 should have sent batch ops");
+
+        // Phase 3 should have applied locally
+        let inodes = vfs.inode_table.read().unwrap();
+        let entry = inodes.get(src_ino).unwrap();
+        assert_eq!(entry.full_path, "dst.txt");
+    });
+}

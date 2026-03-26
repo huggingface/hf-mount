@@ -2248,16 +2248,28 @@ impl VirtualFs {
         }
 
         // Phase 2: sync to remote (add + delete ops).
-        // TOCTOU note: between this remote commit and the local apply below, a
-        // concurrent unlink/create can change local state. If that happens,
-        // rename_apply_local re-validates and returns ENOENT (source gone) or
-        // EEXIST (destination appeared). The remote state may then have a
-        // stale add+delete, but the next poll cycle or flush corrects it.
-        // A true fix would require a transactional rename API on the Hub.
-        self.rename_remote(&info).await?;
+        let remote_mutated = self.rename_remote(&info).await?;
 
-        // Phase 3: apply to local inode table under write lock
-        self.rename_apply_local(info, parent, name, newparent, newname, no_replace)
+        // Phase 3: apply to local inode table under write lock.
+        // If Phase 2 mutated the remote and Phase 3 fails with ENOENT (source
+        // concurrently unlinked), swallow the error and let poll reconcile.
+        // Destination-conflict errors (EEXIST, EISDIR, etc.) are propagated
+        // since poll may not fix a dirty local inode at the destination path.
+        match self.rename_apply_local(info, parent, name, newparent, newname, no_replace) {
+            Ok(()) => Ok(()),
+            Err(libc::ENOENT) if remote_mutated => {
+                warn!("rename: source gone after remote rename; poll will reconcile");
+                // Invalidate parents so the next lookup re-fetches from remote
+                // instead of trusting the stale children_loaded state.
+                let mut inodes = self.inode_table.write().expect("inodes poisoned");
+                inodes.invalidate_children(parent);
+                if parent != newparent {
+                    inodes.invalidate_children(newparent);
+                }
+                Ok(())
+            }
+            Err(errno) => Err(errno),
+        }
     }
 
     /// Phase 1: validate rename under inode read lock, return all info needed for phases 2+3.
@@ -2358,7 +2370,9 @@ impl VirtualFs {
     }
 
     /// Phase 2: send batch rename ops to the Hub (add new paths + delete old ones).
-    async fn rename_remote(&self, info: &RenameInfo) -> VirtualFsResult<()> {
+    /// Returns true if remote operations were actually sent, false if skipped
+    /// (e.g. dirty file with no remote presence).
+    async fn rename_remote(&self, info: &RenameInfo) -> VirtualFsResult<bool> {
         let mtime_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -2399,7 +2413,7 @@ impl VirtualFs {
             ops.append(&mut deletes);
             ops
         } else {
-            return Ok(());
+            return Ok(false);
         };
 
         debug!(
@@ -2413,7 +2427,7 @@ impl VirtualFs {
             return Err(libc::EIO);
         }
         debug!("rename_remote: success");
-        Ok(())
+        Ok(true)
     }
 
     /// Phase 3: apply rename to local inode table under write lock.
