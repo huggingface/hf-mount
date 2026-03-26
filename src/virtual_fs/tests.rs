@@ -3074,3 +3074,39 @@ fn rename_overwrite_cleans_destination() {
         assert_eq!(entry.inode, src_attr.ino, "dst.txt should now be src's inode");
     });
 }
+
+// ── setattr truncate + write serialization ────────────────────────────
+
+/// After setattr(truncate=0) followed by a write, inode.size must reflect the
+/// write. This exercises the fix for REVIEW.md #4: setattr now holds
+/// inode_table.write() during file truncation, so a concurrent write's size
+/// update is serialized rather than clobbered.
+#[test]
+fn setattr_truncate_then_write_size_consistent() {
+    let hub = MockHub::new();
+    hub.add_file("data.txt", 100, Some("hash1"), None);
+    let xet = MockXet::new();
+    xet.add_file("hash1", &[0u8; 100]);
+    let (rt, vfs) = vfs_advanced(&hub, &xet);
+
+    rt.block_on(async {
+        let attr = vfs.lookup(ROOT_INODE, "data.txt").await.unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open(ino, true, true, None).await.unwrap();
+
+        // Truncate to 0
+        vfs.setattr(ino, Some(0), None, None, None, None, None).await.unwrap();
+        let attr = vfs.getattr(ino).unwrap();
+        assert_eq!(attr.size, 0, "size should be 0 after truncate");
+
+        // Write 10 bytes at offset 0
+        let data = b"helloworld";
+        write_blocking(&vfs, ino, fh, 0, data).await.unwrap();
+
+        // inode.size must reflect the write, not the prior truncation
+        let attr = vfs.getattr(ino).unwrap();
+        assert_eq!(attr.size, 10, "size should match write length after truncate+write");
+
+        let _ = vfs.release(fh).await;
+    });
+}

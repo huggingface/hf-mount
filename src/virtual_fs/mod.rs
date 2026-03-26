@@ -75,6 +75,10 @@ pub struct VfsConfig {
 /// General discipline: locks are held briefly and never across await points
 /// (except tokio::sync::Mutex in staging_locks). Most paths acquire a lock,
 /// extract data, drop the lock, perform async I/O, then re-acquire to apply.
+///
+/// Exception: setattr(truncate) holds inode_table.write() across File::create
+/// / set_len syscalls (microseconds) to prevent write() from updating
+/// inode.size between the file truncation and the metadata update.
 pub struct VirtualFs {
     runtime: tokio::runtime::Handle,
     hub_client: Arc<dyn HubOps>,
@@ -2572,33 +2576,38 @@ impl VirtualFs {
                     .expect("staging_dir required for advanced writes")
                     .path(ino);
 
+                // Phase 1: ensure staging file exists (may download, async).
+                if new_size > 0 && !staging_path.exists() {
+                    let (xet_hash, file_size) = {
+                        let inodes = self.inode_table.read().expect("inodes poisoned");
+                        let entry = inodes.get(ino).ok_or(libc::ENOENT)?;
+                        (entry.xet_hash.clone().unwrap_or_default(), entry.size)
+                    };
+                    if !xet_hash.is_empty() && file_size > 0 {
+                        if let Err(e) = self
+                            .xet_sessions
+                            .download_to_file(&xet_hash, file_size, &staging_path)
+                            .await
+                        {
+                            error!("Failed to download file for truncate: {}", e);
+                            return Err(libc::EIO);
+                        }
+                    } else if let Err(e) = File::create(&staging_path) {
+                        error!("Failed to create staging file for truncate: {}", e);
+                        return Err(libc::EIO);
+                    }
+                }
+
+                // Phase 2: truncate file + update inode under the same write lock.
+                // This prevents write()'s inode size update from interleaving
+                // between our truncation and metadata update.
+                let mut inodes = self.inode_table.write().expect("inodes poisoned");
                 if new_size == 0 {
                     if let Err(e) = File::create(&staging_path) {
                         error!("Failed to truncate staging file: {}", e);
                         return Err(libc::EIO);
                     }
                 } else {
-                    // If staging file doesn't exist, download from remote first
-                    if !staging_path.exists() {
-                        let (xet_hash, file_size) = {
-                            let inodes = self.inode_table.read().expect("inodes poisoned");
-                            let entry = inodes.get(ino).ok_or(libc::ENOENT)?;
-                            (entry.xet_hash.clone().unwrap_or_default(), entry.size)
-                        };
-                        if !xet_hash.is_empty() && file_size > 0 {
-                            if let Err(e) = self
-                                .xet_sessions
-                                .download_to_file(&xet_hash, file_size, &staging_path)
-                                .await
-                            {
-                                error!("Failed to download file for truncate: {}", e);
-                                return Err(libc::EIO);
-                            }
-                        } else if let Err(e) = File::create(&staging_path) {
-                            error!("Failed to create staging file for truncate: {}", e);
-                            return Err(libc::EIO);
-                        }
-                    }
                     if let Err(e) = OpenOptions::new()
                         .write(true)
                         .open(&staging_path)
@@ -2608,8 +2617,6 @@ impl VirtualFs {
                         return Err(libc::EIO);
                     }
                 }
-
-                let mut inodes = self.inode_table.write().expect("inodes poisoned");
                 if let Some(entry) = inodes.get_mut(ino) {
                     entry.size = new_size;
                     entry.mtime = SystemTime::now();
@@ -2619,9 +2626,9 @@ impl VirtualFs {
                         entry.xet_hash = None;
                     }
                 }
+                drop(inodes);
 
                 // Schedule flush so the truncation is committed to CAS/bucket
-                drop(inodes);
                 if let Some(fm) = &self.flush_manager {
                     fm.enqueue(ino);
                 }
