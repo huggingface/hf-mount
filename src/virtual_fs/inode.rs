@@ -86,9 +86,12 @@ impl InodeEntry {
     /// Apply a successful commit: update hash, size, timestamps, and
     /// conditionally clear dirty + pending_deletes if the generation matches.
     pub fn apply_commit(&mut self, hash: &str, size: u64, dirty_generation: u64) {
-        self.xet_hash = Some(hash.to_string());
-        self.size = size;
         if self.clear_dirty_if(dirty_generation) {
+            // Only update metadata when the generation matches. A concurrent
+            // writer may have advanced the generation with newer content;
+            // overwriting size/hash here would clobber the in-progress data.
+            self.xet_hash = Some(hash.to_string());
+            self.size = size;
             self.pending_deletes.clear();
         }
         let now = SystemTime::now();
@@ -628,7 +631,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_commit_keeps_dirty_on_generation_mismatch() {
+    fn apply_commit_preserves_state_on_generation_mismatch() {
         let mut table = InodeTable::new();
         let ino = table.insert(
             ROOT_INODE,
@@ -649,11 +652,16 @@ mod tests {
 
         entry.apply_commit("new_hash", 200, 1); // stale snapshot
 
-        // Hash and size updated, but dirty NOT cleared and pending_deletes preserved
+        // Generation mismatch: dirty stays, and size/hash must NOT be overwritten
+        // (a concurrent writer may have newer content in staging).
         assert!(entry.is_dirty());
-        assert_eq!(entry.xet_hash.as_deref(), Some("new_hash"));
-        assert_eq!(entry.size, 200);
-        assert_eq!(entry.pending_deletes.len(), 1);
+        assert_eq!(
+            entry.xet_hash.as_deref(),
+            Some("old_hash"),
+            "hash should not be clobbered by stale flush"
+        );
+        assert_eq!(entry.size, 100, "size should not be clobbered by stale flush");
+        assert_eq!(entry.pending_deletes.len(), 1, "pending_deletes should be preserved");
     }
 
     #[test]
