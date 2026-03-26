@@ -176,21 +176,26 @@ impl super::VirtualFs {
             for ino in &deletions {
                 // Re-check under write lock: inode may have been removed or
                 // dirtied between the read-lock snapshot and now.
-                let parent_ino = match inode_table.get(*ino) {
+                let (parent_ino, name) = match inode_table.get(*ino) {
                     Some(entry) if entry.is_dirty() => continue,
-                    Some(entry) => entry.parent,
+                    Some(entry) => (entry.parent, entry.name.clone()),
                     None => continue,
                 };
-                // Skip removal if the inode has open file handles. Removing it
-                // would cause read/getattr/release on those handles to fail
-                // with ENOENT. The next poll cycle will retry once handles close.
                 if has_open_handles_for(open_files, *ino) {
-                    info!("Skipping remote deletion of ino={}: has open handles", ino);
-                    continue;
+                    // Unlink the pathname but keep the inode as orphan (nlink=0)
+                    // so open handles can still read/fstat. release() will clean
+                    // up the orphan. Without this, the file stays visible by name
+                    // and a recreated file at the same path would collide.
+                    inode_table.unlink_one(parent_ino, &name);
+                    info!(
+                        "Remote deletion of ino={}: unlinked path, kept orphan (open handles)",
+                        ino
+                    );
+                } else {
+                    inode_table.remove(*ino);
                 }
                 inos_to_invalidate.push(parent_ino);
                 inos_to_invalidate.push(*ino);
-                inode_table.remove(*ino);
             }
 
             // Phase 3: New remote entries (files AND directories) -> invalidate parent dir.

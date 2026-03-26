@@ -2256,37 +2256,23 @@ fn poll_skips_deletion_with_open_handles() {
         // closed.txt should be deleted (no open handles)
         assert_eq!(vfs.lookup(ROOT_INODE, "closed.txt").await.unwrap_err(), libc::ENOENT);
 
-        // open.txt should survive (has open handle)
+        // open.txt: inode survives as orphan (nlink=0), but path is unlinked
         let inodes = vfs.inode_table.read().unwrap();
+        let entry = inodes.get(open_attr.ino).expect("orphan inode should survive");
+        assert_eq!(entry.nlink, 0, "inode should be orphaned (nlink=0)");
         assert!(
-            inodes.get(open_attr.ino).is_some(),
-            "inode with open handle should survive poll deletion"
+            inodes.lookup_child(ROOT_INODE, "open.txt").is_none(),
+            "open.txt should not be visible by name"
         );
         drop(inodes);
 
-        // Release the handle, then poll again: inode should now be deleted
+        // Release the handle: release() cleans up the orphan
         vfs.release(fh).await.unwrap();
 
-        let prefixes2 = vfs.inode_table.read().unwrap().loaded_dir_prefixes();
-        let mut remote2 = Vec::new();
-        for prefix in &prefixes2 {
-            remote2.extend(hub.list_tree(prefix).await.unwrap());
-        }
-        let polled2: std::collections::HashSet<String> = prefixes2.into_iter().collect();
-        VirtualFs::apply_poll_diff(
-            remote2,
-            &polled2,
-            &vfs.inode_table,
-            &vfs.open_files,
-            &vfs.negative_cache,
-            &vfs.invalidator,
-        );
-
-        // Now open.txt should be gone (handle released, second poll cleans up)
         let inodes = vfs.inode_table.read().unwrap();
         assert!(
             inodes.get(open_attr.ino).is_none(),
-            "inode should be removed after handle release + second poll"
+            "orphan should be removed after release"
         );
     });
 }
