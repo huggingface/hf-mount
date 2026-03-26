@@ -2865,3 +2865,453 @@ fn failed_writer_create_preserves_inode() {
         assert!(!entry.is_dirty(), "inode should not be dirty after failed open");
     });
 }
+
+// ── Flush pipeline ─────────────────────────────────────────────────
+
+/// Enqueuing the same inode multiple times should result in only one upload
+/// (the flush_batch dedup logic collapses duplicate inode IDs).
+#[test]
+fn flush_dedup_same_inode() {
+    let hub = MockHub::new();
+    hub.add_file("file.txt", 100, Some("hash1"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_advanced(&hub, &xet);
+
+    rt.block_on(async {
+        let attr = vfs.lookup(ROOT_INODE, "file.txt").await.unwrap();
+        let ino = attr.ino;
+
+        // Open with truncate, write some data to make dirty
+        let fh = vfs.open(ino, true, true, Some(42)).await.unwrap();
+        write_blocking(&vfs, ino, fh, 0, b"hello").await.unwrap();
+
+        // Enqueue the same inode multiple times via flush_manager
+        let fm = vfs.flush_manager.as_ref().unwrap();
+        fm.enqueue(ino);
+        fm.enqueue(ino);
+        fm.enqueue(ino);
+
+        // Wait for debounce (100ms) + max_batch_window (1s) + processing margin
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+
+        // Despite 3 enqueues, dedup should yield only 1 upload call
+        assert_eq!(
+            xet.upload_count(),
+            1,
+            "expected exactly 1 upload despite multiple enqueues"
+        );
+
+        vfs.release(fh).await.unwrap();
+    });
+}
+
+/// cancel_delete prevents a queued path from being deleted in the next flush cycle.
+#[test]
+fn flush_cancel_delete() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_advanced(&hub, &xet);
+
+    rt.block_on(async {
+        let fm = vfs.flush_manager.as_ref().unwrap();
+
+        // Queue a delete then immediately cancel it
+        fm.enqueue_delete("old/path.txt".to_string());
+        fm.cancel_delete("old/path.txt");
+
+        // Wait for flush cycle to complete
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+
+        let logs = hub.take_batch_log();
+        let has_delete = logs
+            .iter()
+            .flatten()
+            .any(|op| matches!(op, BatchOp::DeleteFile { path } if path == "old/path.txt"));
+        assert!(!has_delete, "cancelled delete should not appear in batch log");
+    });
+}
+
+/// cancel_delete_prefix cancels all queued deletes under a directory prefix.
+#[test]
+fn flush_cancel_delete_prefix() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_advanced(&hub, &xet);
+
+    rt.block_on(async {
+        let fm = vfs.flush_manager.as_ref().unwrap();
+
+        // Queue deletes for paths under "dir/" and one outside
+        fm.enqueue_delete("dir/a.txt".to_string());
+        fm.enqueue_delete("dir/b.txt".to_string());
+        fm.enqueue_delete("other.txt".to_string());
+
+        // Cancel all deletes under "dir/"
+        fm.cancel_delete_prefix("dir/");
+
+        // Wait for flush cycle
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+
+        let logs = hub.take_batch_log();
+        let all_ops: Vec<&BatchOp> = logs.iter().flatten().collect();
+
+        let has_dir_delete = all_ops
+            .iter()
+            .any(|op| matches!(op, BatchOp::DeleteFile { path } if path.starts_with("dir/")));
+        assert!(!has_dir_delete, "dir/ deletes should have been cancelled");
+
+        let has_other_delete = all_ops
+            .iter()
+            .any(|op| matches!(op, BatchOp::DeleteFile { path } if path == "other.txt"));
+        assert!(has_other_delete, "other.txt delete should still be sent");
+    });
+}
+
+/// Pending deletes are re-queued on batch failure and retried when the next
+/// flush cycle is triggered.  (Re-queue only writes back to the Vec; it does
+/// not send a new WakeDeletes signal, so we trigger a second cycle manually.)
+#[test]
+fn flush_pending_deletes_requeue_on_failure() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_advanced(&hub, &xet);
+
+    rt.block_on(async {
+        let fm = vfs.flush_manager.as_ref().unwrap();
+
+        // Make the first batch call fail
+        hub.fail_next_batch(1);
+
+        fm.enqueue_delete("retry/file.txt".to_string());
+
+        // Wait for first flush cycle (debounce + processing)
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+
+        // First attempt failed — batch_log should be empty because the call errored
+        let logs = hub.take_batch_log();
+        assert!(logs.is_empty(), "first attempt should have failed, no batch log");
+
+        // Trigger a second flush cycle. The re-queued path is sitting in the
+        // pending_deletes Vec but no WakeDeletes was sent, so we send one by
+        // enqueuing a dummy delete (which also sends WakeDeletes internally).
+        fm.enqueue_delete("dummy_wake.txt".to_string());
+
+        // Wait for second flush cycle
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+
+        // Both the retried delete and the dummy should appear
+        let logs = hub.take_batch_log();
+        let has_retry_delete = logs
+            .iter()
+            .flatten()
+            .any(|op| matches!(op, BatchOp::DeleteFile { path } if path == "retry/file.txt"));
+        assert!(has_retry_delete, "delete should succeed on retry after initial failure");
+    });
+}
+
+// ── poll_remote_changes ─────────────────────────────────────────────
+
+/// Verifies that poll_remote_changes skips dirty inodes during the snapshot
+/// phase (is_dirty == true causes `continue`), so a locally-modified file
+/// is NOT removed even when the remote file disappears.
+///
+/// NOTE: There is still a TOCTOU race between snapshot and Phase 2 (the file
+/// could become dirty after the snapshot but before the removal). This test
+/// only covers the common case where the file is already dirty at snapshot time.
+// TODO: this test documents a known race-condition concern (see REVIEW.md #1)
+#[test]
+fn poll_deletes_dirty_inode() {
+    let hub = MockHub::new();
+    hub.add_file("data.txt", 100, Some("hash1"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_advanced(&hub, &xet);
+
+    rt.block_on(async {
+        // Lookup + open + write to make the file dirty
+        let attr = vfs.lookup(ROOT_INODE, "data.txt").await.unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open(ino, true, true, None).await.unwrap();
+        write_blocking(&vfs, ino, fh, 0, b"dirty local data").await.unwrap();
+
+        // Confirm the file is dirty
+        {
+            let inodes = vfs.inode_table.read().unwrap();
+            assert!(inodes.get(ino).unwrap().is_dirty(), "file should be dirty after write");
+        }
+
+        // Simulate remote deletion
+        hub.remove_file("data.txt");
+
+        // Run poll_remote_changes as a background task with a tiny interval.
+        // It loops forever so we race it against a timeout.
+        let poll_hub: std::sync::Arc<dyn crate::hub_api::HubOps> = hub.clone();
+        let poll_inodes = vfs.inode_table.clone();
+        let poll_neg = vfs.negative_cache.clone();
+        let poll_inv = vfs.invalidator.clone();
+        let poll_task = tokio::spawn(async move {
+            VirtualFs::poll_remote_changes(poll_hub, poll_inodes, poll_neg, poll_inv, Duration::from_millis(1)).await;
+        });
+
+        // Give poll time to execute one iteration
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        poll_task.abort();
+
+        // Dirty inode should still exist: poll_remote_changes skips dirty files
+        // in its snapshot phase (is_dirty check at the top of the loop).
+        let inodes = vfs.inode_table.read().unwrap();
+        assert!(
+            inodes.get(ino).is_some(),
+            "Dirty inode should NOT be removed by poll. \
+             poll_remote_changes skips dirty files in the snapshot phase."
+        );
+        assert!(
+            inodes.get(ino).unwrap().is_dirty(),
+            "Inode should still be dirty after poll."
+        );
+
+        // Clean up
+        drop(inodes);
+        let _ = vfs.release(fh).await;
+    });
+}
+
+// ── symlink tests ───────────────────────────────────────────────────
+
+/// Create a symlink and read it back via readlink.
+#[test]
+fn symlink_create_and_readlink() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        // Create symlink: "link" -> "target.txt"
+        let attr = vfs
+            .symlink(ROOT_INODE, "link", "target.txt", 0o777, 1000, 1000)
+            .await
+            .unwrap();
+        let ino = attr.ino;
+
+        // Lookup should find the symlink
+        let looked_up = vfs.lookup(ROOT_INODE, "link").await.unwrap();
+        assert_eq!(looked_up.ino, ino);
+
+        // readlink should return the target
+        let target = vfs.readlink(ino).unwrap();
+        assert_eq!(target, "target.txt");
+
+        // getattr should show symlink kind
+        assert_eq!(attr.kind, super::inode::InodeKind::Symlink);
+    });
+}
+
+/// readlink on a regular file returns EINVAL.
+#[test]
+fn readlink_regular_file_returns_error() {
+    let hub = MockHub::new();
+    hub.add_file("regular.txt", 100, Some("hash1"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let attr = vfs.lookup(ROOT_INODE, "regular.txt").await.unwrap();
+        let ino = attr.ino;
+
+        // readlink on a regular file should return EINVAL
+        let result = vfs.readlink(ino);
+        assert_eq!(result.unwrap_err(), libc::EINVAL);
+    });
+}
+
+// ── Bug-proving tests ──────────────────────────────────────────────
+//
+// These tests demonstrate known bugs documented in REVIEW.md.
+// Each test asserts the CORRECT (desired) behavior. They currently FAIL
+// because the bugs have not been fixed yet.
+//
+// Run with: cargo test --lib --features nfs -- --ignored bug_
+//
+// When a bug is fixed, remove #[ignore] from the corresponding test.
+
+/// BUG: apply_commit clobbers size/xet_hash even when dirty_generation
+/// doesn't match (REVIEW.md #3).
+///
+/// When a concurrent writer advances the generation between flush snapshot
+/// and commit, apply_commit should NOT update size or xet_hash — otherwise
+/// getattr reports a stale size until the next flush cycle.
+///
+/// This test asserts the CORRECT behavior: size and xet_hash should remain
+/// at the values set by the concurrent writer (size=100, hash="old_hash"),
+/// not the values from the stale flush (size=200, hash="new_hash").
+#[test]
+#[ignore] // Fails due to bug: apply_commit unconditionally sets size/xet_hash
+fn bug_apply_commit_clobbers_size_on_generation_mismatch() {
+    let mut table = super::inode::InodeTable::new();
+    let ino = table.insert(
+        ROOT_INODE,
+        "test".to_string(),
+        "test".to_string(),
+        super::inode::InodeKind::File,
+        100,
+        std::time::UNIX_EPOCH,
+        Some("old_hash".to_string()),
+        0o644,
+        0,
+        0,
+    );
+    let entry = table.get_mut(ino).unwrap();
+    entry.set_dirty(); // gen=1 (flush snapshots this)
+    entry.set_dirty(); // gen=2 (concurrent writer advanced it)
+
+    // Flush completes with stale generation=1, new content hash/size
+    entry.apply_commit("new_hash", 200, 1);
+
+    // CORRECT behavior: dirty flag stays (this already works)
+    assert!(entry.is_dirty());
+    assert_eq!(entry.pending_deletes.len(), 0); // pending_deletes NOT cleared (works)
+
+    // CORRECT behavior: size and hash should NOT be overwritten by stale flush.
+    // BUG: current code unconditionally sets size=200 and xet_hash="new_hash"
+    // before checking the generation, so these assertions FAIL.
+    assert_eq!(
+        entry.size, 100,
+        "BUG: size was clobbered to 200 by stale flush (should remain 100)"
+    );
+    assert_eq!(
+        entry.xet_hash.as_deref(),
+        Some("old_hash"),
+        "BUG: xet_hash was clobbered to 'new_hash' by stale flush (should remain 'old_hash')"
+    );
+}
+
+/// BUG: poll_remote_changes can delete an inode that became dirty between
+/// snapshot and Phase 2 write-lock (REVIEW.md #1 — TOCTOU race).
+///
+/// This test simulates the race by:
+/// 1. Creating a clean file visible to the poll snapshot
+/// 2. Removing it from remote (so poll marks it for deletion)
+/// 3. Making the file dirty AFTER the snapshot but BEFORE the deletion
+///
+/// Since we can't easily inject between poll's snapshot and Phase 2, we
+/// replicate the poll logic manually to demonstrate the race.
+#[test]
+#[ignore] // Fails due to bug: poll does not re-check is_dirty() before remove()
+fn bug_poll_deletes_dirty_inode_toctou() {
+    use std::collections::HashMap;
+
+    let hub = MockHub::new();
+    hub.add_file("racey.txt", 100, Some("hash1"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_advanced(&hub, &xet);
+
+    rt.block_on(async {
+        // Step 1: Lookup file so it's in the inode table
+        let attr = vfs.lookup(ROOT_INODE, "racey.txt").await.unwrap();
+        let ino = attr.ino;
+
+        // Confirm it's clean
+        assert!(!vfs.inode_table.read().unwrap().get(ino).unwrap().is_dirty());
+
+        // Step 2: Take snapshot (simulating what poll does at line 39)
+        let snapshot = vfs.inode_table.read().unwrap().file_snapshot();
+
+        // Step 3: Remove from remote (simulating remote deletion)
+        hub.remove_file("racey.txt");
+
+        // Step 4: Make the file dirty AFTER snapshot (the TOCTOU window)
+        let fh = vfs.open(ino, true, true, None).await.unwrap();
+        write_blocking(&vfs, ino, fh, 0, b"important data").await.unwrap();
+        assert!(vfs.inode_table.read().unwrap().get(ino).unwrap().is_dirty());
+
+        // Step 5: Simulate Phase 1 diff computation (what poll does at lines 52-90)
+        // The snapshot saw the file as clean, remote no longer has it → deletion
+        let remote_entries = hub.list_tree("").await.unwrap();
+        let remote_map: HashMap<String, _> = remote_entries
+            .iter()
+            .filter(|e| e.entry_type == "file")
+            .map(|e| (e.path.clone(), e))
+            .collect();
+
+        let mut deletions = Vec::new();
+        for (sn_ino, path, _hash, _etag, _size, is_dirty) in &snapshot {
+            if *is_dirty {
+                continue; // this check passes — file was clean in snapshot
+            }
+            if remote_map.get(path.as_str()).is_none() {
+                deletions.push(*sn_ino);
+            }
+        }
+        assert_eq!(deletions, vec![ino], "poll would mark this for deletion");
+
+        // Step 6: Simulate Phase 2 — apply deletions under write lock
+        // (what poll does at lines 109-118)
+        // BUG: no re-check of is_dirty() before remove()
+        {
+            let mut inode_table = vfs.inode_table.write().unwrap();
+            for del_ino in &deletions {
+                // This is what poll currently does — unconditional remove
+                inode_table.remove(*del_ino);
+            }
+        }
+
+        // CORRECT behavior: dirty inode should NOT have been removed
+        // BUG: the inode was removed despite being dirty
+        assert!(
+            vfs.inode_table.read().unwrap().get(ino).is_some(),
+            "BUG: poll deleted a dirty inode! Data loss — the inode had uncommitted \
+             writes that are now lost because poll did not re-check is_dirty() \
+             inside the write lock before calling remove()."
+        );
+
+        let _ = vfs.release(fh).await;
+    });
+}
+
+/// BUG: setattr truncate and concurrent write race in advanced mode
+/// (REVIEW.md #4).
+///
+/// write() does pwrite() on the staging file fd WITHOUT acquiring the staging
+/// lock. setattr truncate acquires the staging lock and truncates the file.
+/// When they run concurrently, the pwrite can land after ftruncate, creating
+/// a sparse file whose actual size doesn't match inode.size.
+///
+/// This test proves the design flaw by showing that write() succeeds while
+/// the staging lock is held — meaning it never synchronizes with setattr's
+/// truncate path, and a concurrent setattr(truncate) can race with pwrite().
+#[test]
+#[ignore] // Demonstrates design flaw: write() bypasses staging lock
+fn bug_setattr_write_no_staging_lock() {
+    let hub = MockHub::new();
+    hub.add_file("data.txt", 100, Some("hash1"), None);
+    let xet = MockXet::new();
+    xet.add_file("hash1", &[0u8; 100]);
+    let (rt, vfs) = vfs_advanced(&hub, &xet);
+
+    rt.block_on(async {
+        let attr = vfs.lookup(ROOT_INODE, "data.txt").await.unwrap();
+        let ino = attr.ino;
+
+        // Open for advanced write (creates staging file, acquires staging lock)
+        let fh = vfs.open(ino, true, true, None).await.unwrap();
+
+        // Hold the staging lock. If write() also tried to acquire it,
+        // it would deadlock (tokio mutex) or block. Since write() is sync
+        // (not async), it can't await the lock — proving it never tries.
+        let staging_mutex = vfs.staging_lock(ino);
+        let _guard = staging_mutex.lock().await;
+
+        // write() should FAIL here if it properly acquired the staging lock.
+        // BUG: write() succeeds because it uses pwrite() directly on the fd
+        // without any staging lock synchronization.
+        let result = write_blocking(&vfs, ino, fh, 50, b"data while staging locked").await;
+        assert!(
+            result.is_err(),
+            "BUG: write() succeeded while staging lock was held by another task. \
+             It should fail or block, but instead it bypasses the staging lock \
+             entirely, allowing races with setattr(truncate). See REVIEW.md #4."
+        );
+
+        drop(_guard);
+        let _ = vfs.release(fh).await;
+    });
+}
