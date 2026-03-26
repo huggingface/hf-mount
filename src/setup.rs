@@ -413,9 +413,28 @@ pub fn build(source: Source, options: MountOptions, is_nfs: bool) -> MountSetup 
 /// Parse CLI args, build VFS and all dependencies.
 /// `is_nfs` controls whether advanced writes are forced (NFS has no open/close).
 pub fn setup(is_nfs: bool) -> MountSetup {
+    raise_fd_limit();
     let args = Args::parse();
     init_tracing(false);
     build(args.source, args.options, is_nfs)
+}
+
+/// Try to raise the soft file descriptor limit to avoid "Too many open files"
+/// errors during large batch operations. Most FUSE/NFS filesystems do this.
+fn raise_fd_limit() {
+    const TARGET_NOFILE: u64 = 65536;
+    let mut rlim = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: rlim is a plain C struct, getrlimit/setrlimit are standard POSIX.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) } != 0 || rlim.rlim_cur >= TARGET_NOFILE {
+        return;
+    }
+    rlim.rlim_cur = TARGET_NOFILE.min(rlim.rlim_max);
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &rlim) } != 0 {
+        eprintln!("warning: failed to raise file descriptor limit to {TARGET_NOFILE}");
+    }
 }
 
 fn build_cas_config(runtime: &tokio::runtime::Runtime, refresher: &Arc<HubTokenRefresher>) -> Arc<TranslatorConfig> {

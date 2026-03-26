@@ -155,7 +155,20 @@ impl NFSFileSystem for NFSAdapter {
                 // get_or_open_handle and read. Purge stale pool entry and retry
                 // internally (returning STALE would be treated as a hard error
                 // by some NFS clients instead of a transparent retry).
-                self.handle_pool.lock().expect("handle_pool poisoned").remove(id);
+                //
+                // Only evict+release if the pool still holds the same stale handle.
+                // Another task may have already re-opened a fresh handle for this ino.
+                let stale = {
+                    let mut pool = self.handle_pool.lock().expect("handle_pool poisoned");
+                    if pool.get(id) == Some(file_handle) {
+                        pool.remove(id)
+                    } else {
+                        None
+                    }
+                };
+                if let Some(stale_handle) = stale {
+                    let _ = self.virtual_fs.release(stale_handle).await;
+                }
                 let file_handle = self.get_or_open_handle(id).await?;
                 self.virtual_fs
                     .read(file_handle, offset, count)
@@ -313,10 +326,18 @@ impl NFSFileSystem for NFSAdapter {
     async fn remove(&self, dirid: fileid3, filename: &filename3) -> Result<(), nfsstat3> {
         let name = nfs_name(filename)?;
         let attr = self.virtual_fs.lookup(dirid, name).await.map_err(errno_to_nfs)?;
+        let ino = attr.ino;
         match attr.kind {
-            InodeKind::Directory => self.virtual_fs.rmdir(dirid, name).await.map_err(errno_to_nfs),
-            _ => self.virtual_fs.unlink(dirid, name).await.map_err(errno_to_nfs),
+            InodeKind::Directory => self.virtual_fs.rmdir(dirid, name).await.map_err(errno_to_nfs)?,
+            _ => self.virtual_fs.unlink(dirid, name).await.map_err(errno_to_nfs)?,
         }
+        // Evict from handle pool so the FD is released immediately.
+        // Without this, deleted files' handles linger until LRU-evicted.
+        let evicted = self.handle_pool.lock().expect("handle_pool poisoned").remove(ino);
+        if let Some(file_handle) = evicted {
+            self.evict_handle(ino, file_handle).await;
+        }
+        Ok(())
     }
 
     async fn rename(
@@ -328,10 +349,24 @@ impl NFSFileSystem for NFSAdapter {
     ) -> Result<(), nfsstat3> {
         let from_name = nfs_name(from_filename)?;
         let to_name = nfs_name(to_filename)?;
+        // If destination exists and is a different inode from source, it will be
+        // unlinked by rename. Evict its stale handle (same reason as remove()).
+        // Skip for same-inode renames (no-op) to avoid evicting the live handle.
+        let src_ino = self.virtual_fs.lookup(from_dirid, from_name).await.ok().map(|a| a.ino);
+        let dest_ino = self.virtual_fs.lookup(to_dirid, to_name).await.ok().map(|a| a.ino);
         self.virtual_fs
             .rename(from_dirid, from_name, to_dirid, to_name, false)
             .await
-            .map_err(errno_to_nfs)
+            .map_err(errno_to_nfs)?;
+        if let Some(ino) = dest_ino
+            && dest_ino != src_ino
+        {
+            let evicted = self.handle_pool.lock().expect("handle_pool poisoned").remove(ino);
+            if let Some(file_handle) = evicted {
+                self.evict_handle(ino, file_handle).await;
+            }
+        }
+        Ok(())
     }
 
     async fn symlink(
@@ -555,10 +590,11 @@ impl HandlePool {
         }
     }
 
-    /// Remove an entry from the pool (both handles map and order deque).
-    fn remove(&mut self, ino: u64) {
-        self.handles.remove(&ino);
+    /// Remove an entry from the pool, returning the file handle if present.
+    fn remove(&mut self, ino: u64) -> Option<u64> {
+        let file_handle = self.handles.remove(&ino)?;
         self.order_remove(ino);
+        Some(file_handle)
     }
 
     /// Drain all entries, returning (ino, file_handle) pairs.
@@ -812,7 +848,7 @@ mod tests {
         pool.insert(2, 200);
         pool.insert(3, 300);
 
-        pool.remove(2);
+        assert_eq!(pool.remove(2), Some(200));
         assert!(pool.get(2).is_none());
         assert_eq!(pool.order.len(), 2);
         assert_eq!(pool.handles.len(), 2);
@@ -842,7 +878,7 @@ mod tests {
     fn handle_pool_remove_nonexistent() {
         let mut pool = HandlePool::new();
         pool.insert(1, 100);
-        pool.remove(999); // no-op
+        assert_eq!(pool.remove(999), None); // no-op
         assert_eq!(pool.get(1), Some(100));
         assert_eq!(pool.order.len(), 1);
     }
