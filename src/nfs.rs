@@ -64,10 +64,7 @@ impl NFSAdapter {
                 (None, Some((existing, file_handle)))
             } else {
                 let result = pool.insert(ino, file_handle);
-                // Pin the just-inserted entry so it survives until the caller unpins.
-                if let Some(entry) = pool.handles.get_mut(&ino) {
-                    entry.pin_count += 1;
-                }
+                pool.pin(ino);
                 (Some(result), None)
             }
         };
@@ -598,7 +595,14 @@ impl HandlePool {
         Some(file_handle)
     }
 
-    /// Release a pin acquired by `get()`.
+    /// Pin an entry without looking it up (e.g. right after insert).
+    fn pin(&mut self, ino: u64) {
+        if let Some(entry) = self.handles.get_mut(&ino) {
+            entry.pin_count += 1;
+        }
+    }
+
+    /// Release a pin acquired by `get()` or `pin()`.
     fn unpin(&mut self, ino: u64) {
         if let Some(entry) = self.handles.get_mut(&ino) {
             entry.pin_count = entry.pin_count.saturating_sub(1);

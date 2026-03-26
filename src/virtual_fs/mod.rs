@@ -1282,8 +1282,7 @@ impl VirtualFs {
                     ino: *ino,
                     prefetch: prefetch.clone(),
                 },
-                // write-only, not readable
-                Some(OpenFile::Streaming { .. }) => return Err(libc::EBADF), // write-only, not readable
+                Some(OpenFile::Streaming { .. }) => return Err(libc::EBADF), // write-only
                 None => return Err(libc::EBADF), // handle already closed (race with release)
             }
         };
@@ -1313,16 +1312,25 @@ impl VirtualFs {
             ReadTarget::Remote { ino, prefetch } => {
                 // Try to acquire the prefetch lock without blocking. If another
                 // read on the same handle is in progress (common in NFS where
-                // one handle is shared per inode), fall back to a direct range
-                // download instead of serializing behind the other reader's I/O.
+                // one handle is shared per inode), fall back to a direct CAS
+                // range download instead of serializing behind the other reader's
+                // network I/O. Non-xet files (plain git/LFS) cannot use the
+                // direct path, so they wait for the lock.
                 match prefetch.try_lock() {
                     Ok(prefetch_state) => self.read_with_prefetch(prefetch_state, offset, size).await,
                     Err(_) => {
                         debug!(
-                            "read: prefetch lock contended for ino={}, falling back to direct range download",
+                            "read: prefetch lock contended for ino={}, trying direct range download",
                             ino,
                         );
-                        self.read_direct(ino, offset, size).await
+                        match self.try_read_direct(ino, offset, size).await? {
+                            Some(result) => Ok(result),
+                            None => {
+                                // Non-xet file: must go through prefetch path.
+                                let prefetch_state = prefetch.lock().await;
+                                self.read_with_prefetch(prefetch_state, offset, size).await
+                            }
+                        }
                     }
                 }
             }
@@ -1408,31 +1416,29 @@ impl VirtualFs {
     /// one handle per inode). Fetches only the requested bytes — no prefetch
     /// window, no stream reuse — so it does not interfere with the other
     /// reader's sequential access pattern.
-    async fn read_direct(&self, ino: u64, offset: u64, size: u32) -> VirtualFsResult<(Bytes, bool)> {
-        let (xet_hash, file_size) = {
-            let inodes = self.inode_table.read().expect("inodes poisoned");
-            let entry = inodes.get(ino).ok_or(libc::ENOENT)?;
-            let hash = entry.xet_hash.clone().unwrap_or_default();
-            (hash, entry.size)
-        };
+    ///
+    /// Returns `None` for non-xet files (plain git/LFS) since those require
+    /// the prefetch path (HTTP download to staging). The caller should fall
+    /// back to waiting for the prefetch lock.
+    async fn try_read_direct(&self, ino: u64, offset: u64, size: u32) -> VirtualFsResult<Option<(Bytes, bool)>> {
+        let entry = self.get_file_entry(ino)?;
 
-        if offset >= file_size {
-            return Ok((Bytes::new(), true));
+        if entry.xet_hash.is_empty() {
+            return Ok(None);
         }
 
-        let needed = (size as u64).min(file_size - offset);
-
-        if xet_hash.is_empty() || needed == 0 {
-            return Ok((Bytes::new(), offset >= file_size));
+        if offset >= entry.size {
+            return Ok(Some((Bytes::new(), true)));
         }
 
-        let file_info = XetFileInfo::new(xet_hash, file_size);
+        let needed = (size as u64).min(entry.size - offset);
+        let file_info = XetFileInfo::new(entry.xet_hash, entry.size);
         let end = offset + needed;
         let mut stream = self
             .xet_sessions
             .download_stream_boxed(&file_info, offset, Some(end))
             .map_err(|err| {
-                tracing::error!("read_direct: stream open failed for ino={}: {}", ino, err);
+                tracing::error!("try_read_direct: stream open failed for ino={}: {}", ino, err);
                 libc::EIO
             })?;
 
@@ -1443,15 +1449,15 @@ impl VirtualFs {
                 Ok(Some(chunk)) => response.extend_from_slice(&chunk),
                 Ok(None) => break,
                 Err(err) => {
-                    tracing::error!("read_direct: stream error for ino={}: {}", ino, err);
+                    tracing::error!("try_read_direct: stream error for ino={}: {}", ino, err);
                     return Err(libc::EIO);
                 }
             }
         }
 
         response.truncate(to_read);
-        let eof = offset + response.len() as u64 >= file_size;
-        Ok((response.freeze(), eof))
+        let eof = offset + response.len() as u64 >= entry.size;
+        Ok(Some((response.freeze(), eof)))
     }
 
     pub fn write(&self, ino: u64, file_handle: u64, offset: u64, data: &[u8]) -> VirtualFsResult<u32> {
