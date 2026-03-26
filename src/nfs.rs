@@ -290,6 +290,7 @@ impl NFSFileSystem for NFSAdapter {
                 self.virtual_fs.default_gid(),
             )
             .await?;
+        self.virtual_fs.schedule_flush(ino);
         Ok(ino)
     }
 
