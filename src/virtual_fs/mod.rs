@@ -545,7 +545,7 @@ impl VirtualFs {
 
     /// Check if any open file handle references the given inode.
     fn has_open_handles(&self, ino: u64) -> bool {
-        poll::has_open_handles_for(&self.open_files, ino)
+        has_open_handles_for(&self.open_files, ino)
     }
 
     /// Get or create a per-directory lock for serializing ensure_children_loaded().
@@ -2863,6 +2863,19 @@ enum ReadTarget {
     Remote {
         prefetch: Arc<tokio::sync::Mutex<PrefetchState>>,
     },
+}
+
+/// Check if any open file handle references the given inode.
+fn has_open_handles_for(open_files: &RwLock<HashMap<u64, OpenFile>>, ino: u64) -> bool {
+    open_files
+        .read()
+        .expect("open_files poisoned")
+        .values()
+        .any(|of| match of {
+            OpenFile::Local { ino: i, .. } | OpenFile::Lazy { ino: i, .. } | OpenFile::Streaming { ino: i, .. } => {
+                *i == ino
+            }
+        })
 }
 
 #[cfg(test)]

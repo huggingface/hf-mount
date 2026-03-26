@@ -181,7 +181,7 @@ impl super::VirtualFs {
                     Some(entry) => (entry.parent, entry.name.clone()),
                     None => continue,
                 };
-                if has_open_handles_for(open_files, *ino) {
+                if super::has_open_handles_for(open_files, *ino) {
                     // Unlink the pathname but keep the inode as orphan (nlink=0)
                     // so open handles can still read/fstat. release() will clean
                     // up the orphan. Without this, the file stays visible by name
@@ -269,19 +269,4 @@ impl super::VirtualFs {
             }
         }
     }
-}
-
-/// Check if any open file handle references the given inode.
-/// Free function so it can be used from both `VirtualFs::has_open_handles` and
-/// the static `apply_poll_diff`.
-pub(super) fn has_open_handles_for(open_files: &RwLock<HashMap<u64, super::OpenFile>>, ino: u64) -> bool {
-    open_files
-        .read()
-        .expect("open_files poisoned")
-        .values()
-        .any(|of| match of {
-            super::OpenFile::Local { ino: i, .. }
-            | super::OpenFile::Lazy { ino: i, .. }
-            | super::OpenFile::Streaming { ino: i, .. } => *i == ino,
-        })
 }
