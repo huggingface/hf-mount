@@ -2865,3 +2865,108 @@ fn failed_writer_create_preserves_inode() {
         assert!(!entry.is_dirty(), "inode should not be dirty after failed open");
     });
 }
+
+// ── FD leak: open handles cleaned up on unlink/release ────────────────
+
+/// Unlink a file with an open handle (advanced writes) releases the handle on close.
+/// Verifies that open_files is empty after release (no FD leak).
+#[test]
+fn unlink_with_open_handle_cleans_open_files() {
+    let hub = MockHub::new();
+    hub.add_file("file.txt", 0, None, None);
+    hub.set_head(
+        "file.txt",
+        Some(HeadFileInfo {
+            xet_hash: None,
+            etag: None,
+            size: Some(0),
+            last_modified: None,
+        }),
+    );
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_advanced(&hub, &xet);
+
+    rt.block_on(async {
+        let attr = vfs.lookup(ROOT_INODE, "file.txt").await.unwrap();
+        let ino = attr.ino;
+
+        // Open for write → creates entry in open_files
+        let fh = vfs.open(ino, true, true, None).await.unwrap();
+        assert!(vfs.has_open_handles(ino), "should have open handle after open");
+
+        // Unlink while handle is open → inode stays as orphan
+        vfs.unlink(ROOT_INODE, "file.txt").await.unwrap();
+        assert!(vfs.has_open_handles(ino), "handle should still be open after unlink");
+
+        // Release → handle removed, orphan cleaned up, no FD leak
+        vfs.release(fh).await.unwrap();
+        assert!(!vfs.has_open_handles(ino), "handle should be gone after release");
+
+        // open_files should be empty
+        let count = vfs.open_files.read().unwrap().len();
+        assert_eq!(count, 0, "open_files should be empty after unlink+release");
+    });
+}
+
+/// Creating and deleting many files (advanced writes) leaves no orphan open_files entries.
+#[test]
+fn bulk_create_delete_no_open_files_leak() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_advanced(&hub, &xet);
+
+    rt.block_on(async {
+        // Create 100 files, release handles, then delete
+        let mut inos = Vec::new();
+        for i in 0..100 {
+            let name = format!("file_{i}.txt");
+            let (attr, fh) = vfs.create(ROOT_INODE, &name, 0o644, 1000, 1000, None).await.unwrap();
+            inos.push(attr.ino);
+            vfs.release(fh).await.unwrap();
+        }
+
+        for i in 0..100 {
+            let name = format!("file_{i}.txt");
+            vfs.unlink(ROOT_INODE, &name).await.unwrap();
+        }
+
+        // All handles released, all inodes unlinked → open_files should be empty
+        let count = vfs.open_files.read().unwrap().len();
+        assert_eq!(count, 0, "open_files should be empty after bulk create+delete");
+
+        // All inodes should be gone
+        let inodes = vfs.inode_table.read().unwrap();
+        for ino in &inos {
+            assert!(inodes.get(*ino).is_none(), "ino={ino} should be removed after unlink");
+        }
+    });
+}
+
+/// Rename overwriting a destination cleans up the destination inode.
+#[test]
+fn rename_overwrite_cleans_destination() {
+    let hub = MockHub::new();
+    hub.add_file("src.txt", 100, Some("hash_src"), None);
+    hub.add_file("dst.txt", 200, Some("hash_dst"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_advanced(&hub, &xet);
+
+    rt.block_on(async {
+        let src_attr = vfs.lookup(ROOT_INODE, "src.txt").await.unwrap();
+        let dst_attr = vfs.lookup(ROOT_INODE, "dst.txt").await.unwrap();
+        let dst_ino = dst_attr.ino;
+
+        // Rename src -> dst (overwrites dst)
+        vfs.rename(ROOT_INODE, "src.txt", ROOT_INODE, "dst.txt", false)
+            .await
+            .unwrap();
+
+        // dst_ino should be gone (overwritten)
+        let inodes = vfs.inode_table.read().unwrap();
+        assert!(inodes.get(dst_ino).is_none(), "overwritten dst inode should be removed");
+
+        // src_ino should now be at dst.txt
+        let entry = inodes.lookup_child(ROOT_INODE, "dst.txt").unwrap();
+        assert_eq!(entry.inode, src_attr.ino, "dst.txt should now be src's inode");
+    });
+}
