@@ -4,10 +4,12 @@ on:
   workflow_dispatch:
     inputs:
       bump:
-        description: "Version bump type"
+        description: "Version bump type (leave 'auto' to detect from commit messages)"
         required: true
         type: choice
+        default: auto
         options:
+          - auto
           - patch
           - minor
           - major
@@ -21,14 +23,53 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Detect bump type from commits
+        id: detect
+        run: |
+          LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+          if [ -z "$LAST_TAG" ]; then
+            RANGE="HEAD"
+          else
+            RANGE="${LAST_TAG}..HEAD"
+          fi
+
+          COMMITS=$(git log --pretty=format:"%s" "$RANGE")
+          echo "## Commits since $LAST_TAG:"
+          echo "$COMMITS"
+          echo ""
+
+          BUMP="patch"
+          if echo "$COMMITS" | grep -qiE "^feat(\(.*\))?!:|BREAKING CHANGE"; then
+            BUMP="major"
+          elif echo "$COMMITS" | grep -qiE "^feat(\(.*\))?:"; then
+            BUMP="minor"
+          elif echo "$COMMITS" | grep -qiE "^(fix|perf)(\(.*\))?:"; then
+            BUMP="patch"
+          fi
+
+          echo "detected=$BUMP" >> "$GITHUB_OUTPUT"
+          echo "Detected bump: $BUMP"
+
+      - name: Resolve bump type
+        id: bump
+        run: |
+          if [ "${{ inputs.bump }}" = "auto" ]; then
+            BUMP="${{ steps.detect.outputs.detected }}"
+          else
+            BUMP="${{ inputs.bump }}"
+          fi
+          echo "type=$BUMP" >> "$GITHUB_OUTPUT"
+          echo "Using bump type: $BUMP"
 
       - name: Compute new version
         id: version
         run: |
           CURRENT=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)"/\1/')
           IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
-          case "${{ inputs.bump }}" in
+          case "${{ steps.bump.outputs.type }}" in
             major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
             minor) MINOR=$((MINOR + 1)); PATCH=0 ;;
             patch) PATCH=$((PATCH + 1)) ;;
@@ -36,7 +77,17 @@ jobs:
           NEW="${MAJOR}.${MINOR}.${PATCH}"
           echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
           echo "new=$NEW" >> "$GITHUB_OUTPUT"
-          echo "Bumping $CURRENT -> $NEW"
+
+      - name: Summary
+        run: |
+          echo "### Release Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| | |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Current** | v${{ steps.version.outputs.current }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **New** | v${{ steps.version.outputs.new }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Bump** | ${{ steps.bump.outputs.type }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Auto-detected** | ${{ steps.detect.outputs.detected }} |" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Bump Cargo.toml
         run: sed -i "0,/^version = \".*\"/s//version = \"${{ steps.version.outputs.new }}\"/" Cargo.toml
