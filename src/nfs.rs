@@ -157,7 +157,8 @@ impl NFSFileSystem for NFSAdapter {
                 // by some NFS clients instead of a transparent retry).
                 //
                 // Only evict+release if the pool still holds the same stale handle.
-                // Another task may have already re-opened a fresh handle for this ino.
+                // If another task already replaced it, the old handle was released
+                // by that task's eviction (insert/get_or_open_handle path).
                 let stale = {
                     let mut pool = self.handle_pool.lock().expect("handle_pool poisoned");
                     if pool.get(id) == Some(file_handle) {
@@ -351,13 +352,18 @@ impl NFSFileSystem for NFSAdapter {
         let to_name = nfs_name(to_filename)?;
         // If destination exists and is a different inode from source, it will be
         // unlinked by rename. Evict its stale handle (same reason as remove()).
-        // Skip for same-inode renames (no-op) to avoid evicting the live handle.
-        let src_ino = self.virtual_fs.lookup(from_dirid, from_name).await.ok().map(|a| a.ino);
+        // Only resolve source ino when destination exists (the rare overwrite case).
         let dest_ino = self.virtual_fs.lookup(to_dirid, to_name).await.ok().map(|a| a.ino);
+        let src_ino = if dest_ino.is_some() {
+            self.virtual_fs.lookup(from_dirid, from_name).await.ok().map(|a| a.ino)
+        } else {
+            None
+        };
         self.virtual_fs
             .rename(from_dirid, from_name, to_dirid, to_name, false)
             .await
             .map_err(errno_to_nfs)?;
+        // Skip same-inode renames (no-op) to avoid evicting the live handle.
         if let Some(ino) = dest_ino
             && dest_ino != src_ino
         {
