@@ -14,6 +14,7 @@ impl super::VirtualFs {
     pub(super) async fn poll_remote_changes(
         hub_client: Arc<dyn HubOps>,
         inodes: Arc<RwLock<InodeTable>>,
+        open_files: Arc<RwLock<HashMap<u64, super::OpenFile>>>,
         negative_cache: Arc<RwLock<HashMap<String, Instant>>>,
         invalidator: Invalidator,
         interval: Duration,
@@ -59,7 +60,14 @@ impl super::VirtualFs {
                     }
                 }
             }
-            Self::apply_poll_diff(all_entries, &polled_prefixes, &inodes, &negative_cache, &invalidator);
+            Self::apply_poll_diff(
+                all_entries,
+                &polled_prefixes,
+                &inodes,
+                &open_files,
+                &negative_cache,
+                &invalidator,
+            );
         }
     }
 
@@ -74,6 +82,7 @@ impl super::VirtualFs {
         remote_entries: Vec<crate::hub_api::TreeEntry>,
         polled_prefixes: &HashSet<String>,
         inodes: &Arc<RwLock<InodeTable>>,
+        open_files: &Arc<RwLock<HashMap<u64, super::OpenFile>>>,
         negative_cache: &Arc<RwLock<HashMap<String, Instant>>>,
         invalidator: &Invalidator,
     ) {
@@ -175,6 +184,23 @@ impl super::VirtualFs {
                     }
                     let parent_ino = entry.parent;
                     inos_to_invalidate.push(parent_ino);
+                }
+                // Skip removal if the inode has open file handles. Removing it
+                // would cause read/getattr/release on those handles to fail
+                // with ENOENT. The handles keep working on stale data until
+                // closed, at which point release() cleans up the orphan.
+                let has_handles = open_files
+                    .read()
+                    .expect("open_files poisoned")
+                    .values()
+                    .any(|of| match of {
+                        super::OpenFile::Local { ino: i, .. }
+                        | super::OpenFile::Lazy { ino: i, .. }
+                        | super::OpenFile::Streaming { ino: i, .. } => i == ino,
+                    });
+                if has_handles {
+                    info!("Skipping remote deletion of ino={}: has open handles", ino);
+                    continue;
                 }
                 inos_to_invalidate.push(*ino);
                 inode_table.remove(*ino);

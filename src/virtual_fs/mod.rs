@@ -84,7 +84,7 @@ pub struct VirtualFs {
     advanced_writes: bool,
     inode_table: Arc<RwLock<InodeTable>>,
     /// Maps file_handle → OpenFile (local fd or lazy remote reference).
-    open_files: RwLock<HashMap<u64, OpenFile>>,
+    open_files: Arc<RwLock<HashMap<u64, OpenFile>>>,
     next_file_handle: AtomicU64,
     uid: u32,
     gid: u32,
@@ -150,11 +150,15 @@ impl VirtualFs {
             None
         };
 
+        // Create open_files before poll task so we can share with it
+        let open_files: Arc<RwLock<HashMap<u64, OpenFile>>> = Arc::new(RwLock::new(HashMap::new()));
+
         // Spawn remote change polling task (if interval > 0)
         let invalidator: Invalidator = Arc::new(Mutex::new(None));
         let poll_handle = if config.poll_interval_secs > 0 {
             let bg_hub = hub_client.clone();
             let bg_inodes = inodes.clone();
+            let bg_open_files = open_files.clone();
             let bg_neg_cache = negative_cache.clone();
             let bg_invalidator = invalidator.clone();
             let interval = Duration::from_secs(config.poll_interval_secs);
@@ -162,6 +166,7 @@ impl VirtualFs {
             Some(runtime.spawn(Self::poll_remote_changes(
                 bg_hub,
                 bg_inodes,
+                bg_open_files,
                 bg_neg_cache,
                 bg_invalidator,
                 interval,
@@ -178,7 +183,7 @@ impl VirtualFs {
             read_only: config.read_only,
             advanced_writes: config.advanced_writes,
             inode_table: inodes,
-            open_files: RwLock::new(HashMap::new()),
+            open_files,
             next_file_handle: AtomicU64::new(1),
             uid: config.uid,
             gid: config.gid,
