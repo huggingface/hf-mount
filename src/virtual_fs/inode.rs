@@ -94,6 +94,9 @@ impl InodeEntry {
         let now = SystemTime::now();
         self.mtime = now;
         self.ctime = now;
+        // Mark as recently validated so subsequent lookups skip HEAD revalidation
+        // for the duration of metadata_ttl (we just committed this exact hash).
+        self.last_revalidated = Some(Instant::now());
     }
 }
 
