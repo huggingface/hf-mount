@@ -545,15 +545,7 @@ impl VirtualFs {
 
     /// Check if any open file handle references the given inode.
     fn has_open_handles(&self, ino: u64) -> bool {
-        self.open_files
-            .read()
-            .expect("open_files poisoned")
-            .values()
-            .any(|of| match of {
-                OpenFile::Local { ino: i, .. } | OpenFile::Lazy { ino: i, .. } | OpenFile::Streaming { ino: i, .. } => {
-                    *i == ino
-                }
-            })
+        poll::has_open_handles_for(&self.open_files, ino)
     }
 
     /// Get or create a per-directory lock for serializing ensure_children_loaded().

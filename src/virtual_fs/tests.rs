@@ -2264,8 +2264,30 @@ fn poll_skips_deletion_with_open_handles() {
         );
         drop(inodes);
 
-        // Release the handle
+        // Release the handle, then poll again: inode should now be deleted
         vfs.release(fh).await.unwrap();
+
+        let prefixes2 = vfs.inode_table.read().unwrap().loaded_dir_prefixes();
+        let mut remote2 = Vec::new();
+        for prefix in &prefixes2 {
+            remote2.extend(hub.list_tree(prefix).await.unwrap());
+        }
+        let polled2: std::collections::HashSet<String> = prefixes2.into_iter().collect();
+        VirtualFs::apply_poll_diff(
+            remote2,
+            &polled2,
+            &vfs.inode_table,
+            &vfs.open_files,
+            &vfs.negative_cache,
+            &vfs.invalidator,
+        );
+
+        // Now open.txt should be gone (handle released, second poll cleans up)
+        let inodes = vfs.inode_table.read().unwrap();
+        assert!(
+            inodes.get(open_attr.ino).is_none(),
+            "inode should be removed after handle release + second poll"
+        );
     });
 }
 

@@ -174,34 +174,21 @@ impl super::VirtualFs {
             }
 
             for ino in &deletions {
-                // Re-check dirty status under the write lock: a local write
-                // may have dirtied this inode between the read-lock snapshot
-                // and now. Dirty inodes must not be removed, as that would
-                // discard uncommitted local data (TOCTOU race).
-                if let Some(entry) = inode_table.get(*ino) {
-                    if entry.is_dirty() {
-                        continue;
-                    }
-                    let parent_ino = entry.parent;
-                    inos_to_invalidate.push(parent_ino);
-                }
+                // Re-check under write lock: inode may have been removed or
+                // dirtied between the read-lock snapshot and now.
+                let parent_ino = match inode_table.get(*ino) {
+                    Some(entry) if entry.is_dirty() => continue,
+                    Some(entry) => entry.parent,
+                    None => continue,
+                };
                 // Skip removal if the inode has open file handles. Removing it
                 // would cause read/getattr/release on those handles to fail
-                // with ENOENT. The handles keep working on stale data until
-                // closed, at which point release() cleans up the orphan.
-                let has_handles = open_files
-                    .read()
-                    .expect("open_files poisoned")
-                    .values()
-                    .any(|of| match of {
-                        super::OpenFile::Local { ino: i, .. }
-                        | super::OpenFile::Lazy { ino: i, .. }
-                        | super::OpenFile::Streaming { ino: i, .. } => i == ino,
-                    });
-                if has_handles {
+                // with ENOENT. The next poll cycle will retry once handles close.
+                if has_open_handles_for(open_files, *ino) {
                     info!("Skipping remote deletion of ino={}: has open handles", ino);
                     continue;
                 }
+                inos_to_invalidate.push(parent_ino);
                 inos_to_invalidate.push(*ino);
                 inode_table.remove(*ino);
             }
@@ -277,4 +264,19 @@ impl super::VirtualFs {
             }
         }
     }
+}
+
+/// Check if any open file handle references the given inode.
+/// Free function so it can be used from both `VirtualFs::has_open_handles` and
+/// the static `apply_poll_diff`.
+pub(super) fn has_open_handles_for(open_files: &RwLock<HashMap<u64, super::OpenFile>>, ino: u64) -> bool {
+    open_files
+        .read()
+        .expect("open_files poisoned")
+        .values()
+        .any(|of| match of {
+            super::OpenFile::Local { ino: i, .. }
+            | super::OpenFile::Lazy { ino: i, .. }
+            | super::OpenFile::Streaming { ino: i, .. } => *i == ino,
+        })
 }
