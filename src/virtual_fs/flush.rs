@@ -400,48 +400,63 @@ async fn flush_batch(
         return;
     }
 
-    // Upload all files through a single upload session
-    let staging_paths: Vec<&std::path::Path> = to_flush.iter().map(|item| item.staging_path.as_path()).collect();
-    let upload_results = match xet_sessions.upload_files(&staging_paths).await {
-        Ok(results) => results,
-        Err(e) => {
-            error!("Batch upload failed: {}", e);
-            let msg = format!("upload failed: {e}");
-            let mut errs = flush_errors.lock().expect("flush_errors poisoned");
-            for item in &to_flush {
-                errs.insert(item.ino, msg.clone());
+    // Upload in chunks to bound FD usage (xet-core opens all staging files per
+    // upload session), but accumulate all batch ops for a single Hub commit to
+    // preserve the global adds-before-deletes ordering required by the Hub API.
+    const UPLOAD_CHUNK_SIZE: usize = 500;
+    let mut all_results = Vec::new();
+
+    for (chunk_idx, chunk) in to_flush.chunks(UPLOAD_CHUNK_SIZE).enumerate() {
+        let staging_paths: Vec<&std::path::Path> = chunk.iter().map(|item| item.staging_path.as_path()).collect();
+        match xet_sessions.upload_files(&staging_paths).await {
+            Ok(results) => all_results.push((chunk_idx, results)),
+            Err(e) => {
+                // Abort the entire batch: committing partial results could apply
+                // deletes without the corresponding adds from this failed chunk.
+                error!("Batch upload failed (chunk {}), aborting flush: {}", chunk_idx, e);
+                let msg = format!("upload failed: {e}");
+                let mut errs = flush_errors.lock().expect("flush_errors poisoned");
+                for item in &to_flush {
+                    errs.insert(item.ino, msg.clone());
+                }
+                return;
             }
-            return;
         }
-    };
+    }
+
+    if all_results.is_empty() {
+        return;
+    }
 
     let mtime_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
 
-    // Build batch operations -- Hub API requires all adds before all deletes
-    let mut ops = Vec::with_capacity(to_flush.len());
+    // Build batch operations -- Hub API requires all adds before all deletes.
+    let mut ops = Vec::new();
     let mut delete_ops = Vec::new();
 
-    for (item, file_info) in to_flush.iter().zip(upload_results.iter()) {
-        info!(
-            "Uploaded file ino={} path={} xet_hash={} size={}",
-            item.ino,
-            item.full_path,
-            file_info.hash(),
-            file_info.file_size()
-        );
-
-        ops.push(BatchOp::AddFile {
-            path: item.full_path.clone(),
-            xet_hash: file_info.hash().to_string(),
-            mtime: mtime_ms,
-            content_type: None,
-        });
-
-        for old_path in &item.pending_deletes {
-            delete_ops.push(BatchOp::DeleteFile { path: old_path.clone() });
+    for (chunk_idx, results) in &all_results {
+        let chunk_start = chunk_idx * UPLOAD_CHUNK_SIZE;
+        let chunk = &to_flush[chunk_start..chunk_start + results.len()];
+        for (item, file_info) in chunk.iter().zip(results.iter()) {
+            info!(
+                "Uploaded file ino={} path={} xet_hash={} size={}",
+                item.ino,
+                item.full_path,
+                file_info.hash(),
+                file_info.file_size()
+            );
+            ops.push(BatchOp::AddFile {
+                path: item.full_path.clone(),
+                xet_hash: file_info.hash().to_string(),
+                mtime: mtime_ms,
+                content_type: None,
+            });
+            for old_path in &item.pending_deletes {
+                delete_ops.push(BatchOp::DeleteFile { path: old_path.clone() });
+            }
         }
     }
 
@@ -459,9 +474,13 @@ async fn flush_batch(
     }
 
     let mut inode_table = inodes.write().expect("inodes poisoned");
-    for (item, file_info) in to_flush.iter().zip(upload_results.iter()) {
-        if let Some(entry) = inode_table.get_mut(item.ino) {
-            entry.apply_commit(file_info.hash(), file_info.file_size(), item.dirty_generation);
+    for (chunk_idx, results) in &all_results {
+        let chunk_start = chunk_idx * UPLOAD_CHUNK_SIZE;
+        let chunk = &to_flush[chunk_start..chunk_start + results.len()];
+        for (item, file_info) in chunk.iter().zip(results.iter()) {
+            if let Some(entry) = inode_table.get_mut(item.ino) {
+                entry.apply_commit(file_info.hash(), file_info.file_size(), item.dirty_generation);
+            }
         }
     }
 
