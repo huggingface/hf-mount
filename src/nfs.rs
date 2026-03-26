@@ -74,7 +74,7 @@ impl NFSAdapter {
             return Ok(existing);
         }
         if let Some(result) = result {
-            if let Some((evicted_ino, evicted_handle)) = result.evicted {
+            for (evicted_ino, evicted_handle) in result.evicted {
                 self.evict_handle(evicted_ino, evicted_handle).await;
             }
             if let Some(replaced_handle) = result.replaced {
@@ -111,7 +111,7 @@ impl NFSAdapter {
             let mut pool = self.handle_pool.lock().expect("handle_pool poisoned");
             pool.insert(ino, file_handle)
         };
-        if let Some((evicted_ino, evicted_handle)) = result.evicted {
+        for (evicted_ino, evicted_handle) in result.evicted {
             self.evict_handle(evicted_ino, evicted_handle).await;
         }
         if let Some(replaced_handle) = result.replaced {
@@ -156,7 +156,25 @@ impl NFSFileSystem for NFSAdapter {
         let file_handle = self.get_or_open_handle(id).await?;
         let result = self.virtual_fs.read(file_handle, offset, count).await;
         self.handle_pool.lock().expect("handle_pool poisoned").unpin(id);
-        result.map(|(b, eof)| (b.to_vec(), eof)).map_err(errno_to_nfs)
+        match result {
+            Ok((bytes, eof)) => Ok((bytes.to_vec(), eof)),
+            Err(libc::EBADF) => {
+                // Pinning prevents LRU eviction, but remove() (unlink/rename)
+                // can still delete the handle while we hold a pin. Purge the
+                // stale entry and retry once with a fresh handle.
+                {
+                    let mut pool = self.handle_pool.lock().expect("handle_pool poisoned");
+                    if pool.get_unpinned(id) == Some(file_handle) {
+                        pool.remove(id);
+                    }
+                }
+                let file_handle = self.get_or_open_handle(id).await?;
+                let result = self.virtual_fs.read(file_handle, offset, count).await;
+                self.handle_pool.lock().expect("handle_pool poisoned").unpin(id);
+                result.map(|(b, eof)| (b.to_vec(), eof)).map_err(errno_to_nfs)
+            }
+            Err(err) => Err(errno_to_nfs(err)),
+        }
     }
 
     async fn readdir(
@@ -547,8 +565,8 @@ pub async fn mount_nfs(
 const HANDLE_POOL_CAPACITY: usize = 64;
 
 struct InsertResult {
-    /// LRU eviction of a different ino (pool was full).
-    evicted: Option<(u64, u64)>,
+    /// LRU evictions of unpinned entries to bring the pool back to capacity.
+    evicted: Vec<(u64, u64)>,
     /// Replaced handle for the same ino (e.g. read -> write upgrade).
     replaced: Option<u64>,
 }
@@ -632,11 +650,12 @@ impl HandlePool {
     }
 
     /// Insert a handle. Returns evicted entries that the caller must release:
-    /// - `evicted`: LRU eviction if pool was full (different ino)
+    /// - `evicted`: LRU evictions to bring the pool back to capacity
     /// - `replaced`: old handle for the same ino (e.g. replacing read with write)
     ///
     /// Pinned entries (in-flight reads) are skipped during eviction. If all
-    /// entries are pinned the pool grows beyond capacity temporarily.
+    /// entries are pinned the pool grows beyond capacity temporarily but
+    /// shrinks back on the next insert after pins are released.
     fn insert(&mut self, ino: u64, file_handle: u64) -> InsertResult {
         let replaced = if let Some(old) = self.handles.remove(&ino) {
             self.order_remove(ino);
@@ -644,21 +663,27 @@ impl HandlePool {
         } else {
             None
         };
-        let evicted = if self.handles.len() >= HANDLE_POOL_CAPACITY {
-            // Find the oldest unpinned entry for eviction.
+        // Evict unpinned entries until we are back at capacity.
+        // This also reclaims overflow from previous pinned bursts.
+        let mut evicted = Vec::new();
+        while self.handles.len() >= HANDLE_POOL_CAPACITY {
             let evict_pos = self.order.iter().enumerate().find_map(|(idx, &candidate)| {
                 self.handles
                     .get(&candidate)
                     .filter(|entry| entry.pin_count == 0)
                     .map(|_| idx)
             });
-            evict_pos.and_then(|idx| {
-                let old_ino = self.order.remove(idx)?;
-                self.handles.remove(&old_ino).map(|entry| (old_ino, entry.file_handle))
-            })
-        } else {
-            None
-        };
+            match evict_pos {
+                Some(idx) => {
+                    if let Some(old_ino) = self.order.remove(idx)
+                        && let Some(entry) = self.handles.remove(&old_ino)
+                    {
+                        evicted.push((old_ino, entry.file_handle));
+                    }
+                }
+                None => break, // all remaining entries are pinned
+            }
+        }
         self.handles.insert(
             ino,
             HandleEntry {
@@ -812,7 +837,7 @@ mod tests {
         assert!(pool.get_unpinned(1).is_none());
 
         let result = pool.insert(1, 100);
-        assert!(result.evicted.is_none());
+        assert!(result.evicted.is_empty());
         assert!(result.replaced.is_none());
         assert_eq!(pool.get_unpinned(1), Some(100));
     }
@@ -834,8 +859,8 @@ mod tests {
         // Insert one more -> evicts LRU. ino=0 was accessed last (by get above),
         // so ino=1 (oldest untouched) should be evicted.
         let result = pool.insert(999, 9999);
-        assert!(result.evicted.is_some());
-        let (evicted_ino, evicted_fh) = result.evicted.unwrap();
+        assert_eq!(result.evicted.len(), 1);
+        let (evicted_ino, evicted_fh) = result.evicted[0];
         assert_eq!(evicted_ino, 1);
         assert_eq!(evicted_fh, 1001);
         assert!(result.replaced.is_none());
@@ -854,7 +879,7 @@ mod tests {
         // Re-insert ino=1 with new handle (e.g. replacing read with write)
         let result = pool.insert(1, 101);
         assert_eq!(result.replaced, Some(100), "old handle should be returned for release");
-        assert!(result.evicted.is_none());
+        assert!(result.evicted.is_empty());
 
         assert_eq!(pool.get_unpinned(1), Some(101));
         // order should have exactly 2 entries, not 3
@@ -877,7 +902,7 @@ mod tests {
         }
         let result = pool.insert(999, 9999);
         // ino=2 should be evicted (oldest after ino=1 was promoted)
-        assert_eq!(result.evicted, Some((2, 200)));
+        assert_eq!(result.evicted, vec![(2, 200)]);
     }
 
     #[test]
@@ -934,8 +959,8 @@ mod tests {
 
         // Insert one more — ino=0 is pinned so ino=1 should be evicted instead
         let result = pool.insert(999, 9999);
-        let (evicted_ino, _) = result.evicted.unwrap();
-        assert_eq!(evicted_ino, 1, "pinned entry should be skipped");
+        assert_eq!(result.evicted.len(), 1);
+        assert_eq!(result.evicted[0].0, 1, "pinned entry should be skipped");
 
         // ino=0 still present (was pinned)
         assert_eq!(pool.get_unpinned(0), Some(1000));
@@ -955,8 +980,8 @@ mod tests {
         // Now ino=0 (LRU, unpinned) should be evictable.
         // But ino=0 was promoted to MRU by get(), so ino=1 is still LRU.
         let result = pool.insert(999, 9999);
-        let (evicted_ino, _) = result.evicted.unwrap();
-        assert_eq!(evicted_ino, 1);
+        assert_eq!(result.evicted.len(), 1);
+        assert_eq!(result.evicted[0].0, 1);
     }
 
     #[test]
@@ -968,13 +993,20 @@ mod tests {
         }
         // All entries pinned — insert should succeed with no eviction
         let result = pool.insert(999, 9999);
-        assert!(result.evicted.is_none(), "no eviction when all entries are pinned");
+        assert!(result.evicted.is_empty(), "no eviction when all entries are pinned");
         assert_eq!(pool.handles.len(), HANDLE_POOL_CAPACITY + 1);
 
         // Unpin all
         for i in 0..HANDLE_POOL_CAPACITY as u64 {
             pool.unpin(i);
         }
+
+        // Next insert should reclaim overflow entries
+        let result = pool.insert(998, 9998);
+        // Should evict enough to bring pool back to capacity (evict 2: the
+        // overflow entry 999 is MRU, so oldest unpinned entries are evicted)
+        assert!(result.evicted.len() >= 2, "pool should shrink after overflow");
+        assert!(pool.handles.len() <= HANDLE_POOL_CAPACITY + 1);
     }
 
     #[test]

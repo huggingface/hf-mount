@@ -1129,15 +1129,20 @@ impl VirtualFs {
     /// Allocate a lazy file handle backed by a prefetch buffer.
     fn open_lazy(&self, ino: u64, xet_hash: String, size: u64) -> VirtualFsResult<u64> {
         let prefetch = Arc::new(tokio::sync::Mutex::new(PrefetchState::new(
-            xet_hash,
+            xet_hash.clone(),
             size,
             self.direct_io,
         )));
         let file_handle = self.alloc_file_handle();
-        self.open_files
-            .write()
-            .expect("open_files poisoned")
-            .insert(file_handle, OpenFile::Lazy { ino, prefetch });
+        self.open_files.write().expect("open_files poisoned").insert(
+            file_handle,
+            OpenFile::Lazy {
+                ino,
+                xet_hash,
+                file_size: size,
+                prefetch,
+            },
+        );
         Ok(file_handle)
     }
 
@@ -1278,8 +1283,15 @@ impl VirtualFs {
             let files = self.open_files.read().expect("open_files poisoned");
             match files.get(&file_handle) {
                 Some(OpenFile::Local { file, .. }) => ReadTarget::LocalFd(file.clone()),
-                Some(OpenFile::Lazy { ino, prefetch }) => ReadTarget::Remote {
+                Some(OpenFile::Lazy {
+                    ino,
+                    xet_hash,
+                    file_size,
+                    prefetch,
+                }) => ReadTarget::Remote {
                     ino: *ino,
+                    xet_hash: xet_hash.clone(),
+                    file_size: *file_size,
                     prefetch: prefetch.clone(),
                 },
                 Some(OpenFile::Streaming { .. }) => return Err(libc::EBADF), // write-only
@@ -1309,7 +1321,12 @@ impl VirtualFs {
                     Ok((buf.freeze(), eof))
                 }
             }
-            ReadTarget::Remote { ino, prefetch } => {
+            ReadTarget::Remote {
+                ino,
+                xet_hash,
+                file_size,
+                prefetch,
+            } => {
                 // Try to acquire the prefetch lock without blocking. If another
                 // read on the same handle is in progress (common in NFS where
                 // one handle is shared per inode), fall back to a direct CAS
@@ -1323,7 +1340,7 @@ impl VirtualFs {
                             "read: prefetch lock contended for ino={}, trying direct range download",
                             ino,
                         );
-                        match self.try_read_direct(ino, offset, size).await? {
+                        match self.try_read_direct(&xet_hash, file_size, offset, size).await? {
                             Some(result) => Ok(result),
                             None => {
                                 // Non-xet file: must go through prefetch path.
@@ -1417,28 +1434,35 @@ impl VirtualFs {
     /// window, no stream reuse — so it does not interfere with the other
     /// reader's sequential access pattern.
     ///
+    /// Uses the xet_hash/file_size snapshot from open time (same revision as
+    /// the prefetch path) to avoid reading a potentially stale inode table.
+    ///
     /// Returns `None` for non-xet files (plain git/LFS) since those require
     /// the prefetch path (HTTP download to staging). The caller should fall
     /// back to waiting for the prefetch lock.
-    async fn try_read_direct(&self, ino: u64, offset: u64, size: u32) -> VirtualFsResult<Option<(Bytes, bool)>> {
-        let entry = self.get_file_entry(ino)?;
-
-        if entry.xet_hash.is_empty() {
+    async fn try_read_direct(
+        &self,
+        xet_hash: &str,
+        file_size: u64,
+        offset: u64,
+        size: u32,
+    ) -> VirtualFsResult<Option<(Bytes, bool)>> {
+        if xet_hash.is_empty() {
             return Ok(None);
         }
 
-        if offset >= entry.size {
+        if offset >= file_size {
             return Ok(Some((Bytes::new(), true)));
         }
 
-        let needed = (size as u64).min(entry.size - offset);
-        let file_info = XetFileInfo::new(entry.xet_hash, entry.size);
+        let needed = (size as u64).min(file_size - offset);
+        let file_info = XetFileInfo::new(xet_hash.to_string(), file_size);
         let end = offset + needed;
         let mut stream = self
             .xet_sessions
             .download_stream_boxed(&file_info, offset, Some(end))
             .map_err(|err| {
-                tracing::error!("try_read_direct: stream open failed for ino={}: {}", ino, err);
+                tracing::error!("try_read_direct: stream open failed: {}", err);
                 libc::EIO
             })?;
 
@@ -1447,16 +1471,30 @@ impl VirtualFs {
         while response.len() < to_read {
             match stream.next().await {
                 Ok(Some(chunk)) => response.extend_from_slice(&chunk),
-                Ok(None) => break,
+                Ok(None) => {
+                    // Premature EOF — returning a short read would violate the
+                    // FUSE invariant (fuse_read_update_size shrinks i_size).
+                    if response.len() < to_read {
+                        tracing::error!(
+                            "try_read_direct: premature EOF at offset={}, got={}/{}, file_size={}",
+                            offset,
+                            response.len(),
+                            to_read,
+                            file_size,
+                        );
+                        return Err(libc::EIO);
+                    }
+                    break;
+                }
                 Err(err) => {
-                    tracing::error!("try_read_direct: stream error for ino={}: {}", ino, err);
+                    tracing::error!("try_read_direct: stream error: {}", err);
                     return Err(libc::EIO);
                 }
             }
         }
 
         response.truncate(to_read);
-        let eof = offset + response.len() as u64 >= entry.size;
+        let eof = offset + response.len() as u64 >= file_size;
         Ok(Some((response.freeze(), eof)))
     }
 
@@ -2881,6 +2919,10 @@ enum OpenFile {
     /// Lazy remote — data fetched on-demand with adaptive prefetch buffer.
     Lazy {
         ino: u64,
+        /// Snapshot of xet_hash at open time (used by direct-read fallback
+        /// to avoid re-reading a potentially stale inode table).
+        xet_hash: String,
+        file_size: u64,
         prefetch: Arc<tokio::sync::Mutex<PrefetchState>>,
     },
     /// Streaming append-only writer (default write mode).
@@ -2957,6 +2999,9 @@ enum ReadTarget {
     LocalFd(Arc<File>),
     Remote {
         ino: u64,
+        /// Snapshot from open time — avoids re-reading a potentially stale inode.
+        xet_hash: String,
+        file_size: u64,
         prefetch: Arc<tokio::sync::Mutex<PrefetchState>>,
     },
 }
