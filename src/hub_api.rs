@@ -555,7 +555,7 @@ impl HubApiClient {
 
     async fn list_tree_bucket(&self, bucket_id: &str, prefix: &str) -> Result<Vec<TreeEntry>> {
         let mut all_entries = Vec::new();
-        let recursive_param = "?recursive=false";
+        let recursive_param = "?recursive=false&limit=10000";
         let mut url = if prefix.is_empty() {
             format!("{}/api/buckets/{}/tree{recursive_param}", self.endpoint, bucket_id)
         } else {
@@ -594,9 +594,7 @@ impl HubApiClient {
         prefix: &str,
     ) -> Result<Vec<TreeEntry>> {
         let mut all_entries = Vec::new();
-        // expand=true fetches per-file lastCommit (mtime) from Gitaly.
-        // Acceptable for non-recursive listings where entry count is small.
-        let params = "?expand=true";
+        let params = "?limit=1000";
         let mut url = if prefix.is_empty() {
             format!(
                 "{}/api/{}/{}/tree/{}{params}",
