@@ -431,9 +431,11 @@ async fn flush_batch(
             .collect()
     };
 
-    // GC stale staging files (already-clean inodes re-enqueued after fsync/flush_one).
-    // Serialize with open_advanced_write via staging_lock to prevent races.
-    gc_staging(&stale_gc, staging_dir, inodes, has_open_handles, staging_locks).await;
+    // GC stale staging files only when over the disk budget.
+    // When under limit, staging files persist as a read-after-write cache.
+    if staging_dir.is_over_limit() {
+        gc_staging(&stale_gc, staging_dir, inodes, has_open_handles, staging_locks).await;
+    }
 
     if to_flush.is_empty() {
         return;
@@ -530,7 +532,11 @@ async fn flush_batch(
         gc
     };
 
-    let gc_count = gc_staging(&gc_inos, staging_dir, inodes, has_open_handles, staging_locks).await;
+    let gc_count = if staging_dir.is_over_limit() {
+        gc_staging(&gc_inos, staging_dir, inodes, has_open_handles, staging_locks).await
+    } else {
+        0
+    };
 
     info!(
         "Batch flush completed: {} file(s) committed, {} staging file(s) reclaimed",

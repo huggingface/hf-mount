@@ -2718,13 +2718,32 @@ fn shutdown_flushes_dirty() {
     assert!(!logs.is_empty());
 }
 
+/// Helper: create VFS with advanced writes + staging GC enabled (low limit).
+fn vfs_advanced_with_gc(
+    hub: &std::sync::Arc<MockHub>,
+    xet: &std::sync::Arc<MockXet>,
+) -> (tokio::runtime::Runtime, std::sync::Arc<VirtualFs>) {
+    let rt = new_runtime();
+    let vfs = make_test_vfs(
+        hub.clone(),
+        xet.clone(),
+        TestOpts {
+            advanced_writes: true,
+            max_staging_size: 1, // 1 byte = always over limit, GC always runs
+            ..Default::default()
+        },
+        &rt,
+    );
+    (rt, vfs)
+}
+
 /// After a successful flush, the staging file for a clean inode should be
 /// garbage-collected (deleted from disk).
 #[test]
 fn staging_gc_after_flush() {
     let hub = MockHub::new();
     let xet = MockXet::new();
-    let (rt, vfs) = vfs_advanced(&hub, &xet);
+    let (rt, vfs) = vfs_advanced_with_gc(&hub, &xet);
 
     rt.block_on(async {
         let (attr, fh) = vfs
@@ -2762,7 +2781,7 @@ fn staging_gc_after_flush() {
 fn staging_gc_after_fsync_then_release() {
     let hub = MockHub::new();
     let xet = MockXet::new();
-    let (rt, vfs) = vfs_advanced(&hub, &xet);
+    let (rt, vfs) = vfs_advanced_with_gc(&hub, &xet);
 
     rt.block_on(async {
         let (attr, fh) = vfs

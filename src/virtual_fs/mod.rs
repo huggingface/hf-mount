@@ -980,6 +980,9 @@ impl VirtualFs {
 
         // Reuse existing dirty staging file (unless truncating)
         if !(is_dirty && staging_path.exists() && !truncate) {
+            // Capture the old file size before overwriting (may be a cached
+            // staging file from a previous open that persisted under budget).
+            let old_size = std::fs::metadata(&staging_path).map(|m| m.len()).unwrap_or(0);
             if !truncate && !xet_hash.is_empty() && size > 0 {
                 // Download remote content for read-modify-write
                 self.xet_sessions
@@ -995,6 +998,12 @@ impl VirtualFs {
                     error!("Failed to create staging file: {}", e);
                     libc::EIO
                 })?;
+            }
+            // Adjust bytes after successful write: subtract the old size and add the new.
+            if let Some(ref sd) = self.staging_dir {
+                sd.sub_bytes(old_size);
+                let file_size = std::fs::metadata(&staging_path).map(|m| m.len()).unwrap_or(0);
+                sd.add_bytes(file_size);
             }
         }
 
@@ -1475,6 +1484,9 @@ impl VirtualFs {
                     let mut inodes = self.inode_table.write().expect("inodes poisoned");
                     if let Some(entry) = inodes.get_mut(handle_ino) {
                         if new_end > entry.size {
+                            if let Some(ref sd) = self.staging_dir {
+                                sd.add_bytes(new_end - entry.size);
+                            }
                             entry.size = new_end;
                         }
                         entry.set_dirty();
@@ -1704,10 +1716,13 @@ impl VirtualFs {
                 // After remove_orphan, any entry still in the table has nlink > 0.
                 inodes.get(ino).is_some_and(|entry| !entry.is_dirty())
             };
-            // GC staging outside the inode lock. Serialize with open_advanced_write
-            // via staging_lock to prevent deleting a staging file that a concurrent
-            // open is preparing.
-            if is_clean && let Some(ref staging_dir) = self.staging_dir {
+            // GC staging only when over the disk budget. Serialize with
+            // open_advanced_write via staging_lock to prevent deleting a staging
+            // file that a concurrent open is preparing.
+            if is_clean
+                && let Some(ref staging_dir) = self.staging_dir
+                && staging_dir.is_over_limit()
+            {
                 let lock = self.staging_lock(ino);
                 let _guard = lock.lock().await;
                 // Re-check: open_advanced_write may have set dirty while we waited.
@@ -2656,6 +2671,11 @@ impl VirtualFs {
                         error!("Failed to create staging file for truncate: {}", e);
                         return Err(libc::EIO);
                     }
+                    // Track the newly materialized staging file.
+                    if let Some(ref sd) = self.staging_dir {
+                        let size = std::fs::metadata(&staging_path).map(|m| m.len()).unwrap_or(0);
+                        sd.add_bytes(size);
+                    }
                 }
 
                 // Phase 2: truncate file + update inode under the same write lock.
@@ -2678,6 +2698,13 @@ impl VirtualFs {
                     }
                 }
                 if let Some(entry) = inodes.get_mut(ino) {
+                    if let Some(ref sd) = self.staging_dir {
+                        if new_size < entry.size {
+                            sd.sub_bytes(entry.size - new_size);
+                        } else if new_size > entry.size {
+                            sd.add_bytes(new_size - entry.size);
+                        }
+                    }
                     entry.size = new_size;
                     entry.mtime = SystemTime::now();
                     entry.ctime = entry.mtime;
