@@ -2718,6 +2718,99 @@ fn shutdown_flushes_dirty() {
     assert!(!logs.is_empty());
 }
 
+/// Helper: create VFS with advanced writes + staging GC enabled (low limit).
+fn vfs_advanced_with_gc(
+    hub: &std::sync::Arc<MockHub>,
+    xet: &std::sync::Arc<MockXet>,
+) -> (tokio::runtime::Runtime, std::sync::Arc<VirtualFs>) {
+    let rt = new_runtime();
+    let vfs = make_test_vfs(
+        hub.clone(),
+        xet.clone(),
+        TestOpts {
+            advanced_writes: true,
+            max_staging_size: 1, // 1 byte = always over limit, GC always runs
+            ..Default::default()
+        },
+        &rt,
+    );
+    (rt, vfs)
+}
+
+/// After a successful flush, the staging file for a clean inode should be
+/// garbage-collected (deleted from disk).
+#[test]
+fn staging_gc_after_flush() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_advanced_with_gc(&hub, &xet);
+
+    rt.block_on(async {
+        let (attr, fh) = vfs
+            .create(ROOT_INODE, "gc_test.txt", 0o644, 1000, 1000, None)
+            .await
+            .unwrap();
+        let ino = attr.ino;
+
+        write_blocking(&vfs, ino, fh, 0, b"some data").await.unwrap();
+
+        // Staging file should exist before release
+        let staging_path = vfs.staging_dir.as_ref().unwrap().path(ino);
+        assert!(staging_path.exists(), "staging file should exist after write");
+
+        vfs.release(fh).await.unwrap();
+
+        // Wait for flush debounce (100ms) + processing
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        // After flush, inode should be clean
+        let is_clean = vfs.inode_table.read().unwrap().get(ino).is_some_and(|e| !e.is_dirty());
+        assert!(is_clean, "inode should be clean after flush");
+
+        // Staging file should have been GC'd
+        assert!(
+            !staging_path.exists(),
+            "staging file should be deleted after successful flush"
+        );
+    });
+}
+
+/// After fsync (flush_one) commits a file, the staging file is preserved (still
+/// open for writing). On release, the GC should clean it up since the inode is clean.
+#[test]
+fn staging_gc_after_fsync_then_release() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_advanced_with_gc(&hub, &xet);
+
+    rt.block_on(async {
+        let (attr, fh) = vfs
+            .create(ROOT_INODE, "fsync_gc.txt", 0o644, 1000, 1000, None)
+            .await
+            .unwrap();
+        let ino = attr.ino;
+
+        write_blocking(&vfs, ino, fh, 0, b"fsync data").await.unwrap();
+
+        let staging_path = vfs.staging_dir.as_ref().unwrap().path(ino);
+        assert!(staging_path.exists(), "staging file should exist after write");
+
+        // fsync commits the file but staging must survive (handle still open)
+        vfs.fsync(ino, fh, None).await.unwrap();
+        assert!(
+            staging_path.exists(),
+            "staging file should survive fsync (handle still open)"
+        );
+
+        // Release the handle — inode is already clean, GC should remove staging
+        vfs.release(fh).await.unwrap();
+        assert!(
+            !staging_path.exists(),
+            "staging file should be GC'd on release of clean inode"
+        );
+    });
+}
+
 /// Sequential reads should pass `end=None` (unbounded stream), while seek reads
 /// should pass `end=Some(offset+size)` (bounded range). Validates that the mock
 /// correctly records and respects the `end` parameter.

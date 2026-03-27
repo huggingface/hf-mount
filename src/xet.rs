@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use ulid::Ulid;
@@ -178,20 +179,48 @@ impl DownloadStreamOps for DownloadStreamWrapper {
 
 /// On-disk staging area for advanced writes (random seek, read-modify-write).
 /// Not used in simple (append-only) mode.
+///
+/// Tracks disk usage via `bytes_used`. When `max_bytes > 0` and usage exceeds
+/// the limit, the flush loop garbage-collects flushed staging files. When under
+/// the limit (or unlimited), staging files persist as a local read-after-write cache.
 #[derive(Clone)]
 pub struct StagingDir {
     dir: PathBuf,
     /// Per-session random key to make staging paths unpredictable.
     session_key: u64,
+    /// Approximate bytes used by staging files on disk.
+    bytes_used: Arc<AtomicU64>,
+    /// Maximum staging bytes before GC kicks in. 0 = unlimited.
+    max_bytes: u64,
 }
 
 impl StagingDir {
-    pub fn new(cache_dir: &Path) -> Self {
+    pub fn new(cache_dir: &Path, max_bytes: u64) -> Self {
         let dir = cache_dir.join("staging");
         std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("Failed to create staging dir {:?}: {e}", dir));
+
+        let session_key = rand_u64();
+
+        // Seed bytes_used from pre-existing staging files so the budget is
+        // correct from the start. Don't delete them: another mount process
+        // may share the same cache_dir.
+        let mut existing_bytes = 0u64;
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                if entry.file_name().to_string_lossy().starts_with("ino_")
+                    && let Ok(meta) = entry.metadata()
+                    && meta.is_file()
+                {
+                    existing_bytes += meta.len();
+                }
+            }
+        }
+
         Self {
             dir,
-            session_key: rand_u64(),
+            session_key,
+            bytes_used: Arc::new(AtomicU64::new(existing_bytes)),
+            max_bytes,
         }
     }
 
@@ -204,6 +233,44 @@ impl StagingDir {
     /// Deterministic within a session but unpredictable from outside.
     pub fn path(&self, inode: u64) -> PathBuf {
         self.dir.join(format!("ino_{:x}_{:016x}", inode, self.session_key))
+    }
+
+    /// Remove the staging file for `inode`, ignoring NotFound.
+    /// Returns `true` if the file was actually removed.
+    pub fn try_remove(&self, inode: u64) -> bool {
+        let path = self.path(inode);
+        let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        match std::fs::remove_file(&path) {
+            Ok(()) => {
+                self.sub_bytes(size);
+                true
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => {
+                tracing::warn!("staging GC: failed to remove ino={}: {}", inode, e);
+                false
+            }
+        }
+    }
+
+    /// Whether staging usage exceeds the configured limit.
+    pub fn is_over_limit(&self) -> bool {
+        self.max_bytes > 0 && self.bytes_used.load(Ordering::Relaxed) > self.max_bytes
+    }
+
+    /// Record bytes added to staging (file download or write growth).
+    pub fn add_bytes(&self, n: u64) {
+        self.bytes_used.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Record bytes removed from staging (file deletion or truncation).
+    /// Saturates at zero to avoid wrapping on accounting mismatches.
+    pub fn sub_bytes(&self, n: u64) {
+        self.bytes_used
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_sub(n))
+            })
+            .ok();
     }
 }
 

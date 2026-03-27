@@ -445,6 +445,7 @@ pub struct TestOpts {
     pub advanced_writes: bool,
     pub serve_lookup_from_cache: bool,
     pub metadata_ttl: Duration,
+    pub max_staging_size: u64,
 }
 
 impl Default for TestOpts {
@@ -454,6 +455,7 @@ impl Default for TestOpts {
             advanced_writes: false,
             serve_lookup_from_cache: false,
             metadata_ttl: Duration::from_secs(1),
+            max_staging_size: 0,
         }
     }
 }
@@ -469,9 +471,12 @@ pub fn make_test_vfs(
     // Repos need a staging dir for HTTP download cache (open_readonly),
     // even when advanced_writes is disabled (mirrors setup.rs logic).
     let staging_dir = if opts.advanced_writes || hub.is_repo() {
-        let path = std::env::temp_dir().join(format!("hf_mount_test_{}", std::process::id()));
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("hf_mount_test_{}_{}", std::process::id(), id));
         std::fs::create_dir_all(&path).expect("failed to create temp staging dir");
-        Some(StagingDir::new(&path))
+        Some(StagingDir::new(&path, opts.max_staging_size))
     } else {
         None
     };
