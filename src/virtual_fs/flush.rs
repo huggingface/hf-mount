@@ -11,6 +11,24 @@ use crate::xet::{StagingDir, XetOps};
 
 use super::inode::InodeTable;
 
+/// Callback to check if any open file handle references a given inode.
+/// Used by GC to avoid removing staging files while a handle is still open
+/// (e.g. long-lived NFS handles that survive across flush cycles).
+type HasOpenHandlesFn = Arc<dyn Fn(u64) -> bool + Send + Sync>;
+
+/// Shared per-inode staging locks. Used by GC to serialize with
+/// open_advanced_write, which creates staging files under this lock.
+pub(super) type StagingLocks = Arc<Mutex<HashMap<u64, Arc<tokio::sync::Mutex<()>>>>>;
+
+fn get_staging_lock(locks: &StagingLocks, ino: u64) -> Arc<tokio::sync::Mutex<()>> {
+    locks
+        .lock()
+        .expect("staging_locks poisoned")
+        .entry(ino)
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
+
 enum FlushSignal {
     /// Flush a dirty inode.
     Dirty(u64),
@@ -30,11 +48,14 @@ pub(crate) struct FlushManager {
 }
 
 impl FlushManager {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         xet_sessions: Arc<dyn XetOps>,
         staging_dir: StagingDir,
         hub_client: Arc<dyn HubOps>,
         inodes: Arc<RwLock<InodeTable>>,
+        has_open_handles: HasOpenHandlesFn,
+        staging_locks: StagingLocks,
         runtime: &tokio::runtime::Handle,
         debounce: Duration,
         max_batch_window: Duration,
@@ -52,6 +73,8 @@ impl FlushManager {
             staging_dir,
             bg_hub,
             inodes,
+            has_open_handles,
+            staging_locks,
             bg_errors,
             debounce,
             max_batch_window,
@@ -160,6 +183,8 @@ async fn flush_loop(
     staging_dir: StagingDir,
     hub_client: Arc<dyn HubOps>,
     inodes: Arc<RwLock<InodeTable>>,
+    has_open_handles: HasOpenHandlesFn,
+    staging_locks: StagingLocks,
     flush_errors: Arc<Mutex<HashMap<u64, String>>>,
     debounce: Duration,
     max_batch_window: Duration,
@@ -210,6 +235,8 @@ async fn flush_loop(
                 &*hub_client,
                 &inodes,
                 &flush_errors,
+                &has_open_handles,
+                &staging_locks,
             )
             .await;
         }
@@ -341,6 +368,7 @@ struct FlushItem {
     dirty_generation: u64,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn flush_batch(
     pending: Vec<u64>,
     xet_sessions: &dyn XetOps,
@@ -348,6 +376,8 @@ async fn flush_batch(
     hub_client: &dyn HubOps,
     inodes: &RwLock<InodeTable>,
     flush_errors: &Mutex<HashMap<u64, String>>,
+    has_open_handles: &HasOpenHandlesFn,
+    staging_locks: &StagingLocks,
 ) {
     // Dedup by inode (keep last request per ino).
     // Walk backwards so last occurrence wins, then reverse in-place.
@@ -359,6 +389,8 @@ async fn flush_batch(
 
     // Resolve paths from inode table, skip deleted/non-dirty/unlinked inodes.
     // Snapshot the dirty_generation so we only clear dirty if no concurrent writer advanced it.
+    // Also collect stale (already-clean) inodes for deferred staging GC.
+    let mut stale_gc = Vec::new();
     let to_flush: Vec<FlushItem> = {
         let inode_table = inodes.read().expect("inodes poisoned");
         deduped
@@ -371,11 +403,14 @@ async fn flush_batch(
                         return None;
                     }
                 };
-                if !entry.is_dirty() || entry.nlink == 0 {
-                    debug!(
-                        "flush: ino={} path={} not dirty or unlinked, skipping",
-                        ino, entry.full_path
-                    );
+                if entry.nlink == 0 {
+                    debug!("flush: ino={} unlinked, skipping", ino);
+                    return None;
+                }
+                if !entry.is_dirty() {
+                    // Defer GC to after the lock is released (needs async staging_lock).
+                    stale_gc.push(ino);
+                    debug!("flush: ino={} path={} not dirty, skipping", ino, entry.full_path);
                     return None;
                 }
                 let staging_path = staging_dir.path(ino);
@@ -395,6 +430,10 @@ async fn flush_batch(
             })
             .collect()
     };
+
+    // GC stale staging files (already-clean inodes re-enqueued after fsync/flush_one).
+    // Serialize with open_advanced_write via staging_lock to prevent races.
+    gc_staging(&stale_gc, staging_dir, inodes, has_open_handles, staging_locks).await;
 
     if to_flush.is_empty() {
         return;
@@ -473,16 +512,65 @@ async fn flush_batch(
         return;
     }
 
-    let mut inode_table = inodes.write().expect("inodes poisoned");
-    for (chunk_idx, results) in &all_results {
-        let chunk_start = chunk_idx * UPLOAD_CHUNK_SIZE;
-        let chunk = &to_flush[chunk_start..chunk_start + results.len()];
-        for (item, file_info) in chunk.iter().zip(results.iter()) {
-            if let Some(entry) = inode_table.get_mut(item.ino) {
-                entry.apply_commit(file_info.hash(), file_info.file_size(), item.dirty_generation);
+    let gc_inos: Vec<u64> = {
+        let mut inode_table = inodes.write().expect("inodes poisoned");
+        let mut gc = Vec::new();
+        for (chunk_idx, results) in &all_results {
+            let chunk_start = chunk_idx * UPLOAD_CHUNK_SIZE;
+            let chunk = &to_flush[chunk_start..chunk_start + results.len()];
+            for (item, file_info) in chunk.iter().zip(results.iter()) {
+                if let Some(entry) = inode_table.get_mut(item.ino) {
+                    entry.apply_commit(file_info.hash(), file_info.file_size(), item.dirty_generation);
+                    if !entry.is_dirty() {
+                        gc.push(item.ino);
+                    }
+                }
             }
         }
-    }
+        gc
+    };
 
-    info!("Batch flush completed: {} file(s) committed", to_flush.len());
+    let gc_count = gc_staging(&gc_inos, staging_dir, inodes, has_open_handles, staging_locks).await;
+
+    info!(
+        "Batch flush completed: {} file(s) committed, {} staging file(s) reclaimed",
+        to_flush.len(),
+        gc_count
+    );
+}
+
+/// Remove staging files for clean inodes, serialized with open_advanced_write
+/// via staging_lock. Returns the number of files reclaimed.
+///
+/// Safety: (1) has_open_handles skips inodes with active writable handles (NFS),
+/// (2) staging_lock prevents races with concurrent open_advanced_write, and
+/// (3) re-checking is_dirty after the lock catches concurrent set_dirty calls.
+/// Existing readonly fds remain valid via Unix unlink semantics.
+async fn gc_staging(
+    inos: &[u64],
+    staging_dir: &StagingDir,
+    inodes: &RwLock<InodeTable>,
+    has_open_handles: &HasOpenHandlesFn,
+    staging_locks: &StagingLocks,
+) -> usize {
+    let mut count = 0;
+    for &ino in inos {
+        if has_open_handles(ino) {
+            debug!("staging GC: skipping ino={} (open handles)", ino);
+            continue;
+        }
+        let lock = get_staging_lock(staging_locks, ino);
+        let _guard = lock.lock().await;
+        // Re-check: open_advanced_write may have set dirty while we waited.
+        let still_clean = inodes
+            .read()
+            .expect("inodes poisoned")
+            .get(ino)
+            .is_some_and(|entry| !entry.is_dirty());
+        if still_clean && staging_dir.try_remove(ino) {
+            count += 1;
+            debug!("staging GC: removed ino={}", ino);
+        }
+    }
+    count
 }

@@ -205,6 +205,19 @@ impl StagingDir {
     pub fn path(&self, inode: u64) -> PathBuf {
         self.dir.join(format!("ino_{:x}_{:016x}", inode, self.session_key))
     }
+
+    /// Remove the staging file for `inode`, ignoring NotFound.
+    /// Returns `true` if the file was actually removed.
+    pub fn try_remove(&self, inode: u64) -> bool {
+        match std::fs::remove_file(self.path(inode)) {
+            Ok(()) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => {
+                tracing::warn!("staging GC: failed to remove ino={}: {}", inode, e);
+                false
+            }
+        }
+    }
 }
 
 fn rand_u64() -> u64 {
