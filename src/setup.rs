@@ -150,6 +150,14 @@ pub struct MountOptions {
     /// When not set, requires `user_allow_other` in /etc/fuse.conf on Linux.
     #[arg(long, default_value_t = false)]
     pub fuse_owner_only: bool,
+
+    /// Use a pre-opened /dev/fuse file descriptor instead of opening /dev/fuse
+    /// and performing the kernel mount. The kernel FUSE mount must already be
+    /// established on this fd by the caller (e.g. a CSI driver).
+    /// When set, the mount_point argument is ignored for mounting but still
+    /// used for logging.
+    #[arg(long)]
+    pub fuse_fd: Option<i32>,
 }
 
 /// CLI args for the foreground FUSE/NFS binaries.
@@ -175,6 +183,7 @@ pub struct MountSetup {
     pub max_threads: usize,
     pub metadata_ttl_ms: u64,
     pub fuse_owner_only: bool,
+    pub fuse_fd: Option<i32>,
 }
 
 // ── Tracing + env vars (no threads) ──────────────────────────────────
@@ -405,6 +414,7 @@ pub fn build(source: Source, options: MountOptions, is_nfs: bool) -> MountSetup 
         max_threads: options.max_threads,
         metadata_ttl_ms: options.metadata_ttl_ms,
         fuse_owner_only: options.fuse_owner_only,
+        fuse_fd: options.fuse_fd,
     }
 }
 

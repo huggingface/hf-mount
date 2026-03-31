@@ -18,6 +18,7 @@ fn main() {
         &s.runtime,
         daemon_guard.as_mut(),
         s.fuse_owner_only,
+        s.fuse_fd,
     ) {
         std::process::exit(1);
     }
