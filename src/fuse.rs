@@ -1,4 +1,5 @@
 use std::ffi::OsStr;
+use std::os::fd::FromRawFd;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -510,6 +511,7 @@ pub fn mount_fuse(
     runtime: &tokio::runtime::Runtime,
     daemon_guard: Option<&mut DaemonGuard>,
     fuse_owner_only: bool,
+    fuse_fd: Option<i32>,
 ) -> bool {
     let adapter = FuseAdapter::new(
         runtime.handle().clone(),
@@ -557,19 +559,33 @@ pub fn mount_fuse(
         config.n_threads = Some(max_threads);
     }
 
-    let session = match fuser::Session::new(adapter, mount_point, &config) {
-        Ok(s) => s,
-        Err(e) => {
-            if e.kind() == std::io::ErrorKind::PermissionDenied {
-                error!(
-                    "Permission denied: mounting a FUSE filesystem requires root privileges. \
-                     Try running with: sudo {}",
-                    std::env::args().collect::<Vec<_>>().join(" ")
-                );
-            } else {
-                error!("FUSE session failed: {}", e);
+    let session = if let Some(raw_fd) = fuse_fd {
+        // Use a pre-opened /dev/fuse fd (sidecar mode). The kernel FUSE mount
+        // was already performed by the CSI driver; we just run the userspace daemon.
+        let owned_fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw_fd) };
+        info!("Using pre-opened FUSE fd={}", raw_fd);
+        match fuser::Session::from_fd(adapter, owned_fd, config.acl, config) {
+            Ok(s) => s,
+            Err(e) => {
+                error!("FUSE session from fd={} failed: {}", raw_fd, e);
+                return false;
             }
-            return false;
+        }
+    } else {
+        match fuser::Session::new(adapter, mount_point, &config) {
+            Ok(s) => s,
+            Err(e) => {
+                if e.kind() == std::io::ErrorKind::PermissionDenied {
+                    error!(
+                        "Permission denied: mounting a FUSE filesystem requires root privileges. \
+                         Try running with: sudo {}",
+                        std::env::args().collect::<Vec<_>>().join(" ")
+                    );
+                } else {
+                    error!("FUSE session failed: {}", e);
+                }
+                return false;
+            }
         }
     };
     let notifier = session.notifier();
