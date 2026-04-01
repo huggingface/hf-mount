@@ -1096,6 +1096,48 @@ fn flush_manager_check_error_surfaces() {
     });
 }
 
+/// Concurrent shutdown calls must not deadlock. Reproduces the scenario where
+/// destroy() and the signal handler both call shutdown() simultaneously.
+#[test]
+fn concurrent_shutdown_no_deadlock() {
+    let hub = MockHub::new();
+    hub.add_file("file.txt", 100, Some("hash1"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_advanced(&hub, &xet);
+
+    rt.block_on(async {
+        let attr = vfs.lookup(ROOT_INODE, "file.txt").await.unwrap();
+        let fh = vfs.open(attr.ino, true, true, Some(42)).await.unwrap();
+        write_blocking(&vfs, attr.ino, fh, 0, b"dirty data").await.unwrap();
+        vfs.release(fh).await.unwrap();
+    });
+
+    // Spawn two threads calling shutdown concurrently (simulates destroy + signal handler).
+    let vfs1 = vfs.clone();
+    let vfs2 = vfs.clone();
+
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let done_tx2 = done_tx.clone();
+
+    std::thread::spawn(move || {
+        vfs1.shutdown();
+        let _ = done_tx.send(());
+    });
+    std::thread::spawn(move || {
+        // Small delay to overlap with the first shutdown.
+        std::thread::sleep(Duration::from_millis(10));
+        vfs2.shutdown();
+        let _ = done_tx2.send(());
+    });
+
+    // Both must complete within 10s, otherwise we have a deadlock.
+    for _ in 0..2 {
+        done_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("shutdown deadlocked: thread did not complete within 10s");
+    }
+}
+
 /// getattr on a nonexistent inode returns ENOENT.
 #[test]
 fn getattr_nonexistent_enoent() {
