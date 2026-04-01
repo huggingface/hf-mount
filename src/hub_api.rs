@@ -338,7 +338,7 @@ async fn send_with_retry(
 }
 
 fn make_clients(backend: &str) -> (Client, Client) {
-    let user_agent = format!("hf-mount/{} (fs={})", env!("CARGO_PKG_VERSION"), backend);
+    let user_agent = format!("hf-mount/{}; fs/{}", env!("CARGO_PKG_VERSION"), backend);
     let client = Client::builder()
         .user_agent(&user_agent)
         .build()
