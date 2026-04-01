@@ -493,6 +493,7 @@ pub fn make_test_vfs(
             direct_io: false,
             flush_debounce: Duration::from_millis(100),
             flush_max_batch_window: Duration::from_secs(1),
+            no_push: false,
         },
     )
 }

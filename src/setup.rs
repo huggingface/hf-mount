@@ -150,6 +150,14 @@ pub struct MountOptions {
     /// When not set, requires `user_allow_other` in /etc/fuse.conf on Linux.
     #[arg(long, default_value_t = false)]
     pub fuse_owner_only: bool,
+
+    /// Allow local writes without pushing to remote storage.
+    /// The mount accepts writes that are stored locally in --cache-dir,
+    /// but never uploaded to the remote. Reads check local files first,
+    /// then fall back to the remote (overlay semantics).
+    /// Implies --advanced-writes; incompatible with explicit --read-only.
+    #[arg(long, default_value_t = false)]
+    pub no_push: bool,
 }
 
 /// CLI args for the foreground FUSE/NFS binaries.
@@ -278,9 +286,18 @@ pub fn build(source: Source, options: MountOptions, is_nfs: bool) -> MountSetup 
         });
     }
 
-    let read_only = options.read_only || hub_client.is_repo();
-    if hub_client.is_repo() && !options.read_only {
+    if options.no_push && options.read_only {
+        panic!("--no-push and --read-only are mutually exclusive");
+    }
+    let read_only = (options.read_only || hub_client.is_repo()) && !options.no_push;
+    if hub_client.is_repo() && !options.read_only && !options.no_push {
         info!("Repo mounts are always read-only");
+    }
+    if options.no_push {
+        info!(
+            "No-push mode: writes are stored locally in {:?}, never uploaded",
+            options.cache_dir
+        );
     }
 
     let refresher = hub_client.token_refresher(read_only);
@@ -315,7 +332,7 @@ pub fn build(source: Source, options: MountOptions, is_nfs: bool) -> MountSetup 
     let upload_config = if read_only { None } else { Some(cas_config) };
     let xet_sessions = XetSessions::new(download_session, upload_config, cached_client);
 
-    let advanced_writes = options.advanced_writes || (is_nfs && !read_only);
+    let advanced_writes = options.advanced_writes || options.no_push || (is_nfs && !read_only);
     // Repos need a staging dir for HTTP download cache (open_readonly),
     // even when advanced_writes is disabled.
     let staging_dir = if advanced_writes || hub_client.is_repo() {
@@ -356,7 +373,8 @@ pub fn build(source: Source, options: MountOptions, is_nfs: bool) -> MountSetup 
     info!(
         "Config: advanced_writes={} direct_io={} poll_interval={}s metadata_ttl={}ms \
          cache_dir={:?} cache_size={} no_disk_cache={} max_threads={} \
-         flush_debounce={}ms flush_max_batch={}ms uid={} gid={} filter_os_files={}",
+         flush_debounce={}ms flush_max_batch={}ms uid={} gid={} filter_os_files={} \
+         no_push={}",
         advanced_writes,
         options.direct_io,
         options.poll_interval_secs,
@@ -370,6 +388,7 @@ pub fn build(source: Source, options: MountOptions, is_nfs: bool) -> MountSetup 
         uid,
         gid,
         !options.no_filter_os_files,
+        options.no_push,
     );
 
     let metadata_ttl = std::time::Duration::from_millis(options.metadata_ttl_ms);
@@ -391,6 +410,7 @@ pub fn build(source: Source, options: MountOptions, is_nfs: bool) -> MountSetup 
             direct_io: options.direct_io && !is_nfs,
             flush_debounce: std::time::Duration::from_millis(options.flush_debounce_ms),
             flush_max_batch_window: std::time::Duration::from_millis(options.flush_max_batch_window_ms),
+            no_push: options.no_push,
         },
     );
 
