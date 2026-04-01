@@ -338,8 +338,13 @@ async fn send_with_retry(
 }
 
 fn make_clients() -> (Client, Client) {
-    let client = Client::new();
+    let user_agent = format!("hf-mount/{}", env!("CARGO_PKG_VERSION"));
+    let client = Client::builder()
+        .user_agent(&user_agent)
+        .build()
+        .expect("failed to build client");
     let head_client = Client::builder()
+        .user_agent(&user_agent)
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .expect("failed to build head_client");
