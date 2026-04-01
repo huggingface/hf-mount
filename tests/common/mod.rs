@@ -36,7 +36,7 @@ pub async fn setup_bucket(test_name: &str) -> Option<(String, String, Arc<hf_mou
     create_bucket(&ep, &token, &bucket_id).await;
     eprintln!("Created bucket: {}", bucket_id);
 
-    let hub = hf_mount::hub_api::HubApiClient::new(&ep, Some(&token), &bucket_id);
+    let hub = hf_mount::hub_api::HubApiClient::new(&ep, Some(&token), &bucket_id, "test");
     Some((token, bucket_id, hub))
 }
 

@@ -257,6 +257,7 @@ pub fn build(source: Source, options: MountOptions, is_nfs: bool) -> MountSetup 
         }
     };
 
+    let backend = if is_nfs { "nfs" } else { "fuse" };
     let hub_client = runtime.block_on(async {
         HubApiClient::from_source(
             &options.hub_endpoint,
@@ -264,6 +265,7 @@ pub fn build(source: Source, options: MountOptions, is_nfs: bool) -> MountSetup 
             options.token_file.clone(),
             source_kind,
             path_prefix,
+            backend,
         )
         .await
         .unwrap_or_else(|e| panic!("Failed to initialize Hub client: {e}"))

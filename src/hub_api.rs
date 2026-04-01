@@ -337,8 +337,8 @@ async fn send_with_retry(
     }
 }
 
-fn make_clients() -> (Client, Client) {
-    let user_agent = format!("hf-mount/{}", env!("CARGO_PKG_VERSION"));
+fn make_clients(backend: &str) -> (Client, Client) {
+    let user_agent = format!("hf-mount/{} ({})", env!("CARGO_PKG_VERSION"), backend);
     let client = Client::builder()
         .user_agent(&user_agent)
         .build()
@@ -361,8 +361,9 @@ impl HubApiClient {
         token_file: Option<PathBuf>,
         source: SourceKind,
         path_prefix: String,
+        backend: &str,
     ) -> Result<Arc<Self>> {
-        let (client, head_client) = make_clients();
+        let (client, head_client) = make_clients(backend);
         let endpoint = endpoint.trim_end_matches('/').to_string();
 
         let (source, last_modified) = match source {
@@ -417,8 +418,8 @@ impl HubApiClient {
     }
 
     /// Create a client for a HuggingFace bucket.
-    pub fn new(endpoint: &str, token: Option<&str>, bucket_id: &str) -> Arc<Self> {
-        let (client, head_client) = make_clients();
+    pub fn new(endpoint: &str, token: Option<&str>, bucket_id: &str, backend: &str) -> Arc<Self> {
+        let (client, head_client) = make_clients(backend);
         Arc::new(Self {
             client,
             head_client,
@@ -1179,7 +1180,7 @@ mod tests {
     // ── prefixed_path / strip_path_prefix tests ───────────────────────
 
     fn make_test_client(prefix: &str, token_file: Option<PathBuf>) -> HubApiClient {
-        let (client, head_client) = make_clients();
+        let (client, head_client) = make_clients("test");
         HubApiClient {
             client,
             head_client,
