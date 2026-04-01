@@ -8,7 +8,7 @@ use fuser::{
     OpenFlags, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite,
     Request, TimeOrNow,
 };
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::daemon::DaemonGuard;
 use crate::virtual_fs::inode::InodeKind;
@@ -588,9 +588,6 @@ pub fn mount_fuse(
 
     info!("FUSE mount active at {:?}", mount_point);
 
-    // Grab the PID file path before signalling ready (for cleanup in signal handler).
-    let daemon_pid_file = daemon_guard.as_ref().map(|g| g.pid_file().to_path_buf());
-
     // Signal the parent process that the mount is live (daemon mode).
     if let Some(guard) = daemon_guard {
         guard.notify_ready();
@@ -603,12 +600,8 @@ pub fn mount_fuse(
     let session_ended_signal = session_ended.clone();
 
     // Catch SIGINT/SIGTERM and trigger a clean unmount. On success, fuser
-    // calls destroy() which runs shutdown(). On failure, we flush here before
-    // exiting so dirty data is not silently lost.
-    // We intentionally do NOT call shutdown() before unmount: FUSE is still
-    // live, so other processes could write to staging files during the flush,
-    // causing CAS to upload a mid-write snapshot.
-    let vfs_for_signal = virtual_fs.clone();
+    // calls destroy() which runs shutdown(). If unmount fails (e.g. CSI
+    // already unmounted), we defer to destroy()'s in-flight flush.
     let mp = mount_point.to_path_buf();
     runtime.spawn(async move {
         wait_for_signal().await;
@@ -619,15 +612,12 @@ pub fn mount_fuse(
         }
         info!("Received signal, unmounting...");
         if !unmount_fuse(&mp) {
-            // Unmount failed -- flush dirty data before force-exiting so we
-            // don't silently lose writes.
-            error!("Unmount failed, flushing dirty files before exit...");
-            vfs_for_signal.shutdown();
-            // Clean up PID file since process::exit skips DaemonGuard drop.
-            if let Some(pid_file) = &daemon_pid_file {
-                let _ = std::fs::remove_file(pid_file);
-            }
-            std::process::exit(1);
+            // Unmount failed. This typically means the CSI driver already
+            // unmounted the FUSE filesystem, so destroy() is running and
+            // will flush dirty files. Let the normal shutdown path
+            // (destroy -> bg.join -> safety-net shutdown) handle cleanup
+            // instead of killing the in-flight flush with process::exit.
+            warn!("Unmount failed, deferring to destroy() shutdown path");
         }
     });
 

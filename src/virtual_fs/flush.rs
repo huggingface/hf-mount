@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, Once, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::mpsc;
@@ -27,6 +27,8 @@ pub(crate) struct FlushManager {
     /// Queued remote delete paths. Shared with flush_loop, flushed in batch cycle and shutdown.
     pending_deletes: Arc<Mutex<Vec<String>>>,
     hub_client: Arc<dyn HubOps>,
+    /// Ensures shutdown runs exactly once. Subsequent calls are no-ops.
+    shutdown_once: Once,
 }
 
 impl FlushManager {
@@ -64,6 +66,7 @@ impl FlushManager {
             errors,
             pending_deletes,
             hub_client,
+            shutdown_once: Once::new(),
         }
     }
 
@@ -118,26 +121,32 @@ impl FlushManager {
     // ── Shutdown ────────────────────────────────────────────────────
 
     pub(crate) fn shutdown(&self, dirty_inos: Vec<u64>, runtime: &tokio::runtime::Handle) {
-        // Enqueue all remaining dirty files
-        if let Some(tx) = self.tx.lock().expect("flush_tx poisoned").as_ref() {
-            for ino in dirty_inos {
-                let _ = tx.send(FlushSignal::Dirty(ino));
-            }
-        }
-        // Drop the sender to signal the flush loop to drain and exit
-        self.tx.lock().expect("flush_tx poisoned").take();
-        // Wait for the flush task to complete.
-        // Use block_in_place so this is safe even when called from within the tokio runtime
-        // (e.g. NFS shutdown path which runs inside an async context).
-        if let Some(handle) = self.handle.lock().expect("flush_handle poisoned").take() {
-            run_blocking(|| {
-                if let Err(e) = runtime.block_on(handle) {
-                    error!("Flush task panicked: {}", e);
+        // Run shutdown exactly once. Subsequent calls (e.g. signal handler
+        // racing with destroy()) are no-ops.
+        self.shutdown_once.call_once(|| {
+            // Enqueue all remaining dirty files
+            if let Some(tx) = self.tx.lock().expect("flush_tx poisoned").as_ref() {
+                for ino in dirty_inos {
+                    let _ = tx.send(FlushSignal::Dirty(ino));
                 }
-            });
-        }
-        // Flush remaining queued deletes.
-        run_blocking(|| runtime.block_on(self.flush_deletes()));
+            }
+            // Drop the sender to signal the flush loop to drain and exit
+            self.tx.lock().expect("flush_tx poisoned").take();
+
+            // Take the handle then drop the guard before blocking.
+            let handle = self.handle.lock().expect("flush_handle poisoned").take();
+            if let Some(handle) = handle {
+                // Use block_in_place so this is safe even when called from within
+                // the tokio runtime (e.g. NFS shutdown path).
+                run_blocking(|| {
+                    if let Err(err) = runtime.block_on(handle) {
+                        error!("Flush task panicked: {}", err);
+                    }
+                });
+            }
+            // Flush remaining queued deletes.
+            run_blocking(|| runtime.block_on(self.flush_deletes()));
+        });
     }
 }
 
