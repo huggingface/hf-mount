@@ -336,7 +336,11 @@ pub fn build(source: Source, options: MountOptions, is_nfs: bool) -> MountSetup 
     // Repos need a staging dir for HTTP download cache (open_readonly),
     // even when advanced_writes is disabled.
     let staging_dir = if advanced_writes || hub_client.is_repo() {
-        Some(StagingDir::new(&options.cache_dir))
+        let sd = StagingDir::new(&options.cache_dir);
+        if options.no_push {
+            info!("Local writes will be stored in {:?}", sd.root());
+        }
+        Some(sd)
     } else {
         None
     };
