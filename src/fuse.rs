@@ -1,7 +1,10 @@
 use std::ffi::OsStr;
+use std::io;
 use std::os::fd::OwnedFd;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
 
 use fuser::{
@@ -12,6 +15,7 @@ use fuser::{
 use tracing::{error, info, warn};
 
 use crate::daemon::DaemonGuard;
+use crate::setup::MountSetup;
 use crate::virtual_fs::inode::InodeKind;
 use crate::virtual_fs::{VirtualFs, VirtualFsAttr};
 
@@ -98,7 +102,7 @@ macro_rules! os_to_str {
 
 impl Filesystem for FuseAdapter {
     /// Called once when the filesystem is mounted. Configures kernel FUSE parameters.
-    fn init(&mut self, _req: &Request, config: &mut KernelConfig) -> std::io::Result<()> {
+    fn init(&mut self, _req: &Request, config: &mut KernelConfig) -> io::Result<()> {
         // Max concurrent background kernel requests (readahead, writeback…).
         // Kernel default (12) is too low for network-backed I/O.
         let _ = config.set_max_background(64);
@@ -128,8 +132,8 @@ impl Filesystem for FuseAdapter {
                      simple streaming write mode cannot function. \
                      Use --advanced-writes or upgrade your kernel."
                 );
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Unsupported,
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
                     "FUSE_ATOMIC_O_TRUNC not supported by kernel",
                 ));
             }
@@ -497,47 +501,77 @@ impl Filesystem for FuseAdapter {
     }
 }
 
-/// Mount the VFS as a FUSE filesystem and block until unmount.
-/// Returns `true` if the mount ran and exited cleanly, `false` on startup failure.
-#[allow(clippy::too_many_arguments)]
-pub fn mount_fuse(
+/// A running FUSE session. The FUSE daemon is serving requests as soon as
+/// this is returned. Call `wait()` to block until the session ends.
+pub struct FuseSession {
+    bg: fuser::BackgroundSession,
     virtual_fs: Arc<VirtualFs>,
-    mount_point: &Path,
-    metadata_ttl: Duration,
-    read_only: bool,
-    advanced_writes: bool,
-    direct_io: bool,
-    max_threads: usize,
-    runtime: &tokio::runtime::Runtime,
+    mount_point: PathBuf,
+    runtime: tokio::runtime::Handle,
+}
+
+impl FuseSession {
+    /// Block until the FUSE session ends (unmount, signal, or error).
+    /// Installs a signal handler for clean unmount on SIGINT/SIGTERM/SIGHUP.
+    pub fn wait(self) {
+        let session_ended = Arc::new(AtomicBool::new(false));
+        let session_ended_signal = session_ended.clone();
+
+        // Catch SIGINT/SIGTERM and trigger a clean unmount. On success, fuser
+        // calls destroy() which runs shutdown(). If unmount fails (e.g. CSI
+        // already unmounted), we defer to destroy()'s in-flight flush.
+        let mp = self.mount_point.clone();
+        self.runtime.spawn(async move {
+            wait_for_signal().await;
+            if session_ended_signal.load(Ordering::Acquire) {
+                return;
+            }
+            info!("Received signal, unmounting...");
+            if !unmount_fuse(&mp) {
+                warn!("Unmount failed, deferring to destroy() shutdown path");
+            }
+        });
+
+        if let Err(err) = self.bg.join() {
+            error!("FUSE session error: {}", err);
+        }
+        session_ended.store(true, Ordering::Release);
+        // Safety net: flush after FUSE session ends. Covers external unmount
+        // (e.g. `fusermount -u`) where destroy() may not fire.
+        self.virtual_fs.shutdown();
+    }
+}
+
+/// Start a FUSE session. Returns immediately once the daemon is serving.
+/// The caller can signal readiness, then call `session.wait()` to block.
+pub fn mount_fuse(
+    setup: &MountSetup,
     daemon_guard: Option<&mut DaemonGuard>,
-    fuse_owner_only: bool,
     fuse_fd: Option<OwnedFd>,
-) -> bool {
+) -> Result<FuseSession, io::Error> {
     let adapter = FuseAdapter::new(
-        runtime.handle().clone(),
-        virtual_fs.clone(),
-        metadata_ttl,
-        read_only,
-        advanced_writes,
-        direct_io,
+        setup.runtime.handle().clone(),
+        setup.virtual_fs.clone(),
+        setup.metadata_ttl,
+        setup.read_only,
+        setup.advanced_writes,
+        setup.direct_io,
     );
+    let mount_point = &setup.mount_point;
 
     let mut config = fuser::Config::default();
     config.mount_options = vec![
         fuser::MountOption::FSName("hf-mount".to_string()),
         fuser::MountOption::DefaultPermissions,
     ];
-    if read_only {
+    if setup.read_only {
         config.mount_options.push(fuser::MountOption::RO);
     }
-    // macFUSE: show the volume in Finder sidebar.
-    // Skip volname if the mount path basename contains a comma (would corrupt
-    // the comma-separated FUSE -o option list).
     #[cfg(target_os = "macos")]
     {
         let volname = mount_point
             .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
+            .map(|n: &OsStr| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "hf-mount".to_string());
         if !volname.contains(',') {
             config
@@ -548,7 +582,7 @@ pub fn mount_fuse(
             .mount_options
             .push(fuser::MountOption::CUSTOM("local".to_string()));
     }
-    config.acl = if fuse_owner_only {
+    config.acl = if setup.fuse_owner_only {
         fuser::SessionACL::Owner
     } else {
         fuser::SessionACL::All
@@ -558,95 +592,43 @@ pub fn mount_fuse(
     // and cannot open /dev/fuse to create cloned fds. See #94.
     if cfg!(target_os = "linux") {
         config.clone_fd = fuse_fd.is_none();
-        config.n_threads = Some(max_threads);
+        config.n_threads = Some(setup.max_threads);
     }
 
     let session = if let Some(owned_fd) = fuse_fd {
-        // Use a pre-opened /dev/fuse fd (sidecar mode). The kernel FUSE mount
-        // was already performed by the CSI driver; we just run the userspace daemon.
         info!("Using pre-opened FUSE fd={:?}", owned_fd);
-        match fuser::Session::from_fd(adapter, owned_fd, config.acl, config) {
-            Ok(s) => s,
-            Err(e) => {
-                error!("FUSE session from fd failed: {}", e);
-                return false;
-            }
-        }
+        fuser::Session::from_fd(adapter, owned_fd, config.acl, config)?
     } else {
-        match fuser::Session::new(adapter, mount_point, &config) {
-            Ok(s) => s,
-            Err(e) => {
-                if e.kind() == std::io::ErrorKind::PermissionDenied {
-                    error!(
-                        "Permission denied: mounting a FUSE filesystem requires root privileges. \
-                         Try running with: sudo {}",
-                        std::env::args().collect::<Vec<_>>().join(" ")
-                    );
-                } else {
-                    error!("FUSE session failed: {}", e);
-                }
-                return false;
+        fuser::Session::new(adapter, mount_point, &config).inspect_err(|e| {
+            if e.kind() == io::ErrorKind::PermissionDenied {
+                error!(
+                    "Permission denied: mounting a FUSE filesystem requires root privileges. \
+                     Try running with: sudo {}",
+                    std::env::args().collect::<Vec<_>>().join(" ")
+                );
             }
-        }
+        })?
     };
     let notifier = session.notifier();
-    virtual_fs.set_invalidator(Box::new(move |ino| {
+    setup.virtual_fs.set_invalidator(Box::new(move |ino| {
         if let Err(e) = notifier.inval_inode(fuser::INodeNo(ino), 0, -1) {
             tracing::debug!("inval_inode({}) failed: {}", ino, e);
         }
     }));
-    let bg = match session.spawn() {
-        Ok(bg) => bg,
-        Err(e) => {
-            error!("FUSE spawn failed: {}", e);
-            return false;
-        }
-    };
+    let bg = session.spawn()?;
 
     info!("FUSE mount active at {:?}", mount_point);
 
-    // Signal the parent process that the mount is live (daemon mode).
     if let Some(guard) = daemon_guard {
         guard.notify_ready();
     }
 
-    // Flag set once the FUSE session has ended normally (bg.join returned).
-    // Prevents the signal handler from calling process::exit during the
-    // post-unmount shutdown flush.
-    let session_ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let session_ended_signal = session_ended.clone();
-
-    // Catch SIGINT/SIGTERM and trigger a clean unmount. On success, fuser
-    // calls destroy() which runs shutdown(). If unmount fails (e.g. CSI
-    // already unmounted), we defer to destroy()'s in-flight flush.
-    let mp = mount_point.to_path_buf();
-    runtime.spawn(async move {
-        wait_for_signal().await;
-        // If the FUSE session already ended (normal unmount path), the
-        // safety-net shutdown below will handle flushing. Don't interfere.
-        if session_ended_signal.load(std::sync::atomic::Ordering::Acquire) {
-            return;
-        }
-        info!("Received signal, unmounting...");
-        if !unmount_fuse(&mp) {
-            // Unmount failed. This typically means the CSI driver already
-            // unmounted the FUSE filesystem, so destroy() is running and
-            // will flush dirty files. Let the normal shutdown path
-            // (destroy -> bg.join -> safety-net shutdown) handle cleanup
-            // instead of killing the in-flight flush with process::exit.
-            warn!("Unmount failed, deferring to destroy() shutdown path");
-        }
-    });
-
-    if let Err(err) = bg.join() {
-        error!("FUSE session error: {}", err);
-    }
-    session_ended.store(true, std::sync::atomic::Ordering::Release);
-    // Safety net: flush after FUSE session ends. Covers external unmount
-    // (e.g. `fusermount -u`) where destroy() may not fire. Idempotent
-    // because shutdown() takes handles from Mutex<Option<...>>.
-    virtual_fs.shutdown();
-    true
+    Ok(FuseSession {
+        bg,
+        virtual_fs: setup.virtual_fs.clone(),
+        mount_point: mount_point.to_path_buf(),
+        runtime: setup.runtime.handle().clone(),
+    })
 }
 
 /// Wait for SIGINT, SIGTERM, or SIGHUP.
@@ -688,16 +670,16 @@ fn unmount_fuse(mount_point: &Path) -> bool {
 
     // Fallback: external command. Try fusermount3 first (FUSE3), then fusermount.
     #[cfg(target_os = "linux")]
-    let cmd_ok = std::process::Command::new("fusermount3")
+    let cmd_ok = Command::new("fusermount3")
         .args(["-u", "-z", &mount_point.to_string_lossy()])
         .status()
         .is_ok_and(|s| s.success())
-        || std::process::Command::new("fusermount")
+        || Command::new("fusermount")
             .args(["-u", "-z", &mount_point.to_string_lossy()])
             .status()
             .is_ok_and(|s| s.success());
     #[cfg(target_os = "macos")]
-    let cmd_ok = std::process::Command::new("umount")
+    let cmd_ok = Command::new("umount")
         .arg(mount_point)
         .status()
         .is_ok_and(|s| s.success());
