@@ -9,6 +9,8 @@ use xet_data::processing::data_client::default_config;
 use xet_data::processing::{CacheConfig, FileDownloadSession, create_remote_client, get_cache};
 
 use crate::cached_xet_client::CachedXetClient;
+#[cfg(feature = "encrypt")]
+use crate::hub_api::HubOps;
 use crate::hub_api::{HubApiClient, HubTokenRefresher, SourceKind, parse_repo_id, split_path_prefix};
 use crate::virtual_fs::{VfsConfig, VirtualFs};
 use crate::xet::{StagingDir, XetSessions};
@@ -150,6 +152,21 @@ pub struct MountOptions {
     /// When not set, requires `user_allow_other` in /etc/fuse.conf on Linux.
     #[arg(long, default_value_t = false)]
     pub fuse_owner_only: bool,
+
+    /// Path to a file containing the 256-bit master key. Enables client-side
+    /// encryption: files are encrypted locally before upload and decrypted
+    /// transparently on read. The key file must contain exactly 32 raw bytes
+    /// or the same bytes base64-encoded.
+    #[cfg(feature = "encrypt")]
+    #[arg(long)]
+    pub encryption_key_file: Option<PathBuf>,
+
+    /// Encryption algorithm. Only used when --encryption-key-file is set.
+    /// Files record their algorithm in remote metadata, so reads always
+    /// use the correct variant regardless of this setting.
+    #[cfg(feature = "encrypt")]
+    #[arg(long, default_value = "aegis-128x2")]
+    pub encryption_algorithm: String,
 }
 
 /// CLI args for the foreground FUSE/NFS binaries.
@@ -258,6 +275,29 @@ pub fn build(source: Source, options: MountOptions, is_nfs: bool) -> MountSetup 
     };
 
     let backend = if is_nfs { "nfs" } else { "fuse" };
+
+    #[cfg(feature = "encrypt")]
+    let (enc_prk, enc_filename_key) = if let Some(ref key_path) = options.encryption_key_file {
+        let master_key = crate::crypto::load_master_key(key_path).unwrap_or_else(|e| {
+            eprintln!("Error: failed to load encryption key: {e}");
+            std::process::exit(1);
+        });
+        let prk = crate::crypto::extract_prk(&master_key);
+        let source_context = source_kind.encryption_context();
+        let fk = crate::crypto::derive_filename_key(&prk, &source_context);
+        (Some(prk), Some(fk))
+    } else {
+        (None, None)
+    };
+
+    #[cfg(feature = "encrypt")]
+    let path_prefix = if let Some(ref key) = enc_filename_key {
+        crate::filename_crypto::encrypt_path(&path_prefix, key).unwrap_or_else(|e| {
+            panic!("Failed to encrypt path prefix: {e}");
+        })
+    } else {
+        path_prefix
+    };
     let hub_client = runtime.block_on(async {
         HubApiClient::from_source(
             &options.hub_endpoint,
@@ -317,10 +357,44 @@ pub fn build(source: Source, options: MountOptions, is_nfs: bool) -> MountSetup 
     let upload_config = if read_only { None } else { Some(cas_config) };
     let xet_sessions = XetSessions::new(download_session, upload_config, cached_client);
 
-    let advanced_writes = options.advanced_writes || (is_nfs && !read_only);
+    #[allow(unused_mut)]
+    let mut advanced_writes = options.advanced_writes || (is_nfs && !read_only);
+
+    #[cfg(feature = "encrypt")]
+    let encryption_config = if let Some(prk) = enc_prk {
+        let algorithm: crate::crypto::Algorithm = options.encryption_algorithm.parse().unwrap_or_else(|e| {
+            eprintln!("Error: invalid encryption algorithm: {e}");
+            std::process::exit(1);
+        });
+        let source_context = hub_client.source().encryption_context();
+        if !read_only && !advanced_writes {
+            info!("Encryption enabled, forcing advanced writes mode");
+            advanced_writes = true;
+        }
+        Some(crate::crypto::EncryptionConfig {
+            prk,
+            source_context,
+            algorithm,
+            chunk_size: 65536,
+            filename_key: enc_filename_key.unwrap(),
+        })
+    } else {
+        None
+    };
+
+    let is_repo = hub_client.is_repo();
+    let path_prefix_display = hub_client.path_prefix().to_string();
+
+    #[cfg(feature = "encrypt")]
+    let hub_client: Arc<dyn HubOps> = if let Some(key) = enc_filename_key {
+        Arc::new(crate::hub_api::EncryptedHubOps::new(hub_client, key))
+    } else {
+        hub_client
+    };
+
     // Repos need a staging dir for HTTP download cache (open_readonly),
     // even when advanced_writes is disabled.
-    let staging_dir = if advanced_writes || hub_client.is_repo() {
+    let staging_dir = if advanced_writes || is_repo {
         Some(StagingDir::new(&options.cache_dir))
     } else {
         None
@@ -342,10 +416,10 @@ pub fn build(source: Source, options: MountOptions, is_nfs: bool) -> MountSetup 
     }
 
     let backend_name = if is_nfs { "nfs" } else { "fuse" };
-    let subfolder_info = if hub_client.path_prefix().is_empty() {
+    let subfolder_info = if path_prefix_display.is_empty() {
         String::new()
     } else {
-        format!(" (subfolder: {})", hub_client.path_prefix())
+        format!(" (subfolder: {path_prefix_display})")
     };
     info!(
         "Mounting {}{} at {:?} ({}, backend={})",
@@ -393,6 +467,8 @@ pub fn build(source: Source, options: MountOptions, is_nfs: bool) -> MountSetup 
             direct_io: options.direct_io && !is_nfs,
             flush_debounce: std::time::Duration::from_millis(options.flush_debounce_ms),
             flush_max_batch_window: std::time::Duration::from_millis(options.flush_max_batch_window_ms),
+            #[cfg(feature = "encrypt")]
+            encryption_config,
         },
     );
 

@@ -73,6 +73,9 @@ cargo build --release --features fuse
 
 # All backends
 cargo build --release --features fuse,nfs
+
+# With client-side encryption support
+cargo build --release --features nfs,encrypt
 ```
 
 Binaries: `target/release/hf-mount`, `target/release/hf-mount-nfs`, `target/release/hf-mount-fuse`
@@ -128,6 +131,29 @@ hf-mount start --hf-token $HF_TOKEN --read-only bucket myuser/my-bucket /tmp/dat
 # Subfolder only
 hf-mount start --hf-token $HF_TOKEN bucket myuser/my-bucket/checkpoints /tmp/ckpts
 ```
+
+### Client-side encryption
+
+Files can be encrypted locally before upload and decrypted transparently on read. The remote side only ever sees ciphertext. Requires building with `--features encrypt`.
+
+```bash
+# Generate a 256-bit master key (same key works for all algorithm variants)
+head -c 32 /dev/urandom > /path/to/key.bin
+
+# Mount with encryption (writes encrypt, reads decrypt)
+hf-mount start --encryption-key-file /path/to/key.bin bucket myuser/encrypted-bucket /tmp/data
+
+# Use a different algorithm (default: aegis-128x2)
+hf-mount start --encryption-key-file /path/to/key.bin --encryption-algorithm aegis-256 bucket myuser/my-bucket /tmp/data
+```
+
+Each file records its algorithm in remote metadata, so files encrypted with different algorithms can coexist and are always read with the correct variant. Supported algorithms: `aegis-128l`, `aegis-128x2` (default), `aegis-128x4`, `aegis-256`, `aegis-256x2`, `aegis-256x4`.
+
+Filenames are also encrypted automatically.
+
+The master key is always 32 bytes regardless of algorithm.
+
+Directory structure and metadata (file sizes, timestamps) are not encrypted.
 
 ### Manage mounts
 
@@ -224,6 +250,8 @@ hf-mount stop /tmp/data          # daemon mounts
 | `--uid` / `--gid` | current user | Override UID/GID for mounted files |
 | `--fuse-owner-only` | `false` | Restrict mount access to the mounting user only (FUSE only; by default all users can access, which requires `user_allow_other` in /etc/fuse.conf) |
 | `--token-file` | | Path to a token file (re-read on each request for credential rotation) |
+| `--encryption-key-file` | | Path to 256-bit master key file; enables client-side encryption (requires `--features encrypt`) |
+| `--encryption-algorithm` | `aegis-128x2` | Encryption algorithm (requires `--encryption-key-file`) |
 
 ### Logging
 
@@ -240,6 +268,7 @@ RUST_LOG=hf_mount=debug hf-mount-fuse repo gpt2 /mnt/gpt2
 - **Advanced writes** (`--advanced-writes`) -- staging files on disk, random writes + seek, async debounced flush
 - **Remote sync** -- background polling detects remote changes and updates the local view
 - **POSIX metadata** -- chmod, chown, timestamps, symlinks (in-memory only, lost on unmount)
+- **Client-side encryption** (`--features encrypt`) -- AEGIS-based authenticated encryption via the [aegis](https://crates.io/crates/aegis) crate's RAF layer; per-source HKDF-SHA256 key derivation, six algorithm variants, per-file algorithm tracking, optional filename encryption via HCTR2-128
 
 ## Consistency model
 
@@ -302,6 +331,9 @@ See the [hf-csi-driver README](https://github.com/huggingface/hf-csi-driver#read
 ```bash
 # Unit tests (no network, no token)
 cargo test --lib --features fuse,nfs
+
+# Unit tests with encryption
+cargo test --lib --features encrypt
 
 # Integration tests (require HF_TOKEN and FUSE)
 HF_TOKEN=... cargo test --release --features fuse,nfs --test fuse_ops -- --test-threads=1 --nocapture
