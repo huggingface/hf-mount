@@ -423,7 +423,7 @@ pub fn setup(is_nfs: bool) -> MountSetup {
 
 /// Try to raise the soft file descriptor limit to avoid "Too many open files"
 /// errors during large batch operations. Most FUSE/NFS filesystems do this.
-fn raise_fd_limit() {
+pub fn raise_fd_limit() {
     const TARGET_NOFILE: u64 = 65536;
     let mut rlim = libc::rlimit {
         rlim_cur: 0,
