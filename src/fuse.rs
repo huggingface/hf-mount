@@ -1,4 +1,5 @@
 use std::ffi::OsStr;
+use std::os::fd::OwnedFd;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -510,6 +511,7 @@ pub fn mount_fuse(
     runtime: &tokio::runtime::Runtime,
     daemon_guard: Option<&mut DaemonGuard>,
     fuse_owner_only: bool,
+    fuse_fd: Option<OwnedFd>,
 ) -> bool {
     let adapter = FuseAdapter::new(
         runtime.handle().clone(),
@@ -551,25 +553,40 @@ pub fn mount_fuse(
     } else {
         fuser::SessionACL::All
     };
-    // clone_fd and multi-threading are only supported on Linux by fuser
+    // clone_fd and multi-threading are only supported on Linux by fuser.
+    // Disable clone_fd in sidecar mode (from_fd): the sidecar is unprivileged
+    // and cannot open /dev/fuse to create cloned fds. See #94.
     if cfg!(target_os = "linux") {
-        config.clone_fd = true;
+        config.clone_fd = fuse_fd.is_none();
         config.n_threads = Some(max_threads);
     }
 
-    let session = match fuser::Session::new(adapter, mount_point, &config) {
-        Ok(s) => s,
-        Err(e) => {
-            if e.kind() == std::io::ErrorKind::PermissionDenied {
-                error!(
-                    "Permission denied: mounting a FUSE filesystem requires root privileges. \
-                     Try running with: sudo {}",
-                    std::env::args().collect::<Vec<_>>().join(" ")
-                );
-            } else {
-                error!("FUSE session failed: {}", e);
+    let session = if let Some(owned_fd) = fuse_fd {
+        // Use a pre-opened /dev/fuse fd (sidecar mode). The kernel FUSE mount
+        // was already performed by the CSI driver; we just run the userspace daemon.
+        info!("Using pre-opened FUSE fd={:?}", owned_fd);
+        match fuser::Session::from_fd(adapter, owned_fd, config.acl, config) {
+            Ok(s) => s,
+            Err(e) => {
+                error!("FUSE session from fd failed: {}", e);
+                return false;
             }
-            return false;
+        }
+    } else {
+        match fuser::Session::new(adapter, mount_point, &config) {
+            Ok(s) => s,
+            Err(e) => {
+                if e.kind() == std::io::ErrorKind::PermissionDenied {
+                    error!(
+                        "Permission denied: mounting a FUSE filesystem requires root privileges. \
+                         Try running with: sudo {}",
+                        std::env::args().collect::<Vec<_>>().join(" ")
+                    );
+                } else {
+                    error!("FUSE session failed: {}", e);
+                }
+                return false;
+            }
         }
     };
     let notifier = session.notifier();

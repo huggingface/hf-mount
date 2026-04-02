@@ -20,6 +20,7 @@ async-trait = "0.1"
 bytes = "1"
 chrono = "0.4"
 clap = { version = "4", features = ["derive", "env"] }
+ctrlc = "3"
 fuser = { version = "0.17", optional = true }
 futures = "0.3"
 libc = "0.2"
@@ -56,3 +57,8 @@ required-features = ["nfs"]
 [[bin]]
 name = "hf-mount"
 path = "src/bin/hf-mount.rs"
+
+[[bin]]
+name = "hf-mount-sidecar"
+path = "src/bin/hf-mount-sidecar.rs"
+required-features = ["fuse"]
