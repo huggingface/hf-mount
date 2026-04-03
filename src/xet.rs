@@ -242,12 +242,11 @@ impl StagingDir {
     }
 
     /// Create parent dirs for overlay staging path. No-op outside overlay.
-    pub fn ensure_staging_parents(&self, full_path: &str) -> std::io::Result<()> {
-        if let Some(root) = &self.overlay_root {
-            let path = root.join(full_path);
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
+    pub fn ensure_staging_parents(&self, inode: u64, full_path: &str) -> std::io::Result<()> {
+        if self.overlay_root.is_some()
+            && let Some(parent) = self.staging_path(inode, full_path).parent()
+        {
+            std::fs::create_dir_all(parent)?;
         }
         Ok(())
     }

@@ -566,6 +566,7 @@ impl VirtualFs {
                     if let Some(e) = inodes.get_mut(ino) {
                         e.size = size;
                         e.mtime = mtime;
+                        e.mode = mode;
                         e.xet_hash = None;
                         e.set_dirty();
                         if kind == InodeKind::Directory {
@@ -1011,7 +1012,7 @@ impl VirtualFs {
 
         // Overlay: ensure parent dirs exist before write.
         if writable && let Some(sd) = &self.staging_dir {
-            sd.ensure_staging_parents(&file_entry.full_path).map_err(|e| {
+            sd.ensure_staging_parents(ino, &file_entry.full_path).map_err(|e| {
                 error!("Failed to create staging parent dirs for ino={}: {}", ino, e);
                 libc::EIO
             })?;
@@ -1789,7 +1790,7 @@ impl VirtualFs {
 
     /// Finalize a streaming write: send Finish to the worker, await CAS upload, commit to Hub.
     async fn streaming_commit(&self, ino: u64, channel: &StreamingChannel) -> Result<(), i32> {
-        debug_assert!(!self.overlay, "overlay forces advanced_writes; streaming unreachable");
+        assert!(!self.overlay, "overlay forces advanced_writes; streaming unreachable");
 
         // Unlinked files (nlink=0) must not be re-committed on close —
         // user deleted the file, uploading would resurrect it.
@@ -1953,7 +1954,7 @@ impl VirtualFs {
                 .staging_dir
                 .as_ref()
                 .expect("staging_dir required for advanced writes");
-            if let Err(e) = sd.ensure_staging_parents(&full_path) {
+            if let Err(e) = sd.ensure_staging_parents(ino, &full_path) {
                 error!("Failed to create staging parent dirs for {}: {}", full_path, e);
                 self.inode_table.write().expect("inodes poisoned").remove(ino);
                 return Err(libc::EIO);
@@ -2753,7 +2754,7 @@ impl VirtualFs {
                     .staging_dir
                     .as_ref()
                     .expect("staging_dir required for advanced writes");
-                sd.ensure_staging_parents(&full_path).map_err(|e| {
+                sd.ensure_staging_parents(ino, &full_path).map_err(|e| {
                     error!("Failed to create staging parent dirs for ino={}: {}", ino, e);
                     e.raw_os_error().unwrap_or(libc::EIO)
                 })?;
