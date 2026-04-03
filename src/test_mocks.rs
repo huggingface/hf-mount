@@ -460,7 +460,7 @@ impl Default for TestOpts {
     }
 }
 
-/// Return value from `make_test_vfs` when overlay mode is used.
+/// Return value from `make_overlay_test_vfs_with_root`.
 /// Includes the overlay root path so tests can pre-populate or inspect local files.
 pub struct OverlayTestVfs {
     pub runtime: tokio::runtime::Runtime,
@@ -522,7 +522,6 @@ pub fn make_test_vfs(
 /// Build a VFS with overlay mode for testing. The given `overlay_root`
 /// is used as the overlay directory, allowing tests to pre-populate
 /// files before VFS creation.
-/// Otherwise a fresh temp dir is created.
 pub fn make_overlay_test_vfs_with_root(
     hub: Arc<MockHub>,
     xet: Arc<MockXet>,

@@ -234,6 +234,14 @@ impl StagingDir {
     /// This is a pure path computation with no I/O side effects.
     pub fn staging_path(&self, inode: u64, full_path: &str) -> PathBuf {
         if let Some(root) = &self.overlay_root {
+            debug_assert!(
+                !Path::new(full_path).has_root()
+                    && !Path::new(full_path)
+                        .components()
+                        .any(|c| matches!(c, std::path::Component::ParentDir)),
+                "overlay staging path must be a safe relative path, got: {:?}",
+                full_path
+            );
             root.join(full_path)
         } else {
             self.path(inode)

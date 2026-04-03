@@ -3619,7 +3619,15 @@ fn overlay_skips_symlinks() {
     let overlay_root = fresh_overlay_dir("symlink");
     std::fs::write(overlay_root.join("real.txt"), b"content").unwrap();
     // Create a symlink — should be ignored by overlay merge
-    let _ = std::os::unix::fs::symlink(overlay_root.join("real.txt"), overlay_root.join("link.txt"));
+    if let Err(e) = std::os::unix::fs::symlink(overlay_root.join("real.txt"), overlay_root.join("link.txt")) {
+        match e.kind() {
+            std::io::ErrorKind::Unsupported | std::io::ErrorKind::PermissionDenied => {
+                eprintln!("skipping overlay_skips_symlinks: unable to create symlink: {e}");
+                return;
+            }
+            _ => panic!("failed to create test symlink: {e}"),
+        }
+    }
 
     let t = make_overlay_test_vfs_with_root(hub, xet, overlay_root);
 

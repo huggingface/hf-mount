@@ -1008,9 +1008,7 @@ impl VirtualFs {
             .map(|sd| sd.staging_path(ino, &file_entry.full_path));
 
         // Ensure overlay parent dirs exist before any write path
-        if writable
-            && let Some(sd) = &self.staging_dir
-        {
+        if writable && let Some(sd) = &self.staging_dir {
             sd.ensure_staging_parents(&file_entry.full_path).map_err(|e| {
                 error!("Failed to create staging parent dirs for ino={}: {}", ino, e);
                 libc::EIO
