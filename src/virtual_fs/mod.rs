@@ -228,6 +228,15 @@ impl VirtualFs {
         vfs
     }
 
+    /// Overlay root path, if overlay mode is active.
+    fn overlay_root(&self) -> Option<&std::path::Path> {
+        if self.overlay {
+            self.staging_dir.as_ref().and_then(|sd| sd.overlay_root())
+        } else {
+            None
+        }
+    }
+
     /// Set the kernel cache invalidation callback. Called after mount setup
     /// so the poll loop can actively invalidate stale inodes on remote changes.
     pub fn set_invalidator(&self, f: Box<dyn Fn(u64) + Send + Sync>) {
@@ -519,9 +528,7 @@ impl VirtualFs {
         }
 
         // Overlay: merge local entries (local overrides remote, via pre-mount fd).
-        if self.overlay
-            && let Some(overlay_root) = self.staging_dir.as_ref().and_then(|sd| sd.overlay_root())
-        {
+        if let Some(overlay_root) = self.overlay_root() {
             let dir_path = inodes.get(parent_ino).map(|e| e.full_path.clone()).unwrap_or_default();
             let local_dir = overlay_root.join(&dir_path);
             if let Ok(entries) = std::fs::read_dir(&local_dir) {
@@ -2077,12 +2084,7 @@ impl VirtualFs {
         self.negative_cache_remove(&full_path);
 
         // Overlay: persist directory to disk.
-        if self.overlay
-            && let Some(overlay_path) = self
-                .staging_dir
-                .as_ref()
-                .and_then(|sd| sd.overlay_root())
-                .map(|r| r.join(&full_path))
+        if let Some(overlay_path) = self.overlay_root().map(|r| r.join(&full_path))
             && let Err(e) = std::fs::create_dir_all(&overlay_path)
         {
             error!("Failed to create overlay directory {}: {}", overlay_path.display(), e);
@@ -2265,6 +2267,10 @@ impl VirtualFs {
             let inodes = self.inode_table.read().expect("inodes poisoned");
             match inodes.lookup_child(parent, name) {
                 Some(entry) if entry.kind == InodeKind::Directory => {
+                    // Overlay: clean (remote) directories cannot be removed.
+                    if self.overlay && !entry.is_dirty() {
+                        return Err(libc::EPERM);
+                    }
                     if !entry.children.is_empty() {
                         return Err(libc::ENOTEMPTY);
                     }
@@ -2288,9 +2294,7 @@ impl VirtualFs {
         };
 
         // Overlay: remove on-disk dir before inode, so failure doesn't leave stale state.
-        if self.overlay
-            && let Some(overlay_root) = self.staging_dir.as_ref().and_then(|sd| sd.overlay_root())
-        {
+        if let Some(overlay_root) = self.overlay_root() {
             let dir_path = overlay_root.join(&full_path);
             if let Err(e) = std::fs::remove_dir(&dir_path)
                 && e.kind() != std::io::ErrorKind::NotFound
@@ -2393,9 +2397,7 @@ impl VirtualFs {
         };
 
         // Overlay: move the on-disk file to match the new path.
-        if self.overlay
-            && let Some(overlay_root) = self.staging_dir.as_ref().and_then(|sd| sd.overlay_root())
-        {
+        if let Some(overlay_root) = self.overlay_root() {
             let old_disk_path = overlay_root.join(&info.old_path);
             let new_disk_path = overlay_root.join(&info.new_full_path);
             if !old_disk_path.exists() {

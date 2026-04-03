@@ -3725,3 +3725,28 @@ fn overlay_type_conflict_local_dir_wins() {
         assert_eq!(entry.kind, InodeKind::Directory);
     });
 }
+
+/// rmdir of a clean remote directory returns EPERM in overlay mode.
+#[test]
+fn overlay_rmdir_remote_dir_eperm() {
+    let hub = MockHub::new();
+    hub.add_file("subdir/file.txt", 5, Some("rhash"), None);
+    let xet = MockXet::new();
+
+    let overlay_root = fresh_overlay_dir("rmdirremote");
+    let t = make_overlay_test_vfs_with_root(hub, xet, overlay_root);
+
+    t.runtime.block_on(async {
+        // Load root to discover subdir, then load subdir children
+        let entries = t.vfs.readdir(ROOT_INODE).await.unwrap();
+        let subdir = entries.iter().find(|e| e.name == "subdir").unwrap();
+        t.vfs.readdir(subdir.ino).await.unwrap();
+
+        // Unlink the child first so dir is empty
+        t.vfs.unlink(subdir.ino, "file.txt").await.unwrap_err(); // EPERM: clean remote file
+
+        // rmdir should also fail: clean remote directory
+        let err = t.vfs.rmdir(ROOT_INODE, "subdir").await.unwrap_err();
+        assert_eq!(err, libc::EPERM);
+    });
+}
