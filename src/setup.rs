@@ -150,6 +150,14 @@ pub struct MountOptions {
     /// When not set, requires `user_allow_other` in /etc/fuse.conf on Linux.
     #[arg(long, default_value_t = false)]
     pub fuse_owner_only: bool,
+
+    /// Enable overlay mode. The mount point directory serves as the local
+    /// layer: pre-existing files are visible through the mount, and new
+    /// writes persist there in their original path layout. Reads merge
+    /// local files with remote bucket contents (local takes precedence).
+    /// Implies --advanced-writes. Writes are never pushed to remote.
+    #[arg(long, default_value_t = false)]
+    pub overlay: bool,
 }
 
 /// CLI args for the foreground FUSE/NFS binaries.
@@ -175,6 +183,8 @@ pub struct MountSetup {
     pub max_threads: usize,
     pub metadata_ttl_ms: u64,
     pub fuse_owner_only: bool,
+    /// Kept alive to preserve access to the underlying dir via /proc/self/fd/N.
+    pub _overlay_fd: Option<std::fs::File>,
 }
 
 // ── Tracing + env vars (no threads) ──────────────────────────────────
@@ -280,12 +290,20 @@ pub fn build(source: Source, options: MountOptions, is_nfs: bool) -> MountSetup 
         });
     }
 
-    let read_only = options.read_only || hub_client.is_repo();
-    if hub_client.is_repo() && !options.read_only {
+    if options.overlay && options.read_only {
+        panic!(
+            "--overlay with --read-only is pointless: overlay enables local writes, --read-only disables them. Use --read-only alone instead."
+        );
+    }
+
+    let read_only = (options.read_only || hub_client.is_repo()) && !options.overlay;
+    if hub_client.is_repo() && !options.read_only && !options.overlay {
         info!("Repo mounts are always read-only");
     }
 
-    let refresher = hub_client.token_refresher(read_only);
+    // Overlay: local writes allowed, but no remote write token/upload.
+    let remote_read_only = read_only || options.overlay;
+    let refresher = hub_client.token_refresher(remote_read_only);
     let cas_config = build_cas_config(&runtime, &refresher);
 
     // Ensure cache directory exists and is writable (needed for staging even without chunk cache).
@@ -314,14 +332,37 @@ pub fn build(source: Source, options: MountOptions, is_nfs: bool) -> MountSetup 
         .expect("Failed to create storage client");
     let cached_client = CachedXetClient::new(raw_client);
     let download_session = FileDownloadSession::from_client(cached_client.clone(), None, xorb_cache);
-    let upload_config = if read_only { None } else { Some(cas_config) };
+    let upload_config = if remote_read_only { None } else { Some(cas_config) };
     let xet_sessions = XetSessions::new(download_session, upload_config, cached_client);
 
-    let advanced_writes = options.advanced_writes || (is_nfs && !read_only);
+    let advanced_writes = options.advanced_writes || options.overlay || (is_nfs && !read_only);
+
+    // Overlay: pre-mount fd preserves access to the dir after mount shadows it.
+    let overlay_fd = if options.overlay {
+        use std::os::unix::io::AsRawFd;
+        std::fs::create_dir_all(&mount_point)
+            .unwrap_or_else(|e| panic!("Failed to create mount point {:?} for overlay: {e}", mount_point));
+        let fd = std::fs::File::open(&mount_point)
+            .unwrap_or_else(|e| panic!("Failed to open mount point {:?} for overlay: {e}", mount_point));
+        let raw_fd = fd.as_raw_fd();
+        #[cfg(target_os = "linux")]
+        let overlay_root = PathBuf::from(format!("/proc/self/fd/{}", raw_fd));
+        #[cfg(not(target_os = "linux"))]
+        let overlay_root = PathBuf::from(format!("/dev/fd/{}", raw_fd));
+        info!("Overlay mode: local dir accessible via {:?}", overlay_root);
+        Some((fd, overlay_root))
+    } else {
+        None
+    };
+
     // Repos need a staging dir for HTTP download cache (open_readonly),
     // even when advanced_writes is disabled.
     let staging_dir = if advanced_writes || hub_client.is_repo() {
-        Some(StagingDir::new(&options.cache_dir))
+        if let Some((_, ref overlay_root)) = overlay_fd {
+            Some(StagingDir::new_overlay(&options.cache_dir, overlay_root.clone()))
+        } else {
+            Some(StagingDir::new(&options.cache_dir))
+        }
     } else {
         None
     };
@@ -356,10 +397,11 @@ pub fn build(source: Source, options: MountOptions, is_nfs: bool) -> MountSetup 
         backend_name,
     );
     info!(
-        "Config: advanced_writes={} direct_io={} poll_interval={}s metadata_ttl={}ms \
+        "Config: advanced_writes={} overlay={} direct_io={} poll_interval={}s metadata_ttl={}ms \
          cache_dir={:?} cache_size={} no_disk_cache={} max_threads={} \
          flush_debounce={}ms flush_max_batch={}ms uid={} gid={} filter_os_files={}",
         advanced_writes,
+        options.overlay,
         options.direct_io,
         options.poll_interval_secs,
         options.metadata_ttl_ms,
@@ -384,6 +426,7 @@ pub fn build(source: Source, options: MountOptions, is_nfs: bool) -> MountSetup 
         VfsConfig {
             read_only,
             advanced_writes,
+            overlay: options.overlay,
             uid,
             gid,
             poll_interval_secs: options.poll_interval_secs,
@@ -407,6 +450,7 @@ pub fn build(source: Source, options: MountOptions, is_nfs: bool) -> MountSetup 
         max_threads: options.max_threads,
         metadata_ttl_ms: options.metadata_ttl_ms,
         fuse_owner_only: options.fuse_owner_only,
+        _overlay_fd: overlay_fd.map(|(fd, _)| fd),
     }
 }
 

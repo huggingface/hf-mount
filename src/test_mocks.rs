@@ -443,6 +443,7 @@ impl DownloadStreamOps for MockDownloadStream {
 pub struct TestOpts {
     pub read_only: bool,
     pub advanced_writes: bool,
+    pub overlay: bool,
     pub serve_lookup_from_cache: bool,
     pub metadata_ttl: Duration,
 }
@@ -452,10 +453,19 @@ impl Default for TestOpts {
         Self {
             read_only: false,
             advanced_writes: false,
+            overlay: false,
             serve_lookup_from_cache: false,
             metadata_ttl: Duration::from_secs(1),
         }
     }
+}
+
+/// Return value from `make_overlay_test_vfs_with_root`.
+/// Includes the overlay root path so tests can pre-populate or inspect local files.
+pub struct OverlayTestVfs {
+    pub runtime: tokio::runtime::Runtime,
+    pub vfs: Arc<crate::virtual_fs::VirtualFs>,
+    pub overlay_root: std::path::PathBuf,
 }
 
 /// Build a VirtualFs for testing. Must be called from a sync context
@@ -466,12 +476,23 @@ pub fn make_test_vfs(
     opts: TestOpts,
     runtime: &tokio::runtime::Runtime,
 ) -> Arc<crate::virtual_fs::VirtualFs> {
+    let advanced_writes = opts.advanced_writes || opts.overlay;
+
     // Repos need a staging dir for HTTP download cache (open_readonly),
     // even when advanced_writes is disabled (mirrors setup.rs logic).
-    let staging_dir = if opts.advanced_writes || hub.is_repo() {
+    let staging_dir = if advanced_writes || hub.is_repo() {
         let path = std::env::temp_dir().join(format!("hf_mount_test_{}", std::process::id()));
         std::fs::create_dir_all(&path).expect("failed to create temp staging dir");
-        Some(StagingDir::new(&path))
+        if opts.overlay {
+            let overlay_root = std::env::temp_dir().join(format!("hf_mount_overlay_{}", std::process::id()));
+            if overlay_root.exists() {
+                std::fs::remove_dir_all(&overlay_root).expect("failed to clean stale overlay dir");
+            }
+            std::fs::create_dir_all(&overlay_root).expect("failed to create overlay root dir");
+            Some(StagingDir::new_overlay(&path, overlay_root))
+        } else {
+            Some(StagingDir::new(&path))
+        }
     } else {
         None
     };
@@ -483,7 +504,8 @@ pub fn make_test_vfs(
         staging_dir,
         crate::virtual_fs::VfsConfig {
             read_only: opts.read_only,
-            advanced_writes: opts.advanced_writes,
+            advanced_writes,
+            overlay: opts.overlay,
             uid: 1000,
             gid: 1000,
             poll_interval_secs: 0,
@@ -495,4 +517,47 @@ pub fn make_test_vfs(
             flush_max_batch_window: Duration::from_secs(1),
         },
     )
+}
+
+/// Build a VFS with overlay mode for testing. The given `overlay_root`
+/// is used as the overlay directory, allowing tests to pre-populate
+/// files before VFS creation.
+pub fn make_overlay_test_vfs_with_root(
+    hub: Arc<MockHub>,
+    xet: Arc<MockXet>,
+    overlay_root: std::path::PathBuf,
+) -> OverlayTestVfs {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let cache_dir = std::env::temp_dir().join(format!("hf_mount_test_{}", std::process::id()));
+    std::fs::create_dir_all(&cache_dir).expect("failed to create temp staging dir");
+    let staging_dir = Some(StagingDir::new_overlay(&cache_dir, overlay_root.clone()));
+
+    let vfs = crate::virtual_fs::VirtualFs::new(
+        rt.handle().clone(),
+        hub,
+        xet,
+        staging_dir,
+        crate::virtual_fs::VfsConfig {
+            read_only: false,
+            advanced_writes: true,
+            overlay: true,
+            uid: 1000,
+            gid: 1000,
+            poll_interval_secs: 0,
+            metadata_ttl: Duration::from_secs(1),
+            serve_lookup_from_cache: false,
+            filter_os_files: true,
+            direct_io: false,
+            flush_debounce: Duration::from_millis(100),
+            flush_max_batch_window: Duration::from_secs(1),
+        },
+    );
+    OverlayTestVfs {
+        runtime: rt,
+        vfs,
+        overlay_root,
+    }
 }

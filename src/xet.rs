@@ -183,6 +183,8 @@ pub struct StagingDir {
     dir: PathBuf,
     /// Per-session random key to make staging paths unpredictable.
     session_key: u64,
+    /// Overlay: stage at original file paths instead of inode-based names.
+    overlay_root: Option<PathBuf>,
 }
 
 impl StagingDir {
@@ -192,6 +194,18 @@ impl StagingDir {
         Self {
             dir,
             session_key: rand_u64(),
+            overlay_root: None,
+        }
+    }
+
+    /// Create a staging dir with overlay mode.
+    pub fn new_overlay(cache_dir: &Path, overlay_root: PathBuf) -> Self {
+        let dir = cache_dir.join("staging");
+        std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("Failed to create staging dir {:?}: {e}", dir));
+        Self {
+            dir,
+            session_key: rand_u64(),
+            overlay_root: Some(overlay_root),
         }
     }
 
@@ -200,10 +214,41 @@ impl StagingDir {
         &self.dir
     }
 
-    /// Get the staging path for a given inode.
-    /// Deterministic within a session but unpredictable from outside.
+    /// The overlay root directory, if overlay mode is active.
+    pub fn overlay_root(&self) -> Option<&Path> {
+        self.overlay_root.as_deref()
+    }
+
+    /// Inode-based staging path (used by FlushManager).
     pub fn path(&self, inode: u64) -> PathBuf {
         self.dir.join(format!("ino_{:x}_{:016x}", inode, self.session_key))
+    }
+
+    /// Staging path: overlay root + original path, or inode-based. Pure (no I/O).
+    pub fn staging_path(&self, inode: u64, full_path: &str) -> PathBuf {
+        if let Some(root) = &self.overlay_root {
+            debug_assert!(
+                !Path::new(full_path).has_root()
+                    && !Path::new(full_path)
+                        .components()
+                        .any(|c| matches!(c, std::path::Component::ParentDir)),
+                "overlay staging path must be a safe relative path, got: {:?}",
+                full_path
+            );
+            root.join(full_path)
+        } else {
+            self.path(inode)
+        }
+    }
+
+    /// Create parent dirs for overlay staging path. No-op outside overlay.
+    pub fn ensure_staging_parents(&self, inode: u64, full_path: &str) -> std::io::Result<()> {
+        if self.overlay_root.is_some()
+            && let Some(parent) = self.staging_path(inode, full_path).parent()
+        {
+            std::fs::create_dir_all(parent)?;
+        }
+        Ok(())
     }
 }
 
