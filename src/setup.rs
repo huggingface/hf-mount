@@ -291,7 +291,9 @@ pub fn build(source: Source, options: MountOptions, is_nfs: bool) -> MountSetup 
     }
 
     if options.overlay && options.read_only {
-        panic!("--overlay and --read-only are mutually exclusive");
+        panic!(
+            "--overlay with --read-only is pointless: overlay enables local writes, --read-only disables them. Use --read-only alone instead."
+        );
     }
 
     let read_only = (options.read_only || hub_client.is_repo()) && !options.overlay;
@@ -299,7 +301,10 @@ pub fn build(source: Source, options: MountOptions, is_nfs: bool) -> MountSetup 
         info!("Repo mounts are always read-only");
     }
 
-    let refresher = hub_client.token_refresher(read_only);
+    // Overlay mode: VFS is read-write (local writes), but remote is read-only
+    // (no write token, no upload config).
+    let remote_read_only = read_only || options.overlay;
+    let refresher = hub_client.token_refresher(remote_read_only);
     let cas_config = build_cas_config(&runtime, &refresher);
 
     // Ensure cache directory exists and is writable (needed for staging even without chunk cache).
@@ -328,14 +333,13 @@ pub fn build(source: Source, options: MountOptions, is_nfs: bool) -> MountSetup 
         .expect("Failed to create storage client");
     let cached_client = CachedXetClient::new(raw_client);
     let download_session = FileDownloadSession::from_client(cached_client.clone(), None, xorb_cache);
-    let upload_config = if read_only { None } else { Some(cas_config) };
+    let upload_config = if remote_read_only { None } else { Some(cas_config) };
     let xet_sessions = XetSessions::new(download_session, upload_config, cached_client);
 
     let advanced_writes = options.advanced_writes || options.overlay || (is_nfs && !read_only);
 
     // In overlay mode, open a fd to the mount point directory BEFORE mounting.
     // This preserves access to the underlying local files after the mount shadows them.
-    // We use /dev/fd/N to access it (works on both Linux and macOS).
     let overlay_fd = if options.overlay {
         use std::os::unix::io::AsRawFd;
         // Ensure mount point exists before opening fd
@@ -344,6 +348,9 @@ pub fn build(source: Source, options: MountOptions, is_nfs: bool) -> MountSetup 
         let fd = std::fs::File::open(&mount_point)
             .unwrap_or_else(|e| panic!("Failed to open mount point {:?} for overlay: {e}", mount_point));
         let raw_fd = fd.as_raw_fd();
+        #[cfg(target_os = "linux")]
+        let overlay_root = PathBuf::from(format!("/proc/self/fd/{}", raw_fd));
+        #[cfg(not(target_os = "linux"))]
         let overlay_root = PathBuf::from(format!("/dev/fd/{}", raw_fd));
         info!("Overlay mode: local dir accessible via {:?}", overlay_root);
         Some((fd, overlay_root))

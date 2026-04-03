@@ -528,6 +528,9 @@ impl VirtualFs {
                 let now = SystemTime::now();
                 for entry in entries.flatten() {
                     let name = entry.file_name().to_string_lossy().to_string();
+                    if self.filter_os_files && is_os_junk(&name) {
+                        continue;
+                    }
                     // Use symlink_metadata to avoid following symlinks
                     let metadata = match std::fs::symlink_metadata(entry.path()) {
                         Ok(m) => m,
@@ -1029,7 +1032,10 @@ impl VirtualFs {
 
         // Overlay paths may need parent directories created
         if let Some(parent) = staging_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+            std::fs::create_dir_all(parent).map_err(|e| {
+                error!("Failed to create staging parent dir {:?}: {}", parent, e);
+                libc::EIO
+            })?;
         }
 
         // Serialize staging preparation per inode (prevents concurrent download races)
@@ -1942,8 +1948,12 @@ impl VirtualFs {
                 .expect("staging_dir required for advanced writes")
                 .staging_path(ino, &full_path);
             // Overlay paths may need parent directories created
-            if let Some(parent) = staging_path.parent() {
-                let _ = std::fs::create_dir_all(parent);
+            if let Some(parent) = staging_path.parent()
+                && let Err(e) = std::fs::create_dir_all(parent)
+            {
+                error!("Failed to create staging parent dir {:?}: {}", parent, e);
+                self.inode_table.write().expect("inodes poisoned").remove(ino);
+                return Err(libc::EIO);
             }
             match OpenOptions::new()
                 .create(true)

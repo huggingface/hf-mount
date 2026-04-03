@@ -3,7 +3,7 @@ use std::time::Duration;
 use super::inode::ROOT_INODE;
 use super::*;
 use crate::hub_api::HeadFileInfo;
-use crate::test_mocks::{MockHub, MockXet, TestOpts, make_test_vfs};
+use crate::test_mocks::{MockHub, MockXet, TestOpts, make_overlay_test_vfs_with_root, make_test_vfs};
 
 fn new_runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_multi_thread()
@@ -3186,8 +3186,6 @@ fn rename_clean_file_remote_and_local() {
 
 // ── Overlay mode tests ─────────────────────────────────────────────
 
-use crate::test_mocks::make_overlay_test_vfs_with_root;
-
 /// Readdir merges remote bucket entries with local overlay files.
 #[test]
 fn overlay_readdir_merges_local_and_remote() {
@@ -3275,12 +3273,14 @@ fn overlay_write_lands_at_original_path() {
     let t = make_overlay_test_vfs_with_root(hub, xet, overlay_root);
 
     t.runtime.block_on(async {
-        let (_, fh) = t
+        let (attr, fh) = t
             .vfs
             .create(ROOT_INODE, "new.txt", 0o644, 1000, 1000, None)
             .await
             .unwrap();
-        write_blocking(&t.vfs, 2, fh, 0, b"written via vfs").await.unwrap();
+        write_blocking(&t.vfs, attr.ino, fh, 0, b"written via vfs")
+            .await
+            .unwrap();
         t.vfs.release(fh).await.unwrap();
     });
 
@@ -3316,12 +3316,12 @@ fn overlay_no_flush_manager() {
     let t = make_overlay_test_vfs_with_root(hub.clone(), xet, overlay_root);
 
     t.runtime.block_on(async {
-        let (_, fh) = t
+        let (attr, fh) = t
             .vfs
             .create(ROOT_INODE, "nopush.txt", 0o644, 1000, 1000, None)
             .await
             .unwrap();
-        write_blocking(&t.vfs, 2, fh, 0, b"data").await.unwrap();
+        write_blocking(&t.vfs, attr.ino, fh, 0, b"data").await.unwrap();
         t.vfs.release(fh).await.unwrap();
     });
 
@@ -3340,13 +3340,13 @@ fn overlay_fsync_no_upload() {
     let t = make_overlay_test_vfs_with_root(hub.clone(), xet, overlay_root);
 
     t.runtime.block_on(async {
-        let (_, fh) = t
+        let (attr, fh) = t
             .vfs
             .create(ROOT_INODE, "synced.txt", 0o644, 1000, 1000, None)
             .await
             .unwrap();
-        write_blocking(&t.vfs, 2, fh, 0, b"data").await.unwrap();
-        t.vfs.fsync(2, fh, None).await.unwrap();
+        write_blocking(&t.vfs, attr.ino, fh, 0, b"data").await.unwrap();
+        t.vfs.fsync(attr.ino, fh, None).await.unwrap();
         t.vfs.release(fh).await.unwrap();
     });
 
@@ -3417,17 +3417,16 @@ fn overlay_write_persists_after_reread() {
     let t = make_overlay_test_vfs_with_root(hub, xet, overlay_root);
 
     t.runtime.block_on(async {
-        let (_, fh) = t
+        let (attr, fh) = t
             .vfs
             .create(ROOT_INODE, "reread.txt", 0o644, 1000, 1000, None)
             .await
             .unwrap();
-        let ino = 2; // first created inode after root
-        write_blocking(&t.vfs, ino, fh, 0, b"hello").await.unwrap();
+        write_blocking(&t.vfs, attr.ino, fh, 0, b"hello").await.unwrap();
         t.vfs.release(fh).await.unwrap();
 
         // Re-open read-only
-        let fh2 = t.vfs.open(ino, false, false, None).await.unwrap();
+        let fh2 = t.vfs.open(attr.ino, false, false, None).await.unwrap();
         let (data, _eof) = t.vfs.read(fh2, 0, 1024).await.unwrap();
         assert_eq!(data.as_ref(), b"hello");
     });
