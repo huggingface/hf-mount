@@ -57,6 +57,8 @@ pub struct VfsConfig {
     pub direct_io: bool,
     pub flush_debounce: Duration,
     pub flush_max_batch_window: Duration,
+    /// When true, writes are kept locally and never pushed to remote.
+    pub no_push: bool,
 }
 
 /// Lock ordering (acquire in this order to prevent deadlocks):
@@ -137,7 +139,7 @@ impl VirtualFs {
         let inodes = Arc::new(RwLock::new(InodeTable::new()));
         let negative_cache = Arc::new(RwLock::new(HashMap::new()));
 
-        let flush_manager = if !config.read_only && config.advanced_writes {
+        let flush_manager = if !config.read_only && config.advanced_writes && !config.no_push {
             let sd = staging_dir
                 .as_ref()
                 .expect("--advanced-writes requires a staging directory");
