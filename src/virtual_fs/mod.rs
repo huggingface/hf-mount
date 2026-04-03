@@ -95,7 +95,8 @@ pub struct VirtualFs {
     /// Negative lookup cache: paths known to not exist (TTL-based).
     negative_cache: Arc<RwLock<HashMap<String, Instant>>>,
     /// Per-inode locks for staging file preparation (prevents concurrent open races).
-    staging_locks: Mutex<HashMap<u64, Arc<tokio::sync::Mutex<()>>>>,
+    /// Shared with the flush loop for staging GC serialization.
+    staging_locks: Arc<Mutex<HashMap<u64, Arc<tokio::sync::Mutex<()>>>>>,
     /// Per-directory loading locks: serializes concurrent ensure_children_loaded() calls
     /// for the same directory so only one HTTP request is made (prevents thundering herd
     /// when Finder/Spotlight send many lookups on mount).
@@ -137,15 +138,23 @@ impl VirtualFs {
         let inodes = Arc::new(RwLock::new(InodeTable::new()));
         let negative_cache = Arc::new(RwLock::new(HashMap::new()));
 
+        let open_files: Arc<RwLock<HashMap<u64, OpenFile>>> = Arc::new(RwLock::new(HashMap::new()));
+        let staging_locks: Arc<Mutex<HashMap<u64, Arc<tokio::sync::Mutex<()>>>>> = Arc::new(Mutex::new(HashMap::new()));
+
         let flush_manager = if !config.read_only && config.advanced_writes {
             let sd = staging_dir
                 .as_ref()
                 .expect("--advanced-writes requires a staging directory");
+            let of = open_files.clone();
+            let has_open_handles: Arc<dyn Fn(u64) -> bool + Send + Sync> =
+                Arc::new(move |ino| has_open_handles_for(&of, ino));
             Some(flush::FlushManager::new(
                 xet_sessions.clone(),
                 sd.clone(),
                 hub_client.clone(),
                 inodes.clone(),
+                has_open_handles,
+                staging_locks.clone(),
                 &runtime,
                 config.flush_debounce,
                 config.flush_max_batch_window,
@@ -153,9 +162,6 @@ impl VirtualFs {
         } else {
             None
         };
-
-        // Create open_files before poll task so we can share with it
-        let open_files: Arc<RwLock<HashMap<u64, OpenFile>>> = Arc::new(RwLock::new(HashMap::new()));
 
         // Spawn remote change polling task (if interval > 0)
         let invalidator: Invalidator = Arc::new(Mutex::new(None));
@@ -192,7 +198,7 @@ impl VirtualFs {
             uid: config.uid,
             gid: config.gid,
             negative_cache,
-            staging_locks: Mutex::new(HashMap::new()),
+            staging_locks,
             dir_loading_locks: Mutex::new(HashMap::new()),
             pending_commits: Mutex::new(HashMap::new()),
             flush_manager,
@@ -974,6 +980,9 @@ impl VirtualFs {
 
         // Reuse existing dirty staging file (unless truncating)
         if !(is_dirty && staging_path.exists() && !truncate) {
+            // Capture the old file size before overwriting (may be a cached
+            // staging file from a previous open that persisted under budget).
+            let old_size = std::fs::metadata(&staging_path).map(|m| m.len()).unwrap_or(0);
             if !truncate && !xet_hash.is_empty() && size > 0 {
                 // Download remote content for read-modify-write
                 self.xet_sessions
@@ -989,6 +998,12 @@ impl VirtualFs {
                     error!("Failed to create staging file: {}", e);
                     libc::EIO
                 })?;
+            }
+            // Adjust bytes after successful write: subtract the old size and add the new.
+            if let Some(ref sd) = self.staging_dir {
+                sd.sub_bytes(old_size);
+                let file_size = std::fs::metadata(&staging_path).map(|m| m.len()).unwrap_or(0);
+                sd.add_bytes(file_size);
             }
         }
 
@@ -1073,13 +1088,15 @@ impl VirtualFs {
     async fn open_readonly(&self, ino: u64, fe: FileEntry, staging_path: Option<PathBuf>) -> VirtualFsResult<u64> {
         match (fe.is_dirty, &staging_path) {
             // Advanced write in progress — read from local staging file.
-            (true, Some(path)) if path.exists() => self.open_local_readonly(ino, path),
+            // If the staging file vanishes between exists() and File::open() (GC race),
+            // fall through to the remote path below.
+            (true, Some(path)) if path.exists() => match self.open_local_readonly(ino, path) {
+                ok @ Ok(_) => ok,
+                Err(_) => self.open_readonly_after_gc_race(ino, staging_path).await,
+            },
 
-            // Dirty file but staging file is missing — should not happen.
-            (true, Some(_)) => {
-                error!("Dirty file ino={} has missing staging file", ino);
-                Err(libc::EIO)
-            }
+            // Dirty snapshot but staging file already gone (GC raced before exists()).
+            (true, Some(_)) => self.open_readonly_after_gc_race(ino, staging_path).await,
 
             // Streaming write in progress (simple mode) — wait for commit.
             (true, None) if fe.xet_hash.is_empty() && fe.size > 0 => {
@@ -1124,6 +1141,26 @@ impl VirtualFs {
             // Empty file (size=0, no hash).
             _ => self.open_lazy(ino, String::new(), 0),
         }
+    }
+
+    /// Fallback for read-only opens when staging GC raced with our open.
+    /// Re-reads the inode: if clean, uses remote (lazy CAS); if dirty and
+    /// staging was recreated by a new writer, retries local open.
+    async fn open_readonly_after_gc_race(&self, ino: u64, staging_path: Option<PathBuf>) -> VirtualFsResult<u64> {
+        let fe = self.get_file_entry(ino)?;
+        if !fe.is_dirty {
+            debug!("open_readonly: ino={} cleaned by concurrent flush, using remote", ino);
+            return self.open_lazy(ino, fe.xet_hash, fe.size);
+        }
+        // Inode re-dirtied by a new writer that recreated staging — retry.
+        if let Some(ref path) = staging_path
+            && path.exists()
+        {
+            debug!("open_readonly: ino={} re-dirtied with new staging, retrying local", ino);
+            return self.open_local_readonly(ino, path);
+        }
+        error!("Dirty file ino={} has missing staging file", ino);
+        Err(libc::EIO)
     }
 
     /// Allocate a lazy file handle backed by a prefetch buffer.
@@ -1447,6 +1484,9 @@ impl VirtualFs {
                     let mut inodes = self.inode_table.write().expect("inodes poisoned");
                     if let Some(entry) = inodes.get_mut(handle_ino) {
                         if new_end > entry.size {
+                            if let Some(ref sd) = self.staging_dir {
+                                sd.add_bytes(new_end - entry.size);
+                            }
                             entry.size = new_end;
                         }
                         entry.set_dirty();
@@ -1664,12 +1704,38 @@ impl VirtualFs {
             _ => {}
         }
 
-        // Clean up orphan inodes (nlink == 0) when no more handles reference them.
+        // Clean up orphan inodes (nlink == 0) and GC staging files for clean inodes
+        // when no more handles reference them.
         if let Some(ino) = released_ino
             && !self.has_open_handles(ino)
         {
-            let mut inodes = self.inode_table.write().expect("inodes poisoned");
-            inodes.remove_orphan(ino);
+            // Orphan removal + dirty check under a single lock acquisition.
+            let is_clean = {
+                let mut inodes = self.inode_table.write().expect("inodes poisoned");
+                inodes.remove_orphan(ino);
+                // After remove_orphan, any entry still in the table has nlink > 0.
+                inodes.get(ino).is_some_and(|entry| !entry.is_dirty())
+            };
+            // GC staging only when over the disk budget. Serialize with
+            // open_advanced_write via staging_lock to prevent deleting a staging
+            // file that a concurrent open is preparing.
+            if is_clean
+                && let Some(ref staging_dir) = self.staging_dir
+                && staging_dir.is_over_limit()
+            {
+                let lock = self.staging_lock(ino);
+                let _guard = lock.lock().await;
+                // Re-check: open_advanced_write may have set dirty while we waited.
+                let still_clean = self
+                    .inode_table
+                    .read()
+                    .expect("inodes poisoned")
+                    .get(ino)
+                    .is_some_and(|entry| !entry.is_dirty());
+                if still_clean && staging_dir.try_remove(ino) {
+                    debug!("staging GC: removed ino={} on release", ino);
+                }
+            }
         }
 
         // staging_locks entries are intentionally not cleaned up here: removing
@@ -2053,12 +2119,7 @@ impl VirtualFs {
 
         // Clean up staging file only if inode was fully removed (no remaining hard links)
         if inode_removed && let Some(ref staging_dir) = self.staging_dir {
-            let staging_path = staging_dir.path(ino);
-            if let Err(e) = std::fs::remove_file(&staging_path)
-                && e.kind() != std::io::ErrorKind::NotFound
-            {
-                warn!("Failed to remove staging file for ino={}: {}", ino, e);
-            }
+            staging_dir.try_remove(ino);
         }
 
         info!("Deleted file: {}", full_path);
@@ -2610,6 +2671,11 @@ impl VirtualFs {
                         error!("Failed to create staging file for truncate: {}", e);
                         return Err(libc::EIO);
                     }
+                    // Track the newly materialized staging file.
+                    if let Some(ref sd) = self.staging_dir {
+                        let size = std::fs::metadata(&staging_path).map(|m| m.len()).unwrap_or(0);
+                        sd.add_bytes(size);
+                    }
                 }
 
                 // Phase 2: truncate file + update inode under the same write lock.
@@ -2632,6 +2698,13 @@ impl VirtualFs {
                     }
                 }
                 if let Some(entry) = inodes.get_mut(ino) {
+                    if let Some(ref sd) = self.staging_dir {
+                        if new_size < entry.size {
+                            sd.sub_bytes(entry.size - new_size);
+                        } else if new_size > entry.size {
+                            sd.add_bytes(new_size - entry.size);
+                        }
+                    }
                     entry.size = new_size;
                     entry.mtime = SystemTime::now();
                     entry.ctime = entry.mtime;

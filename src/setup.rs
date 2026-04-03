@@ -101,6 +101,13 @@ pub struct MountOptions {
     #[arg(long, default_value_t = 10_000_000_000)]
     pub cache_size: u64,
 
+    /// Maximum size in bytes for staging files (advanced writes).
+    /// When exceeded, flushed staging files are garbage-collected to reclaim
+    /// disk space. When not exceeded, staging files persist as a local cache
+    /// for fast read-after-write. 0 = unlimited (no GC).
+    #[arg(long, default_value_t = 0)]
+    pub max_staging_size: u64,
+
     /// Disable the on-disk chunk cache. Every read fetches data from
     /// HF storage (no local disk caching between reads). Useful for
     /// benchmarking without cache effects.
@@ -321,7 +328,7 @@ pub fn build(source: Source, options: MountOptions, is_nfs: bool) -> MountSetup 
     // Repos need a staging dir for HTTP download cache (open_readonly),
     // even when advanced_writes is disabled.
     let staging_dir = if advanced_writes || hub_client.is_repo() {
-        Some(StagingDir::new(&options.cache_dir))
+        Some(StagingDir::new(&options.cache_dir, options.max_staging_size))
     } else {
         None
     };
@@ -357,7 +364,7 @@ pub fn build(source: Source, options: MountOptions, is_nfs: bool) -> MountSetup 
     );
     info!(
         "Config: advanced_writes={} direct_io={} poll_interval={}s metadata_ttl={}ms \
-         cache_dir={:?} cache_size={} no_disk_cache={} max_threads={} \
+         cache_dir={:?} cache_size={} no_disk_cache={} max_staging_size={} max_threads={} \
          flush_debounce={}ms flush_max_batch={}ms uid={} gid={} filter_os_files={}",
         advanced_writes,
         options.direct_io,
@@ -366,6 +373,7 @@ pub fn build(source: Source, options: MountOptions, is_nfs: bool) -> MountSetup 
         options.cache_dir,
         options.cache_size,
         options.no_disk_cache,
+        options.max_staging_size,
         options.max_threads,
         options.flush_debounce_ms,
         options.flush_max_batch_window_ms,
