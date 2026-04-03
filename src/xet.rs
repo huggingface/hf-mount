@@ -183,9 +183,7 @@ pub struct StagingDir {
     dir: PathBuf,
     /// Per-session random key to make staging paths unpredictable.
     session_key: u64,
-    /// When set, staging uses original file paths under the overlay root
-    /// instead of inode-based paths. This makes writes persist across
-    /// mount sessions and land in the actual local directory.
+    /// Overlay: stage at original file paths instead of inode-based names.
     overlay_root: Option<PathBuf>,
 }
 
@@ -200,8 +198,7 @@ impl StagingDir {
         }
     }
 
-    /// Create a staging dir with overlay mode: staging paths use original
-    /// file paths under `overlay_root` instead of inode-based names.
+    /// Create a staging dir with overlay mode.
     pub fn new_overlay(cache_dir: &Path, overlay_root: PathBuf) -> Self {
         let dir = cache_dir.join("staging");
         std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("Failed to create staging dir {:?}: {e}", dir));
@@ -222,16 +219,12 @@ impl StagingDir {
         self.overlay_root.as_deref()
     }
 
-    /// Inode-based staging path (non-overlay mode only).
-    /// Used by FlushManager which doesn't have access to `full_path`.
+    /// Inode-based staging path (used by FlushManager).
     pub fn path(&self, inode: u64) -> PathBuf {
         self.dir.join(format!("ino_{:x}_{:016x}", inode, self.session_key))
     }
 
-    /// Get the staging path for a file.
-    /// In overlay mode, uses the file's original path under the overlay root
-    /// (persists across mount sessions). Otherwise, uses an inode-based path.
-    /// This is a pure path computation with no I/O side effects.
+    /// Staging path: overlay root + original path, or inode-based. Pure (no I/O).
     pub fn staging_path(&self, inode: u64, full_path: &str) -> PathBuf {
         if let Some(root) = &self.overlay_root {
             debug_assert!(
@@ -248,9 +241,7 @@ impl StagingDir {
         }
     }
 
-    /// Create parent directories for an overlay staging path.
-    /// Call this only from write/create/truncate paths that need to
-    /// materialize the file on disk. No-op in non-overlay mode.
+    /// Create parent dirs for overlay staging path. No-op outside overlay.
     pub fn ensure_staging_parents(&self, full_path: &str) -> std::io::Result<()> {
         if let Some(root) = &self.overlay_root {
             let path = root.join(full_path);

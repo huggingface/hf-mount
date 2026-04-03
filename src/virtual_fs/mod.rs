@@ -518,10 +518,7 @@ impl VirtualFs {
             }
         }
 
-        // Overlay mode: merge local directory entries into the inode table.
-        // New local files are inserted; existing remote entries with the same
-        // name are overridden (local size/mtime, marked dirty so reads come
-        // from the local file). Uses the pre-mount fd to access the shadowed dir.
+        // Overlay: merge local entries (local overrides remote, via pre-mount fd).
         if self.overlay
             && let Some(overlay_root) = self.staging_dir.as_ref().and_then(|sd| sd.overlay_root())
         {
@@ -534,12 +531,10 @@ impl VirtualFs {
                     if self.filter_os_files && is_os_junk(&name) {
                         continue;
                     }
-                    // Use symlink_metadata to avoid following symlinks
                     let metadata = match std::fs::symlink_metadata(entry.path()) {
                         Ok(m) => m,
                         Err(_) => continue,
                     };
-                    // Skip symlinks — only regular files and directories
                     if metadata.is_symlink() {
                         continue;
                     }
@@ -555,12 +550,10 @@ impl VirtualFs {
                         use std::os::unix::fs::PermissionsExt;
                         (metadata.permissions().mode() & 0o777) as u16
                     };
-                    // insert() returns existing inode if path already exists (e.g. remote file)
                     let ino = inodes.insert(
                         parent_ino, name, full_path, kind, size, mtime, None, mode, self.uid, self.gid,
                     );
-                    // Always update from local file (local overrides remote).
-                    // Clear xet_hash so unlink/rename won't send stale remote ops.
+                    // Local overrides remote: update metadata, clear remote identity.
                     if let Some(e) = inodes.get_mut(ino) {
                         e.size = size;
                         e.mtime = mtime;
@@ -920,7 +913,7 @@ impl VirtualFs {
             }
         }
         // Advanced-writes: flush staging file to Hub immediately.
-        // In overlay mode, sync the local fd for durability but skip remote upload.
+        // Overlay: local fsync only, no remote upload.
         if self.overlay {
             let files = self.open_files.read().expect("open_files poisoned");
             if let Some(OpenFile::Local { file, .. }) = files.get(&file_handle) {
@@ -1007,7 +1000,7 @@ impl VirtualFs {
             .as_ref()
             .map(|sd| sd.staging_path(ino, &file_entry.full_path));
 
-        // Ensure overlay parent dirs exist before any write path
+        // Overlay: ensure parent dirs exist before write.
         if writable && let Some(sd) = &self.staging_dir {
             sd.ensure_staging_parents(&file_entry.full_path).map_err(|e| {
                 error!("Failed to create staging parent dirs for ino={}: {}", ino, e);
@@ -1787,8 +1780,7 @@ impl VirtualFs {
 
     /// Finalize a streaming write: send Finish to the worker, await CAS upload, commit to Hub.
     async fn streaming_commit(&self, ino: u64, channel: &StreamingChannel) -> Result<(), i32> {
-        // Overlay mode forces advanced_writes, so streaming writes are unreachable.
-        debug_assert!(!self.overlay, "streaming_commit must not be called in overlay mode");
+        debug_assert!(!self.overlay, "overlay forces advanced_writes; streaming unreachable");
 
         // Unlinked files (nlink=0) must not be re-committed on close —
         // user deleted the file, uploading would resurrect it.
@@ -2063,7 +2055,6 @@ impl VirtualFs {
             );
             if let Some(entry) = inodes.get_mut(ino) {
                 entry.children_loaded = true;
-                // Overlay: mark as dirty so stale-child pruning won't remove it
                 if self.overlay {
                     entry.set_dirty();
                 }
@@ -2075,7 +2066,7 @@ impl VirtualFs {
 
         self.negative_cache_remove(&full_path);
 
-        // Overlay mode: create the directory on disk so it persists
+        // Overlay: persist directory to disk.
         if self.overlay
             && let Some(overlay_path) = self
                 .staging_dir
@@ -2109,14 +2100,12 @@ impl VirtualFs {
                 Some(_) => return Err(libc::EISDIR),
                 None => return Err(libc::ENOENT),
             };
-            // Overlay mode: remote-only files cannot be deleted (no whiteout support).
-            // Local or COW'd files (dirty) can be deleted — the remote original
-            // reappears on remount, which is standard overlay semantics.
-            if self.overlay && !entry.is_dirty() && entry.xet_hash.is_some() {
+            // Overlay: clean (remote) entries cannot be deleted (no whiteouts).
+            // Dirty (local) entries can be deleted; remote reappears on remount.
+            if self.overlay && !entry.is_dirty() {
                 return Err(libc::EPERM);
             }
-            // Remote delete only when last link is removed and file exists on the hub.
-            // Overlay mode never mutates remote.
+            // Remote delete only when last link removed and file exists on hub.
             let needs_remote = !self.overlay && entry.xet_hash.is_some() && entry.nlink <= 1;
             (entry.inode, entry.full_path.clone(), needs_remote)
         };
@@ -2324,9 +2313,7 @@ impl VirtualFs {
             self.ensure_children_loaded(newparent).await?;
         }
 
-        // Overlay mode: clean (non-local) entries cannot be renamed — no whiteout
-        // for the old path and no remote mutation. This covers remote files (xet_hash),
-        // etag-based files, and remote directories.
+        // Overlay: clean (remote) entries cannot be renamed (no whiteouts).
         if self.overlay
             && let Some(src) = self
                 .inode_table
@@ -2375,23 +2362,20 @@ impl VirtualFs {
             }
         }
 
-        // Phase 2: sync to remote (add + delete ops). Overlay never mutates remote.
+        // Phase 2: sync to remote (skipped in overlay mode).
         let remote_mutated = if self.overlay {
             false
         } else {
             self.rename_remote(&info).await?
         };
 
-        // Overlay mode: rename the on-disk file/directory so staging_path()
-        // (which is based on full_path) stays consistent with the physical layout.
+        // Overlay: move the on-disk file to match the new path.
         if self.overlay
             && let Some(overlay_root) = self.staging_dir.as_ref().and_then(|sd| sd.overlay_root())
         {
             let old_disk_path = overlay_root.join(&info.old_path);
             let new_disk_path = overlay_root.join(&info.new_full_path);
             if !old_disk_path.exists() {
-                // Source not materialized locally — rename would have no effect
-                // on disk, and the old name would reappear on next directory reload.
                 return Err(libc::EPERM);
             }
             if let Some(parent) = new_disk_path.parent()

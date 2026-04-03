@@ -301,8 +301,7 @@ pub fn build(source: Source, options: MountOptions, is_nfs: bool) -> MountSetup 
         info!("Repo mounts are always read-only");
     }
 
-    // Overlay mode: VFS is read-write (local writes), but remote is read-only
-    // (no write token, no upload config).
+    // Overlay: local writes allowed, but no remote write token/upload.
     let remote_read_only = read_only || options.overlay;
     let refresher = hub_client.token_refresher(remote_read_only);
     let cas_config = build_cas_config(&runtime, &refresher);
@@ -338,11 +337,9 @@ pub fn build(source: Source, options: MountOptions, is_nfs: bool) -> MountSetup 
 
     let advanced_writes = options.advanced_writes || options.overlay || (is_nfs && !read_only);
 
-    // In overlay mode, open a fd to the mount point directory BEFORE mounting.
-    // This preserves access to the underlying local files after the mount shadows them.
+    // Overlay: pre-mount fd preserves access to the dir after mount shadows it.
     let overlay_fd = if options.overlay {
         use std::os::unix::io::AsRawFd;
-        // Ensure mount point exists before opening fd
         std::fs::create_dir_all(&mount_point)
             .unwrap_or_else(|e| panic!("Failed to create mount point {:?} for overlay: {e}", mount_point));
         let fd = std::fs::File::open(&mount_point)
