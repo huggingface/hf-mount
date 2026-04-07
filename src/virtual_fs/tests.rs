@@ -843,7 +843,7 @@ fn poll_dirty_files_skipped() {
         }
 
         let mut inodes = vfs.inode_table.write().unwrap();
-        let updated = inodes.update_remote_file(ino, Some("new_hash".to_string()), None, 999, SystemTime::now());
+        let updated = inodes.update_remote_file(ino, Some("new_hash".to_string()), None, 999, SystemTime::now(), None);
         assert!(!updated);
         assert_eq!(inodes.get(ino).unwrap().xet_hash.as_deref(), Some("hash1"));
     });
@@ -3182,4 +3182,150 @@ fn rename_clean_file_remote_and_local() {
         let entry = inodes.get(src_ino).unwrap();
         assert_eq!(entry.full_path, "dst.txt");
     });
+}
+
+// ── Encryption tests ────────────────────────────────────────────────
+
+#[cfg(feature = "encrypt")]
+mod encrypt {
+    use super::*;
+    use crate::crypto::{self, Algorithm, EncryptionConfig};
+
+    fn test_config() -> EncryptionConfig {
+        let master_key = [0x42u8; crypto::MASTER_KEY_LEN];
+        let prk = crypto::extract_prk(&master_key);
+        let source_context = "bucket/test".to_string();
+        EncryptionConfig {
+            filename_key: crypto::derive_filename_key(&prk, &source_context),
+            prk,
+            source_context,
+            algorithm: Algorithm::Aegis128X2,
+            chunk_size: 65536,
+        }
+    }
+
+    fn vfs_encrypted(
+        hub: &std::sync::Arc<MockHub>,
+        xet: &std::sync::Arc<MockXet>,
+    ) -> (tokio::runtime::Runtime, std::sync::Arc<VirtualFs>) {
+        let rt = new_runtime();
+        let vfs = make_test_vfs(
+            hub.clone(),
+            xet.clone(),
+            TestOpts {
+                encryption_config: Some(test_config()),
+                ..Default::default()
+            },
+            &rt,
+        );
+        (rt, vfs)
+    }
+
+    #[test]
+    fn encrypted_create_write_flush_sets_metadata() {
+        let hub = MockHub::new();
+        let xet = MockXet::new();
+        let (rt, vfs) = vfs_encrypted(&hub, &xet);
+
+        rt.block_on(async {
+            let (attr, fh) = vfs
+                .create(ROOT_INODE, "secret.txt", 0o644, 1000, 1000, Some(42))
+                .await
+                .unwrap();
+            let ino = attr.ino;
+
+            write_blocking(&vfs, ino, fh, 0, b"hello encrypted world")
+                .await
+                .unwrap();
+            vfs.release(fh).await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+            let inodes = vfs.inode_table.read().unwrap();
+            let entry = inodes.get(ino).unwrap();
+
+            assert!(entry.encrypted, "file should be marked encrypted after flush");
+            assert_eq!(entry.file_algorithm, Some(Algorithm::Aegis128X2));
+            assert!(entry.xet_hash.is_some());
+            assert_eq!(entry.size, 21, "size should be plaintext size");
+            assert!(entry.remote_size.is_some(), "remote_size should be set");
+            assert!(
+                entry.remote_size.unwrap() > 21,
+                "ciphertext should be larger than plaintext"
+            );
+            assert_ne!(entry.size, entry.remote_size.unwrap());
+
+            // Verify batch log has content_type set
+            let log = hub.take_batch_log();
+            let has_ct = log.iter().any(|ops| {
+                ops.iter().any(|op| match op {
+                    crate::hub_api::BatchOp::AddFile { content_type, .. } => content_type.is_some(),
+                    _ => false,
+                })
+            });
+            assert!(has_ct, "commit should include content_type for encrypted file");
+        });
+    }
+
+    #[test]
+    fn encrypted_write_read_roundtrip() {
+        let hub = MockHub::new();
+        let xet = MockXet::new();
+        let (rt, vfs) = vfs_encrypted(&hub, &xet);
+
+        rt.block_on(async {
+            let (attr, fh) = vfs
+                .create(ROOT_INODE, "roundtrip.bin", 0o644, 1000, 1000, Some(42))
+                .await
+                .unwrap();
+            let ino = attr.ino;
+
+            let data = b"the quick brown fox jumps over the lazy dog";
+            write_blocking(&vfs, ino, fh, 0, data).await.unwrap();
+
+            // Read back while still open (reads from plaintext staging file)
+            let (read_data, _) = vfs.read(fh, 0, 100).await.unwrap();
+            assert_eq!(&read_data[..], data);
+
+            vfs.release(fh).await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+            let entry = vfs.inode_table.read().unwrap().get(ino).unwrap().clone();
+            assert!(entry.encrypted);
+            assert_eq!(entry.size, data.len() as u64);
+
+            // Open for reading — this goes through open_encrypted_xet (download + decrypt)
+            let fh2 = vfs.open(ino, false, false, Some(42)).await.unwrap();
+            let (read_data, _) = vfs.read(fh2, 0, 100).await.unwrap();
+            assert_eq!(&read_data[..], data);
+
+            vfs.release(fh2).await.unwrap();
+        });
+    }
+
+    #[test]
+    fn content_type_populates_inode_on_tree_listing() {
+        let hub = MockHub::new();
+        let xet = MockXet::new();
+
+        let ct = crypto::format_content_type(&crypto::EncryptedFileInfo {
+            algorithm: Algorithm::Aegis128X2,
+            plaintext_size: 1000,
+            ciphertext_size: 1100,
+            chunk_size: 65536,
+        });
+        hub.add_file_with_content_type("encrypted_file.bin", 1100, Some("hash_enc"), Some(ct));
+
+        let (rt, vfs) = vfs_encrypted(&hub, &xet);
+        rt.block_on(async {
+            let attr = vfs.lookup(ROOT_INODE, "encrypted_file.bin").await.unwrap();
+
+            let inodes = vfs.inode_table.read().unwrap();
+            let entry = inodes.get(attr.ino).unwrap();
+
+            assert!(entry.encrypted);
+            assert_eq!(entry.file_algorithm, Some(Algorithm::Aegis128X2));
+            assert_eq!(entry.size, 1000, "size should be plaintext from content_type");
+            assert_eq!(entry.remote_size, Some(1100));
+        });
+    }
 }

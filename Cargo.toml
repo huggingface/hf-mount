@@ -33,11 +33,16 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ulid = "1"
 uuid = { version = "1", features = ["v4"] }
+aegis = { version = "0.9", features = ["raf"], optional = true }
+base64 = { version = "0.22", optional = true }
+hctr2-rs = { version = "0.9", optional = true }
+hmac-sha256 = { version = "1", optional = true }
 
 [features]
 default = []
 fuse = ["dep:fuser"]
 nfs = ["dep:nfsserve"]
+encrypt = ["dep:aegis", "dep:base64", "dep:hctr2-rs", "dep:hmac-sha256"]
 vendored-openssl = ["openssl-sys/vendored"]
 
 [dependencies.openssl-sys]
