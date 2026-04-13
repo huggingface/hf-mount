@@ -847,10 +847,12 @@ impl VirtualFs {
         }
     }
 
-    /// Synchronous fsync: ensures data is committed to Hub before returning.
-    /// - Streaming handles: no-op (data is committed synchronously on close).
-    ///   Cannot delegate to flush() because it sends Finish which tears down the writer.
-    /// - Advanced-writes handles: uploads staging file and commits immediately.
+    /// Enqueues the inode for background flush rather than blocking on a
+    /// synchronous Hub upload. Data is already durable in the local staging
+    /// file after write(); the background flush loop commits to Hub.
+    ///
+    /// - Streaming handles: no-op (committed synchronously on close).
+    /// - Advanced-writes handles: enqueues for background flush.
     /// - Read-only / lazy handles: no-op.
     pub async fn fsync(&self, ino: u64, file_handle: u64, _pid: Option<u32>) -> VirtualFsResult<()> {
         {
@@ -859,22 +861,8 @@ impl VirtualFs {
                 return Ok(());
             }
         }
-        // Advanced-writes: flush staging file to Hub immediately.
-        // Note: if the flush_loop is concurrently processing this inode, both may
-        // upload the same content. This is benign (idempotent commit, generation-aware
-        // clear ensures only one clears dirty).
-        let staging_dir = match &self.staging_dir {
-            Some(sd) => sd,
-            None => return Ok(()),
-        };
-        flush::flush_one(
-            ino,
-            &*self.xet_sessions,
-            staging_dir,
-            &*self.hub_client,
-            &self.inode_table,
-        )
-        .await
+        self.schedule_flush(ino);
+        Ok(())
     }
 
     pub fn getattr(&self, ino: u64) -> VirtualFsResult<VirtualFsAttr> {
