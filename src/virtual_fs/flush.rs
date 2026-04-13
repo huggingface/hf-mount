@@ -339,7 +339,16 @@ async fn flush_batch(
     for (chunk_idx, chunk) in to_flush.chunks(UPLOAD_CHUNK_SIZE).enumerate() {
         let staging_paths: Vec<&std::path::Path> = chunk.iter().map(|item| item.staging_path.as_path()).collect();
         match xet_sessions.upload_files(&staging_paths).await {
-            Ok(results) => upload_results.extend(results),
+            Ok(results) => {
+                assert_eq!(
+                    results.len(),
+                    chunk.len(),
+                    "upload_files returned {} results for {} inputs",
+                    results.len(),
+                    chunk.len()
+                );
+                upload_results.extend(results);
+            }
             Err(e) => {
                 // Abort the entire batch: committing partial results could apply
                 // deletes without the corresponding adds from this failed chunk.
@@ -424,8 +433,10 @@ async fn flush_batch(
         error!("Batch commit failed: {}", e);
         let msg = format!("commit failed: {e}");
         let mut errs = flush_errors.lock().expect("flush_errors poisoned");
-        for item in &to_flush {
-            errs.insert(item.ino, msg.clone());
+        for (i, item) in to_flush.iter().enumerate() {
+            if !unchanged[i] {
+                errs.insert(item.ino, msg.clone());
+            }
         }
         return;
     }

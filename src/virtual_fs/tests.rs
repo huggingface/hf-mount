@@ -2918,6 +2918,128 @@ fn fsync_between_writes_stays_dirty() {
     });
 }
 
+/// When a file is flushed and then re-dirtied without content change,
+/// the background flush should skip the Hub commit (same xet_hash).
+#[test]
+fn flush_skips_hub_commit_when_hash_unchanged() {
+    use std::sync::atomic::Ordering;
+
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_advanced(&hub, &xet);
+
+    rt.block_on(async {
+        let (_, fh) = vfs.create(ROOT_INODE, "f.txt", 0o644, 0, 0, None).await.unwrap();
+        let ino = ROOT_INODE + 1;
+
+        write_blocking(&vfs, ino, fh, 0, b"hello").await.unwrap();
+        vfs.release(fh).await.unwrap();
+
+        // Wait for background flush (debounce = 100ms).
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        // First flush committed to Hub.
+        let logs = hub.take_batch_log();
+        assert_eq!(logs.len(), 1, "first flush should commit");
+
+        let entry = vfs.inode_table.read().unwrap().get(ino).unwrap().clone();
+        assert!(!entry.is_dirty());
+        let hash = entry.xet_hash.unwrap();
+
+        // Reset MockXet's counter so next upload returns the same hash.
+        // e.g. hash = "mock_hash_1" → store 1 so next_hash_string() returns "mock_hash_1".
+        let counter: u64 = hash.strip_prefix("mock_hash_").unwrap().parse().unwrap();
+        xet.next_hash.store(counter, Ordering::SeqCst);
+
+        // Re-dirty the inode (simulates a write that didn't change content).
+        vfs.inode_table.write().unwrap().get_mut(ino).unwrap().set_dirty();
+        vfs.schedule_flush(ino);
+
+        // Wait for second flush.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        // Second flush should NOT commit (same hash → skipped).
+        let logs2 = hub.take_batch_log();
+        assert!(logs2.is_empty(), "unchanged file should skip Hub commit");
+
+        // Inode should be clean again.
+        assert!(!vfs.inode_table.read().unwrap().get(ino).unwrap().is_dirty());
+    });
+
+    vfs.shutdown();
+}
+
+/// In a batch with mixed changed/unchanged files, only changed files
+/// appear in the Hub commit. Unchanged files still get cleared dirty.
+#[test]
+fn flush_mixed_changed_and_unchanged() {
+    use std::sync::atomic::Ordering;
+
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_advanced(&hub, &xet);
+
+    rt.block_on(async {
+        // Create two files and flush them.
+        let (_, fh1) = vfs.create(ROOT_INODE, "file1.txt", 0o644, 0, 0, None).await.unwrap();
+        let ino1 = ROOT_INODE + 1;
+        write_blocking(&vfs, ino1, fh1, 0, b"content1").await.unwrap();
+
+        let (_, fh2) = vfs.create(ROOT_INODE, "file2.txt", 0o644, 0, 0, None).await.unwrap();
+        let ino2 = ROOT_INODE + 2;
+        write_blocking(&vfs, ino2, fh2, 0, b"content2").await.unwrap();
+
+        vfs.release(fh1).await.unwrap();
+        vfs.release(fh2).await.unwrap();
+
+        // Wait for background flush.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        let logs = hub.take_batch_log();
+        assert_eq!(logs.len(), 1, "both files in one batch");
+        assert_eq!(logs[0].len(), 2, "both files committed");
+
+        // Grab hash for file1 (will be "unchanged").
+        let hash1 = vfs
+            .inode_table
+            .read()
+            .unwrap()
+            .get(ino1)
+            .unwrap()
+            .xet_hash
+            .clone()
+            .unwrap();
+        let counter1: u64 = hash1.strip_prefix("mock_hash_").unwrap().parse().unwrap();
+
+        // Reset counter so file1 gets the same hash (unchanged).
+        // File2's prev hash is changed to force a mismatch (simulates changed content).
+        xet.next_hash.store(counter1, Ordering::SeqCst);
+
+        {
+            let mut inodes = vfs.inode_table.write().unwrap();
+            inodes.get_mut(ino1).unwrap().set_dirty();
+            inodes.get_mut(ino2).unwrap().xet_hash = Some("stale_hash".to_string());
+            inodes.get_mut(ino2).unwrap().set_dirty();
+        }
+        vfs.schedule_flush(ino1);
+        vfs.schedule_flush(ino2);
+
+        // Wait for second flush.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        let logs2 = hub.take_batch_log();
+        assert_eq!(logs2.len(), 1, "should still make one Hub commit");
+        // Only file2 (changed) should be in the commit.
+        assert_eq!(logs2[0].len(), 1, "only changed file should be committed");
+
+        // Both inodes should be clean.
+        assert!(!vfs.inode_table.read().unwrap().get(ino1).unwrap().is_dirty());
+        assert!(!vfs.inode_table.read().unwrap().get(ino2).unwrap().is_dirty());
+    });
+
+    vfs.shutdown();
+}
+
 /// If streaming writer creation fails on open(O_TRUNC), the inode must NOT
 /// be truncated. Before the fix, the inode was mutated before writer setup,
 /// leaving it stuck at size=0 with no handle to recover.
