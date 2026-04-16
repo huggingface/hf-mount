@@ -2427,8 +2427,8 @@ impl VirtualFs {
         // since poll may not fix a dirty local inode at the destination path.
         match self.rename_apply_local(info, parent, name, newparent, newname, no_replace) {
             Ok(()) => Ok(()),
-            Err(libc::ENOENT) if remote_mutated => {
-                warn!("rename: source gone after remote rename; poll will reconcile");
+            Err(libc::ENOENT) if remote_mutated || self.overlay => {
+                warn!("rename: source gone after rename; next dir load will reconcile");
                 // Invalidate parents so the next lookup re-fetches from remote
                 // instead of trusting the stale children_loaded state.
                 let mut inodes = self.inode_table.write().expect("inodes poisoned");
