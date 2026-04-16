@@ -1028,8 +1028,10 @@ impl VirtualFs {
                 libc::EIO
             })?;
 
-        // Overlay: ensure parent dirs exist before write.
-        if writable && let Some(sd) = &self.staging_dir {
+        if writable
+            && self.overlay
+            && let Some(sd) = &self.staging_dir
+        {
             sd.ensure_staging_parents(ino, &file_entry.full_path).map_err(|e| {
                 error!("Failed to create staging parent dirs for ino={}: {}", ino, e);
                 libc::EIO
