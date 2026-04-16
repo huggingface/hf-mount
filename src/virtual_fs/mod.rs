@@ -229,6 +229,11 @@ impl VirtualFs {
         vfs
     }
 
+    /// True if the entry is a clean remote entry that overlay mode treats as immutable.
+    fn is_overlay_immutable(&self, entry: &inode::InodeEntry) -> bool {
+        self.overlay && !entry.is_dirty()
+    }
+
     /// Overlay root path, if overlay mode is active.
     fn overlay_root(&self) -> Option<&std::path::Path> {
         if self.overlay {
@@ -2122,9 +2127,9 @@ impl VirtualFs {
                 Some(_) => return Err(libc::EISDIR),
                 None => return Err(libc::ENOENT),
             };
-            // Overlay: clean (remote) entries cannot be deleted (no whiteouts).
-            // Dirty (local) entries can be deleted; remote reappears on remount.
-            if self.overlay && !entry.is_dirty() {
+            // Overlay: cannot delete clean remote entries (no whiteout support).
+            // Deleting dirty (local) entries is allowed; remote reappears on remount.
+            if self.is_overlay_immutable(entry) {
                 return Err(libc::EPERM);
             }
             // Remote delete only when last link removed and file exists on hub.
@@ -2278,8 +2283,8 @@ impl VirtualFs {
             let inodes = self.inode_table.read().expect("inodes poisoned");
             match inodes.lookup_child(parent, name) {
                 Some(entry) if entry.kind == InodeKind::Directory => {
-                    // Overlay: clean (remote) directories cannot be removed.
-                    if self.overlay && !entry.is_dirty() {
+                    // Overlay: cannot remove clean remote directories.
+                    if self.is_overlay_immutable(entry) {
                         return Err(libc::EPERM);
                     }
                     if !entry.children.is_empty() {
@@ -2351,14 +2356,13 @@ impl VirtualFs {
             self.ensure_children_loaded(newparent).await?;
         }
 
-        // Overlay: clean (remote) entries cannot be renamed (no whiteouts).
-        if self.overlay
-            && let Some(src) = self
-                .inode_table
-                .read()
-                .expect("inodes poisoned")
-                .lookup_child(parent, name)
-            && !src.is_dirty()
+        // Overlay: cannot rename clean remote entries (no whiteout for old path).
+        if let Some(src) = self
+            .inode_table
+            .read()
+            .expect("inodes poisoned")
+            .lookup_child(parent, name)
+            && self.is_overlay_immutable(src)
         {
             return Err(libc::EPERM);
         }
