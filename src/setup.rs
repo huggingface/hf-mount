@@ -183,8 +183,6 @@ pub struct MountSetup {
     pub max_threads: usize,
     pub metadata_ttl_ms: u64,
     pub fuse_owner_only: bool,
-    /// Kept alive to preserve access to the underlying dir via /proc/self/fd/N.
-    pub _overlay_fd: Option<std::fs::File>,
 }
 
 // ── Tracing + env vars (no threads) ──────────────────────────────────
@@ -337,20 +335,15 @@ pub fn build(source: Source, options: MountOptions, is_nfs: bool) -> MountSetup 
 
     let advanced_writes = options.advanced_writes || options.overlay || (is_nfs && !read_only);
 
-    // Overlay: pre-mount fd preserves access to the dir after mount shadows it.
+    // Overlay: open a pre-mount fd to the mount point directory. The fd is
+    // passed to StagingDir which derives the overlay root path from it.
     let overlay_fd = if options.overlay {
-        use std::os::unix::io::AsRawFd;
         std::fs::create_dir_all(&mount_point)
             .unwrap_or_else(|e| panic!("Failed to create mount point {:?} for overlay: {e}", mount_point));
-        let fd = std::fs::File::open(&mount_point)
-            .unwrap_or_else(|e| panic!("Failed to open mount point {:?} for overlay: {e}", mount_point));
-        let raw_fd = fd.as_raw_fd();
-        #[cfg(target_os = "linux")]
-        let overlay_root = PathBuf::from(format!("/proc/self/fd/{}", raw_fd));
-        #[cfg(not(target_os = "linux"))]
-        let overlay_root = PathBuf::from(format!("/dev/fd/{}", raw_fd));
-        info!("Overlay mode: local dir accessible via {:?}", overlay_root);
-        Some((fd, overlay_root))
+        Some(
+            std::fs::File::open(&mount_point)
+                .unwrap_or_else(|e| panic!("Failed to open mount point {:?} for overlay: {e}", mount_point)),
+        )
     } else {
         None
     };
@@ -358,8 +351,8 @@ pub fn build(source: Source, options: MountOptions, is_nfs: bool) -> MountSetup 
     // Repos need a staging dir for HTTP download cache (open_readonly),
     // even when advanced_writes is disabled.
     let staging_dir = if advanced_writes || hub_client.is_repo() {
-        if let Some((_, ref overlay_root)) = overlay_fd {
-            Some(StagingDir::new_overlay(&options.cache_dir, overlay_root.clone()))
+        if let Some(fd) = overlay_fd {
+            Some(StagingDir::new_overlay(&options.cache_dir, fd))
         } else {
             Some(StagingDir::new(&options.cache_dir))
         }
@@ -450,7 +443,6 @@ pub fn build(source: Source, options: MountOptions, is_nfs: bool) -> MountSetup 
         max_threads: options.max_threads,
         metadata_ttl_ms: options.metadata_ttl_ms,
         fuse_owner_only: options.fuse_owner_only,
-        _overlay_fd: overlay_fd.map(|(fd, _)| fd),
     }
 }
 

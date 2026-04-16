@@ -84,7 +84,7 @@ pub struct VirtualFs {
     runtime: tokio::runtime::Handle,
     hub_client: Arc<dyn HubOps>,
     xet_sessions: Arc<dyn XetOps>,
-    staging_dir: Option<StagingDir>,
+    staging_dir: Option<Arc<StagingDir>>,
     read_only: bool,
     advanced_writes: bool,
     inode_table: Arc<RwLock<InodeTable>>,
@@ -137,6 +137,7 @@ impl VirtualFs {
         staging_dir: Option<StagingDir>,
         config: VfsConfig,
     ) -> Arc<Self> {
+        let staging_dir = staging_dir.map(Arc::new);
         let inodes = Arc::new(RwLock::new(InodeTable::new()));
         let negative_cache = Arc::new(RwLock::new(HashMap::new()));
 
@@ -146,7 +147,7 @@ impl VirtualFs {
                 .expect("--advanced-writes requires a staging directory");
             Some(flush::FlushManager::new(
                 xet_sessions.clone(),
-                sd.clone(),
+                Arc::clone(sd),
                 hub_client.clone(),
                 inodes.clone(),
                 &runtime,

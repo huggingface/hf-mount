@@ -178,13 +178,18 @@ impl DownloadStreamOps for DownloadStreamWrapper {
 
 /// On-disk staging area for advanced writes (random seek, read-modify-write).
 /// Not used in simple (append-only) mode.
-#[derive(Clone)]
+///
+/// Not Clone: overlay mode holds a file descriptor to the pre-mount directory.
+/// Shared via Arc between VFS and FlushManager instead.
 pub struct StagingDir {
     dir: PathBuf,
     /// Per-session random key to make staging paths unpredictable.
     session_key: u64,
     /// Overlay: stage at original file paths instead of inode-based names.
     overlay_root: Option<PathBuf>,
+    /// Kept alive so /proc/self/fd/N (overlay_root) remains valid.
+    #[allow(dead_code)]
+    overlay_fd: Option<std::fs::File>,
 }
 
 impl StagingDir {
@@ -195,17 +200,27 @@ impl StagingDir {
             dir,
             session_key: rand_u64(),
             overlay_root: None,
+            overlay_fd: None,
         }
     }
 
-    /// Create a staging dir with overlay mode.
-    pub fn new_overlay(cache_dir: &Path, overlay_root: PathBuf) -> Self {
+    /// Create a staging dir with overlay mode. The `fd` must be an open handle
+    /// to the mount point directory (opened before mounting). The overlay root
+    /// path is derived from the fd so the two stay coupled.
+    pub fn new_overlay(cache_dir: &Path, fd: std::fs::File) -> Self {
+        use std::os::unix::io::AsRawFd;
         let dir = cache_dir.join("staging");
         std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("Failed to create staging dir {:?}: {e}", dir));
+        let raw_fd = fd.as_raw_fd();
+        #[cfg(target_os = "linux")]
+        let overlay_root = PathBuf::from(format!("/proc/self/fd/{}", raw_fd));
+        #[cfg(not(target_os = "linux"))]
+        let overlay_root = PathBuf::from(format!("/dev/fd/{}", raw_fd));
         Self {
             dir,
             session_key: rand_u64(),
             overlay_root: Some(overlay_root),
+            overlay_fd: Some(fd),
         }
     }
 

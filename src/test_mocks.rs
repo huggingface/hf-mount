@@ -489,7 +489,8 @@ pub fn make_test_vfs(
                 std::fs::remove_dir_all(&overlay_root).expect("failed to clean stale overlay dir");
             }
             std::fs::create_dir_all(&overlay_root).expect("failed to create overlay root dir");
-            Some(StagingDir::new_overlay(&path, overlay_root))
+            let fd = std::fs::File::open(&overlay_root).expect("failed to open overlay root dir");
+            Some(StagingDir::new_overlay(&path, fd))
         } else {
             Some(StagingDir::new(&path))
         }
@@ -533,7 +534,8 @@ pub fn make_overlay_test_vfs_with_root(
         .unwrap();
     let cache_dir = std::env::temp_dir().join(format!("hf_mount_test_{}", std::process::id()));
     std::fs::create_dir_all(&cache_dir).expect("failed to create temp staging dir");
-    let staging_dir = Some(StagingDir::new_overlay(&cache_dir, overlay_root.clone()));
+    let fd = std::fs::File::open(&overlay_root).expect("failed to open overlay root dir");
+    let staging_dir = Some(StagingDir::new_overlay(&cache_dir, fd));
 
     let vfs = crate::virtual_fs::VirtualFs::new(
         rt.handle().clone(),
