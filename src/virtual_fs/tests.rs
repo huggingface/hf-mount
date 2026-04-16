@@ -3254,6 +3254,28 @@ fn rename_clean_file_remote_and_local() {
 
 // ── Overlay mode tests ─────────────────────────────────────────────
 
+/// Overlay mode forces advanced_writes inside the VFS constructor.
+#[test]
+fn overlay_constructor_forces_advanced_writes() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    let rt = new_runtime();
+    let vfs = make_test_vfs(
+        hub,
+        xet,
+        TestOpts {
+            overlay: true,
+            advanced_writes: false,
+            ..Default::default()
+        },
+        &rt,
+    );
+
+    assert!(vfs.overlay);
+    assert!(vfs.advanced_writes);
+    assert!(vfs.flush_manager.is_none());
+}
+
 /// Readdir merges remote bucket entries with local overlay files.
 #[test]
 fn overlay_readdir_merges_local_and_remote() {
@@ -3466,6 +3488,50 @@ fn overlay_read_remote_file() {
     assert!(!t.overlay_root.join("remote_only.txt").exists());
 }
 
+/// Remote-only files cannot be opened writable in overlay mode.
+#[test]
+fn overlay_open_remote_write_eperm() {
+    let hub = MockHub::new();
+    hub.add_file("remote.txt", 11, Some("xhash"), None);
+    let xet = MockXet::new();
+    xet.add_file("xhash", b"remote data");
+
+    let overlay_root = fresh_overlay_dir("openremote");
+    let t = make_overlay_test_vfs_with_root(hub, xet, overlay_root);
+
+    t.runtime.block_on(async {
+        let entries = t.vfs.readdir(ROOT_INODE).await.unwrap();
+        let ino = entries.iter().find(|e| e.name == "remote.txt").unwrap().ino;
+
+        let err = t.vfs.open(ino, true, false, None).await.unwrap_err();
+        assert_eq!(err, libc::EPERM);
+    });
+
+    assert!(!t.overlay_root.join("remote.txt").exists());
+}
+
+/// O_TRUNC on a remote-only file is rejected in overlay mode.
+#[test]
+fn overlay_open_remote_truncate_eperm() {
+    let hub = MockHub::new();
+    hub.add_file("remote.txt", 11, Some("xhash"), None);
+    let xet = MockXet::new();
+    xet.add_file("xhash", b"remote data");
+
+    let overlay_root = fresh_overlay_dir("truncremote");
+    let t = make_overlay_test_vfs_with_root(hub, xet, overlay_root);
+
+    t.runtime.block_on(async {
+        let entries = t.vfs.readdir(ROOT_INODE).await.unwrap();
+        let ino = entries.iter().find(|e| e.name == "remote.txt").unwrap().ino;
+
+        let err = t.vfs.open(ino, true, true, None).await.unwrap_err();
+        assert_eq!(err, libc::EPERM);
+    });
+
+    assert!(!t.overlay_root.join("remote.txt").exists());
+}
+
 /// Data written via VFS is readable back in the same session.
 #[test]
 fn overlay_write_persists_after_reread() {
@@ -3488,6 +3554,53 @@ fn overlay_write_persists_after_reread() {
         let fh2 = t.vfs.open(attr.ino, false, false, None).await.unwrap();
         let (data, _eof) = t.vfs.read(fh2, 0, 1024).await.unwrap();
         assert_eq!(data.as_ref(), b"hello");
+    });
+}
+
+/// Reloading a directory should not keep bumping dirty_generation for the same
+/// overlay-local entry when nothing changed on disk.
+#[test]
+fn overlay_reread_does_not_bump_dirty_generation() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+
+    let overlay_root = fresh_overlay_dir("dirtyreload");
+    std::fs::write(overlay_root.join("local.txt"), b"stable").unwrap();
+
+    let t = make_overlay_test_vfs_with_root(hub, xet, overlay_root);
+
+    t.runtime.block_on(async {
+        let entries = t.vfs.readdir(ROOT_INODE).await.unwrap();
+        let ino = entries
+            .iter()
+            .find(|e| e.name == "local.txt")
+            .expect("local.txt not in readdir")
+            .ino;
+
+        let first_generation = {
+            let inodes = t.vfs.inode_table.read().unwrap();
+            inodes.get(ino).unwrap().dirty_generation
+        };
+        assert!(first_generation > 0, "overlay-local entries should be marked dirty");
+
+        {
+            let mut inodes = t.vfs.inode_table.write().unwrap();
+            inodes.get_mut(ROOT_INODE).unwrap().children_loaded = false;
+        }
+
+        let entries = t.vfs.readdir(ROOT_INODE).await.unwrap();
+        let ino_after_reload = entries
+            .iter()
+            .find(|e| e.name == "local.txt")
+            .expect("local.txt missing after reload")
+            .ino;
+        let second_generation = {
+            let inodes = t.vfs.inode_table.read().unwrap();
+            inodes.get(ino_after_reload).unwrap().dirty_generation
+        };
+
+        assert_eq!(ino_after_reload, ino);
+        assert_eq!(second_generation, first_generation);
     });
 }
 
@@ -3620,6 +3733,85 @@ fn overlay_setattr_truncate_uses_overlay_path() {
 
     // The truncated file should exist at the overlay path, not an inode-based path
     assert!(t.overlay_root.join("trunc.txt").exists());
+}
+
+/// Overlay create/chmod mode changes persist to disk and survive a directory reload.
+#[test]
+fn overlay_mode_changes_persist_on_disk() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+
+    let overlay_root = fresh_overlay_dir("modepersist");
+    let t = make_overlay_test_vfs_with_root(hub, xet, overlay_root);
+
+    t.runtime.block_on(async {
+        let (attr, fh) = t
+            .vfs
+            .create(ROOT_INODE, "mode.txt", 0o600, 1000, 1000, None)
+            .await
+            .unwrap();
+        t.vfs.release(fh).await.unwrap();
+
+        let created_mode = std::fs::metadata(t.overlay_root.join("mode.txt"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(created_mode, 0o600);
+
+        t.vfs
+            .setattr(attr.ino, None, Some(0o700), None, None, None, None)
+            .await
+            .unwrap();
+
+        let updated_mode = std::fs::metadata(t.overlay_root.join("mode.txt"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(updated_mode, 0o700);
+
+        {
+            let mut inodes = t.vfs.inode_table.write().unwrap();
+            inodes.get_mut(ROOT_INODE).unwrap().children_loaded = false;
+        }
+        t.vfs.readdir(ROOT_INODE).await.unwrap();
+        assert_eq!(t.vfs.getattr(attr.ino).unwrap().perm, 0o700);
+    });
+}
+
+/// setattr truncation of a clean remote file is rejected in overlay mode.
+#[test]
+fn overlay_setattr_remote_truncate_eperm() {
+    let hub = MockHub::new();
+    hub.add_file("remote.txt", 11, Some("xhash"), None);
+    let xet = MockXet::new();
+
+    let overlay_root = fresh_overlay_dir("setattrremote");
+    let t = make_overlay_test_vfs_with_root(hub, xet, overlay_root);
+
+    t.runtime.block_on(async {
+        let entries = t.vfs.readdir(ROOT_INODE).await.unwrap();
+        let ino = entries.iter().find(|e| e.name == "remote.txt").unwrap().ino;
+
+        let err = t
+            .vfs
+            .setattr(ino, Some(0), None, None, None, None, None)
+            .await
+            .unwrap_err();
+        assert_eq!(err, libc::EPERM);
+
+        let err = t
+            .vfs
+            .setattr(ino, None, Some(0o600), None, None, None, None)
+            .await
+            .unwrap_err();
+        assert_eq!(err, libc::EPERM);
+    });
+
+    assert!(!t.overlay_root.join("remote.txt").exists());
 }
 
 /// When a local file shadows a remote file, xet_hash is cleared so the

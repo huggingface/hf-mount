@@ -11,7 +11,8 @@ use xet_data::processing::XetFileInfo;
 
 use crate::error::{Error, Result};
 use crate::hub_api::{BatchOp, HeadFileInfo, HubOps, SourceKind, TreeEntry};
-use crate::xet::{DownloadStreamOps, OverlayBacking, StagingDir, StreamingWriterOps, XetOps};
+use crate::overlay::OverlayBacking;
+use crate::xet::{DownloadStreamOps, StagingDir, StreamingWriterOps, XetOps};
 
 // ── MockHub ───────────────────────────────────────────────────────────
 
@@ -461,6 +462,28 @@ pub struct OverlayTestVfs {
     pub overlay_root: std::path::PathBuf,
 }
 
+fn fresh_test_dir(prefix: &str) -> std::path::PathBuf {
+    static TEST_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    loop {
+        let unique_suffix = format!(
+            "{}_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time before unix epoch")
+                .as_nanos(),
+            TEST_DIR_COUNTER.fetch_add(1, Ordering::Relaxed)
+        );
+        let path = std::env::temp_dir().join(format!("{prefix}_{unique_suffix}"));
+        match std::fs::create_dir(&path) {
+            Ok(()) => return path,
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => panic!("failed to create temp test dir: {err}"),
+        }
+    }
+}
+
 /// Build a VirtualFs for testing. Must be called from a sync context
 /// (not inside #[tokio::test]) because VirtualFs::new() calls block_on internally.
 pub fn make_test_vfs(
@@ -469,14 +492,10 @@ pub fn make_test_vfs(
     opts: TestOpts,
     runtime: &tokio::runtime::Runtime,
 ) -> Arc<crate::virtual_fs::VirtualFs> {
-    let advanced_writes = opts.advanced_writes || opts.overlay;
+    let effective_advanced_writes = opts.advanced_writes || opts.overlay;
 
     let overlay_backing = if opts.overlay {
-        let overlay_root = std::env::temp_dir().join(format!("hf_mount_overlay_{}", std::process::id()));
-        if overlay_root.exists() {
-            std::fs::remove_dir_all(&overlay_root).expect("failed to clean stale overlay dir");
-        }
-        std::fs::create_dir_all(&overlay_root).expect("failed to create overlay root dir");
+        let overlay_root = fresh_test_dir("hf_mount_overlay");
         let fd = std::fs::File::open(&overlay_root).expect("failed to open overlay root dir");
         Some(OverlayBacking::new(fd))
     } else {
@@ -485,9 +504,8 @@ pub fn make_test_vfs(
 
     // Repos need a staging dir for HTTP download cache (open_readonly),
     // even when advanced_writes is disabled (mirrors setup.rs logic).
-    let staging_dir = if advanced_writes || hub.is_repo() {
-        let path = std::env::temp_dir().join(format!("hf_mount_test_{}", std::process::id()));
-        std::fs::create_dir_all(&path).expect("failed to create temp staging dir");
+    let staging_dir = if effective_advanced_writes || hub.is_repo() {
+        let path = fresh_test_dir("hf_mount_test");
         Some(StagingDir::new(&path))
     } else {
         None
@@ -501,7 +519,7 @@ pub fn make_test_vfs(
         overlay_backing,
         crate::virtual_fs::VfsConfig {
             read_only: opts.read_only,
-            advanced_writes,
+            advanced_writes: opts.advanced_writes,
             overlay: opts.overlay,
             uid: 1000,
             gid: 1000,
@@ -528,8 +546,7 @@ pub fn make_overlay_test_vfs_with_root(
         .enable_all()
         .build()
         .unwrap();
-    let cache_dir = std::env::temp_dir().join(format!("hf_mount_test_{}", std::process::id()));
-    std::fs::create_dir_all(&cache_dir).expect("failed to create temp staging dir");
+    let cache_dir = fresh_test_dir("hf_mount_test");
     let fd = std::fs::File::open(&overlay_root).expect("failed to open overlay root dir");
     let staging_dir = Some(StagingDir::new(&cache_dir));
     let overlay_backing = Some(OverlayBacking::new(fd));
@@ -542,7 +559,7 @@ pub fn make_overlay_test_vfs_with_root(
         overlay_backing,
         crate::virtual_fs::VfsConfig {
             read_only: false,
-            advanced_writes: true,
+            advanced_writes: false,
             overlay: true,
             uid: 1000,
             gid: 1000,

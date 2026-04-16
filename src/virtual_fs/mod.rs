@@ -11,12 +11,13 @@ use tracing::{debug, error, info, warn};
 use xet_data::processing::XetFileInfo;
 
 use crate::hub_api::{BatchOp, HubOps};
+use crate::overlay::OverlayBacking;
 
 mod flush;
 pub mod inode;
 mod poll;
 mod prefetch;
-use crate::xet::{OverlayBacking, StagingDir, StreamingWriterOps, XetOps};
+use crate::xet::{StagingDir, StreamingWriterOps, XetOps};
 use inode::{InodeEntry, InodeKind, InodeTable};
 use prefetch::{FetchPlan, PrefetchState};
 
@@ -139,12 +140,13 @@ impl VirtualFs {
         overlay_backing: Option<OverlayBacking>,
         config: VfsConfig,
     ) -> Arc<Self> {
+        let advanced_writes = config.advanced_writes || config.overlay;
         let staging_dir = staging_dir.map(Arc::new);
         let overlay_backing = overlay_backing.map(Arc::new);
         let inodes = Arc::new(RwLock::new(InodeTable::new()));
         let negative_cache = Arc::new(RwLock::new(HashMap::new()));
 
-        let flush_manager = if !config.read_only && config.advanced_writes && !config.overlay {
+        let flush_manager = if !config.read_only && advanced_writes && !config.overlay {
             let sd = staging_dir
                 .as_ref()
                 .expect("--advanced-writes requires a staging directory");
@@ -193,7 +195,7 @@ impl VirtualFs {
             staging_dir,
             overlay_backing,
             read_only: config.read_only,
-            advanced_writes: config.advanced_writes,
+            advanced_writes,
             inode_table: inodes,
             open_files,
             next_file_handle: AtomicU64::new(1),
@@ -569,7 +571,9 @@ impl VirtualFs {
                         e.mtime = mtime;
                         e.mode = mode;
                         e.xet_hash = None;
-                        e.set_dirty();
+                        if !e.is_dirty() {
+                            e.set_dirty();
+                        }
                         if kind == InodeKind::Directory {
                             e.children_loaded = false; // will be lazy-loaded on access
                         }
@@ -677,6 +681,13 @@ impl VirtualFs {
                 .as_ref()
                 .expect("staging_dir required for local backing")
                 .open_local_file(ino, read, write, create, truncate),
+        }
+    }
+
+    fn set_local_backing_mode(&self, full_path: &str, mode: u16) -> std::io::Result<()> {
+        match self.overlay_backing.as_deref() {
+            Some(overlay) => overlay.set_mode(full_path, mode),
+            None => Ok(()),
         }
     }
 
@@ -976,19 +987,20 @@ impl VirtualFs {
     /// - Advanced-writes handles: enqueues for background flush.
     /// - Read-only / lazy handles: no-op.
     pub async fn fsync(&self, ino: u64, file_handle: u64, _pid: Option<u32>) -> VirtualFsResult<()> {
-        {
+        let overlay_file = {
             let files = self.open_files.read().expect("open_files poisoned");
             match files.get(&file_handle) {
                 Some(OpenFile::Streaming { .. }) => return Ok(()),
                 // Overlay: sync local fd for durability, skip remote upload.
-                Some(OpenFile::Local { file, .. }) if self.overlay => {
-                    return file.sync_all().map_err(|e| {
-                        error!("Overlay fsync failed for ino={}: {}", ino, e);
-                        libc::EIO
-                    });
-                }
-                _ => {}
+                Some(OpenFile::Local { file, .. }) if self.overlay => Some(Arc::clone(file)),
+                _ => None,
             }
+        };
+        if let Some(file) = overlay_file {
+            return file.sync_all().map_err(|e| {
+                error!("Overlay fsync failed for ino={}: {}", ino, e);
+                libc::EIO
+            });
         }
         self.schedule_flush(ino);
         Ok(())
@@ -2006,6 +2018,11 @@ impl VirtualFs {
             let open_result = self.open_local_backing_file(ino, &full_path, true, true, true, true);
             match open_result {
                 Ok(file) => {
+                    if let Err(e) = self.set_local_backing_mode(&full_path, mode) {
+                        error!("Failed to set local backing mode for {}: {}", full_path, e);
+                        self.inode_table.write().expect("inodes poisoned").remove(ino);
+                        return Err(libc::EIO);
+                    }
                     let file_handle = self.insert_local_handle(ino, file, true);
 
                     let inodes = self.inode_table.read().expect("inodes poisoned");
@@ -2808,34 +2825,13 @@ impl VirtualFs {
                             (entry.xet_hash.clone().unwrap_or_default(), entry.size)
                         };
                         if !xet_hash.is_empty() && file_size > 0 {
-                            if self.overlay {
-                                let temp_path = sd.path(ino);
-                                if let Err(e) = self
-                                    .xet_sessions
-                                    .download_to_file(&xet_hash, file_size, &temp_path)
-                                    .await
-                                {
-                                    error!("Failed to download file for truncate: {}", e);
-                                    return Err(libc::EIO);
-                                }
-                                if let Err(e) = sd.overlay_copy_from_path(&full_path, &temp_path) {
-                                    error!("Failed to materialize overlay file for truncate: {}", e);
-                                    return Err(libc::EIO);
-                                }
-                                let _ = std::fs::remove_file(&temp_path);
-                            } else {
-                                let staging_path = sd.staging_path(ino, &full_path).map_err(|e| {
-                                    error!("Invalid staging path for ino={}: {}", ino, e);
-                                    libc::EIO
-                                })?;
-                                if let Err(e) = self
-                                    .xet_sessions
-                                    .download_to_file(&xet_hash, file_size, &staging_path)
-                                    .await
-                                {
-                                    error!("Failed to download file for truncate: {}", e);
-                                    return Err(libc::EIO);
-                                }
+                            if let Err(e) = self
+                                .xet_sessions
+                                .download_to_file(&xet_hash, file_size, &staging_path)
+                                .await
+                            {
+                                error!("Failed to download file for truncate: {}", e);
+                                return Err(libc::EIO);
                             }
                         } else if let Err(e) = self.open_local_backing_file(ino, &full_path, true, true, true, true) {
                             error!("Failed to create staging file for truncate: {}", e);
@@ -2881,6 +2877,26 @@ impl VirtualFs {
 
         // Apply metadata-only changes (mode, uid, gid, atime, mtime)
         if mode.is_some() || uid.is_some() || gid.is_some() || atime.is_some() || mtime.is_some() {
+            if self.overlay
+                && let Some(new_mode) = mode
+            {
+                let full_path = {
+                    let inodes = self.inode_table.read().expect("inodes poisoned");
+                    inodes.get(ino).ok_or(libc::ENOENT)?.full_path.clone()
+                };
+                let local_exists = self.local_backing_exists(ino, &full_path).map_err(|e| {
+                    error!("Failed to check local backing file for ino={}: {}", ino, e);
+                    e.raw_os_error().unwrap_or(libc::EIO)
+                })?;
+                if !local_exists {
+                    return Err(libc::EPERM);
+                }
+                self.set_local_backing_mode(&full_path, new_mode).map_err(|e| {
+                    error!("Failed to update local backing mode for ino={}: {}", ino, e);
+                    e.raw_os_error().unwrap_or(libc::EIO)
+                })?;
+            }
+
             let mut inodes = self.inode_table.write().expect("inodes poisoned");
             if let Some(entry) = inodes.get_mut(ino) {
                 if let Some(m) = mode {
