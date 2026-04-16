@@ -923,45 +923,30 @@ impl VirtualFs {
         }
     }
 
-    /// Synchronous fsync: ensures data is committed to Hub before returning.
-    /// - Streaming handles: no-op (data is committed synchronously on close).
-    ///   Cannot delegate to flush() because it sends Finish which tears down the writer.
-    /// - Advanced-writes handles: uploads staging file and commits immediately.
+    /// Enqueues the inode for background flush rather than blocking on a
+    /// synchronous Hub upload. Data is already durable in the local staging
+    /// file after write(); the background flush loop commits to Hub.
+    ///
+    /// - Streaming handles: no-op (committed synchronously on close).
+    /// - Advanced-writes handles: enqueues for background flush.
     /// - Read-only / lazy handles: no-op.
     pub async fn fsync(&self, ino: u64, file_handle: u64, _pid: Option<u32>) -> VirtualFsResult<()> {
         {
             let files = self.open_files.read().expect("open_files poisoned");
-            if matches!(files.get(&file_handle), Some(OpenFile::Streaming { .. })) {
-                return Ok(());
+            match files.get(&file_handle) {
+                Some(OpenFile::Streaming { .. }) => return Ok(()),
+                // Overlay: sync local fd for durability, skip remote upload.
+                Some(OpenFile::Local { file, .. }) if self.overlay => {
+                    return file.sync_all().map_err(|e| {
+                        error!("Overlay fsync failed for ino={}: {}", ino, e);
+                        libc::EIO
+                    });
+                }
+                _ => {}
             }
         }
-        // Advanced-writes: flush staging file to Hub immediately.
-        // Overlay: local fsync only, no remote upload.
-        if self.overlay {
-            let files = self.open_files.read().expect("open_files poisoned");
-            if let Some(OpenFile::Local { file, .. }) = files.get(&file_handle) {
-                file.sync_all().map_err(|e| {
-                    error!("Overlay fsync failed for ino={}: {}", ino, e);
-                    libc::EIO
-                })?;
-            }
-            return Ok(());
-        }
-        // Note: if the flush_loop is concurrently processing this inode, both may
-        // upload the same content. This is benign (idempotent commit, generation-aware
-        // clear ensures only one clears dirty).
-        let staging_dir = match &self.staging_dir {
-            Some(sd) => sd,
-            None => return Ok(()),
-        };
-        flush::flush_one(
-            ino,
-            &*self.xet_sessions,
-            staging_dir,
-            &*self.hub_client,
-            &self.inode_table,
-        )
-        .await
+        self.schedule_flush(ino);
+        Ok(())
     }
 
     pub fn getattr(&self, ino: u64) -> VirtualFsResult<VirtualFsAttr> {

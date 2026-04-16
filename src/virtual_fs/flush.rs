@@ -259,95 +259,15 @@ async fn flush_pending_deletes(queue: &Mutex<Vec<String>>, hub_client: &dyn HubO
     }
 }
 
-/// Flush a single dirty inode synchronously: upload staging file, commit to Hub,
-/// update inode table with generation-aware dirty clear. Returns Ok(()) on success
-/// or if the inode is not dirty / doesn't exist / has no staging file.
-pub(crate) async fn flush_one(
-    ino: u64,
-    xet_sessions: &dyn XetOps,
-    staging_dir: &StagingDir,
-    hub_client: &dyn HubOps,
-    inodes: &RwLock<InodeTable>,
-) -> Result<(), i32> {
-    let item = {
-        let inode_table = inodes.read().expect("inodes poisoned");
-        let entry = match inode_table.get(ino) {
-            Some(e) if e.is_dirty() && e.nlink > 0 => e,
-            _ => return Ok(()),
-        };
-        let staging_path = staging_dir.path(ino);
-        if !staging_path.exists() {
-            return Ok(());
-        }
-        FlushItem {
-            ino,
-            full_path: entry.full_path.clone(),
-            staging_path,
-            pending_deletes: entry.pending_deletes.clone(),
-            dirty_generation: entry.dirty_generation,
-        }
-    };
-
-    let upload_results = xet_sessions
-        .upload_files(&[item.staging_path.as_path()])
-        .await
-        .map_err(|e| {
-            error!("flush_one upload failed for ino={}: {}", ino, e);
-            libc::EIO
-        })?;
-    let file_info = &upload_results[0];
-
-    // Skip Hub commit if content hasn't changed (same hash as last commit).
-    // This avoids redundant round-trips when fsync is called repeatedly
-    // without new writes (e.g. xfstests write+fsync loops).
-    let same_content = {
-        let inode_table = inodes.read().expect("inodes poisoned");
-        inode_table
-            .get(ino)
-            .is_some_and(|e| e.xet_hash.as_deref() == Some(file_info.hash()))
-    };
-    if same_content && item.pending_deletes.is_empty() {
-        let mut inode_table = inodes.write().expect("inodes poisoned");
-        if let Some(entry) = inode_table.get_mut(ino) {
-            entry.apply_commit(file_info.hash(), file_info.file_size(), item.dirty_generation);
-        }
-        debug!("flush_one: skipped commit for ino={} (same hash)", ino);
-        return Ok(());
-    }
-
-    let mtime_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
-    let mut ops = vec![BatchOp::AddFile {
-        path: item.full_path.clone(),
-        xet_hash: file_info.hash().to_string(),
-        mtime: mtime_ms,
-        content_type: None,
-    }];
-    for old_path in &item.pending_deletes {
-        ops.push(BatchOp::DeleteFile { path: old_path.clone() });
-    }
-    hub_client.batch_operations(&ops).await.map_err(|e| {
-        error!("flush_one commit failed for {}: {}", item.full_path, e);
-        libc::EIO
-    })?;
-
-    let mut inode_table = inodes.write().expect("inodes poisoned");
-    if let Some(entry) = inode_table.get_mut(ino) {
-        entry.apply_commit(file_info.hash(), file_info.file_size(), item.dirty_generation);
-    }
-
-    info!("flush_one: committed ino={} path={}", ino, item.full_path);
-    Ok(())
-}
-
 struct FlushItem {
     ino: u64,
     full_path: String,
     staging_path: PathBuf,
     pending_deletes: Vec<String>,
     dirty_generation: u64,
+    /// Hash from the last successful commit, used to skip redundant Hub commits
+    /// when the CAS upload produces the same hash (content unchanged).
+    prev_xet_hash: Option<String>,
 }
 
 async fn flush_batch(
@@ -400,6 +320,7 @@ async fn flush_batch(
                     staging_path,
                     pending_deletes: entry.pending_deletes.clone(),
                     dirty_generation: entry.dirty_generation,
+                    prev_xet_hash: entry.xet_hash.clone(),
                 })
             })
             .collect()
@@ -413,12 +334,21 @@ async fn flush_batch(
     // upload session), but accumulate all batch ops for a single Hub commit to
     // preserve the global adds-before-deletes ordering required by the Hub API.
     const UPLOAD_CHUNK_SIZE: usize = 500;
-    let mut all_results = Vec::new();
+    let mut upload_results = Vec::with_capacity(to_flush.len());
 
     for (chunk_idx, chunk) in to_flush.chunks(UPLOAD_CHUNK_SIZE).enumerate() {
         let staging_paths: Vec<&std::path::Path> = chunk.iter().map(|item| item.staging_path.as_path()).collect();
         match xet_sessions.upload_files(&staging_paths).await {
-            Ok(results) => all_results.push((chunk_idx, results)),
+            Ok(results) => {
+                assert_eq!(
+                    results.len(),
+                    chunk.len(),
+                    "upload_files returned {} results for {} inputs",
+                    results.len(),
+                    chunk.len()
+                );
+                upload_results.extend(results);
+            }
             Err(e) => {
                 // Abort the entire batch: committing partial results could apply
                 // deletes without the corresponding adds from this failed chunk.
@@ -433,7 +363,7 @@ async fn flush_batch(
         }
     }
 
-    if all_results.is_empty() {
+    if upload_results.is_empty() {
         return;
     }
 
@@ -442,56 +372,89 @@ async fn flush_batch(
         .unwrap_or_default()
         .as_millis() as u64;
 
-    // Build batch operations -- Hub API requires all adds before all deletes.
+    // Build batch operations (Hub API requires all adds before all deletes).
+    // Track which files are unchanged so we can clear dirty without a Hub commit.
     let mut ops = Vec::new();
     let mut delete_ops = Vec::new();
+    let mut unchanged = vec![false; to_flush.len()];
 
-    for (chunk_idx, results) in &all_results {
-        let chunk_start = chunk_idx * UPLOAD_CHUNK_SIZE;
-        let chunk = &to_flush[chunk_start..chunk_start + results.len()];
-        for (item, file_info) in chunk.iter().zip(results.iter()) {
-            info!(
-                "Uploaded file ino={} path={} xet_hash={} size={}",
+    for (i, (item, file_info)) in to_flush.iter().zip(upload_results.iter()).enumerate() {
+        if item.pending_deletes.is_empty() && item.prev_xet_hash.as_deref() == Some(file_info.hash()) {
+            debug!(
+                "flush_batch: unchanged ino={} path={} (hash {})",
                 item.ino,
                 item.full_path,
-                file_info.hash(),
-                file_info.file_size()
+                file_info.hash()
             );
-            ops.push(BatchOp::AddFile {
-                path: item.full_path.clone(),
-                xet_hash: file_info.hash().to_string(),
-                mtime: mtime_ms,
-                content_type: None,
-            });
-            for old_path in &item.pending_deletes {
-                delete_ops.push(BatchOp::DeleteFile { path: old_path.clone() });
+            unchanged[i] = true;
+            continue;
+        }
+        info!(
+            "Uploaded file ino={} path={} xet_hash={} size={}",
+            item.ino,
+            item.full_path,
+            file_info.hash(),
+            file_info.file_size()
+        );
+        ops.push(BatchOp::AddFile {
+            path: item.full_path.clone(),
+            xet_hash: file_info.hash().to_string(),
+            mtime: mtime_ms,
+            content_type: None,
+        });
+        for old_path in &item.pending_deletes {
+            delete_ops.push(BatchOp::DeleteFile { path: old_path.clone() });
+        }
+    }
+
+    // Clear dirty for unchanged files before the Hub commit (they don't need it).
+    {
+        let mut inode_table = inodes.write().expect("inodes poisoned");
+        for (i, (item, file_info)) in to_flush.iter().zip(upload_results.iter()).enumerate() {
+            if unchanged[i]
+                && let Some(entry) = inode_table.get_mut(item.ino)
+            {
+                entry.apply_commit(file_info.hash(), file_info.file_size(), item.dirty_generation);
             }
         }
     }
 
     ops.append(&mut delete_ops);
 
-    // Single batch commit. Transient errors (429, 5xx) are retried by the hub layer.
+    if ops.is_empty() {
+        info!(
+            "Batch flush: all {} file(s) unchanged, no Hub commit needed",
+            to_flush.len()
+        );
+        return;
+    }
+
     if let Err(e) = hub_client.batch_operations(&ops).await {
         error!("Batch commit failed: {}", e);
         let msg = format!("commit failed: {e}");
         let mut errs = flush_errors.lock().expect("flush_errors poisoned");
-        for item in &to_flush {
-            errs.insert(item.ino, msg.clone());
+        for (i, item) in to_flush.iter().enumerate() {
+            if !unchanged[i] {
+                errs.insert(item.ino, msg.clone());
+            }
         }
         return;
     }
 
     let mut inode_table = inodes.write().expect("inodes poisoned");
-    for (chunk_idx, results) in &all_results {
-        let chunk_start = chunk_idx * UPLOAD_CHUNK_SIZE;
-        let chunk = &to_flush[chunk_start..chunk_start + results.len()];
-        for (item, file_info) in chunk.iter().zip(results.iter()) {
-            if let Some(entry) = inode_table.get_mut(item.ino) {
-                entry.apply_commit(file_info.hash(), file_info.file_size(), item.dirty_generation);
-            }
+    for (i, (item, file_info)) in to_flush.iter().zip(upload_results.iter()).enumerate() {
+        if unchanged[i] {
+            continue;
+        }
+        if let Some(entry) = inode_table.get_mut(item.ino) {
+            entry.apply_commit(file_info.hash(), file_info.file_size(), item.dirty_generation);
         }
     }
 
-    info!("Batch flush completed: {} file(s) committed", to_flush.len());
+    let changed_count = unchanged.iter().filter(|u| !**u).count();
+    let unchanged_count = unchanged.len() - changed_count;
+    info!(
+        "Batch flush completed: {} file(s) committed, {} unchanged",
+        changed_count, unchanged_count
+    );
 }
