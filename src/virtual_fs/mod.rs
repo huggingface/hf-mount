@@ -1015,7 +1015,12 @@ impl VirtualFs {
         let staging_path = self
             .staging_dir
             .as_ref()
-            .map(|sd| sd.staging_path(ino, &file_entry.full_path));
+            .map(|sd| sd.staging_path(ino, &file_entry.full_path))
+            .transpose()
+            .map_err(|e| {
+                error!("Invalid staging path for ino={}: {}", ino, e);
+                libc::EIO
+            })?;
 
         // Overlay: ensure parent dirs exist before write.
         if writable && let Some(sd) = &self.staging_dir {
@@ -1966,7 +1971,11 @@ impl VirtualFs {
                 self.inode_table.write().expect("inodes poisoned").remove(ino);
                 return Err(libc::EIO);
             }
-            let staging_path = sd.staging_path(ino, &full_path);
+            let staging_path = sd.staging_path(ino, &full_path).map_err(|e| {
+                error!("Invalid staging path for {}: {}", full_path, e);
+                self.inode_table.write().expect("inodes poisoned").remove(ino);
+                libc::EIO
+            })?;
             match OpenOptions::new()
                 .create(true)
                 .truncate(true)
@@ -2170,7 +2179,8 @@ impl VirtualFs {
         // Clean up staging file only if inode was fully removed (no remaining hard links)
         if inode_removed
             && let Some(ref staging_dir) = self.staging_dir
-            && let Err(e) = std::fs::remove_file(staging_dir.staging_path(ino, &full_path))
+            && let Ok(staging_path) = staging_dir.staging_path(ino, &full_path)
+            && let Err(e) = std::fs::remove_file(staging_path)
             && e.kind() != std::io::ErrorKind::NotFound
         {
             warn!("Failed to remove staging file for ino={}: {}", ino, e);
@@ -2760,7 +2770,10 @@ impl VirtualFs {
                     error!("Failed to create staging parent dirs for ino={}: {}", ino, e);
                     e.raw_os_error().unwrap_or(libc::EIO)
                 })?;
-                let staging_path = sd.staging_path(ino, &full_path);
+                let staging_path = sd.staging_path(ino, &full_path).map_err(|e| {
+                    error!("Invalid staging path for ino={}: {}", ino, e);
+                    libc::EIO
+                })?;
 
                 // Phase 1: ensure staging file exists (may download, async).
                 if new_size > 0 && !staging_path.exists() {

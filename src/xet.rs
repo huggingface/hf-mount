@@ -225,26 +225,26 @@ impl StagingDir {
     }
 
     /// Staging path: overlay root + original path, or inode-based. Pure (no I/O).
-    pub fn staging_path(&self, inode: u64, full_path: &str) -> PathBuf {
+    /// Returns an error if `full_path` contains unsafe components (absolute, `..`).
+    pub fn staging_path(&self, inode: u64, full_path: &str) -> std::io::Result<PathBuf> {
         if let Some(root) = &self.overlay_root {
-            debug_assert!(
-                !Path::new(full_path).has_root()
-                    && !Path::new(full_path)
-                        .components()
-                        .any(|c| matches!(c, std::path::Component::ParentDir)),
-                "overlay staging path must be a safe relative path, got: {:?}",
-                full_path
-            );
-            root.join(full_path)
+            let p = Path::new(full_path);
+            if p.has_root() || p.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("overlay staging path must be a safe relative path, got: {full_path:?}"),
+                ));
+            }
+            Ok(root.join(full_path))
         } else {
-            self.path(inode)
+            Ok(self.path(inode))
         }
     }
 
     /// Create parent dirs for overlay staging path. No-op outside overlay.
     pub fn ensure_staging_parents(&self, inode: u64, full_path: &str) -> std::io::Result<()> {
         if self.overlay_root.is_some()
-            && let Some(parent) = self.staging_path(inode, full_path).parent()
+            && let Some(parent) = self.staging_path(inode, full_path)?.parent()
         {
             std::fs::create_dir_all(parent)?;
         }
