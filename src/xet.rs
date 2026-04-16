@@ -1,5 +1,9 @@
+use std::ffi::{CStr, CString};
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use ulid::Ulid;
@@ -177,19 +181,22 @@ impl DownloadStreamOps for DownloadStreamWrapper {
 // ── StagingDir ────────────────────────────────────────────────────────
 
 /// On-disk staging area for advanced writes (random seek, read-modify-write).
-/// Not used in simple (append-only) mode.
 ///
-/// Not Clone: overlay mode holds a file descriptor to the pre-mount directory.
 /// Shared via Arc between VFS and FlushManager instead.
 pub struct StagingDir {
     dir: PathBuf,
     /// Per-session random key to make staging paths unpredictable.
     session_key: u64,
-    /// Overlay: stage at original file paths instead of inode-based names.
-    overlay_root: Option<PathBuf>,
-    /// Kept alive so /proc/self/fd/N (overlay_root) remains valid.
-    #[allow(dead_code)]
-    overlay_fd: Option<std::fs::File>,
+}
+
+#[derive(Debug, Clone)]
+pub struct OverlayDirEntry {
+    pub name: String,
+    pub is_dir: bool,
+    pub is_symlink: bool,
+    pub size: u64,
+    pub mtime: SystemTime,
+    pub mode: u16,
 }
 
 impl StagingDir {
@@ -199,28 +206,6 @@ impl StagingDir {
         Self {
             dir,
             session_key: rand_u64(),
-            overlay_root: None,
-            overlay_fd: None,
-        }
-    }
-
-    /// Create a staging dir with overlay mode. The `fd` must be an open handle
-    /// to the mount point directory (opened before mounting). The overlay root
-    /// path is derived from the fd so the two stay coupled.
-    pub fn new_overlay(cache_dir: &Path, fd: std::fs::File) -> Self {
-        use std::os::unix::io::AsRawFd;
-        let dir = cache_dir.join("staging");
-        std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("Failed to create staging dir {:?}: {e}", dir));
-        let raw_fd = fd.as_raw_fd();
-        #[cfg(target_os = "linux")]
-        let overlay_root = PathBuf::from(format!("/proc/self/fd/{}", raw_fd));
-        #[cfg(not(target_os = "linux"))]
-        let overlay_root = PathBuf::from(format!("/dev/fd/{}", raw_fd));
-        Self {
-            dir,
-            session_key: rand_u64(),
-            overlay_root: Some(overlay_root),
-            overlay_fd: Some(fd),
         }
     }
 
@@ -229,42 +214,314 @@ impl StagingDir {
         &self.dir
     }
 
-    /// The overlay root directory, if overlay mode is active.
-    pub fn overlay_root(&self) -> Option<&Path> {
-        self.overlay_root.as_deref()
-    }
-
     /// Inode-based staging path (used by FlushManager).
     pub fn path(&self, inode: u64) -> PathBuf {
         self.dir.join(format!("ino_{:x}_{:016x}", inode, self.session_key))
     }
 
-    /// Staging path: overlay root + original path, or inode-based. Pure (no I/O).
-    /// Returns an error if `full_path` contains unsafe components (absolute, `..`).
-    pub fn staging_path(&self, inode: u64, full_path: &str) -> std::io::Result<PathBuf> {
-        if let Some(root) = &self.overlay_root {
-            let p = Path::new(full_path);
-            if p.has_root() || p.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!("overlay staging path must be a safe relative path, got: {full_path:?}"),
-                ));
-            }
-            Ok(root.join(full_path))
+    pub fn local_exists(&self, inode: u64) -> std::io::Result<bool> {
+        Ok(self.path(inode).exists())
+    }
+
+    pub fn open_local_file(
+        &self,
+        inode: u64,
+        read: bool,
+        write: bool,
+        create: bool,
+        truncate: bool,
+    ) -> std::io::Result<std::fs::File> {
+        let path = self.path(inode);
+        let mut options = std::fs::OpenOptions::new();
+        options.read(read).write(write);
+        if create {
+            options.create(true);
+        }
+        if truncate {
+            options.truncate(true);
+        }
+        options.open(path)
+    }
+
+    pub fn remove_local_file(&self, inode: u64) -> std::io::Result<()> {
+        std::fs::remove_file(self.path(inode))
+    }
+}
+
+/// Overlay-local writable backing rooted at the pre-mount directory fd.
+pub struct OverlayBacking {
+    /// Kept alive so the pre-mount directory remains reachable and, on macOS,
+    /// provides the dirfd used by fd-relative helper calls.
+    dirfd: std::fs::File,
+}
+
+impl OverlayBacking {
+    pub fn new(fd: std::fs::File) -> Self {
+        Self { dirfd: fd }
+    }
+
+    pub fn exists(&self, full_path: &str) -> std::io::Result<bool> {
+        let rel = Self::validate_rel_path(full_path)?;
+        if rel.as_os_str().is_empty() {
+            return Ok(true);
+        }
+        let path = path_to_cstring(rel)?;
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        let rc = unsafe {
+            libc::fstatat(
+                self.dirfd(),
+                path.as_ptr(),
+                stat.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if rc == 0 {
+            return Ok(true);
+        }
+        let err = std::io::Error::last_os_error();
+        if err.kind() == std::io::ErrorKind::NotFound {
+            Ok(false)
         } else {
-            Ok(self.path(inode))
+            Err(err)
         }
     }
 
-    /// Create parent dirs for overlay staging path. No-op outside overlay.
-    pub fn ensure_staging_parents(&self, inode: u64, full_path: &str) -> std::io::Result<()> {
-        if self.overlay_root.is_some()
-            && let Some(parent) = self.staging_path(inode, full_path)?.parent()
-        {
-            std::fs::create_dir_all(parent)?;
+    pub fn open_file(
+        &self,
+        full_path: &str,
+        read: bool,
+        write: bool,
+        create: bool,
+        truncate: bool,
+    ) -> std::io::Result<std::fs::File> {
+        let rel = Self::validate_rel_path(full_path)?;
+        let path = path_to_cstring(rel)?;
+        let access_mode = match (read, write) {
+            (true, true) => libc::O_RDWR,
+            (true, false) => libc::O_RDONLY,
+            (false, true) => libc::O_WRONLY,
+            (false, false) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "overlay open requires read or write access",
+                ));
+            }
+        };
+        let mut flags = access_mode;
+        if create {
+            flags |= libc::O_CREAT;
+        }
+        if truncate {
+            flags |= libc::O_TRUNC;
+        }
+        let fd = unsafe { libc::openat(self.dirfd(), path.as_ptr(), flags, 0o666) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+    }
+
+    pub fn create_parent_dirs(&self, full_path: &str) -> std::io::Result<()> {
+        let rel = Self::validate_rel_path(full_path)?;
+        let Some(parent) = rel.parent().filter(|p| !p.as_os_str().is_empty()) else {
+            return Ok(());
+        };
+
+        let mut current = PathBuf::new();
+        for component in parent.components() {
+            if let std::path::Component::Normal(part) = component {
+                current.push(part);
+                let path = path_to_cstring(&current)?;
+                let rc = unsafe { libc::mkdirat(self.dirfd(), path.as_ptr(), 0o755) };
+                if rc != 0 {
+                    let err = std::io::Error::last_os_error();
+                    if err.kind() != std::io::ErrorKind::AlreadyExists {
+                        return Err(err);
+                    }
+                }
+            }
         }
         Ok(())
     }
+
+    pub fn create_dir(&self, full_path: &str, mode: u16) -> std::io::Result<()> {
+        let rel = Self::validate_rel_path(full_path)?;
+        let path = path_to_cstring(rel)?;
+        let rc = unsafe { libc::mkdirat(self.dirfd(), path.as_ptr(), mode as libc::mode_t) };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+
+    pub fn remove_file(&self, full_path: &str) -> std::io::Result<()> {
+        let rel = Self::validate_rel_path(full_path)?;
+        let path = path_to_cstring(rel)?;
+        let rc = unsafe { libc::unlinkat(self.dirfd(), path.as_ptr(), 0) };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+
+    pub fn remove_dir(&self, full_path: &str) -> std::io::Result<()> {
+        let rel = Self::validate_rel_path(full_path)?;
+        let path = path_to_cstring(rel)?;
+        let rc = unsafe { libc::unlinkat(self.dirfd(), path.as_ptr(), libc::AT_REMOVEDIR) };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+
+    pub fn rename(&self, old_path: &str, new_path: &str) -> std::io::Result<()> {
+        let old_rel = Self::validate_rel_path(old_path)?;
+        let new_rel = Self::validate_rel_path(new_path)?;
+        let old_cstr = path_to_cstring(old_rel)?;
+        let new_cstr = path_to_cstring(new_rel)?;
+        let rc = unsafe { libc::renameat(self.dirfd(), old_cstr.as_ptr(), self.dirfd(), new_cstr.as_ptr()) };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+
+    pub fn read_dir(&self, full_path: &str) -> std::io::Result<Vec<OverlayDirEntry>> {
+        let rel = Self::validate_rel_path(full_path)?;
+        let fd = if rel.as_os_str().is_empty() {
+            let dup_fd = unsafe { libc::fcntl(self.dirfd(), libc::F_DUPFD_CLOEXEC, 0) };
+            if dup_fd < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            dup_fd
+        } else {
+            let path = path_to_cstring(rel)?;
+            let fd = unsafe { libc::openat(self.dirfd(), path.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY) };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            fd
+        };
+
+        let dir = unsafe { libc::fdopendir(fd) };
+        if dir.is_null() {
+            let err = std::io::Error::last_os_error();
+            unsafe {
+                libc::close(fd);
+            }
+            return Err(err);
+        }
+
+        struct DirGuard(*mut libc::DIR);
+        impl Drop for DirGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    libc::closedir(self.0);
+                }
+            }
+        }
+
+        let guard = DirGuard(dir);
+        let dir_fd = unsafe { libc::dirfd(guard.0) };
+        let mut entries = Vec::new();
+
+        loop {
+            clear_errno();
+            let entry = unsafe { libc::readdir(guard.0) };
+            if entry.is_null() {
+                if current_errno() == 0 {
+                    break;
+                }
+                return Err(std::io::Error::last_os_error());
+            }
+
+            let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }
+                .to_string_lossy()
+                .into_owned();
+            if name == "." || name == ".." {
+                continue;
+            }
+
+            let name_cstr = CString::new(name.as_bytes())
+                .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "overlay entry contains NUL"))?;
+            let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+            let rc = unsafe { libc::fstatat(dir_fd, name_cstr.as_ptr(), stat.as_mut_ptr(), libc::AT_SYMLINK_NOFOLLOW) };
+            if rc != 0 {
+                continue;
+            }
+            let stat = unsafe { stat.assume_init() };
+            let kind = stat.st_mode & libc::S_IFMT;
+            entries.push(OverlayDirEntry {
+                name,
+                is_dir: kind == libc::S_IFDIR,
+                is_symlink: kind == libc::S_IFLNK,
+                size: stat.st_size as u64,
+                mtime: stat_mtime(&stat),
+                mode: (stat.st_mode & 0o777) as u16,
+            });
+        }
+
+        Ok(entries)
+    }
+
+    fn validate_rel_path(full_path: &str) -> std::io::Result<&Path> {
+        let path = Path::new(full_path);
+        if path.has_root()
+            || path.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::ParentDir | std::path::Component::Prefix(_)
+                )
+            })
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("overlay path must be a safe relative path, got: {full_path:?}"),
+            ));
+        }
+        Ok(path)
+    }
+
+    fn dirfd(&self) -> libc::c_int {
+        self.dirfd.as_raw_fd()
+    }
+}
+
+fn path_to_cstring(path: &Path) -> std::io::Result<CString> {
+    CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "overlay path contains NUL"))
+}
+
+fn stat_mtime(stat: &libc::stat) -> SystemTime {
+    if stat.st_mtime < 0 {
+        UNIX_EPOCH
+    } else {
+        UNIX_EPOCH + Duration::new(stat.st_mtime as u64, stat.st_mtime_nsec as u32)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn errno_location() -> *mut libc::c_int {
+    unsafe { libc::__errno_location() }
+}
+
+#[cfg(target_os = "macos")]
+fn errno_location() -> *mut libc::c_int {
+    unsafe { libc::__error() }
+}
+
+fn clear_errno() {
+    unsafe {
+        *errno_location() = 0;
+    }
+}
+
+fn current_errno() -> libc::c_int {
+    unsafe { *errno_location() }
 }
 
 fn rand_u64() -> u64 {

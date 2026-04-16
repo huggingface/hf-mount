@@ -11,7 +11,7 @@ use xet_data::processing::XetFileInfo;
 
 use crate::error::{Error, Result};
 use crate::hub_api::{BatchOp, HeadFileInfo, HubOps, SourceKind, TreeEntry};
-use crate::xet::{DownloadStreamOps, StagingDir, StreamingWriterOps, XetOps};
+use crate::xet::{DownloadStreamOps, OverlayBacking, StagingDir, StreamingWriterOps, XetOps};
 
 // ── MockHub ───────────────────────────────────────────────────────────
 
@@ -471,22 +471,24 @@ pub fn make_test_vfs(
 ) -> Arc<crate::virtual_fs::VirtualFs> {
     let advanced_writes = opts.advanced_writes || opts.overlay;
 
+    let overlay_backing = if opts.overlay {
+        let overlay_root = std::env::temp_dir().join(format!("hf_mount_overlay_{}", std::process::id()));
+        if overlay_root.exists() {
+            std::fs::remove_dir_all(&overlay_root).expect("failed to clean stale overlay dir");
+        }
+        std::fs::create_dir_all(&overlay_root).expect("failed to create overlay root dir");
+        let fd = std::fs::File::open(&overlay_root).expect("failed to open overlay root dir");
+        Some(OverlayBacking::new(fd))
+    } else {
+        None
+    };
+
     // Repos need a staging dir for HTTP download cache (open_readonly),
     // even when advanced_writes is disabled (mirrors setup.rs logic).
     let staging_dir = if advanced_writes || hub.is_repo() {
         let path = std::env::temp_dir().join(format!("hf_mount_test_{}", std::process::id()));
         std::fs::create_dir_all(&path).expect("failed to create temp staging dir");
-        if opts.overlay {
-            let overlay_root = std::env::temp_dir().join(format!("hf_mount_overlay_{}", std::process::id()));
-            if overlay_root.exists() {
-                std::fs::remove_dir_all(&overlay_root).expect("failed to clean stale overlay dir");
-            }
-            std::fs::create_dir_all(&overlay_root).expect("failed to create overlay root dir");
-            let fd = std::fs::File::open(&overlay_root).expect("failed to open overlay root dir");
-            Some(StagingDir::new_overlay(&path, fd))
-        } else {
-            Some(StagingDir::new(&path))
-        }
+        Some(StagingDir::new(&path))
     } else {
         None
     };
@@ -496,6 +498,7 @@ pub fn make_test_vfs(
         hub,
         xet,
         staging_dir,
+        overlay_backing,
         crate::virtual_fs::VfsConfig {
             read_only: opts.read_only,
             advanced_writes,
@@ -528,13 +531,15 @@ pub fn make_overlay_test_vfs_with_root(
     let cache_dir = std::env::temp_dir().join(format!("hf_mount_test_{}", std::process::id()));
     std::fs::create_dir_all(&cache_dir).expect("failed to create temp staging dir");
     let fd = std::fs::File::open(&overlay_root).expect("failed to open overlay root dir");
-    let staging_dir = Some(StagingDir::new_overlay(&cache_dir, fd));
+    let staging_dir = Some(StagingDir::new(&cache_dir));
+    let overlay_backing = Some(OverlayBacking::new(fd));
 
     let vfs = crate::virtual_fs::VirtualFs::new(
         rt.handle().clone(),
         hub,
         xet,
         staging_dir,
+        overlay_backing,
         crate::virtual_fs::VfsConfig {
             read_only: false,
             advanced_writes: true,

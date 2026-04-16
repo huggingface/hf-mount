@@ -11,7 +11,7 @@ use xet_data::processing::{CacheConfig, FileDownloadSession, create_remote_clien
 use crate::cached_xet_client::CachedXetClient;
 use crate::hub_api::{HubApiClient, HubTokenRefresher, SourceKind, parse_repo_id, split_path_prefix};
 use crate::virtual_fs::{VfsConfig, VirtualFs};
-use crate::xet::{StagingDir, XetSessions};
+use crate::xet::{OverlayBacking, StagingDir, XetSessions};
 
 #[derive(clap::Subcommand)]
 pub enum Source {
@@ -336,7 +336,8 @@ pub fn build(source: Source, options: MountOptions, is_nfs: bool) -> MountSetup 
     let advanced_writes = options.advanced_writes || options.overlay || (is_nfs && !read_only);
 
     // Overlay: open a pre-mount fd to the mount point directory. The fd is
-    // passed to StagingDir which derives the overlay root path from it.
+    // held by OverlayBacking so overlay-local filesystem ops can stay rooted
+    // at the covered directory after mount.
     let overlay_fd = if options.overlay {
         std::fs::create_dir_all(&mount_point)
             .unwrap_or_else(|e| panic!("Failed to create mount point {:?} for overlay: {e}", mount_point));
@@ -348,14 +349,12 @@ pub fn build(source: Source, options: MountOptions, is_nfs: bool) -> MountSetup 
         None
     };
 
+    let overlay_backing = overlay_fd.map(OverlayBacking::new);
+
     // Repos need a staging dir for HTTP download cache (open_readonly),
     // even when advanced_writes is disabled.
     let staging_dir = if advanced_writes || hub_client.is_repo() {
-        if let Some(fd) = overlay_fd {
-            Some(StagingDir::new_overlay(&options.cache_dir, fd))
-        } else {
-            Some(StagingDir::new(&options.cache_dir))
-        }
+        Some(StagingDir::new(&options.cache_dir))
     } else {
         None
     };
@@ -416,6 +415,7 @@ pub fn build(source: Source, options: MountOptions, is_nfs: bool) -> MountSetup 
         hub_client,
         xet_sessions,
         staging_dir,
+        overlay_backing,
         VfsConfig {
             read_only,
             advanced_writes,
