@@ -153,10 +153,11 @@ pub struct MountOptions {
     pub fuse_owner_only: bool,
 
     /// Enable overlay mode. The mount point directory serves as the local
-    /// layer: pre-existing files are visible through the mount, and new
-    /// writes persist there in their original path layout. Reads merge
-    /// local files with remote bucket contents (local takes precedence).
-    /// Implies --advanced-writes. Writes are never pushed to remote.
+    /// layer: pre-existing local files are visible through the mount, except
+    /// symlinks, which are skipped/hidden. New writes persist there in their
+    /// original path layout. Reads merge local files with remote bucket or
+    /// repo contents (local takes precedence). Implies --advanced-writes.
+    /// Writes are never pushed to remote.
     #[arg(long, default_value_t = false)]
     pub overlay: bool,
 }
