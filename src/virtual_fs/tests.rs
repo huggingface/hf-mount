@@ -3276,6 +3276,36 @@ fn overlay_constructor_forces_advanced_writes() {
     assert!(vfs.flush_manager.is_none());
 }
 
+#[test]
+#[should_panic(expected = "overlay mode requires an overlay backing")]
+fn overlay_constructor_requires_overlay_backing() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    let rt = new_runtime();
+
+    VirtualFs::new(
+        rt.handle().clone(),
+        hub,
+        xet,
+        Some(StagingDir::new(&fresh_overlay_dir("missing_overlay_backing_cache"))),
+        None,
+        VfsConfig {
+            read_only: false,
+            advanced_writes: false,
+            overlay: true,
+            uid: 1000,
+            gid: 1000,
+            poll_interval_secs: 0,
+            metadata_ttl: Duration::from_secs(1),
+            serve_lookup_from_cache: false,
+            filter_os_files: true,
+            direct_io: false,
+            flush_debounce: Duration::from_millis(100),
+            flush_max_batch_window: Duration::from_secs(1),
+        },
+    );
+}
+
 /// Readdir merges remote bucket entries with local overlay files.
 #[test]
 fn overlay_readdir_merges_local_and_remote() {

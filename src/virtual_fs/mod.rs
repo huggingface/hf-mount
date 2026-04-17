@@ -141,6 +141,10 @@ impl VirtualFs {
         config: VfsConfig,
     ) -> Arc<Self> {
         let advanced_writes = config.advanced_writes || config.overlay;
+        assert!(
+            !config.overlay || overlay_backing.is_some(),
+            "overlay mode requires an overlay backing"
+        );
         let staging_dir = staging_dir.map(Arc::new);
         let overlay_backing = overlay_backing.map(Arc::new);
         let inodes = Arc::new(RwLock::new(InodeTable::new()));
