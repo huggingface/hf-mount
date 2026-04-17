@@ -6,6 +6,7 @@ pub mod fuse;
 pub mod hub_api;
 #[cfg(feature = "nfs")]
 pub mod nfs;
+pub mod overlay;
 pub mod setup;
 pub mod virtual_fs;
 pub mod xet;

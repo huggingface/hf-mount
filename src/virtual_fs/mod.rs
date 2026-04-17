@@ -1,5 +1,5 @@
 use std::collections::{HashMap, VecDeque};
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -11,6 +11,7 @@ use tracing::{debug, error, info, warn};
 use xet_data::processing::XetFileInfo;
 
 use crate::hub_api::{BatchOp, HubOps};
+use crate::overlay::OverlayBacking;
 
 mod flush;
 pub mod inode;
@@ -48,6 +49,7 @@ fn is_os_junk(name: &str) -> bool {
 pub struct VfsConfig {
     pub read_only: bool,
     pub advanced_writes: bool,
+    pub overlay: bool,
     pub uid: u32,
     pub gid: u32,
     pub poll_interval_secs: u64,
@@ -83,7 +85,8 @@ pub struct VirtualFs {
     runtime: tokio::runtime::Handle,
     hub_client: Arc<dyn HubOps>,
     xet_sessions: Arc<dyn XetOps>,
-    staging_dir: Option<StagingDir>,
+    staging_dir: Option<Arc<StagingDir>>,
+    overlay_backing: Option<Arc<OverlayBacking>>,
     read_only: bool,
     advanced_writes: bool,
     inode_table: Arc<RwLock<InodeTable>>,
@@ -123,6 +126,8 @@ pub struct VirtualFs {
     filter_os_files: bool,
     /// When true, prefetch buffers drain after serving (forward-only, no re-read cache).
     direct_io: bool,
+    /// When true, writes stay local and no remote mutations (unlink, rename, flush) are sent.
+    overlay: bool,
 }
 
 /// Where to read file content from when opening read-only.
@@ -132,18 +137,26 @@ impl VirtualFs {
         hub_client: Arc<dyn HubOps>,
         xet_sessions: Arc<dyn XetOps>,
         staging_dir: Option<StagingDir>,
+        overlay_backing: Option<OverlayBacking>,
         config: VfsConfig,
     ) -> Arc<Self> {
+        let advanced_writes = config.advanced_writes || config.overlay;
+        assert!(
+            !config.overlay || overlay_backing.is_some(),
+            "overlay mode requires an overlay backing"
+        );
+        let staging_dir = staging_dir.map(Arc::new);
+        let overlay_backing = overlay_backing.map(Arc::new);
         let inodes = Arc::new(RwLock::new(InodeTable::new()));
         let negative_cache = Arc::new(RwLock::new(HashMap::new()));
 
-        let flush_manager = if !config.read_only && config.advanced_writes {
+        let flush_manager = if !config.read_only && advanced_writes && !config.overlay {
             let sd = staging_dir
                 .as_ref()
                 .expect("--advanced-writes requires a staging directory");
             Some(flush::FlushManager::new(
                 xet_sessions.clone(),
-                sd.clone(),
+                Arc::clone(sd),
                 hub_client.clone(),
                 inodes.clone(),
                 &runtime,
@@ -184,8 +197,9 @@ impl VirtualFs {
             hub_client,
             xet_sessions,
             staging_dir,
+            overlay_backing,
             read_only: config.read_only,
-            advanced_writes: config.advanced_writes,
+            advanced_writes,
             inode_table: inodes,
             open_files,
             next_file_handle: AtomicU64::new(1),
@@ -202,6 +216,7 @@ impl VirtualFs {
             serve_lookup_from_cache: config.serve_lookup_from_cache,
             filter_os_files: config.filter_os_files,
             direct_io: config.direct_io,
+            overlay: config.overlay,
         });
 
         // Set root inode mtime and ownership (repos use the last commit date).
@@ -222,6 +237,11 @@ impl VirtualFs {
         }
 
         vfs
+    }
+
+    /// True if the entry is a clean remote entry that overlay mode treats as immutable.
+    fn is_overlay_immutable(&self, entry: &inode::InodeEntry) -> bool {
+        self.overlay && !entry.is_dirty()
     }
 
     /// Set the kernel cache invalidation callback. Called after mount setup
@@ -514,6 +534,58 @@ impl VirtualFs {
             }
         }
 
+        // Overlay: merge local entries (local overrides remote, via pre-mount fd).
+        if self.overlay
+            && let Some(overlay) = &self.overlay_backing
+        {
+            let dir_path = inodes.get(parent_ino).map(|e| e.full_path.clone()).unwrap_or_default();
+            if let Ok(entries) = overlay.read_dir(&dir_path) {
+                for entry in entries {
+                    let name = entry.name;
+                    if self.filter_os_files && is_os_junk(&name) {
+                        continue;
+                    }
+                    if entry.is_symlink {
+                        continue;
+                    }
+                    let kind = if entry.is_dir {
+                        InodeKind::Directory
+                    } else {
+                        InodeKind::File
+                    };
+                    let full_path = inode::child_path(&dir_path, &name);
+                    let mtime = entry.mtime;
+                    let size = entry.size;
+                    let mode = entry.mode;
+                    // If existing entry has a different kind (e.g. remote file
+                    // vs local dir), remove it first so local wins cleanly.
+                    let conflict = inodes
+                        .lookup_child(parent_ino, &name)
+                        .filter(|e| e.kind != kind)
+                        .map(|e| e.inode);
+                    if let Some(old_ino) = conflict {
+                        inodes.remove(old_ino);
+                    }
+                    let ino = inodes.insert(
+                        parent_ino, name, full_path, kind, size, mtime, None, mode, self.uid, self.gid,
+                    );
+                    // Local overrides remote: update metadata, clear remote identity.
+                    if let Some(e) = inodes.get_mut(ino) {
+                        e.size = size;
+                        e.mtime = mtime;
+                        e.mode = mode;
+                        e.xet_hash = None;
+                        if !e.is_dirty() {
+                            e.set_dirty();
+                        }
+                        if kind == InodeKind::Directory {
+                            e.children_loaded = false; // will be lazy-loaded on access
+                        }
+                    }
+                }
+            }
+        }
+
         if let Some(parent) = inodes.get_mut(parent_ino) {
             parent.children_loaded = true;
         }
@@ -570,6 +642,68 @@ impl VirtualFs {
             .entry(ino)
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone()
+    }
+
+    fn overlay_backing(&self) -> VirtualFsResult<&OverlayBacking> {
+        self.overlay_backing.as_deref().ok_or_else(|| {
+            error!("overlay backing missing in overlay mode");
+            libc::EIO
+        })
+    }
+
+    fn ensure_local_backing_parents(&self, full_path: &str) -> std::io::Result<()> {
+        match self.overlay_backing.as_deref() {
+            Some(overlay) => overlay.create_parent_dirs(full_path),
+            None => Ok(()),
+        }
+    }
+
+    fn local_backing_exists(&self, ino: u64, full_path: &str) -> std::io::Result<bool> {
+        match self.overlay_backing.as_deref() {
+            Some(overlay) => overlay.exists(full_path),
+            None => self
+                .staging_dir
+                .as_ref()
+                .expect("staging_dir required for local backing")
+                .local_exists(ino),
+        }
+    }
+
+    fn open_local_backing_file(
+        &self,
+        ino: u64,
+        full_path: &str,
+        read: bool,
+        write: bool,
+        create: bool,
+        truncate: bool,
+    ) -> std::io::Result<File> {
+        match self.overlay_backing.as_deref() {
+            Some(overlay) => overlay.open_file(full_path, read, write, create, truncate),
+            None => self
+                .staging_dir
+                .as_ref()
+                .expect("staging_dir required for local backing")
+                .open_local_file(ino, read, write, create, truncate),
+        }
+    }
+
+    fn set_local_backing_mode(&self, full_path: &str, mode: u16) -> std::io::Result<()> {
+        match self.overlay_backing.as_deref() {
+            Some(overlay) => overlay.set_mode(full_path, mode),
+            None => Ok(()),
+        }
+    }
+
+    fn remove_local_backing_file(&self, ino: u64, full_path: &str) -> std::io::Result<()> {
+        match self.overlay_backing.as_deref() {
+            Some(overlay) => overlay.remove_file(full_path),
+            None => self
+                .staging_dir
+                .as_ref()
+                .expect("staging_dir required for local backing")
+                .remove_local_file(ino),
+        }
     }
 
     /// Install a pending commit watch hook on a streaming channel.
@@ -666,23 +800,25 @@ impl VirtualFs {
     /// Open a local file as read-only and return the file handle.
     fn open_local_readonly(&self, ino: u64, path: &PathBuf) -> VirtualFsResult<u64> {
         match File::open(path) {
-            Ok(file) => {
-                let file_handle = self.alloc_file_handle();
-                self.open_files.write().expect("open_files poisoned").insert(
-                    file_handle,
-                    OpenFile::Local {
-                        ino,
-                        file: Arc::new(file),
-                        writable: false,
-                    },
-                );
-                Ok(file_handle)
-            }
+            Ok(file) => Ok(self.insert_local_handle(ino, file, false)),
             Err(e) => {
                 error!("Failed to open file {:?}: {}", path, e);
                 Err(libc::EIO)
             }
         }
+    }
+
+    fn insert_local_handle(&self, ino: u64, file: File, writable: bool) -> u64 {
+        let file_handle = self.alloc_file_handle();
+        self.open_files.write().expect("open_files poisoned").insert(
+            file_handle,
+            OpenFile::Local {
+                ino,
+                file: Arc::new(file),
+                writable,
+            },
+        );
+        file_handle
     }
 
     /// Check if a path is in the negative cache (and not expired).
@@ -855,11 +991,20 @@ impl VirtualFs {
     /// - Advanced-writes handles: enqueues for background flush.
     /// - Read-only / lazy handles: no-op.
     pub async fn fsync(&self, ino: u64, file_handle: u64, _pid: Option<u32>) -> VirtualFsResult<()> {
-        {
+        let overlay_file = {
             let files = self.open_files.read().expect("open_files poisoned");
-            if matches!(files.get(&file_handle), Some(OpenFile::Streaming { .. })) {
-                return Ok(());
+            match files.get(&file_handle) {
+                Some(OpenFile::Streaming { .. }) => return Ok(()),
+                // Overlay: sync local fd for durability, skip remote upload.
+                Some(OpenFile::Local { file, .. }) if self.overlay => Some(Arc::clone(file)),
+                _ => None,
             }
+        };
+        if let Some(file) = overlay_file {
+            return file.sync_all().map_err(|e| {
+                error!("Overlay fsync failed for ino={}: {}", ino, e);
+                libc::EIO
+            });
         }
         self.schedule_flush(ino);
         Ok(())
@@ -919,12 +1064,24 @@ impl VirtualFs {
         }
 
         let file_entry = self.get_file_entry(ino)?;
-        let staging_path = self.staging_dir.as_ref().map(|sd| sd.path(ino));
+
+        if writable && self.overlay {
+            self.ensure_local_backing_parents(&file_entry.full_path).map_err(|e| {
+                error!("Failed to create staging parent dirs for ino={}: {}", ino, e);
+                libc::EIO
+            })?;
+        }
 
         if writable && self.advanced_writes {
             // Staging file + async flush (supports random writes and seek)
-            self.open_advanced_write(ino, &file_entry.xet_hash, file_entry.size, staging_path, truncate)
-                .await
+            self.open_advanced_write(
+                ino,
+                &file_entry.full_path,
+                &file_entry.xet_hash,
+                file_entry.size,
+                truncate,
+            )
+            .await
         } else if writable && truncate {
             // Simple streaming write (append-only, synchronous commit on close)
             self.open_streaming_write(ino, pid).await
@@ -932,7 +1089,7 @@ impl VirtualFs {
             // Simple mode without O_TRUNC: random writes not supported
             Err(libc::EPERM)
         } else {
-            self.open_readonly(ino, file_entry, staging_path).await
+            self.open_readonly(ino, file_entry).await
         }
     }
 
@@ -940,13 +1097,11 @@ impl VirtualFs {
     async fn open_advanced_write(
         &self,
         ino: u64,
+        full_path: &str,
         xet_hash: &str,
         size: u64,
-        staging_path: Option<PathBuf>,
         truncate: bool,
     ) -> VirtualFsResult<u64> {
-        let staging_path = staging_path.expect("staging_dir required for advanced writes");
-
         // Serialize staging preparation per inode (prevents concurrent download races)
         let staging_mutex = self.staging_lock(ino);
         let _staging_guard = staging_mutex.lock().await;
@@ -959,10 +1114,23 @@ impl VirtualFs {
             .get(ino)
             .ok_or(libc::ENOENT)?
             .is_dirty();
+        let local_exists = self.local_backing_exists(ino, full_path).map_err(|e| {
+            error!("Failed to check local backing file for ino={}: {}", ino, e);
+            libc::EIO
+        })?;
+
+        if self.overlay && !is_dirty && !local_exists {
+            return Err(libc::EPERM);
+        }
 
         // Reuse existing dirty staging file (unless truncating)
-        if !(is_dirty && staging_path.exists() && !truncate) {
-            if !truncate && !xet_hash.is_empty() && size > 0 {
+        if !(is_dirty && local_exists && !truncate) {
+            if !self.overlay && !truncate && !xet_hash.is_empty() && size > 0 {
+                let staging_path = self
+                    .staging_dir
+                    .as_ref()
+                    .expect("staging_dir required for advanced writes")
+                    .path(ino);
                 // Download remote content for read-modify-write
                 self.xet_sessions
                     .download_to_file(xet_hash, size, &staging_path)
@@ -973,17 +1141,15 @@ impl VirtualFs {
                     })?;
             } else {
                 // Truncate, new file, or empty remote → empty staging file
-                File::create(&staging_path).map_err(|e| {
-                    error!("Failed to create staging file: {}", e);
-                    libc::EIO
-                })?;
+                self.open_local_backing_file(ino, full_path, true, true, true, true)
+                    .map_err(|e| {
+                        error!("Failed to create staging file: {}", e);
+                        libc::EIO
+                    })?;
             }
         }
-
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&staging_path)
+        let file = self
+            .open_local_backing_file(ino, full_path, true, true, false, false)
             .map_err(|e| {
                 error!("Failed to open staging file: {}", e);
                 libc::EIO
@@ -1003,16 +1169,7 @@ impl VirtualFs {
             }
         }
 
-        let file_handle = self.alloc_file_handle();
-        self.open_files.write().expect("open_files poisoned").insert(
-            file_handle,
-            OpenFile::Local {
-                ino,
-                file: Arc::new(file),
-                writable: true,
-            },
-        );
-        Ok(file_handle)
+        Ok(self.insert_local_handle(ino, file, true))
     }
 
     /// Simple streaming write: truncate existing file and set up a new streaming writer.
@@ -1058,60 +1215,64 @@ impl VirtualFs {
     }
 
     /// Open a file for reading. Dispatches based on where the content lives.
-    async fn open_readonly(&self, ino: u64, fe: FileEntry, staging_path: Option<PathBuf>) -> VirtualFsResult<u64> {
-        match (fe.is_dirty, &staging_path) {
-            // Advanced write in progress — read from local staging file.
-            (true, Some(path)) if path.exists() => self.open_local_readonly(ino, path),
-
-            // Dirty file but staging file is missing — should not happen.
-            (true, Some(_)) => {
-                error!("Dirty file ino={} has missing staging file", ino);
-                Err(libc::EIO)
+    async fn open_readonly(&self, ino: u64, fe: FileEntry) -> VirtualFsResult<u64> {
+        if fe.is_dirty {
+            let local_exists = self.local_backing_exists(ino, &fe.full_path).map_err(|e| {
+                error!("Failed to check local backing file for {}: {}", fe.full_path, e);
+                libc::EIO
+            })?;
+            if local_exists {
+                let file = self
+                    .open_local_backing_file(ino, &fe.full_path, true, false, false, false)
+                    .map_err(|e| {
+                        error!("Failed to open local backing file {:?}: {}", fe.full_path, e);
+                        libc::EIO
+                    })?;
+                return Ok(self.insert_local_handle(ino, file, false));
             }
 
-            // Streaming write in progress (simple mode) — wait for commit.
-            (true, None) if fe.xet_hash.is_empty() && fe.size > 0 => {
+            if fe.xet_hash.is_empty() && fe.size > 0 {
                 self.await_pending_commit(ino).await?;
                 let fe = self.get_file_entry(ino)?;
-                self.open_lazy(ino, fe.xet_hash, fe.size)
+                return self.open_lazy(ino, fe.xet_hash, fe.size);
             }
 
-            // Remote xet-backed file — lazy CAS range reads.
-            _ if !fe.xet_hash.is_empty() => self.open_lazy(ino, fe.xet_hash, fe.size),
-
-            // Plain LFS/git file without xet hash — HTTP download to staging cache.
-            _ if fe.size > 0 => {
-                let staging = self.staging_dir.as_ref().ok_or_else(|| {
-                    error!("No staging dir for HTTP download of ino={}", ino);
-                    libc::EIO
-                })?;
-                let path_hash = {
-                    use std::hash::{Hash, Hasher};
-                    let mut h = std::collections::hash_map::DefaultHasher::new();
-                    self.hub_client.source().to_string().hash(&mut h);
-                    fe.full_path.hash(&mut h);
-                    h.finish()
-                };
-                let dest = staging.root().join(format!("http_{:x}", path_hash));
-                {
-                    let lock = self.staging_lock(ino);
-                    let _guard = lock.lock().await;
-                    // download_file_http uses ETag-based conditional requests,
-                    // so this is cheap when the cached file is still valid (304).
-                    self.hub_client
-                        .download_file_http(&fe.full_path, &dest)
-                        .await
-                        .map_err(|e| {
-                            error!("HTTP download failed for {}: {}", fe.full_path, e);
-                            libc::EIO
-                        })?;
-                }
-                self.open_local_readonly(ino, &dest)
-            }
-
-            // Empty file (size=0, no hash).
-            _ => self.open_lazy(ino, String::new(), 0),
+            error!("Dirty file ino={} has missing local backing file", ino);
+            return Err(libc::EIO);
         }
+
+        if !fe.xet_hash.is_empty() {
+            return self.open_lazy(ino, fe.xet_hash, fe.size);
+        }
+
+        if fe.size > 0 {
+            let staging = self.staging_dir.as_ref().ok_or_else(|| {
+                error!("No staging dir for HTTP download of ino={}", ino);
+                libc::EIO
+            })?;
+            let path_hash = {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                self.hub_client.source().to_string().hash(&mut h);
+                fe.full_path.hash(&mut h);
+                h.finish()
+            };
+            let dest = staging.root().join(format!("http_{:x}", path_hash));
+            {
+                let lock = self.staging_lock(ino);
+                let _guard = lock.lock().await;
+                self.hub_client
+                    .download_file_http(&fe.full_path, &dest)
+                    .await
+                    .map_err(|e| {
+                        error!("HTTP download failed for {}: {}", fe.full_path, e);
+                        libc::EIO
+                    })?;
+            }
+            return self.open_local_readonly(ino, &dest);
+        }
+
+        self.open_lazy(ino, String::new(), 0)
     }
 
     /// Allocate a lazy file handle backed by a prefetch buffer.
@@ -1693,6 +1854,8 @@ impl VirtualFs {
 
     /// Finalize a streaming write: send Finish to the worker, await CAS upload, commit to Hub.
     async fn streaming_commit(&self, ino: u64, channel: &StreamingChannel) -> Result<(), i32> {
+        assert!(!self.overlay, "overlay forces advanced_writes; streaming unreachable");
+
         // Unlinked files (nlink=0) must not be re-committed on close —
         // user deleted the file, uploading would resurrect it.
         if self
@@ -1851,28 +2014,20 @@ impl VirtualFs {
 
         if self.advanced_writes {
             // Advanced mode: staging file on disk + async flush
-            let staging_path = self
-                .staging_dir
-                .as_ref()
-                .expect("staging_dir required for advanced writes")
-                .path(ino);
-            match OpenOptions::new()
-                .create(true)
-                .truncate(true)
-                .read(true)
-                .write(true)
-                .open(&staging_path)
-            {
+            if let Err(e) = self.ensure_local_backing_parents(&full_path) {
+                error!("Failed to create staging parent dirs for {}: {}", full_path, e);
+                self.inode_table.write().expect("inodes poisoned").remove(ino);
+                return Err(libc::EIO);
+            }
+            let open_result = self.open_local_backing_file(ino, &full_path, true, true, true, true);
+            match open_result {
                 Ok(file) => {
-                    let file_handle = self.alloc_file_handle();
-                    self.open_files.write().expect("open_files poisoned").insert(
-                        file_handle,
-                        OpenFile::Local {
-                            ino,
-                            file: Arc::new(file),
-                            writable: true,
-                        },
-                    );
+                    if let Err(e) = self.set_local_backing_mode(&full_path, mode) {
+                        error!("Failed to set local backing mode for {}: {}", full_path, e);
+                        self.inode_table.write().expect("inodes poisoned").remove(ino);
+                        return Err(libc::EIO);
+                    }
+                    let file_handle = self.insert_local_handle(ino, file, true);
 
                     let inodes = self.inode_table.read().expect("inodes poisoned");
                     let attr = self.make_vfs_attr(inodes.get(ino).ok_or(libc::ENOENT)?);
@@ -1961,6 +2116,9 @@ impl VirtualFs {
             );
             if let Some(entry) = inodes.get_mut(ino) {
                 entry.children_loaded = true;
+                if self.overlay {
+                    entry.set_dirty();
+                }
             }
             // nlink already incremented by insert()
             inodes.touch_parent(parent, now);
@@ -1968,6 +2126,21 @@ impl VirtualFs {
         };
 
         self.negative_cache_remove(&full_path);
+
+        // Overlay: persist directory to disk.
+        if self.overlay {
+            let overlay = self.overlay_backing()?;
+            if let Err(e) = overlay.create_parent_dirs(&full_path) {
+                error!("Failed to create overlay parent directories for {}: {}", full_path, e);
+                self.inode_table.write().expect("inodes poisoned").remove(ino);
+                return Err(libc::EIO);
+            }
+            if let Err(e) = overlay.create_dir(&full_path, mode) {
+                error!("Failed to create overlay directory {}: {}", full_path, e);
+                self.inode_table.write().expect("inodes poisoned").remove(ino);
+                return Err(e.raw_os_error().unwrap_or(libc::EIO));
+            }
+        }
 
         let inodes = self.inode_table.read().expect("inodes poisoned");
         Ok(self.make_vfs_attr(inodes.get(ino).ok_or(libc::ENOENT)?))
@@ -1989,8 +2162,13 @@ impl VirtualFs {
                 Some(_) => return Err(libc::EISDIR),
                 None => return Err(libc::ENOENT),
             };
-            // Remote delete only when last link is removed and file exists on the hub
-            let needs_remote = entry.xet_hash.is_some() && entry.nlink <= 1;
+            // Overlay: cannot delete clean remote entries (no whiteout support).
+            // Deleting dirty (local) entries is allowed; remote reappears on remount.
+            if self.is_overlay_immutable(entry) {
+                return Err(libc::EPERM);
+            }
+            // Remote delete only when last link removed and file exists on hub.
+            let needs_remote = !self.overlay && entry.xet_hash.is_some() && entry.nlink <= 1;
             (entry.inode, entry.full_path.clone(), needs_remote)
         };
 
@@ -2040,9 +2218,9 @@ impl VirtualFs {
         };
 
         // Clean up staging file only if inode was fully removed (no remaining hard links)
-        if inode_removed && let Some(ref staging_dir) = self.staging_dir {
-            let staging_path = staging_dir.path(ino);
-            if let Err(e) = std::fs::remove_file(&staging_path)
+        if inode_removed && (self.overlay_backing.is_some() || self.staging_dir.is_some()) {
+            let remove_result = self.remove_local_backing_file(ino, &full_path);
+            if let Err(e) = remove_result
                 && e.kind() != std::io::ErrorKind::NotFound
             {
                 warn!("Failed to remove staging file for ino={}: {}", ino, e);
@@ -2140,6 +2318,10 @@ impl VirtualFs {
             let inodes = self.inode_table.read().expect("inodes poisoned");
             match inodes.lookup_child(parent, name) {
                 Some(entry) if entry.kind == InodeKind::Directory => {
+                    // Overlay: cannot remove clean remote directories.
+                    if self.is_overlay_immutable(entry) {
+                        return Err(libc::EPERM);
+                    }
                     if !entry.children.is_empty() {
                         return Err(libc::ENOTEMPTY);
                     }
@@ -2156,14 +2338,25 @@ impl VirtualFs {
         // Re-check ENOTEMPTY + remove under a single write lock to prevent
         // a concurrent create/mkdir from inserting a child in between.
         let mut inodes = self.inode_table.write().expect("inodes poisoned");
-        match inodes.get(ino) {
+        let full_path = match inodes.get(ino) {
             Some(entry) if !entry.children.is_empty() => return Err(libc::ENOTEMPTY),
+            Some(entry) => entry.full_path.clone(),
             None => return Err(libc::ENOENT),
-            _ => {}
+        };
+
+        // Overlay: remove on-disk dir before inode, so failure doesn't leave stale state.
+        if self.overlay {
+            let overlay = self.overlay_backing()?;
+            if let Err(e) = overlay.remove_dir(&full_path)
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                return Err(e.raw_os_error().unwrap_or(libc::EIO));
+            }
         }
+
         inodes.remove(ino);
-        // nlink adjusted by remove()
         inodes.touch_parent(parent, SystemTime::now());
+
         Ok(())
     }
 
@@ -2196,6 +2389,17 @@ impl VirtualFs {
         self.ensure_children_loaded(parent).await?;
         if parent != newparent {
             self.ensure_children_loaded(newparent).await?;
+        }
+
+        // Overlay: cannot rename clean remote entries (no whiteout for old path).
+        if let Some(src) = self
+            .inode_table
+            .read()
+            .expect("inodes poisoned")
+            .lookup_child(parent, name)
+            && self.is_overlay_immutable(src)
+        {
+            return Err(libc::EPERM);
         }
 
         // Pre-load lazy directories before the sync validate phase:
@@ -2235,8 +2439,35 @@ impl VirtualFs {
             }
         }
 
-        // Phase 2: sync to remote (add + delete ops).
-        let remote_mutated = self.rename_remote(&info).await?;
+        // Phase 2: sync to remote (skipped in overlay mode).
+        let remote_mutated = if self.overlay {
+            false
+        } else {
+            self.rename_remote(&info).await?
+        };
+
+        // Overlay: move the on-disk file to match the new path.
+        if self.overlay {
+            let overlay = self.overlay_backing()?;
+            let old_exists = overlay.exists(&info.old_path).map_err(|e| {
+                error!("Overlay rename: failed to stat {}: {}", info.old_path, e);
+                libc::EIO
+            })?;
+            if !old_exists {
+                return Err(libc::EPERM);
+            }
+            if let Err(e) = overlay.create_parent_dirs(&info.new_full_path) {
+                error!("Overlay rename: failed to create destination parents: {}", e);
+                return Err(e.raw_os_error().unwrap_or(libc::EIO));
+            }
+            if let Err(e) = overlay.rename(&info.old_path, &info.new_full_path) {
+                error!(
+                    "Overlay rename {} -> {} failed: {}",
+                    info.old_path, info.new_full_path, e
+                );
+                return Err(e.raw_os_error().unwrap_or(libc::EIO));
+            }
+        }
 
         // Phase 3: apply to local inode table under write lock.
         // If Phase 2 mutated the remote and Phase 3 fails with ENOENT (source
@@ -2245,8 +2476,8 @@ impl VirtualFs {
         // since poll may not fix a dirty local inode at the destination path.
         match self.rename_apply_local(info, parent, name, newparent, newname, no_replace) {
             Ok(()) => Ok(()),
-            Err(libc::ENOENT) if remote_mutated => {
-                warn!("rename: source gone after remote rename; poll will reconcile");
+            Err(libc::ENOENT) if remote_mutated || self.overlay => {
+                warn!("rename: source gone after rename; next dir load will reconcile");
                 // Invalidate parents so the next lookup re-fetches from remote
                 // instead of trusting the stale children_loaded state.
                 let mut inodes = self.inode_table.write().expect("inodes poisoned");
@@ -2555,14 +2786,14 @@ impl VirtualFs {
 
         if let Some(new_size) = size {
             // Validate inode exists and is a file before any side effects
-            {
+            let full_path = {
                 let inodes = self.inode_table.read().expect("inodes poisoned");
                 match inodes.get(ino) {
                     Some(e) if e.kind != InodeKind::File => return Err(libc::EISDIR),
+                    Some(e) => e.full_path.clone(),
                     None => return Err(libc::ENOENT),
-                    _ => {}
                 }
-            }
+            };
 
             if !self.advanced_writes {
                 // Simple mode: ftruncate via setattr is silently ignored.
@@ -2572,52 +2803,63 @@ impl VirtualFs {
                 let staging_mutex = self.staging_lock(ino);
                 let _staging_guard = staging_mutex.lock().await;
 
-                let staging_path = self
-                    .staging_dir
-                    .as_ref()
-                    .expect("staging_dir required for advanced writes")
-                    .path(ino);
+                self.ensure_local_backing_parents(&full_path).map_err(|e| {
+                    error!("Failed to create staging parent dirs for ino={}: {}", ino, e);
+                    e.raw_os_error().unwrap_or(libc::EIO)
+                })?;
+                let local_exists = self.local_backing_exists(ino, &full_path).map_err(|e| {
+                    error!("Failed to check local backing file for ino={}: {}", ino, e);
+                    e.raw_os_error().unwrap_or(libc::EIO)
+                })?;
 
-                // Phase 1: ensure staging file exists (may download, async).
-                if new_size > 0 && !staging_path.exists() {
-                    let (xet_hash, file_size) = {
-                        let inodes = self.inode_table.read().expect("inodes poisoned");
-                        let entry = inodes.get(ino).ok_or(libc::ENOENT)?;
-                        (entry.xet_hash.clone().unwrap_or_default(), entry.size)
-                    };
-                    if !xet_hash.is_empty() && file_size > 0 {
-                        if let Err(e) = self
-                            .xet_sessions
-                            .download_to_file(&xet_hash, file_size, &staging_path)
-                            .await
-                        {
-                            error!("Failed to download file for truncate: {}", e);
+                if self.overlay && !local_exists {
+                    return Err(libc::EPERM);
+                }
+
+                if !local_exists {
+                    if new_size > 0 {
+                        let staging_path = self
+                            .staging_dir
+                            .as_ref()
+                            .expect("staging_dir required for advanced writes")
+                            .path(ino);
+                        let (xet_hash, file_size) = {
+                            let inodes = self.inode_table.read().expect("inodes poisoned");
+                            let entry = inodes.get(ino).ok_or(libc::ENOENT)?;
+                            (entry.xet_hash.clone().unwrap_or_default(), entry.size)
+                        };
+                        if !xet_hash.is_empty() && file_size > 0 {
+                            if let Err(e) = self
+                                .xet_sessions
+                                .download_to_file(&xet_hash, file_size, &staging_path)
+                                .await
+                            {
+                                error!("Failed to download file for truncate: {}", e);
+                                return Err(libc::EIO);
+                            }
+                        } else if let Err(e) = self.open_local_backing_file(ino, &full_path, true, true, true, true) {
+                            error!("Failed to create staging file for truncate: {}", e);
                             return Err(libc::EIO);
                         }
-                    } else if let Err(e) = File::create(&staging_path) {
-                        error!("Failed to create staging file for truncate: {}", e);
+                    } else if let Err(e) = self.open_local_backing_file(ino, &full_path, true, true, true, true) {
+                        error!("Failed to create local backing file for truncate: {}", e);
                         return Err(libc::EIO);
                     }
                 }
 
-                // Phase 2: truncate file + update inode under the same write lock.
-                // This prevents write()'s inode size update from interleaving
-                // between our truncation and metadata update.
+                // Apply the size change under the same write lock so write() cannot
+                // race between the local truncate and inode metadata update.
                 let mut inodes = self.inode_table.write().expect("inodes poisoned");
-                if new_size == 0 {
-                    if let Err(e) = File::create(&staging_path) {
-                        error!("Failed to truncate staging file: {}", e);
-                        return Err(libc::EIO);
-                    }
+                let size_result = if new_size == 0 {
+                    self.open_local_backing_file(ino, &full_path, true, true, true, true)
+                        .map(|_| ())
                 } else {
-                    if let Err(e) = OpenOptions::new()
-                        .write(true)
-                        .open(&staging_path)
-                        .and_then(|f| f.set_len(new_size))
-                    {
-                        error!("Failed to set staging file length: {}", e);
-                        return Err(libc::EIO);
-                    }
+                    self.open_local_backing_file(ino, &full_path, false, true, false, false)
+                        .and_then(|file| file.set_len(new_size))
+                };
+                if let Err(e) = size_result {
+                    error!("Failed to set local backing file length: {}", e);
+                    return Err(libc::EIO);
                 }
                 if let Some(entry) = inodes.get_mut(ino) {
                     entry.size = new_size;
@@ -2639,6 +2881,26 @@ impl VirtualFs {
 
         // Apply metadata-only changes (mode, uid, gid, atime, mtime)
         if mode.is_some() || uid.is_some() || gid.is_some() || atime.is_some() || mtime.is_some() {
+            if self.overlay
+                && let Some(new_mode) = mode
+            {
+                let full_path = {
+                    let inodes = self.inode_table.read().expect("inodes poisoned");
+                    inodes.get(ino).ok_or(libc::ENOENT)?.full_path.clone()
+                };
+                let local_exists = self.local_backing_exists(ino, &full_path).map_err(|e| {
+                    error!("Failed to check local backing file for ino={}: {}", ino, e);
+                    e.raw_os_error().unwrap_or(libc::EIO)
+                })?;
+                if !local_exists {
+                    return Err(libc::EPERM);
+                }
+                self.set_local_backing_mode(&full_path, new_mode).map_err(|e| {
+                    error!("Failed to update local backing mode for ino={}: {}", ino, e);
+                    e.raw_os_error().unwrap_or(libc::EIO)
+                })?;
+            }
+
             let mut inodes = self.inode_table.write().expect("inodes poisoned");
             if let Some(entry) = inodes.get_mut(ino) {
                 if let Some(m) = mode {
