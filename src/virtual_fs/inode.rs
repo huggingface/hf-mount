@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -32,7 +33,10 @@ pub struct InodeEntry {
     pub inode: u64,
     pub parent: u64,
     pub name: String,
-    pub full_path: String,
+    /// Full path from the mount root. Stored as `Arc<str>` so the same
+    /// allocation is shared between `InodeEntry.full_path` and the
+    /// `path_to_inode` HashMap key — cuts per-entry path storage in half.
+    pub full_path: Arc<str>,
     pub kind: InodeKind,
     pub size: u64,
     pub mtime: SystemTime,
@@ -163,7 +167,10 @@ impl InodeEntry {
 
 pub struct InodeTable {
     inodes: HashMap<u64, InodeEntry>,
-    path_to_inode: HashMap<String, u64>,
+    /// Path → inode lookup. The key is an `Arc<str>` that's cloned (cheap
+    /// refcount bump) from the matching `InodeEntry.full_path`, so the path
+    /// string is allocated exactly once per inode.
+    path_to_inode: HashMap<Arc<str>, u64>,
     next_inode: AtomicU64,
 }
 
@@ -182,11 +189,12 @@ impl InodeTable {
         };
 
         // Create root inode
+        let root_path: Arc<str> = Arc::from("");
         let root = InodeEntry {
             inode: ROOT_INODE,
             parent: ROOT_INODE,
             name: String::new(),
-            full_path: String::new(),
+            full_path: root_path.clone(),
             kind: InodeKind::Directory,
             size: 0,
             mtime: UNIX_EPOCH,
@@ -207,7 +215,7 @@ impl InodeTable {
             nlookup: AtomicU64::new(0),
         };
         table.inodes.insert(ROOT_INODE, root);
-        table.path_to_inode.insert(String::new(), ROOT_INODE);
+        table.path_to_inode.insert(root_path, ROOT_INODE);
 
         table
     }
@@ -271,7 +279,7 @@ impl InodeTable {
         gid: u32,
     ) -> u64 {
         // Check if already exists
-        if let Some(&existing_ino) = self.path_to_inode.get(&full_path) {
+        if let Some(&existing_ino) = self.path_to_inode.get(full_path.as_str()) {
             debug_assert!(
                 self.inodes.get(&existing_ino).map(|e| e.kind) == Some(kind),
                 "insert(): path '{}' exists with different kind",
@@ -299,11 +307,14 @@ impl InodeTable {
 
         let inode = self.next_inode.fetch_add(1, Ordering::Relaxed);
         let child_name = name.clone();
+        // Allocate the path once; the InodeEntry and path_to_inode share the
+        // same Arc so the string is stored in memory exactly once per inode.
+        let full_path_arc: Arc<str> = Arc::from(full_path);
         let entry = InodeEntry {
             inode,
             parent,
             name,
-            full_path: full_path.clone(),
+            full_path: full_path_arc.clone(),
             kind,
             size,
             mtime,
@@ -325,7 +336,7 @@ impl InodeTable {
         };
 
         self.inodes.insert(inode, entry);
-        self.path_to_inode.insert(full_path, inode);
+        self.path_to_inode.insert(full_path_arc, inode);
 
         // Add to parent's children
         if let Some(parent_entry) = self.inodes.get_mut(&parent) {
@@ -349,7 +360,7 @@ impl InodeTable {
 
     /// Insert a path → inode mapping.
     pub fn insert_path(&mut self, path: String, inode: u64) {
-        self.path_to_inode.insert(path, inode);
+        self.path_to_inode.insert(Arc::from(path), inode);
     }
 
     /// Return inodes of all dirty files (excludes symlinks — they have no content to flush).
@@ -370,7 +381,7 @@ impl InodeTable {
             .map(|e| {
                 (
                     e.inode,
-                    e.full_path.clone(),
+                    e.full_path.to_string(),
                     e.xet_hash.clone(),
                     e.etag.clone(),
                     e.size,
@@ -437,7 +448,7 @@ impl InodeTable {
         self.inodes
             .values()
             .filter(|e| e.kind == InodeKind::Directory && e.children_loaded)
-            .map(|e| e.full_path.clone())
+            .map(|e| e.full_path.to_string())
             .collect()
     }
 
@@ -456,16 +467,18 @@ impl InodeTable {
     /// Hard-linked inodes whose full_path doesn't match their expected position in the tree
     /// are skipped (they belong elsewhere and their canonical path must not be rewritten).
     pub fn update_subtree_paths(&mut self, inode: u64, new_full_path: String) {
-        // Remove old path mapping
+        // Remove old path mapping (&*Arc<str> borrows as &str for the HashMap).
         if let Some(entry) = self.inodes.get(&inode) {
-            let old_path = entry.full_path.clone();
-            self.path_to_inode.remove(&old_path);
+            let old_path: Arc<str> = entry.full_path.clone();
+            self.path_to_inode.remove(&*old_path);
         }
 
-        // Update this inode's path
+        // Allocate the new path once and share its Arc between the entry and
+        // the path_to_inode key.
+        let new_full_path_arc: Arc<str> = Arc::from(new_full_path.as_str());
         let children = if let Some(entry) = self.inodes.get_mut(&inode) {
-            entry.full_path = new_full_path.clone();
-            self.path_to_inode.insert(new_full_path.clone(), inode);
+            entry.full_path = new_full_path_arc.clone();
+            self.path_to_inode.insert(new_full_path_arc, inode);
             entry.children.clone()
         } else {
             return;
@@ -483,7 +496,7 @@ impl InodeTable {
     /// prevent orphaned entries in the table.
     pub fn remove(&mut self, inode: u64) -> Option<InodeEntry> {
         let entry = self.inodes.remove(&inode)?;
-        self.path_to_inode.remove(&entry.full_path);
+        self.path_to_inode.remove(&*entry.full_path);
 
         // Remove from parent's children
         if let Some(parent) = self.inodes.get_mut(&entry.parent) {
@@ -498,7 +511,7 @@ impl InodeTable {
         let mut stack: Vec<u64> = entry.children.iter().map(|c| c.ino).collect();
         while let Some(child_ino) = stack.pop() {
             if let Some(child) = self.inodes.remove(&child_ino) {
-                self.path_to_inode.remove(&child.full_path);
+                self.path_to_inode.remove(&*child.full_path);
                 stack.extend(child.children.iter().map(|c| c.ino));
             }
         }
@@ -525,8 +538,8 @@ impl InodeTable {
             parent_entry.children.remove(pos);
         }
 
-        // Remove path mapping
-        self.path_to_inode.remove(&full_path);
+        // Remove path mapping (HashMap<Arc<str>, _> borrows &str via Borrow).
+        self.path_to_inode.remove(full_path.as_str());
 
         // Decrement nlink
         let entry_snapshot = {
@@ -626,7 +639,7 @@ mod tests {
         let found = found.unwrap();
         assert_eq!(found.inode, ino);
         assert_eq!(found.name, "hello.txt");
-        assert_eq!(found.full_path, "hello.txt");
+        assert_eq!(found.full_path.as_ref(), "hello.txt");
         assert_eq!(found.kind, InodeKind::File);
         assert_eq!(found.size, 42);
         assert_eq!(found.xet_hash, Some("abc123".to_string()));
@@ -946,10 +959,10 @@ mod tests {
         table.update_subtree_paths(dir_ino, "new_dir".to_string());
 
         // Verify all paths updated
-        assert_eq!(table.get(dir_ino).unwrap().full_path, "new_dir");
-        assert_eq!(table.get(child_ino).unwrap().full_path, "new_dir/child.txt");
-        assert_eq!(table.get(subdir_ino).unwrap().full_path, "new_dir/subdir");
-        assert_eq!(table.get(deep_ino).unwrap().full_path, "new_dir/subdir/deep.txt");
+        assert_eq!(table.get(dir_ino).unwrap().full_path.as_ref(), "new_dir");
+        assert_eq!(table.get(child_ino).unwrap().full_path.as_ref(), "new_dir/child.txt");
+        assert_eq!(table.get(subdir_ino).unwrap().full_path.as_ref(), "new_dir/subdir");
+        assert_eq!(table.get(deep_ino).unwrap().full_path.as_ref(), "new_dir/subdir/deep.txt");
 
         // Verify path_to_inode updated (old paths gone, new paths work)
         assert!(table.get_by_path("old_dir").is_none());

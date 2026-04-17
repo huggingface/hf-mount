@@ -394,7 +394,7 @@ impl VirtualFs {
             match inodes.get(parent_ino) {
                 Some(e) if e.kind != InodeKind::Directory => return Err(libc::ENOTDIR),
                 Some(e) if e.children_loaded => return Ok(()),
-                Some(e) => e.full_path.clone(),
+                Some(e) => e.full_path.to_string(),
                 None => return Err(libc::ENOENT),
             }
         };
@@ -759,7 +759,7 @@ impl VirtualFs {
                     if entry.kind == InodeKind::File && !entry.is_dirty() {
                         FastResult::NeedsRevalidation {
                             ino: entry.inode,
-                            full_path: entry.full_path.clone(),
+                            full_path: entry.full_path.to_string(),
                             current_hash: entry.xet_hash.clone(),
                             current_etag: entry.etag.clone(),
                         }
@@ -1757,7 +1757,7 @@ impl VirtualFs {
         let (full_path, pending_deletes) = {
             let inodes = self.inode_table.read().expect("inodes poisoned");
             let entry = inodes.get(ino).ok_or(libc::ENOENT)?;
-            (entry.full_path.clone(), entry.pending_deletes.clone())
+            (entry.full_path.to_string(), entry.pending_deletes.clone())
         };
 
         let mtime_ms = SystemTime::now()
@@ -2006,7 +2006,7 @@ impl VirtualFs {
             };
             // Remote delete only when last link is removed and file exists on the hub
             let needs_remote = entry.xet_hash.is_some() && entry.nlink <= 1;
-            (entry.inode, entry.full_path.clone(), needs_remote)
+            (entry.inode, entry.full_path.to_string(), needs_remote)
         };
 
         // In streaming mode, block unlink while the file has any open handles.
@@ -2345,7 +2345,7 @@ impl VirtualFs {
                             match child.kind {
                                 InodeKind::File if !child.is_dirty() && child.xet_hash.is_some() => {
                                     files.push((
-                                        child.full_path.clone(),
+                                        child.full_path.to_string(),
                                         child.xet_hash.clone().expect("checked is_some above"),
                                     ));
                                 }
@@ -2363,7 +2363,7 @@ impl VirtualFs {
 
         Ok(RenameInfo {
             ino: src.inode,
-            old_path: src.full_path.clone(),
+            old_path: src.full_path.to_string(),
             kind: src.kind,
             xet_hash: src.xet_hash.clone(),
             is_dirty: src.is_dirty(),
@@ -2517,7 +2517,7 @@ impl VirtualFs {
                     if let Some(child) = inodes.get(child_ref.ino) {
                         match child.kind {
                             InodeKind::File if child.is_dirty() && child.xet_hash.is_some() => {
-                                let old_path = child.full_path.clone();
+                                let old_path = child.full_path.to_string();
                                 if let Some(child_mut) = inodes.get_mut(child_ref.ino) {
                                     child_mut.pending_deletes.push(old_path);
                                 }
@@ -2693,7 +2693,7 @@ impl VirtualFs {
             xet_hash: entry.xet_hash.clone().unwrap_or_default(),
             size: entry.size,
             is_dirty: entry.is_dirty(),
-            full_path: entry.full_path.clone(),
+            full_path: entry.full_path.to_string(),
         })
     }
 }

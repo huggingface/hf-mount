@@ -449,7 +449,7 @@ fn rename_dirty_file_pending_deletes() {
             let inodes = vfs.inode_table.read().unwrap();
             let entry = inodes.get(ino).unwrap();
             assert!(entry.pending_deletes.contains(&"old.txt".to_string()));
-            assert_eq!(entry.full_path, "new.txt");
+            assert_eq!(entry.full_path.as_ref(), "new.txt");
         }
 
         assert!(hub.take_batch_log().is_empty());
@@ -509,7 +509,7 @@ fn rename_clean_file() {
 
         let inodes = vfs.inode_table.read().unwrap();
         let entry = inodes.get(ino).unwrap();
-        assert_eq!(entry.full_path, "dst.txt");
+        assert_eq!(entry.full_path.as_ref(), "dst.txt");
         assert_eq!(entry.name, "dst.txt");
     });
 }
@@ -537,7 +537,7 @@ fn rename_replaces_destination() {
         {
             let inodes = vfs.inode_table.read().unwrap();
             let entry = inodes.get(src_ino).unwrap();
-            assert_eq!(entry.full_path, "dst.txt");
+            assert_eq!(entry.full_path.as_ref(), "dst.txt");
             assert!(inodes.get(dst_ino).is_none());
         }
 
@@ -3238,6 +3238,6 @@ fn rename_clean_file_remote_and_local() {
         // Phase 3 should have applied locally
         let inodes = vfs.inode_table.read().unwrap();
         let entry = inodes.get(src_ino).unwrap();
-        assert_eq!(entry.full_path, "dst.txt");
+        assert_eq!(entry.full_path.as_ref(), "dst.txt");
     });
 }
