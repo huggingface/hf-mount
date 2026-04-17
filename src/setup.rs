@@ -381,20 +381,28 @@ pub fn build(source: Source, options: MountOptions, is_nfs: bool) -> MountSetup 
     } else {
         format!(" (subfolder: {})", hub_client.path_prefix())
     };
+    let access_mode = if options.overlay {
+        "overlay: remote read-only, local writes enabled"
+    } else if read_only {
+        "read-only"
+    } else {
+        "read-write"
+    };
     info!(
         "Mounting {}{} at {:?} ({}, backend={})",
         hub_client.source(),
         subfolder_info,
         mount_point,
-        if read_only { "read-only" } else { "read-write" },
+        access_mode,
         backend_name,
     );
     info!(
-        "Config: advanced_writes={} overlay={} direct_io={} poll_interval={}s metadata_ttl={}ms \
+        "Config: advanced_writes={} overlay={} remote_read_only={} direct_io={} poll_interval={}s metadata_ttl={}ms \
          cache_dir={:?} cache_size={} no_disk_cache={} max_threads={} \
          flush_debounce={}ms flush_max_batch={}ms uid={} gid={} filter_os_files={}",
         advanced_writes,
         options.overlay,
+        remote_read_only,
         options.direct_io,
         options.poll_interval_secs,
         options.metadata_ttl_ms,
