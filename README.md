@@ -314,6 +314,12 @@ cargo test --release --features nfs --test repo_ops -- --test-threads=1 --nocapt
 HF_TOKEN=... cargo test --release --features fuse,nfs --test bench -- --nocapture
 ```
 
+## Troubleshooting
+
+> I'm getting `Operation not permitted` on MacOS while opening or listing files in a mounted bucket using VSCode
+
+You need to enable "Full disk access" to your VSCode (System settings > Privacy > Full disk access).
+
 ## License
 
 Apache-2.0
