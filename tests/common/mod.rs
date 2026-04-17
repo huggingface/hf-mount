@@ -210,14 +210,8 @@ pub fn mount_bucket(bucket_id: &str, mount_point: &str, cache_dir: &str, extra_a
         .spawn()
         .expect("Failed to spawn hf-mount-fuse");
 
-    for i in 0..30 {
-        std::thread::sleep(Duration::from_millis(500));
-        if let Ok(mounts) = std::fs::read_to_string("/proc/mounts")
-            && mounts.lines().any(|line| line.contains(mount_point))
-        {
-            eprintln!("Mount ready after {}ms", (i + 1) * 500);
-            return child;
-        }
+    if wait_for_mount(mount_point) {
+        return child;
     }
 
     eprintln!("Warning: mount may not be ready after 15s");
@@ -260,14 +254,8 @@ pub fn mount_repo(repo_id: &str, mount_point: &str, cache_dir: &str, extra_args:
         .spawn()
         .expect("Failed to spawn hf-mount-fuse");
 
-    for i in 0..30 {
-        std::thread::sleep(Duration::from_millis(500));
-        if let Ok(mounts) = std::fs::read_to_string("/proc/mounts")
-            && mounts.lines().any(|line| line.contains(mount_point))
-        {
-            eprintln!("Mount ready after {}ms", (i + 1) * 500);
-            return child;
-        }
+    if wait_for_mount(mount_point) {
+        return child;
     }
 
     eprintln!("Warning: mount may not be ready after 15s");
@@ -276,8 +264,16 @@ pub fn mount_repo(repo_id: &str, mount_point: &str, cache_dir: &str, extra_args:
 
 /// Spawn hf-mount-nfs to mount a bucket via NFS.
 pub fn mount_bucket_nfs(bucket_id: &str, mount_point: &str, cache_dir: &str, extra_args: &[&str]) -> Child {
-    let token = std::env::var("HF_TOKEN").unwrap();
+    mount_nfs("bucket", bucket_id, mount_point, cache_dir, extra_args)
+}
 
+/// Spawn hf-mount-nfs to mount a repo.
+pub fn mount_repo_nfs(repo_id: &str, mount_point: &str, cache_dir: &str, extra_args: &[&str]) -> Child {
+    mount_nfs("repo", repo_id, mount_point, cache_dir, extra_args)
+}
+
+fn mount_nfs(source_kind: &str, source_id: &str, mount_point: &str, cache_dir: &str, extra_args: &[&str]) -> Child {
+    let token = std::env::var("HF_TOKEN").ok();
     let binary = std::env::current_exe()
         .unwrap()
         .parent()
@@ -289,21 +285,23 @@ pub fn mount_bucket_nfs(bucket_id: &str, mount_point: &str, cache_dir: &str, ext
     eprintln!("Mounting NFS with binary: {:?}", binary);
 
     if !binary.exists() {
-        panic!("hf-mount-nfs binary not found, run cargo build --release first");
+        panic!("hf-mount-nfs binary not found, run cargo build --features nfs --bin hf-mount-nfs first");
     }
 
     std::fs::create_dir_all(mount_point).ok();
     std::fs::create_dir_all(cache_dir).ok();
 
     let ep = endpoint();
-    let child = Command::new(binary)
-        .env(
-            "RUST_LOG",
-            std::env::var("RUST_LOG").unwrap_or_else(|_| "hf_mount=warn".to_string()),
-        )
+    let mut cmd = Command::new(binary);
+    cmd.env(
+        "RUST_LOG",
+        std::env::var("RUST_LOG").unwrap_or_else(|_| "hf_mount=warn".to_string()),
+    );
+    if let Some(ref token) = token {
+        cmd.args(["--hf-token", token]);
+    }
+    let child = cmd
         .args([
-            "--hf-token",
-            &token,
             "--hub-endpoint",
             &ep,
             "--cache-dir",
@@ -312,18 +310,12 @@ pub fn mount_bucket_nfs(bucket_id: &str, mount_point: &str, cache_dir: &str, ext
             "0",
         ])
         .args(extra_args)
-        .args(["bucket", bucket_id, mount_point])
+        .args([source_kind, source_id, mount_point])
         .spawn()
         .expect("Failed to spawn hf-mount-nfs");
 
-    for i in 0..30 {
-        std::thread::sleep(Duration::from_millis(500));
-        if let Ok(mounts) = std::fs::read_to_string("/proc/mounts")
-            && mounts.lines().any(|line| line.contains(mount_point))
-        {
-            eprintln!("Mount ready after {}ms", (i + 1) * 500);
-            return child;
-        }
+    if wait_for_mount(mount_point) {
+        return child;
     }
 
     eprintln!("Warning: mount may not be ready after 15s");
@@ -332,13 +324,129 @@ pub fn mount_bucket_nfs(bucket_id: &str, mount_point: &str, cache_dir: &str, ext
 
 /// Unmount FUSE and wait for hf-mount to exit. Waits up to `graceful_secs`
 /// for a clean exit (destroy() may flush + upload) before force-killing.
+#[cfg(target_os = "macos")]
+pub fn unmount(mount_point: &str, child: Child, graceful_secs: u64) {
+    unmount_with(mount_point, child, graceful_secs, &["umount"]);
+}
+
+#[cfg(not(target_os = "macos"))]
 pub fn unmount(mount_point: &str, child: Child, graceful_secs: u64) {
     unmount_with(mount_point, child, graceful_secs, &["fusermount", "-u"]);
 }
 
 /// Unmount NFS and wait for hf-mount to exit.
+#[cfg(target_os = "macos")]
+pub fn unmount_nfs(mount_point: &str, child: Child, graceful_secs: u64) {
+    unmount_with(mount_point, child, graceful_secs, &["umount"]);
+}
+
+#[cfg(not(target_os = "macos"))]
 pub fn unmount_nfs(mount_point: &str, child: Child, graceful_secs: u64) {
     unmount_with(mount_point, child, graceful_secs, &["sudo", "umount"]);
+}
+
+fn wait_for_mount(mount_point: &str) -> bool {
+    for i in 0..30 {
+        std::thread::sleep(Duration::from_millis(500));
+        if is_mounted(mount_point) {
+            eprintln!("Mount ready after {}ms", (i + 1) * 500);
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(target_os = "linux")]
+fn decode_proc_mount_path(path: &str) -> String {
+    let bytes = path.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+
+    while index < bytes.len() {
+        if bytes[index] == b'\\'
+            && index + 3 < bytes.len()
+            && bytes[index + 1].is_ascii_digit()
+            && bytes[index + 2].is_ascii_digit()
+            && bytes[index + 3].is_ascii_digit()
+        {
+            let octal = &path[index + 1..index + 4];
+            if let Ok(value) = u8::from_str_radix(octal, 8) {
+                decoded.push(value);
+                index += 4;
+                continue;
+            }
+        }
+
+        decoded.push(bytes[index]);
+        index += 1;
+    }
+
+    String::from_utf8_lossy(&decoded).into_owned()
+}
+
+fn is_mounted(mount_point: &str) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let mount_point = std::fs::canonicalize(mount_point)
+            .unwrap_or_else(|_| Path::new(mount_point).to_path_buf())
+            .to_string_lossy()
+            .into_owned();
+        if let Ok(mounts) = std::fs::read_to_string("/proc/mounts")
+            && mounts.lines().any(|line| {
+                let mut fields = line.split_whitespace();
+                let _source = fields.next();
+                fields
+                    .next()
+                    .map(decode_proc_mount_path)
+                    .is_some_and(|mounted_on| mounted_on == mount_point)
+            })
+        {
+            return true;
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        use std::ffi::{CStr, CString};
+        use std::mem::MaybeUninit;
+        use std::os::unix::ffi::OsStrExt;
+
+        let canonical_path = match std::fs::canonicalize(mount_point) {
+            Ok(path) => path,
+            Err(_) => return false,
+        };
+        let c_path = match CString::new(canonical_path.as_os_str().as_bytes()) {
+            Ok(path) => path,
+            Err(_) => return false,
+        };
+
+        unsafe {
+            let mut buf = MaybeUninit::<libc::statfs>::uninit();
+            if libc::statfs(c_path.as_ptr(), buf.as_mut_ptr()) != 0 {
+                return false;
+            }
+
+            let buf = buf.assume_init();
+            let mounted_on = CStr::from_ptr(buf.f_mntonname.as_ptr()).to_bytes();
+            return mounted_on == canonical_path.as_os_str().as_bytes();
+        }
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        return Command::new("mount")
+            .output()
+            .ok()
+            .map(|output| {
+                let mounts = String::from_utf8_lossy(&output.stdout);
+                let needle = format!(" on {} ", mount_point);
+                mounts.lines().any(|line| line.contains(&needle))
+            })
+            .unwrap_or(false);
+    }
+
+    #[allow(unreachable_code)]
+    false
 }
 
 fn unmount_with(mount_point: &str, mut child: Child, graceful_secs: u64, cmd: &[&str]) {
