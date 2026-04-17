@@ -31,6 +31,11 @@ const NEG_CACHE_CAPACITY: usize = 10_000;
 const NEG_CACHE_TTL: Duration = Duration::from_secs(30);
 
 type Invalidator = Arc<Mutex<Option<Box<dyn Fn(u64) + Send + Sync>>>>;
+/// `(parent, name)` maps to `fuse_notify_inval_entry`. Separate from
+/// `Invalidator` because cgroup-bound memory pressure doesn't propagate
+/// to the host's dentry shrinker, so the LRU sweep has to push dentry
+/// drops instead of waiting for the kernel to pull them.
+type EntryInvalidator = Arc<Mutex<Option<Box<dyn Fn(u64, &str) + Send + Sync>>>>;
 type CommitHookTx = tokio::sync::watch::Sender<Option<Result<(), i32>>>;
 type CommitHookRx = tokio::sync::watch::Receiver<Option<Result<(), i32>>>;
 
@@ -57,6 +62,9 @@ pub struct VfsConfig {
     pub direct_io: bool,
     pub flush_debounce: Duration,
     pub flush_max_batch_window: Duration,
+    /// 0 disables the LRU evictor.
+    pub inode_soft_limit: usize,
+    pub lru_sweep_interval: Duration,
 }
 
 /// Lock ordering (acquire in this order to prevent deadlocks):
@@ -112,6 +120,9 @@ pub struct VirtualFs {
     /// The poll loop calls this to actively invalidate stale inodes when remote changes
     /// are detected, allowing the kernel page cache to be used instead of DIRECT_IO.
     invalidator: Invalidator,
+    entry_invalidator: EntryInvalidator,
+    /// Background LRU evictor handle, aborted in `shutdown()`.
+    lru_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// How long a file's metadata is trusted before re-checking via HEAD.
     /// Matches the kernel metadata TTL so HEAD is called at most once per TTL window.
     metadata_ttl: Duration,
@@ -179,6 +190,7 @@ impl VirtualFs {
             None
         };
 
+        let entry_invalidator: EntryInvalidator = Arc::new(Mutex::new(None));
         let vfs = Arc::new(Self {
             runtime,
             hub_client,
@@ -198,6 +210,8 @@ impl VirtualFs {
             flush_manager,
             poll_handle: Mutex::new(poll_handle),
             invalidator,
+            entry_invalidator,
+            lru_handle: Mutex::new(None),
             metadata_ttl: config.metadata_ttl,
             serve_lookup_from_cache: config.serve_lookup_from_cache,
             filter_os_files: config.filter_os_files,
@@ -221,6 +235,26 @@ impl VirtualFs {
             error!("Failed to pre-load root directory: errno={}", e);
         }
 
+        // Spawn LRU evictor if configured. `Weak` so the task exits when
+        // the outer Arc is dropped; still aborted in shutdown() for determinism.
+        if config.inode_soft_limit > 0 {
+            vfs.inode_table
+                .read()
+                .expect("inodes poisoned")
+                .enable_lru();
+            let weak = Arc::downgrade(&vfs);
+            let soft_limit = config.inode_soft_limit;
+            let sweep_interval = config.lru_sweep_interval;
+            let handle = vfs
+                .runtime
+                .spawn(Self::lru_sweep_loop(weak, soft_limit, sweep_interval));
+            *vfs.lru_handle.lock().expect("lru_handle poisoned") = Some(handle);
+            info!(
+                "LRU evictor enabled: soft_limit={} inodes, sweep every {:?}",
+                soft_limit, sweep_interval
+            );
+        }
+
         vfs
     }
 
@@ -230,11 +264,54 @@ impl VirtualFs {
         *self.invalidator.lock().expect("invalidator poisoned") = Some(f);
     }
 
+    pub fn set_entry_invalidator(&self, f: Box<dyn Fn(u64, &str) + Send + Sync>) {
+        *self.entry_invalidator.lock().expect("entry_invalidator poisoned") = Some(f);
+    }
+
+    async fn lru_sweep_loop(weak: std::sync::Weak<Self>, soft_limit: usize, interval: Duration) {
+        loop {
+            tokio::time::sleep(interval).await;
+            let Some(vfs) = weak.upgrade() else { return };
+            let table_len = vfs.inode_table.read().expect("inodes poisoned").len();
+            let evicted = vfs.lru_evict_sweep(soft_limit);
+            if evicted > 0 || table_len > soft_limit {
+                info!(
+                    "lru_sweep: table={} soft_limit={} invalidated={}",
+                    table_len, soft_limit, evicted
+                );
+            }
+        }
+    }
+
+    /// Candidates are collected under a read lock, then the lock is dropped
+    /// before invoking the callback — the callback writes to the FUSE
+    /// channel and can block under backpressure.
+    fn lru_evict_sweep(&self, soft_limit: usize) -> usize {
+        let candidates = {
+            let inodes = self.inode_table.read().expect("inodes poisoned");
+            let len = inodes.len();
+            if len <= soft_limit {
+                return 0;
+            }
+            inodes.lru_candidates(len - soft_limit)
+        };
+        let guard = self.entry_invalidator.lock().expect("entry_invalidator poisoned");
+        let Some(cb) = guard.as_ref() else { return 0 };
+        let n = candidates.len();
+        for (parent, name) in candidates {
+            cb(parent, &name);
+        }
+        n
+    }
+
     /// Graceful shutdown: abort polling, drain flush queue, wait for completion.
     pub fn shutdown(&self) {
         info!("Shutting down VFS, flushing pending writes...");
         // Abort background tasks.
         if let Some(handle) = self.poll_handle.lock().expect("poll_handle poisoned").take() {
+            handle.abort();
+        }
+        if let Some(handle) = self.lru_handle.lock().expect("lru_handle poisoned").take() {
             handle.abort();
         }
         // Flush all dirty files + queued deletes.
@@ -870,17 +947,22 @@ impl VirtualFs {
 
         let inodes = self.inode_table.read().expect("inodes poisoned");
         match inodes.get(ino) {
-            Some(entry) => Ok(self.make_vfs_attr(entry)),
+            Some(entry) => {
+                inodes.touch(ino);
+                Ok(self.make_vfs_attr(entry))
+            }
             None => Err(libc::ENOENT),
         }
     }
 
-    /// Bump the kernel lookup refcount for `ino`. Shared lock only — the
-    /// counter is atomic, so the FUSE hot path never contends the writer.
-    /// Must be called after every `reply.entry()` / `reply.created()`.
+    /// Must be called after every `reply.entry()` / `reply.created()`, or
+    /// the kernel and our `nlookup` will drift and a later `forget()` will
+    /// underflow. Also touches for LRU so actively-looked-up inodes aren't
+    /// immediately evicted.
     pub(crate) fn bump_nlookup(&self, ino: u64) {
         let inodes = self.inode_table.read().expect("inodes poisoned");
         inodes.bump_nlookup(ino);
+        inodes.touch(ino);
     }
 
     /// Handle a FUSE `forget(ino, nlookup)`: drop the refcount by `nlookup`,

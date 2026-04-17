@@ -630,9 +630,19 @@ pub fn mount_fuse(
         })?
     };
     let notifier = session.notifier();
+    let notifier_for_inode = notifier.clone();
     setup.virtual_fs.set_invalidator(Box::new(move |ino| {
-        if let Err(e) = notifier.inval_inode(fuser::INodeNo(ino), 0, -1) {
+        if let Err(e) = notifier_for_inode.inval_inode(fuser::INodeNo(ino), 0, -1) {
             tracing::debug!("inval_inode({}) failed: {}", ino, e);
+        }
+    }));
+    setup.virtual_fs.set_entry_invalidator(Box::new(move |parent, name| {
+        let name_os = std::ffi::OsStr::new(name);
+        if let Err(e) = notifier.inval_entry(fuser::INodeNo(parent), name_os) {
+            // ENOENT is expected (kernel already forgot the entry); only log others.
+            if e.raw_os_error() != Some(libc::ENOENT) {
+                tracing::debug!("inval_entry(parent={}, name={:?}) failed: {}", parent, name, e);
+            }
         }
     }));
     let bg = session.spawn()?;

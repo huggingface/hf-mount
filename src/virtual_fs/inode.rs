@@ -1,6 +1,6 @@
-use std::collections::HashMap;
+use std::collections::{BinaryHeap, HashMap};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 pub const ROOT_INODE: u64 = 1;
@@ -69,6 +69,9 @@ pub struct InodeEntry {
     /// any inode with `nlookup > 0`: the kernel still holds a dentry and a race
     /// would corrupt subsequent getattr/read.
     pub nlookup: AtomicU64,
+    /// Snapshot of `InodeTable.touch_counter` at last lookup/getattr.
+    /// Atomic so the FUSE hot path only needs a read lock on the table.
+    pub last_touched: AtomicU64,
 }
 
 impl Clone for InodeEntry {
@@ -96,6 +99,7 @@ impl Clone for InodeEntry {
             pending_deletes:  self.pending_deletes.clone(),
             last_revalidated: self.last_revalidated,
             nlookup:          AtomicU64::new(self.nlookup.load(Ordering::Relaxed)),
+            last_touched:     AtomicU64::new(self.last_touched.load(Ordering::Relaxed)),
         }
     }
 }
@@ -172,6 +176,14 @@ pub struct InodeTable {
     /// string is allocated exactly once per inode.
     path_to_inode: HashMap<Arc<str>, u64>,
     next_inode: AtomicU64,
+    /// Monotonic counter snapshotted into `InodeEntry.last_touched` — used
+    /// by the LRU evictor to order entries by recency without a wall-clock
+    /// syscall on the hot path.
+    touch_counter: AtomicU64,
+    /// Set to `true` when the LRU evictor is armed. Gates `touch()` so FUSE
+    /// lookups don't pay the HashMap probe + two atomics when the feature
+    /// is off (the common prod config today).
+    lru_enabled: AtomicBool,
 }
 
 impl Default for InodeTable {
@@ -186,6 +198,8 @@ impl InodeTable {
             inodes: HashMap::new(),
             path_to_inode: HashMap::new(),
             next_inode: AtomicU64::new(2),
+            touch_counter: AtomicU64::new(0),
+            lru_enabled: AtomicBool::new(false),
         };
 
         // Create root inode
@@ -213,6 +227,7 @@ impl InodeTable {
             pending_deletes: Vec::new(),
             last_revalidated: None,
             nlookup: AtomicU64::new(0),
+            last_touched: AtomicU64::new(0),
         };
         table.inodes.insert(ROOT_INODE, root);
         table.path_to_inode.insert(root_path, ROOT_INODE);
@@ -243,6 +258,66 @@ impl InodeTable {
     /// refcount reached 0 (safe-to-evict); false if unknown / still held.
     pub(crate) fn drop_nlookup(&self, inode: u64, n: u64) -> bool {
         self.inodes.get(&inode).map(|e| e.drop_nlookup(n)).unwrap_or(false)
+    }
+
+    pub fn len(&self) -> usize {
+        self.inodes.len()
+    }
+
+    /// Arm `touch()` on the FUSE hot path. Called once at startup when the
+    /// LRU evictor is configured; otherwise lookups skip the tracking cost.
+    pub(crate) fn enable_lru(&self) {
+        self.lru_enabled.store(true, Ordering::Relaxed);
+    }
+
+    /// Snapshot a fresh counter value onto `inode.last_touched`. Atomic so
+    /// the FUSE reader pool never contends a writer. Early-out when LRU is
+    /// disabled so the common prod config pays nothing.
+    pub(crate) fn touch(&self, inode: u64) {
+        if !self.lru_enabled.load(Ordering::Relaxed) {
+            return;
+        }
+        if let Some(entry) = self.inodes.get(&inode) {
+            let seq = self.touch_counter.fetch_add(1, Ordering::Relaxed);
+            entry.last_touched.store(seq, Ordering::Relaxed);
+        }
+    }
+
+    /// Return up to `max` oldest-touched file inodes eligible for eviction
+    /// (regular files with `nlink > 0`, clean, no pending renames). The
+    /// caller hands these `(parent, name)` pairs to `inval_entry`; the
+    /// kernel drops its dentry, `forget()` fires, and `evict_if_safe`
+    /// reclaims the inode.
+    ///
+    /// Uses a bounded max-heap so we only clone names for the `max` entries
+    /// we actually return — O(N log max) with max cloned Strings, vs the
+    /// naive sort-and-truncate that allocates for every filter-passing
+    /// entry before discarding most of them.
+    pub(crate) fn lru_candidates(&self, max: usize) -> Vec<(u64, String)> {
+        if max == 0 {
+            return Vec::new();
+        }
+        // BinaryHeap is a max-heap on the first tuple element (timestamp).
+        // Keep size ≤ max by popping the newest when we overflow, so what
+        // remains is the `max` oldest.
+        let mut heap: BinaryHeap<(u64, u64)> = BinaryHeap::with_capacity(max + 1);
+        for e in self.inodes.values() {
+            if e.kind != InodeKind::File || e.nlink == 0 || e.is_dirty() || !e.pending_deletes.is_empty() {
+                continue;
+            }
+            heap.push((e.last_touched.load(Ordering::Relaxed), e.inode));
+            if heap.len() > max {
+                heap.pop();
+            }
+        }
+        // Resolve names in a second pass (oldest-first). One allocation
+        // per returned candidate, not per table entry.
+        let mut picks: Vec<(u64, u64)> = heap.into_vec();
+        picks.sort_by_key(|&(ts, _)| ts);
+        picks
+            .into_iter()
+            .filter_map(|(_, ino)| self.inodes.get(&ino).map(|e| (e.parent, e.name.clone())))
+            .collect()
     }
 
     /// Evict a file inode from the table if it's safe to do so. Returns true
@@ -346,6 +421,7 @@ impl InodeTable {
         };
 
         let inode = self.next_inode.fetch_add(1, Ordering::Relaxed);
+        let touch_seq = self.touch_counter.fetch_add(1, Ordering::Relaxed);
         let child_name = name.clone();
         // Allocate the path once; the InodeEntry and path_to_inode share the
         // same Arc so the string is stored in memory exactly once per inode.
@@ -373,6 +449,7 @@ impl InodeTable {
             pending_deletes: Vec::new(),
             last_revalidated: Some(Instant::now()),
             nlookup: AtomicU64::new(0),
+            last_touched: AtomicU64::new(touch_seq),
         };
 
         self.inodes.insert(inode, entry);

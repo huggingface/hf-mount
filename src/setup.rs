@@ -150,6 +150,19 @@ pub struct MountOptions {
     /// When not set, requires `user_allow_other` in /etc/fuse.conf on Linux.
     #[arg(long, default_value_t = false)]
     pub fuse_owner_only: bool,
+
+    /// Soft cap on the number of inodes kept in memory. When exceeded, a
+    /// background task asks the kernel (via FUSE `notify_inval_entry`) to
+    /// drop the oldest-touched dentries so `forget()` fires and we can
+    /// evict them. 0 disables the evictor (unbounded growth). Recommended:
+    /// set below the working set you'd see under a full-tree scrape.
+    #[arg(long, default_value_t = 0)]
+    pub inode_soft_limit: usize,
+
+    /// Interval in milliseconds between LRU evictor sweeps. Only matters
+    /// when `--inode-soft-limit > 0`.
+    #[arg(long, default_value_t = 5_000)]
+    pub lru_sweep_interval_ms: u64,
 }
 
 /// CLI args for the foreground FUSE/NFS binaries.
@@ -393,6 +406,8 @@ pub fn build(source: Source, options: MountOptions, is_nfs: bool) -> MountSetup 
             direct_io: options.direct_io && !is_nfs,
             flush_debounce: std::time::Duration::from_millis(options.flush_debounce_ms),
             flush_max_batch_window: std::time::Duration::from_millis(options.flush_max_batch_window_ms),
+            inode_soft_limit: options.inode_soft_limit,
+            lru_sweep_interval: std::time::Duration::from_millis(options.lru_sweep_interval_ms),
         },
     );
 
