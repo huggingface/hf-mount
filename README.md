@@ -86,11 +86,13 @@ Binaries: `target/release/hf-mount`, `target/release/hf-mount-nfs`, `target/rele
 - Environments where disk space is limited
 
 **Not for:**
-- General-purpose networked filesystem (no multi-writer support, no file locking)
+- General-purpose networked filesystem (no multi-writer support, no cross-node file locking)
 - Latency-sensitive random I/O (first reads require network round-trips)
 - Workloads that need strong consistency (files can be stale for up to 10 s)
 - Heavy concurrent writes from multiple mounts (last writer wins, no conflict detection)
 - Editing files with text editors in default (streaming) mode (use `--advanced-writes`)
+
+Advisory file locks (`flock`, `fcntl` POSIX record locks) are supported locally on a single mount on both backends — enough for Python `filelock`, `huggingface_hub`, `datasets`, and similar cache-coordination use cases within one machine. They are not coordinated across multiple clients.
 
 See [Consistency model](#consistency-model) for details.
 
