@@ -72,6 +72,11 @@ pub struct InodeEntry {
     /// Snapshot of `InodeTable.touch_counter` at last lookup/getattr.
     /// Atomic so the FUSE hot path only needs a read lock on the table.
     pub last_touched: AtomicU64,
+    /// Set when `forget()` wanted to evict but an open handle blocked it.
+    /// Checked by `release()` after the last handle closes so the entry
+    /// isn't pinned forever (the kernel has already given up on it and
+    /// won't send another `forget`).
+    pub evict_pending: std::sync::atomic::AtomicBool,
 }
 
 impl Clone for InodeEntry {
@@ -100,6 +105,9 @@ impl Clone for InodeEntry {
             last_revalidated: self.last_revalidated,
             nlookup:          AtomicU64::new(self.nlookup.load(Ordering::Relaxed)),
             last_touched:     AtomicU64::new(self.last_touched.load(Ordering::Relaxed)),
+            evict_pending:    std::sync::atomic::AtomicBool::new(
+                self.evict_pending.load(Ordering::Relaxed),
+            ),
         }
     }
 }
@@ -230,6 +238,7 @@ impl InodeTable {
             last_revalidated: None,
             nlookup: AtomicU64::new(0),
             last_touched: AtomicU64::new(0),
+            evict_pending: std::sync::atomic::AtomicBool::new(false),
         };
         table.inodes.insert(ROOT_INODE, root);
         table.path_to_inode.insert(root_path, ROOT_INODE);
@@ -283,6 +292,23 @@ impl InodeTable {
             let seq = self.touch_counter.fetch_add(1, Ordering::Relaxed);
             entry.last_touched.store(seq, Ordering::Relaxed);
         }
+    }
+
+    /// Mark an inode as "wanted to evict but blocked" so `release()` can
+    /// finish the job once the last open handle closes. No-op on unknown
+    /// inode (the entry may have been removed on a racing path).
+    pub(crate) fn mark_evict_pending(&self, ino: u64) {
+        if let Some(entry) = self.inodes.get(&ino) {
+            entry.evict_pending.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Atomically test-and-clear the flag. Returns true if the caller now
+    /// owns the deferred eviction.
+    pub(crate) fn take_evict_pending(&self, ino: u64) -> bool {
+        self.inodes
+            .get(&ino)
+            .is_some_and(|e| e.evict_pending.swap(false, Ordering::Relaxed))
     }
 
     /// Directly drop up to `max` oldest `nlookup==0` file entries (no
@@ -504,6 +530,7 @@ impl InodeTable {
             last_revalidated: Some(Instant::now()),
             nlookup: AtomicU64::new(0),
             last_touched: AtomicU64::new(touch_seq),
+            evict_pending: std::sync::atomic::AtomicBool::new(false),
         };
 
         self.inodes.insert(inode, entry);

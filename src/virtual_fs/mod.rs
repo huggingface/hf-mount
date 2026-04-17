@@ -31,11 +31,19 @@ const NEG_CACHE_CAPACITY: usize = 10_000;
 const NEG_CACHE_TTL: Duration = Duration::from_secs(30);
 
 type Invalidator = Arc<Mutex<Option<Box<dyn Fn(u64) + Send + Sync>>>>;
-/// `(parent, name)` maps to `fuse_notify_inval_entry`. Separate from
-/// `Invalidator` because cgroup-bound memory pressure doesn't propagate
-/// to the host's dentry shrinker, so the LRU sweep has to push dentry
-/// drops instead of waiting for the kernel to pull them.
-type EntryInvalidator = Arc<Mutex<Option<Box<dyn Fn(u64, &str) + Send + Sync>>>>;
+/// `(parent, name) -> Ok/Err` maps to `fuse_notify_inval_entry`. Returns
+/// false when the FUSE notify channel is saturated (EAGAIN/ENOMEM) so the
+/// sweep can back off instead of burning CPU on a full queue. Separate
+/// from `Invalidator` because cgroup-bound memory pressure doesn't
+/// propagate to the host's dentry shrinker, so the LRU sweep has to push
+/// dentry drops instead of waiting for the kernel to pull them.
+type EntryInvalidator = Arc<Mutex<Option<Box<dyn Fn(u64, &str) -> bool + Send + Sync>>>>;
+
+/// Hard cap on `inval_entry` calls per sweep. Prevents the sweep from
+/// bursting tens of thousands of notifications at the FUSE channel after
+/// a long-running crawl — empirically the kernel processes them serially,
+/// so a burst just wastes CPU and queues up stale work.
+const LRU_MAX_INVALS_PER_SWEEP: usize = 1024;
 type CommitHookTx = tokio::sync::watch::Sender<Option<Result<(), i32>>>;
 type CommitHookRx = tokio::sync::watch::Receiver<Option<Result<(), i32>>>;
 
@@ -264,7 +272,7 @@ impl VirtualFs {
         *self.invalidator.lock().expect("invalidator poisoned") = Some(f);
     }
 
-    pub fn set_entry_invalidator(&self, f: Box<dyn Fn(u64, &str) + Send + Sync>) {
+    pub fn set_entry_invalidator(&self, f: Box<dyn Fn(u64, &str) -> bool + Send + Sync>) {
         *self.entry_invalidator.lock().expect("entry_invalidator poisoned") = Some(f);
     }
 
@@ -293,15 +301,22 @@ impl VirtualFs {
             if len <= soft_limit {
                 return 0;
             }
-            inodes.lru_candidates(len - soft_limit)
+            let overflow = (len - soft_limit).min(LRU_MAX_INVALS_PER_SWEEP);
+            inodes.lru_candidates(overflow)
         };
         let guard = self.entry_invalidator.lock().expect("entry_invalidator poisoned");
         let Some(cb) = guard.as_ref() else { return 0 };
-        let n = candidates.len();
+        let mut sent = 0usize;
         for (parent, name) in candidates {
-            cb(parent, &name);
+            if !cb(parent, &name) {
+                // FUSE notify channel refused us — stop bursting. Next sweep
+                // retries with the same oldest entries (their last_touched
+                // hasn't moved), so nothing is lost.
+                break;
+            }
+            sent += 1;
         }
-        n
+        sent
     }
 
     /// Graceful shutdown: abort polling, drain flush queue, wait for completion.
@@ -988,6 +1003,13 @@ impl VirtualFs {
         // is safe: any concurrent lookup will re-bump the count, and any
         // concurrent read/write holds an open handle we'll see.
         if self.has_open_handles(ino) {
+            // The kernel has given up the dentry but our handle keeps the
+            // inode alive. Mark it so `release()` finishes the eviction
+            // once the last handle closes — otherwise it would leak.
+            self.inode_table
+                .read()
+                .expect("inodes poisoned")
+                .mark_evict_pending(ino);
             return;
         }
 
@@ -1773,11 +1795,16 @@ impl VirtualFs {
         }
 
         // Clean up orphan inodes (nlink == 0) when no more handles reference them.
+        // Also finish any eviction that `forget()` had to defer because we were
+        // still holding an open handle at the time.
         if let Some(ino) = released_ino
             && !self.has_open_handles(ino)
         {
             let mut inodes = self.inode_table.write().expect("inodes poisoned");
             inodes.remove_orphan(ino);
+            if inodes.take_evict_pending(ino) {
+                inodes.evict_if_safe(ino);
+            }
         }
 
         // staging_locks entries are intentionally not cleaned up here: removing

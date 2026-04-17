@@ -638,10 +638,20 @@ pub fn mount_fuse(
     }));
     setup.virtual_fs.set_entry_invalidator(Box::new(move |parent, name| {
         let name_os = std::ffi::OsStr::new(name);
-        if let Err(e) = notifier.inval_entry(fuser::INodeNo(parent), name_os) {
-            // ENOENT is expected (kernel already forgot the entry); only log others.
-            if e.raw_os_error() != Some(libc::ENOENT) {
+        match notifier.inval_entry(fuser::INodeNo(parent), name_os) {
+            Ok(()) => true,
+            // ENOENT means the kernel already released the dentry — nothing
+            // went wrong, keep sweeping.
+            Err(e) if e.raw_os_error() == Some(libc::ENOENT) => true,
+            // EAGAIN / ENOMEM: FUSE notify channel is full. Stop the sweep so
+            // we don't waste CPU on a queue the kernel hasn't drained.
+            Err(e) if matches!(e.raw_os_error(), Some(libc::EAGAIN) | Some(libc::ENOMEM)) => {
+                tracing::warn!("inval_entry backpressure: {} — stopping sweep", e);
+                false
+            }
+            Err(e) => {
                 tracing::debug!("inval_entry(parent={}, name={:?}) failed: {}", parent, name, e);
+                true
             }
         }
     }));
