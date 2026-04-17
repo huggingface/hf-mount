@@ -875,23 +875,19 @@ impl VirtualFs {
         }
     }
 
-    /// Increment the kernel lookup refcount for `ino`. The FUSE adapter must
-    /// call this after every `reply.entry()` / `reply.created()` so we know
-    /// the kernel still holds a dentry for that inode. A refcount > 0 MUST
-    /// prevent eviction once the inode cache grows one.
-    pub fn increment_lookup(&self, ino: u64) {
-        let mut inodes = self.inode_table.write().expect("inodes poisoned");
-        inodes.increment_lookup(ino);
+    /// Bump the kernel lookup refcount for `ino`. Shared lock only — the
+    /// counter is atomic, so the FUSE hot path never contends the writer.
+    /// Must be called after every `reply.entry()` / `reply.created()`.
+    pub(crate) fn bump_nlookup(&self, ino: u64) {
+        let inodes = self.inode_table.read().expect("inodes poisoned");
+        inodes.bump_nlookup(ino);
     }
 
-    /// Decrement the kernel lookup refcount for `ino` by `nlookup`. Called
-    /// from the FUSE `forget()` callback when the kernel drops its dentries.
-    /// No eviction happens yet — this is plumbing for the follow-up inode
-    /// cache work.
-    pub fn forget(&self, ino: u64, nlookup: u64) {
+    /// Handle a FUSE `forget(ino, nlookup)`: drop the refcount by `nlookup`.
+    pub(crate) fn forget(&self, ino: u64, nlookup: u64) {
         debug!("forget: ino={} nlookup={}", ino, nlookup);
-        let mut inodes = self.inode_table.write().expect("inodes poisoned");
-        inodes.decrement_lookup(ino, nlookup);
+        let inodes = self.inode_table.read().expect("inodes poisoned");
+        inodes.drop_nlookup(ino, nlookup);
     }
 
     pub async fn readdir(&self, ino: u64) -> VirtualFsResult<Vec<VirtualFsDirEntry>> {

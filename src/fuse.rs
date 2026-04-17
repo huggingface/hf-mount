@@ -60,6 +60,26 @@ impl FuseAdapter {
             FopenFlags::empty()
         }
     }
+
+    /// Return a `VirtualFsAttr` to the kernel while bumping the inode's
+    /// `nlookup` refcount. The bump MUST happen before `reply.entry()` so a
+    /// racing `forget` cannot observe a stale zero refcount.
+    fn reply_entry_tracked(&self, reply: ReplyEntry, attr: &VirtualFsAttr) {
+        self.virtual_fs.bump_nlookup(attr.ino);
+        reply.entry(&self.metadata_ttl, &vfs_attr_to_fuse(attr), GENERATION);
+    }
+
+    /// Same as `reply_entry_tracked` for `ReplyCreate`.
+    fn reply_created_tracked(
+        &self,
+        reply: fuser::ReplyCreate,
+        attr: &VirtualFsAttr,
+        fh: u64,
+        oflags: FopenFlags,
+    ) {
+        self.virtual_fs.bump_nlookup(attr.ino);
+        reply.created(&self.metadata_ttl, &vfs_attr_to_fuse(attr), GENERATION, FileHandle(fh), oflags);
+    }
 }
 
 fn vfs_attr_to_fuse(attr: &VirtualFsAttr) -> FileAttr {
@@ -156,21 +176,13 @@ impl Filesystem for FuseAdapter {
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         let name = os_to_str!(name, reply);
         match self.runtime.block_on(self.virtual_fs.lookup(parent.0, name)) {
-            Ok(attr) => {
-                // Track that the kernel now holds a dentry for this inode.
-                // Must be incremented BEFORE reply.entry so a racing forget
-                // cannot see refcount=0 and evict before we record the hit.
-                self.virtual_fs.increment_lookup(attr.ino);
-                reply.entry(&self.metadata_ttl, &vfs_attr_to_fuse(&attr), GENERATION);
-            }
+            Ok(attr) => self.reply_entry_tracked(reply, &attr),
             Err(e) => reply.error(Errno::from_i32(e)),
         }
     }
 
-    /// Kernel announces it has dropped `nlookup` dentries for `ino`.
-    /// Balances the `increment_lookup` we did in lookup/create/mkdir/symlink.
-    /// Once the refcount hits zero, a future eviction policy may drop the
-    /// inode from the table.
+    /// Balances the `bump_nlookup` issued by `reply_entry_tracked` /
+    /// `reply_created_tracked` in lookup, create, mkdir and symlink.
     fn forget(&self, _req: &Request, ino: INodeNo, nlookup: u64) {
         self.virtual_fs.forget(ino.0, nlookup);
     }
@@ -337,14 +349,7 @@ impl Filesystem for FuseAdapter {
                 } else {
                     self.open_flags()
                 };
-                self.virtual_fs.increment_lookup(attr.ino);
-                reply.created(
-                    &self.metadata_ttl,
-                    &vfs_attr_to_fuse(&attr),
-                    GENERATION,
-                    FileHandle(file_handle),
-                    oflags,
-                );
+                self.reply_created_tracked(reply, &attr, file_handle, oflags);
             }
             Err(e) => reply.error(Errno::from_i32(e)),
         }
@@ -358,10 +363,7 @@ impl Filesystem for FuseAdapter {
             self.virtual_fs
                 .mkdir(parent.0, name, effective_mode, req.uid(), req.gid()),
         ) {
-            Ok(attr) => {
-                self.virtual_fs.increment_lookup(attr.ino);
-                reply.entry(&self.metadata_ttl, &vfs_attr_to_fuse(&attr), GENERATION);
-            }
+            Ok(attr) => self.reply_entry_tracked(reply, &attr),
             Err(e) => reply.error(Errno::from_i32(e)),
         }
     }
@@ -389,10 +391,7 @@ impl Filesystem for FuseAdapter {
             self.virtual_fs
                 .symlink(parent.0, link_name, target, 0o777, req.uid(), req.gid()),
         ) {
-            Ok(attr) => {
-                self.virtual_fs.increment_lookup(attr.ino);
-                reply.entry(&self.metadata_ttl, &vfs_attr_to_fuse(&attr), GENERATION);
-            }
+            Ok(attr) => self.reply_entry_tracked(reply, &attr),
             Err(e) => reply.error(Errno::from_i32(e)),
         }
     }

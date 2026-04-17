@@ -27,7 +27,7 @@ pub struct DirChild {
     pub name: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct InodeEntry {
     pub inode: u64,
     pub parent: u64,
@@ -58,14 +58,42 @@ pub struct InodeEntry {
     /// When this inode's metadata was last validated against the remote (via HEAD).
     /// Used to avoid redundant HEAD requests within the revalidation TTL.
     pub last_revalidated: Option<Instant>,
-    /// Kernel lookup refcount. Incremented every time this inode is returned to
-    /// the kernel via `reply.entry()` / `reply.created()`, decremented by the
-    /// amount the kernel passes to `forget(ino, nlookup)`. An entry whose
-    /// refcount is > 0 MUST NOT be evicted: the kernel still holds a dentry for
-    /// it and subsequent operations (getattr, read, …) would race against
-    /// eviction. Currently only tracked — no evictor consumes this yet; the
-    /// field is plumbing for the follow-up inode-cache work.
-    pub lookup_refcnt: u64,
+    /// Kernel lookup refcount (FUSE `nlookup`). Bumped on every `reply.entry()` /
+    /// `reply.created()`; dropped by the value the kernel passes to `forget()`.
+    /// Atomic so callers only need a shared lock on the inode table — keeps the
+    /// FUSE hot path off the writer queue. A future evictor MUST refuse to drop
+    /// any inode with `nlookup > 0`: the kernel still holds a dentry and a race
+    /// would corrupt subsequent getattr/read.
+    pub nlookup: AtomicU64,
+}
+
+impl Clone for InodeEntry {
+    fn clone(&self) -> Self {
+        Self {
+            inode:            self.inode,
+            parent:           self.parent,
+            name:             self.name.clone(),
+            full_path:        self.full_path.clone(),
+            kind:             self.kind,
+            size:             self.size,
+            mtime:            self.mtime,
+            mode:             self.mode,
+            uid:              self.uid,
+            gid:              self.gid,
+            atime:            self.atime,
+            ctime:            self.ctime,
+            nlink:            self.nlink,
+            symlink_target:   self.symlink_target.clone(),
+            xet_hash:         self.xet_hash.clone(),
+            etag:             self.etag.clone(),
+            dirty_generation: self.dirty_generation,
+            children_loaded:  self.children_loaded,
+            children:         self.children.clone(),
+            pending_deletes:  self.pending_deletes.clone(),
+            last_revalidated: self.last_revalidated,
+            nlookup:          AtomicU64::new(self.nlookup.load(Ordering::Relaxed)),
+        }
+    }
 }
 
 impl InodeEntry {
@@ -110,20 +138,26 @@ impl InodeEntry {
         self.last_revalidated = Some(Instant::now());
     }
 
-    /// Increment the kernel lookup refcount. Called every time this inode is
-    /// returned to the kernel via `reply.entry()` / `reply.created()`. Saturates
-    /// on overflow; a true overflow would mean the kernel has 2^64 dentries for
-    /// the same inode, which is impossible in practice.
-    pub fn increment_lookup(&mut self) {
-        self.lookup_refcnt = self.lookup_refcnt.saturating_add(1);
+    /// Bump the kernel lookup refcount. Shared-ref access via `AtomicU64` so
+    /// FUSE hot paths (lookup, create, mkdir, symlink) only need a read lock
+    /// on the inode table.
+    pub(crate) fn bump_nlookup(&self) {
+        // Relaxed is sufficient: the refcount only gates eviction, which is
+        // guarded separately by the inode table's write lock.
+        self.nlookup.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Decrement the kernel lookup refcount by `nlookup`. Saturates at 0.
-    /// Returns true if the refcount reached 0 (i.e. the kernel no longer holds
-    /// any dentry for this inode and it would be safe to evict).
-    pub fn decrement_lookup(&mut self, nlookup: u64) -> bool {
-        self.lookup_refcnt = self.lookup_refcnt.saturating_sub(nlookup);
-        self.lookup_refcnt == 0
+    /// Drop the kernel lookup refcount by `n`, saturating at 0. Returns true
+    /// if the refcount reached 0 (safe-to-evict).
+    pub(crate) fn drop_nlookup(&self, n: u64) -> bool {
+        let prev = self
+            .nlookup
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| Some(cur.saturating_sub(n)))
+            .expect("fetch_update closure always returns Some");
+        // A forget(n) larger than the current count is a kernel- or us-side
+        // protocol bug. Surface it in debug builds without crashing prod.
+        debug_assert!(n <= prev, "drop_nlookup({n}) exceeded current {prev}");
+        prev.saturating_sub(n) == 0
     }
 }
 
@@ -170,7 +204,7 @@ impl InodeTable {
             children: Vec::new(),
             pending_deletes: Vec::new(),
             last_revalidated: None,
-            lookup_refcnt: 0,
+            nlookup: AtomicU64::new(0),
         };
         table.inodes.insert(ROOT_INODE, root);
         table.path_to_inode.insert(String::new(), ROOT_INODE);
@@ -186,23 +220,21 @@ impl InodeTable {
         self.inodes.get_mut(&inode)
     }
 
-    /// Increment the kernel lookup refcount on `inode`. No-op if the inode is
-    /// unknown (defensive — the caller has already returned the attr to the
-    /// kernel, so there's nothing we can do about a race here).
-    pub fn increment_lookup(&mut self, inode: u64) {
-        if let Some(entry) = self.inodes.get_mut(&inode) {
-            entry.increment_lookup();
+    /// Bump the kernel lookup refcount on `inode`. Shared `&self` because the
+    /// refcount itself is atomic. Calling this on an unknown inode is a bug
+    /// (we just returned that ino to the kernel), but a missing entry here
+    /// would be a race we can't recover from, so we log+return.
+    pub(crate) fn bump_nlookup(&self, inode: u64) {
+        match self.inodes.get(&inode) {
+            Some(entry) => entry.bump_nlookup(),
+            None => debug_assert!(false, "bump_nlookup: unknown inode {inode}"),
         }
     }
 
-    /// Decrement the kernel lookup refcount on `inode` by `nlookup`. Returns
-    /// true if the refcount reached 0 (safe-to-evict). No-op / returns false
-    /// if the inode is unknown.
-    pub fn decrement_lookup(&mut self, inode: u64, nlookup: u64) -> bool {
-        match self.inodes.get_mut(&inode) {
-            Some(entry) => entry.decrement_lookup(nlookup),
-            None => false,
-        }
+    /// Drop the kernel lookup refcount on `inode` by `n`. Returns true if the
+    /// refcount reached 0 (safe-to-evict); false if unknown / still held.
+    pub(crate) fn drop_nlookup(&self, inode: u64, n: u64) -> bool {
+        self.inodes.get(&inode).map(|e| e.drop_nlookup(n)).unwrap_or(false)
     }
 
     pub fn get_by_path(&self, path: &str) -> Option<&InodeEntry> {
@@ -289,7 +321,7 @@ impl InodeTable {
             children: Vec::new(),
             pending_deletes: Vec::new(),
             last_revalidated: Some(Instant::now()),
-            lookup_refcnt: 0,
+            nlookup: AtomicU64::new(0),
         };
 
         self.inodes.insert(inode, entry);
@@ -1598,7 +1630,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lookup_refcnt_starts_at_zero() {
+    fn test_nlookup_starts_at_zero() {
         let mut table = InodeTable::new();
         let ino = table.insert(
             ROOT_INODE,
@@ -1612,11 +1644,11 @@ mod tests {
             0,
             0,
         );
-        assert_eq!(table.get(ino).unwrap().lookup_refcnt, 0);
+        assert_eq!(table.get(ino).unwrap().nlookup.load(Ordering::Relaxed), 0);
     }
 
     #[test]
-    fn test_lookup_refcnt_increment_decrement() {
+    fn test_nlookup_bump_drop() {
         let mut table = InodeTable::new();
         let ino = table.insert(
             ROOT_INODE,
@@ -1631,21 +1663,26 @@ mod tests {
             0,
         );
 
-        table.increment_lookup(ino);
-        table.increment_lookup(ino);
-        table.increment_lookup(ino);
-        assert_eq!(table.get(ino).unwrap().lookup_refcnt, 3);
+        table.bump_nlookup(ino);
+        table.bump_nlookup(ino);
+        table.bump_nlookup(ino);
+        assert_eq!(table.get(ino).unwrap().nlookup.load(Ordering::Relaxed), 3);
 
-        assert!(!table.decrement_lookup(ino, 1));
-        assert_eq!(table.get(ino).unwrap().lookup_refcnt, 2);
+        assert!(!table.drop_nlookup(ino, 1));
+        assert_eq!(table.get(ino).unwrap().nlookup.load(Ordering::Relaxed), 2);
 
         // Reaching zero returns true.
-        assert!(table.decrement_lookup(ino, 2));
-        assert_eq!(table.get(ino).unwrap().lookup_refcnt, 0);
+        assert!(table.drop_nlookup(ino, 2));
+        assert_eq!(table.get(ino).unwrap().nlookup.load(Ordering::Relaxed), 0);
     }
 
     #[test]
-    fn test_lookup_refcnt_saturates_on_underflow() {
+    fn test_nlookup_saturates_on_underflow() {
+        // debug_assert! fires in debug builds, so we can only exercise the
+        // saturation branch in release.
+        if cfg!(debug_assertions) {
+            return;
+        }
         let mut table = InodeTable::new();
         let ino = table.insert(
             ROOT_INODE,
@@ -1660,20 +1697,17 @@ mod tests {
             0,
         );
 
-        // Decrement without any prior increment must not panic / wrap.
-        assert!(table.decrement_lookup(ino, 42));
-        assert_eq!(table.get(ino).unwrap().lookup_refcnt, 0);
+        assert!(table.drop_nlookup(ino, 42));
+        assert_eq!(table.get(ino).unwrap().nlookup.load(Ordering::Relaxed), 0);
 
-        table.increment_lookup(ino);
-        // Overshooting the current count still saturates at zero.
-        assert!(table.decrement_lookup(ino, 1000));
-        assert_eq!(table.get(ino).unwrap().lookup_refcnt, 0);
+        table.bump_nlookup(ino);
+        assert!(table.drop_nlookup(ino, 1000));
+        assert_eq!(table.get(ino).unwrap().nlookup.load(Ordering::Relaxed), 0);
     }
 
     #[test]
-    fn test_lookup_refcnt_unknown_inode_is_noop() {
-        let mut table = InodeTable::new();
-        table.increment_lookup(9999);
-        assert!(!table.decrement_lookup(9999, 1));
+    fn test_nlookup_unknown_inode_drop_returns_false() {
+        let table = InodeTable::new();
+        assert!(!table.drop_nlookup(9999, 1));
     }
 }
