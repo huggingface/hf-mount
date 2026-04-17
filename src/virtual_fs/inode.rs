@@ -58,6 +58,14 @@ pub struct InodeEntry {
     /// When this inode's metadata was last validated against the remote (via HEAD).
     /// Used to avoid redundant HEAD requests within the revalidation TTL.
     pub last_revalidated: Option<Instant>,
+    /// Kernel lookup refcount. Incremented every time this inode is returned to
+    /// the kernel via `reply.entry()` / `reply.created()`, decremented by the
+    /// amount the kernel passes to `forget(ino, nlookup)`. An entry whose
+    /// refcount is > 0 MUST NOT be evicted: the kernel still holds a dentry for
+    /// it and subsequent operations (getattr, read, …) would race against
+    /// eviction. Currently only tracked — no evictor consumes this yet; the
+    /// field is plumbing for the follow-up inode-cache work.
+    pub lookup_refcnt: u64,
 }
 
 impl InodeEntry {
@@ -100,6 +108,22 @@ impl InodeEntry {
         // Mark as recently validated so subsequent lookups skip HEAD revalidation
         // for the duration of metadata_ttl (we just committed this exact hash).
         self.last_revalidated = Some(Instant::now());
+    }
+
+    /// Increment the kernel lookup refcount. Called every time this inode is
+    /// returned to the kernel via `reply.entry()` / `reply.created()`. Saturates
+    /// on overflow; a true overflow would mean the kernel has 2^64 dentries for
+    /// the same inode, which is impossible in practice.
+    pub fn increment_lookup(&mut self) {
+        self.lookup_refcnt = self.lookup_refcnt.saturating_add(1);
+    }
+
+    /// Decrement the kernel lookup refcount by `nlookup`. Saturates at 0.
+    /// Returns true if the refcount reached 0 (i.e. the kernel no longer holds
+    /// any dentry for this inode and it would be safe to evict).
+    pub fn decrement_lookup(&mut self, nlookup: u64) -> bool {
+        self.lookup_refcnt = self.lookup_refcnt.saturating_sub(nlookup);
+        self.lookup_refcnt == 0
     }
 }
 
@@ -146,6 +170,7 @@ impl InodeTable {
             children: Vec::new(),
             pending_deletes: Vec::new(),
             last_revalidated: None,
+            lookup_refcnt: 0,
         };
         table.inodes.insert(ROOT_INODE, root);
         table.path_to_inode.insert(String::new(), ROOT_INODE);
@@ -159,6 +184,25 @@ impl InodeTable {
 
     pub fn get_mut(&mut self, inode: u64) -> Option<&mut InodeEntry> {
         self.inodes.get_mut(&inode)
+    }
+
+    /// Increment the kernel lookup refcount on `inode`. No-op if the inode is
+    /// unknown (defensive — the caller has already returned the attr to the
+    /// kernel, so there's nothing we can do about a race here).
+    pub fn increment_lookup(&mut self, inode: u64) {
+        if let Some(entry) = self.inodes.get_mut(&inode) {
+            entry.increment_lookup();
+        }
+    }
+
+    /// Decrement the kernel lookup refcount on `inode` by `nlookup`. Returns
+    /// true if the refcount reached 0 (safe-to-evict). No-op / returns false
+    /// if the inode is unknown.
+    pub fn decrement_lookup(&mut self, inode: u64, nlookup: u64) -> bool {
+        match self.inodes.get_mut(&inode) {
+            Some(entry) => entry.decrement_lookup(nlookup),
+            None => false,
+        }
     }
 
     pub fn get_by_path(&self, path: &str) -> Option<&InodeEntry> {
@@ -245,6 +289,7 @@ impl InodeTable {
             children: Vec::new(),
             pending_deletes: Vec::new(),
             last_revalidated: Some(Instant::now()),
+            lookup_refcnt: 0,
         };
 
         self.inodes.insert(inode, entry);
@@ -1550,5 +1595,85 @@ mod tests {
         table.remove_orphan(file_ino);
         assert!(table.get(file_ino).is_none());
         assert!(table.get_by_path(&path).is_none(), "path_to_inode should be cleaned up");
+    }
+
+    #[test]
+    fn test_lookup_refcnt_starts_at_zero() {
+        let mut table = InodeTable::new();
+        let ino = table.insert(
+            ROOT_INODE,
+            "f.txt".to_string(),
+            "f.txt".to_string(),
+            InodeKind::File,
+            0,
+            UNIX_EPOCH,
+            None,
+            0o644,
+            0,
+            0,
+        );
+        assert_eq!(table.get(ino).unwrap().lookup_refcnt, 0);
+    }
+
+    #[test]
+    fn test_lookup_refcnt_increment_decrement() {
+        let mut table = InodeTable::new();
+        let ino = table.insert(
+            ROOT_INODE,
+            "f.txt".to_string(),
+            "f.txt".to_string(),
+            InodeKind::File,
+            0,
+            UNIX_EPOCH,
+            None,
+            0o644,
+            0,
+            0,
+        );
+
+        table.increment_lookup(ino);
+        table.increment_lookup(ino);
+        table.increment_lookup(ino);
+        assert_eq!(table.get(ino).unwrap().lookup_refcnt, 3);
+
+        assert!(!table.decrement_lookup(ino, 1));
+        assert_eq!(table.get(ino).unwrap().lookup_refcnt, 2);
+
+        // Reaching zero returns true.
+        assert!(table.decrement_lookup(ino, 2));
+        assert_eq!(table.get(ino).unwrap().lookup_refcnt, 0);
+    }
+
+    #[test]
+    fn test_lookup_refcnt_saturates_on_underflow() {
+        let mut table = InodeTable::new();
+        let ino = table.insert(
+            ROOT_INODE,
+            "f.txt".to_string(),
+            "f.txt".to_string(),
+            InodeKind::File,
+            0,
+            UNIX_EPOCH,
+            None,
+            0o644,
+            0,
+            0,
+        );
+
+        // Decrement without any prior increment must not panic / wrap.
+        assert!(table.decrement_lookup(ino, 42));
+        assert_eq!(table.get(ino).unwrap().lookup_refcnt, 0);
+
+        table.increment_lookup(ino);
+        // Overshooting the current count still saturates at zero.
+        assert!(table.decrement_lookup(ino, 1000));
+        assert_eq!(table.get(ino).unwrap().lookup_refcnt, 0);
+    }
+
+    #[test]
+    fn test_lookup_refcnt_unknown_inode_is_noop() {
+        let mut table = InodeTable::new();
+        table.increment_lookup(9999);
+        assert!(!table.decrement_lookup(9999, 1));
     }
 }

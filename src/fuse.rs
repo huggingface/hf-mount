@@ -156,9 +156,23 @@ impl Filesystem for FuseAdapter {
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         let name = os_to_str!(name, reply);
         match self.runtime.block_on(self.virtual_fs.lookup(parent.0, name)) {
-            Ok(attr) => reply.entry(&self.metadata_ttl, &vfs_attr_to_fuse(&attr), GENERATION),
+            Ok(attr) => {
+                // Track that the kernel now holds a dentry for this inode.
+                // Must be incremented BEFORE reply.entry so a racing forget
+                // cannot see refcount=0 and evict before we record the hit.
+                self.virtual_fs.increment_lookup(attr.ino);
+                reply.entry(&self.metadata_ttl, &vfs_attr_to_fuse(&attr), GENERATION);
+            }
             Err(e) => reply.error(Errno::from_i32(e)),
         }
+    }
+
+    /// Kernel announces it has dropped `nlookup` dentries for `ino`.
+    /// Balances the `increment_lookup` we did in lookup/create/mkdir/symlink.
+    /// Once the refcount hits zero, a future eviction policy may drop the
+    /// inode from the table.
+    fn forget(&self, _req: &Request, ino: INodeNo, nlookup: u64) {
+        self.virtual_fs.forget(ino.0, nlookup);
     }
 
     /// Get file/directory attributes (stat).
@@ -323,6 +337,7 @@ impl Filesystem for FuseAdapter {
                 } else {
                     self.open_flags()
                 };
+                self.virtual_fs.increment_lookup(attr.ino);
                 reply.created(
                     &self.metadata_ttl,
                     &vfs_attr_to_fuse(&attr),
@@ -343,7 +358,10 @@ impl Filesystem for FuseAdapter {
             self.virtual_fs
                 .mkdir(parent.0, name, effective_mode, req.uid(), req.gid()),
         ) {
-            Ok(attr) => reply.entry(&self.metadata_ttl, &vfs_attr_to_fuse(&attr), GENERATION),
+            Ok(attr) => {
+                self.virtual_fs.increment_lookup(attr.ino);
+                reply.entry(&self.metadata_ttl, &vfs_attr_to_fuse(&attr), GENERATION);
+            }
             Err(e) => reply.error(Errno::from_i32(e)),
         }
     }
@@ -371,7 +389,10 @@ impl Filesystem for FuseAdapter {
             self.virtual_fs
                 .symlink(parent.0, link_name, target, 0o777, req.uid(), req.gid()),
         ) {
-            Ok(attr) => reply.entry(&self.metadata_ttl, &vfs_attr_to_fuse(&attr), GENERATION),
+            Ok(attr) => {
+                self.virtual_fs.increment_lookup(attr.ino);
+                reply.entry(&self.metadata_ttl, &vfs_attr_to_fuse(&attr), GENERATION);
+            }
             Err(e) => reply.error(Errno::from_i32(e)),
         }
     }
