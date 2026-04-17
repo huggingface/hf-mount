@@ -1,6 +1,6 @@
 use std::collections::{BinaryHeap, HashMap};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicUsize, AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 pub const ROOT_INODE: u64 = 1;
@@ -180,10 +180,12 @@ pub struct InodeTable {
     /// by the LRU evictor to order entries by recency without a wall-clock
     /// syscall on the hot path.
     touch_counter: AtomicU64,
-    /// Set to `true` when the LRU evictor is armed. Gates `touch()` so FUSE
-    /// lookups don't pay the HashMap probe + two atomics when the feature
-    /// is off (the common prod config today).
-    lru_enabled: AtomicBool,
+    /// Target size for the LRU evictor. 0 = disabled. When non-zero,
+    /// `insert()` evicts oldest `nlookup==0` entries *before* inserting to
+    /// keep the table under the cap — the only path that binds under a
+    /// crawler workload where `readdir` bulk-inserts entries the kernel
+    /// never looks up individually.
+    soft_limit: AtomicUsize,
 }
 
 impl Default for InodeTable {
@@ -199,7 +201,7 @@ impl InodeTable {
             path_to_inode: HashMap::new(),
             next_inode: AtomicU64::new(2),
             touch_counter: AtomicU64::new(0),
-            lru_enabled: AtomicBool::new(false),
+            soft_limit: AtomicUsize::new(0),
         };
 
         // Create root inode
@@ -264,23 +266,63 @@ impl InodeTable {
         self.inodes.len()
     }
 
-    /// Arm `touch()` on the FUSE hot path. Called once at startup when the
-    /// LRU evictor is configured; otherwise lookups skip the tracking cost.
-    pub(crate) fn enable_lru(&self) {
-        self.lru_enabled.store(true, Ordering::Relaxed);
+    /// Configure the LRU eviction cap. 0 disables all eviction hooks
+    /// (common prod config). Called once at startup from `VirtualFs::new`.
+    pub(crate) fn enable_lru(&self, soft_limit: usize) {
+        self.soft_limit.store(soft_limit, Ordering::Relaxed);
     }
 
     /// Snapshot a fresh counter value onto `inode.last_touched`. Atomic so
     /// the FUSE reader pool never contends a writer. Early-out when LRU is
     /// disabled so the common prod config pays nothing.
     pub(crate) fn touch(&self, inode: u64) {
-        if !self.lru_enabled.load(Ordering::Relaxed) {
+        if self.soft_limit.load(Ordering::Relaxed) == 0 {
             return;
         }
         if let Some(entry) = self.inodes.get(&inode) {
             let seq = self.touch_counter.fetch_add(1, Ordering::Relaxed);
             entry.last_touched.store(seq, Ordering::Relaxed);
         }
+    }
+
+    /// Directly drop up to `max` oldest `nlookup==0` file entries (no
+    /// kernel round-trip). Safe because the kernel has no dentry for them
+    /// — `readdir`'s bulk-inserted children stay at nlookup=0 until a
+    /// later `lookup()` bumps them, which is where the `find` workload
+    /// eternally pins InodeTable memory without this path.
+    ///
+    /// Returns the number of entries removed. Caller holds the write lock.
+    pub(crate) fn evict_unreferenced(&mut self, max: usize) -> usize {
+        if max == 0 {
+            return 0;
+        }
+        let mut heap: BinaryHeap<(u64, u64)> = BinaryHeap::with_capacity(max + 1);
+        for e in self.inodes.values() {
+            if e.kind != InodeKind::File
+                || e.nlink == 0
+                || e.is_dirty()
+                || !e.pending_deletes.is_empty()
+                || e.nlookup.load(Ordering::Relaxed) != 0
+            {
+                continue;
+            }
+            heap.push((e.last_touched.load(Ordering::Relaxed), e.inode));
+            if heap.len() > max {
+                heap.pop();
+            }
+        }
+        let mut removed = 0usize;
+        for (_, ino) in heap.into_iter() {
+            if let Some(entry) = self.inodes.remove(&ino) {
+                self.path_to_inode.remove(&*entry.full_path);
+                if let Some(parent) = self.inodes.get_mut(&entry.parent) {
+                    parent.children.retain(|c| c.ino != ino);
+                    parent.children_loaded = false;
+                }
+                removed += 1;
+            }
+        }
+        removed
     }
 
     /// Return up to `max` oldest-touched file inodes eligible for eviction
@@ -413,6 +455,18 @@ impl InodeTable {
             parent,
             full_path
         );
+
+        // Backpressure: if we're over the LRU cap, free room synchronously
+        // BEFORE adding the new entry. Under a full-tree crawl, readdir
+        // bulk-inserts faster than the background sweep can invalidate, so
+        // the periodic sweep alone can't bind memory.
+        let cap = self.soft_limit.load(Ordering::Relaxed);
+        if cap > 0 && self.inodes.len() >= cap {
+            // Target 90% of cap to get some headroom and avoid evict-on-every-insert.
+            let target = cap.saturating_sub(cap / 10);
+            let overflow = self.inodes.len().saturating_sub(target);
+            self.evict_unreferenced(overflow);
+        }
 
         let now = SystemTime::now();
         let nlink = match kind {

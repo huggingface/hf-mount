@@ -241,7 +241,7 @@ impl VirtualFs {
             vfs.inode_table
                 .read()
                 .expect("inodes poisoned")
-                .enable_lru();
+                .enable_lru(config.inode_soft_limit);
             let weak = Arc::downgrade(&vfs);
             let soft_limit = config.inode_soft_limit;
             let sweep_interval = config.lru_sweep_interval;
