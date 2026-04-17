@@ -245,6 +245,46 @@ impl InodeTable {
         self.inodes.get(&inode).map(|e| e.drop_nlookup(n)).unwrap_or(false)
     }
 
+    /// Evict a file inode from the table if it's safe to do so. Returns true
+    /// if evicted. Mirrors mountpoint-s3's forget-driven eviction: only files
+    /// (directories hold children_loaded state we can't easily restore),
+    /// only when the kernel has fully released the dentry (`nlookup == 0`),
+    /// only when there's no unflushed data (`!is_dirty`) and no pending
+    /// rename-delete (`pending_deletes.is_empty`).
+    ///
+    /// Caller is responsible for checking that no open file handles reference
+    /// this inode (see `VirtualFs::has_open_handles`).
+    ///
+    /// After eviction the parent directory is marked `children_loaded = false`
+    /// so a subsequent `readdir`/`lookup` re-fetches the listing and
+    /// re-materializes the inode.
+    pub(crate) fn evict_if_safe(&mut self, ino: u64) -> bool {
+        let should_evict = self.inodes.get(&ino).is_some_and(|e| {
+            e.kind == InodeKind::File
+                && e.nlookup.load(Ordering::Relaxed) == 0
+                && !e.is_dirty()
+                && e.pending_deletes.is_empty()
+                && e.nlink > 0
+        });
+        if !should_evict {
+            return false;
+        }
+
+        let Some(entry) = self.inodes.remove(&ino) else {
+            return false;
+        };
+        self.path_to_inode.remove(&*entry.full_path);
+
+        if let Some(parent) = self.inodes.get_mut(&entry.parent) {
+            parent.children.retain(|c| c.ino != ino);
+            // Force readdir to re-fetch so the inode can be re-materialized
+            // on next access. Without this the kernel would ask for a child
+            // that no longer exists in our in-memory tree.
+            parent.children_loaded = false;
+        }
+        true
+    }
+
     pub fn get_by_path(&self, path: &str) -> Option<&InodeEntry> {
         self.path_to_inode.get(path).and_then(|ino| self.inodes.get(ino))
     }
@@ -1722,5 +1762,146 @@ mod tests {
     fn test_nlookup_unknown_inode_drop_returns_false() {
         let table = InodeTable::new();
         assert!(!table.drop_nlookup(9999, 1));
+    }
+
+    #[test]
+    fn test_evict_if_safe_removes_clean_file() {
+        let mut table = InodeTable::new();
+        let ino = table.insert(
+            ROOT_INODE,
+            "f.txt".to_string(),
+            "f.txt".to_string(),
+            InodeKind::File,
+            10,
+            UNIX_EPOCH,
+            None,
+            0o644,
+            0,
+            0,
+        );
+
+        // Default nlookup is 0, not dirty, no pending deletes → safe to evict.
+        assert!(table.evict_if_safe(ino));
+        assert!(table.get(ino).is_none());
+        assert!(table.get_by_path("f.txt").is_none());
+
+        // Parent's children_loaded is reset so readdir will re-fetch.
+        let root = table.get(ROOT_INODE).unwrap();
+        assert!(!root.children_loaded);
+        assert!(!root.children.iter().any(|c| c.ino == ino));
+    }
+
+    #[test]
+    fn test_evict_if_safe_refuses_when_nlookup_held() {
+        let mut table = InodeTable::new();
+        let ino = table.insert(
+            ROOT_INODE,
+            "f.txt".to_string(),
+            "f.txt".to_string(),
+            InodeKind::File,
+            10,
+            UNIX_EPOCH,
+            None,
+            0o644,
+            0,
+            0,
+        );
+        table.bump_nlookup(ino);
+
+        assert!(!table.evict_if_safe(ino));
+        assert!(table.get(ino).is_some(), "entry must survive when kernel still holds dentry");
+    }
+
+    #[test]
+    fn test_evict_if_safe_refuses_when_dirty() {
+        let mut table = InodeTable::new();
+        let ino = table.insert(
+            ROOT_INODE,
+            "f.txt".to_string(),
+            "f.txt".to_string(),
+            InodeKind::File,
+            10,
+            UNIX_EPOCH,
+            None,
+            0o644,
+            0,
+            0,
+        );
+        table.get_mut(ino).unwrap().set_dirty();
+
+        assert!(!table.evict_if_safe(ino));
+        assert!(table.get(ino).is_some(), "dirty entry must not be evicted — unflushed data");
+    }
+
+    #[test]
+    fn test_evict_if_safe_refuses_when_pending_deletes() {
+        let mut table = InodeTable::new();
+        let ino = table.insert(
+            ROOT_INODE,
+            "f.txt".to_string(),
+            "f.txt".to_string(),
+            InodeKind::File,
+            10,
+            UNIX_EPOCH,
+            None,
+            0o644,
+            0,
+            0,
+        );
+        table.get_mut(ino).unwrap().pending_deletes.push("old_path".to_string());
+
+        assert!(!table.evict_if_safe(ino));
+        assert!(table.get(ino).is_some());
+    }
+
+    #[test]
+    fn test_evict_if_safe_refuses_directory() {
+        let mut table = InodeTable::new();
+        let ino = table.insert(
+            ROOT_INODE,
+            "d".to_string(),
+            "d".to_string(),
+            InodeKind::Directory,
+            0,
+            UNIX_EPOCH,
+            None,
+            0o755,
+            0,
+            0,
+        );
+
+        assert!(!table.evict_if_safe(ino), "directories must never be evicted");
+        assert!(table.get(ino).is_some());
+    }
+
+    #[test]
+    fn test_evict_if_safe_refuses_unlinked_orphan() {
+        // An unlinked-but-still-open file (nlink == 0) must stay in the table
+        // until release() cleans it up via remove_orphan — evicting it would
+        // drop the xet_hash / path a racing read still needs.
+        let mut table = InodeTable::new();
+        let ino = table.insert(
+            ROOT_INODE,
+            "doomed.txt".to_string(),
+            "doomed.txt".to_string(),
+            InodeKind::File,
+            10,
+            UNIX_EPOCH,
+            None,
+            0o644,
+            0,
+            0,
+        );
+        table.unlink_one(ROOT_INODE, "doomed.txt");
+        assert_eq!(table.get(ino).unwrap().nlink, 0);
+
+        assert!(!table.evict_if_safe(ino));
+        assert!(table.get(ino).is_some());
+    }
+
+    #[test]
+    fn test_evict_if_safe_unknown_inode() {
+        let mut table = InodeTable::new();
+        assert!(!table.evict_if_safe(9999));
     }
 }

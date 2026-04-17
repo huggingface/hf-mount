@@ -883,11 +883,34 @@ impl VirtualFs {
         inodes.bump_nlookup(ino);
     }
 
-    /// Handle a FUSE `forget(ino, nlookup)`: drop the refcount by `nlookup`.
+    /// Handle a FUSE `forget(ino, nlookup)`: drop the refcount by `nlookup`,
+    /// and evict the inode if it's now safe (kernel no longer holds the
+    /// dentry, no open handles, nothing dirty). Eviction keeps `InodeTable`
+    /// bounded — without it the table grows for every file ever looked up.
     pub(crate) fn forget(&self, ino: u64, nlookup: u64) {
         debug!("forget: ino={} nlookup={}", ino, nlookup);
-        let inodes = self.inode_table.read().expect("inodes poisoned");
-        inodes.drop_nlookup(ino, nlookup);
+
+        // Shared lock for the hot path: dropping the refcount is an atomic op,
+        // so readers (lookup/getattr/read) aren't blocked on the common case
+        // where the refcount stays > 0.
+        let reached_zero = {
+            let inodes = self.inode_table.read().expect("inodes poisoned");
+            inodes.drop_nlookup(ino, nlookup)
+        };
+        if !reached_zero {
+            return;
+        }
+
+        // A racing open() would insert into `open_files` before calling
+        // `bump_nlookup`, so checking handles here (after the refcount hit 0)
+        // is safe: any concurrent lookup will re-bump the count, and any
+        // concurrent read/write holds an open handle we'll see.
+        if self.has_open_handles(ino) {
+            return;
+        }
+
+        let mut inodes = self.inode_table.write().expect("inodes poisoned");
+        inodes.evict_if_safe(ino);
     }
 
     pub async fn readdir(&self, ino: u64) -> VirtualFsResult<Vec<VirtualFsDirEntry>> {
