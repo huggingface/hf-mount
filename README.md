@@ -224,6 +224,19 @@ hf-mount stop /tmp/data          # daemon mounts
 | `--uid` / `--gid` | current user | Override UID/GID for mounted files |
 | `--fuse-owner-only` | `false` | Restrict mount access to the mounting user only (FUSE only; by default all users can access, which requires `user_allow_other` in /etc/fuse.conf) |
 | `--token-file` | | Path to a token file (re-read on each request for credential rotation) |
+| `--inode-soft-limit` | `0` | Soft cap on the in-memory inode table (0 disables). See "Bounding inode memory" below. |
+| `--lru-sweep-interval-ms` | `5000` | Background LRU sweep interval in milliseconds. Only meaningful when `--inode-soft-limit > 0`. |
+
+### Bounding inode memory
+
+Under workloads that enumerate large trees (a `find`, a documentation scraper, `du -sh`), the in-memory inode table can grow without bound: every path the kernel ever looked up stays resident. With `--inode-soft-limit N` set, two evictors cooperate to keep the table near `N`:
+
+1. **Insert-time evictor** (synchronous): before adding a new entry when `len() >= N + 256`, drop the oldest-touched file/symlink/leaf-directory entries.
+   - *Polite mode*: only entries the kernel has already released (`forget`-ed). Safe, no FUSE races.
+   - *Force mode*: when above `2 × N` and polite found nothing, drop entries even if the kernel still caches the dentry. A racing kernel op sees ENOENT and re-looks up. **Dirty files, locally-created dirs/symlinks, and inodes with live file handles are never dropped** — the force path preserves all user data.
+2. **Background LRU sweep** (every `--lru-sweep-interval-ms`): for inodes the kernel has cached but our table doesn't want, send `FUSE_NOTIFY_INVAL_ENTRY` so the kernel drops its dentry and sends us `forget`. Bounded to 1024 invalidations per sweep with EAGAIN backoff so we don't flood the notify channel.
+
+Tuning: pick `N` below what a full-tree enumeration of your bucket would produce. For `hf-doc-build/doc-dev` with ~20k files, `--inode-soft-limit 10000` keeps sidecar RSS ~250 MiB with a 1 GiB cgroup cap.
 
 ### Logging
 

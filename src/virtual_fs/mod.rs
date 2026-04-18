@@ -246,10 +246,17 @@ impl VirtualFs {
         // Spawn LRU evictor if configured. `Weak` so the task exits when
         // the outer Arc is dropped; still aborted in shutdown() for determinism.
         if config.inode_soft_limit > 0 {
-            vfs.inode_table
-                .read()
-                .expect("inodes poisoned")
-                .enable_lru(config.inode_soft_limit);
+            {
+                let inodes = vfs.inode_table.read().expect("inodes poisoned");
+                inodes.enable_lru(config.inode_soft_limit);
+                // Hook eviction safety: never drop an inode that still has
+                // a live FUSE file handle. Prevents silent data loss on a
+                // racing write() whose inode just got force-evicted.
+                let open_files = vfs.open_files.clone();
+                inodes.set_open_handle_checker(Box::new(move |ino| {
+                    has_open_handles_for(&open_files, ino)
+                }));
+            }
             let weak = Arc::downgrade(&vfs);
             let soft_limit = config.inode_soft_limit;
             let sweep_interval = config.lru_sweep_interval;
@@ -2109,6 +2116,11 @@ impl VirtualFs {
             if let Some(entry) = inodes.get_mut(ino) {
                 entry.children_loaded = true;
             }
+            // Pin: a local mkdir is not persisted to the Hub, so evicting
+            // it would lose the user's directory permanently. Unpinning
+            // only makes sense once the dir gets a remote representation
+            // (e.g. via a flush of a child file) — for now keep pinned.
+            inodes.set_pinned(ino, true);
             // nlink already incremented by insert()
             inodes.touch_parent(parent, now);
             (ino, full_path)
@@ -2244,6 +2256,10 @@ impl VirtualFs {
             if let Some(entry) = inodes.get_mut(ino) {
                 entry.symlink_target = Some(target.to_string());
             }
+            // Pin: the symlink target lives only in this entry — evicting
+            // would lose the link because a re-lookup can't reconstruct it
+            // from the Hub (no remote representation for local symlinks).
+            inodes.set_pinned(ino, true);
             inodes.touch_parent(parent, now);
             (ino, full_path)
         };
