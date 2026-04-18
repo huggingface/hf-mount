@@ -2112,4 +2112,292 @@ mod tests {
         let mut table = InodeTable::new();
         assert!(!table.evict_if_safe(9999));
     }
+
+    // ── evict_unreferenced ──────────────────────────────────────────
+
+    fn mk_table_with_soft_limit(soft: usize) -> InodeTable {
+        let t = InodeTable::new();
+        t.enable_lru(soft);
+        t
+    }
+
+    fn mk_file(table: &mut InodeTable, name: &str) -> u64 {
+        table.insert(
+            ROOT_INODE,
+            name.to_string(),
+            name.to_string(),
+            InodeKind::File,
+            1,
+            UNIX_EPOCH,
+            None,
+            0o644,
+            0,
+            0,
+        )
+    }
+
+    #[test]
+    fn test_evict_unreferenced_polite_skips_nlookup_held() {
+        let mut table = InodeTable::new();
+        let held = mk_file(&mut table, "held.txt");
+        let free = mk_file(&mut table, "free.txt");
+        table.bump_nlookup(held);
+
+        assert_eq!(table.evict_unreferenced(10, false), 1);
+        assert!(table.get(held).is_some(), "held entry stays");
+        assert!(table.get(free).is_none(), "free entry gone");
+    }
+
+    #[test]
+    fn test_evict_unreferenced_force_ignores_nlookup() {
+        let mut table = InodeTable::new();
+        let a = mk_file(&mut table, "a.txt");
+        let b = mk_file(&mut table, "b.txt");
+        table.bump_nlookup(a);
+        table.bump_nlookup(b);
+
+        assert_eq!(table.evict_unreferenced(10, true), 2);
+        assert!(table.get(a).is_none());
+        assert!(table.get(b).is_none());
+    }
+
+    #[test]
+    fn test_evict_unreferenced_preserves_dirty_even_with_force() {
+        let mut table = InodeTable::new();
+        let clean = mk_file(&mut table, "clean.txt");
+        let dirty = mk_file(&mut table, "dirty.txt");
+        table.get_mut(dirty).unwrap().set_dirty();
+
+        assert_eq!(table.evict_unreferenced(10, true), 1);
+        assert!(table.get(clean).is_none());
+        assert!(table.get(dirty).is_some(), "dirty entry never evicted");
+    }
+
+    #[test]
+    fn test_evict_unreferenced_preserves_pending_deletes() {
+        let mut table = InodeTable::new();
+        let pending = mk_file(&mut table, "pending.txt");
+        table.get_mut(pending).unwrap().pending_deletes.push("old".into());
+
+        assert_eq!(table.evict_unreferenced(10, true), 0);
+        assert!(table.get(pending).is_some());
+    }
+
+    #[test]
+    fn test_evict_unreferenced_never_touches_root() {
+        let mut table = mk_table_with_soft_limit(0);
+        let _ = mk_file(&mut table, "f.txt");
+        assert_eq!(table.evict_unreferenced(10, true), 1);
+        assert!(table.get(ROOT_INODE).is_some(), "root must not be evicted");
+    }
+
+    #[test]
+    fn test_evict_unreferenced_drops_symlinks() {
+        let mut table = InodeTable::new();
+        let sym = table.insert(
+            ROOT_INODE,
+            "link".to_string(),
+            "link".to_string(),
+            InodeKind::Symlink,
+            0,
+            UNIX_EPOCH,
+            None,
+            0o777,
+            0,
+            0,
+        );
+        assert_eq!(table.evict_unreferenced(10, false), 1);
+        assert!(table.get(sym).is_none());
+    }
+
+    #[test]
+    fn test_evict_unreferenced_keeps_non_leaf_directory() {
+        let mut table = InodeTable::new();
+        let dir = table.insert(
+            ROOT_INODE,
+            "d".to_string(),
+            "d".to_string(),
+            InodeKind::Directory,
+            0,
+            UNIX_EPOCH,
+            None,
+            0o755,
+            0,
+            0,
+        );
+        let child = table.insert(
+            dir,
+            "c.txt".to_string(),
+            "d/c.txt".to_string(),
+            InodeKind::File,
+            1,
+            UNIX_EPOCH,
+            None,
+            0o644,
+            0,
+            0,
+        );
+        // The child file is leaf + nlookup==0 → evicted. The dir becomes
+        // a leaf after that but this sweep already collected candidates.
+        // The dir itself must survive this pass because it still had
+        // children when we picked candidates.
+        let removed = table.evict_unreferenced(10, true);
+        assert_eq!(removed, 1, "only the child file goes");
+        assert!(table.get(child).is_none());
+        assert!(table.get(dir).is_some(), "dir survives: had children when selected");
+    }
+
+    #[test]
+    fn test_evict_unreferenced_drops_leaf_directory() {
+        let mut table = InodeTable::new();
+        let dir_ino = table.insert(
+            ROOT_INODE,
+            "empty".to_string(),
+            "empty".to_string(),
+            InodeKind::Directory,
+            0,
+            UNIX_EPOCH,
+            None,
+            0o755,
+            0,
+            0,
+        );
+        let root_nlink_before = table.get(ROOT_INODE).unwrap().nlink;
+        assert_eq!(table.evict_unreferenced(10, true), 1);
+        assert!(table.get(dir_ino).is_none());
+        // POSIX: evicting a subdirectory drops the parent's ".." nlink.
+        assert_eq!(table.get(ROOT_INODE).unwrap().nlink, root_nlink_before - 1);
+    }
+
+    #[test]
+    fn test_evict_unreferenced_marks_parent_children_unloaded() {
+        let mut table = InodeTable::new();
+        let f = mk_file(&mut table, "f.txt");
+        table.get_mut(ROOT_INODE).unwrap().children_loaded = true;
+        table.evict_unreferenced(10, false);
+        assert!(table.get(f).is_none());
+        assert!(
+            !table.get(ROOT_INODE).unwrap().children_loaded,
+            "parent must re-fetch since we pulled a child from under it"
+        );
+    }
+
+    #[test]
+    fn test_evict_unreferenced_picks_oldest_first() {
+        let mut table = InodeTable::new();
+        table.enable_lru(100);
+        let oldest = mk_file(&mut table, "old.txt");
+        let middle = mk_file(&mut table, "mid.txt");
+        let newest = mk_file(&mut table, "new.txt");
+        // Re-touch middle and newest to make them fresher than `oldest`.
+        table.touch(middle);
+        table.touch(newest);
+
+        assert_eq!(table.evict_unreferenced(1, false), 1);
+        assert!(table.get(oldest).is_none(), "oldest evicted first");
+        assert!(table.get(middle).is_some());
+        assert!(table.get(newest).is_some());
+    }
+
+    #[test]
+    fn test_evict_unreferenced_max_zero_is_noop() {
+        let mut table = InodeTable::new();
+        let f = mk_file(&mut table, "f.txt");
+        assert_eq!(table.evict_unreferenced(0, true), 0);
+        assert!(table.get(f).is_some());
+    }
+
+    // ── insert-time eviction gating ─────────────────────────────────
+
+    #[test]
+    fn test_insert_below_trigger_does_not_evict() {
+        // cap=100, trigger = 100 + EVICT_TRIGGER_OVERAGE. Below that, no evict.
+        let mut table = mk_table_with_soft_limit(100);
+        for i in 0..150 {
+            mk_file(&mut table, &format!("f{i}.txt"));
+        }
+        // 150 is < 100 + EVICT_TRIGGER_OVERAGE (256), so nothing was evicted yet.
+        assert_eq!(table.len(), 1 + 150, "no evict below trigger");
+    }
+
+    #[test]
+    fn test_insert_above_trigger_evicts_polite() {
+        // cap=100, all entries with nlookup==0 → polite can evict.
+        let mut table = mk_table_with_soft_limit(100);
+        let trigger = 100 + EVICT_TRIGGER_OVERAGE;
+        for i in 0..(trigger + 5) {
+            mk_file(&mut table, &format!("f{i}.txt"));
+        }
+        assert!(
+            table.len() <= 100,
+            "crossing the trigger must bring us back under soft_limit (got {})",
+            table.len()
+        );
+    }
+
+    #[test]
+    fn test_insert_force_evicts_above_hard_ceiling() {
+        // cap=100, all entries nlookup>0 → polite evicts nothing. The
+        // insert-time gate first triggers at len >= cap + EVICT_TRIGGER_OVERAGE,
+        // and force only fires once len > cap * HARD_CEILING_MULTIPLIER (200).
+        // Since trigger (356) is above hard ceiling (200), every time the
+        // gate fires we're already in force territory and the table
+        // collapses back near the target (90% of cap).
+        let cap = 100;
+        let trigger = cap + EVICT_TRIGGER_OVERAGE;
+        let mut table = mk_table_with_soft_limit(cap);
+        for i in 0..(trigger + 50) {
+            let ino = mk_file(&mut table, &format!("f{i}.txt"));
+            table.bump_nlookup(ino);
+        }
+        // After force fires, table drops to target (~90). Further inserts
+        // accumulate until the gate fires again. End state: somewhere
+        // between target and trigger, never above `trigger` by more than
+        // a handful (because insert-then-check is tight).
+        assert!(
+            table.len() < trigger + 5,
+            "force-evict must bind table below gate (got {} vs trigger={})",
+            table.len(),
+            trigger
+        );
+    }
+
+    #[test]
+    fn test_enable_lru_gates_touch() {
+        // touch() is a no-op when LRU is disabled (soft_limit==0), so the
+        // hot path stays cheap in the common case.
+        let mut table = InodeTable::new();
+        let f = mk_file(&mut table, "f.txt");
+        let before = table.get(f).unwrap().last_touched.load(Ordering::Relaxed);
+        table.touch(f);
+        let after = table.get(f).unwrap().last_touched.load(Ordering::Relaxed);
+        assert_eq!(before, after, "touch without enable_lru must be a no-op");
+
+        table.enable_lru(100);
+        table.touch(f);
+        assert_ne!(
+            table.get(f).unwrap().last_touched.load(Ordering::Relaxed),
+            after,
+            "touch after enable_lru must bump last_touched"
+        );
+    }
+
+    // ── evict_pending (deferred eviction on close) ──────────────────
+
+    #[test]
+    fn test_evict_pending_flag_toggle() {
+        let mut table = InodeTable::new();
+        let f = mk_file(&mut table, "f.txt");
+        assert!(!table.take_evict_pending(f), "flag starts false");
+        table.mark_evict_pending(f);
+        assert!(table.take_evict_pending(f), "flag now true");
+        assert!(!table.take_evict_pending(f), "take() clears the flag");
+    }
+
+    #[test]
+    fn test_evict_pending_unknown_inode() {
+        let mut table = InodeTable::new();
+        table.mark_evict_pending(9999); // no-op, must not panic
+        assert!(!table.take_evict_pending(9999));
+    }
 }
