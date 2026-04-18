@@ -82,6 +82,20 @@ fn apply_fuse_patches() {
 
     let patches = [
         (
+            ". common/config",
+            ". common/config\n\n\
+             # FUSE: shadow umount(1) for tests that call it directly (e.g.\n\
+             # generic/330 calls `umount $SCRATCH_MNT` without going through\n\
+             # _scratch_unmount). A bash function takes precedence over the\n\
+             # external command when referenced unqualified.\n\
+             umount() {\n\
+             \tif [ \"$FSTYP\" = \"fuse\" ]; then\n\
+             \t\tsync\n\t\treturn 0\n\
+             \tfi\n\
+             \tcommand umount \"$@\"\n\
+             }",
+        ),
+        (
             "_check_mounted_on()\n{",
             "_check_mounted_on()\n{\n\t# FUSE: skip mount validation\n\tif [ \"$FSTYP\" = \"fuse\" ]; then return 0; fi",
         ),
@@ -232,6 +246,8 @@ async fn test_xfstests_generic() {
             // generic/075,080,215,263,759: mmap write (FUSE MAPWRITE limitation)
             // generic/120,294,604: file locking
             // generic/184: splice/sendfile
+            // generic/504: scans /proc/locks by inode; kernel-local FUSE flock
+            //              emulation renders the entry in a form the grep misses
             // generic/306: concurrent append timing
             // generic/426,467,477,756: open_by_handle (FUSE lacks name_to_handle_at)
             // generic/434: copy_file_range
@@ -242,9 +258,9 @@ async fn test_xfstests_generic() {
             // generic/755: hard links not supported
             "generic/003 generic/035 generic/075 generic/080 generic/113 generic/120 \
              generic/184 generic/215 generic/263 generic/294 generic/306 generic/308 \
-             generic/426 generic/434 generic/467 generic/477 generic/519 generic/604 \
-             generic/632 generic/633 generic/645 generic/732 generic/755 generic/756 \
-             generic/759",
+             generic/426 generic/434 generic/467 generic/477 generic/504 generic/519 \
+             generic/604 generic/632 generic/633 generic/645 generic/732 generic/755 \
+             generic/756 generic/759",
         ])
         .current_dir(XFSTESTS_DIR)
         .output()
