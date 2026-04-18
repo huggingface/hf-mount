@@ -311,14 +311,23 @@ impl InodeTable {
             .is_some_and(|e| e.evict_pending.swap(false, Ordering::Relaxed))
     }
 
-    /// Directly drop up to `max` oldest `nlookup==0` file entries (no
-    /// kernel round-trip). Safe because the kernel has no dentry for them
-    /// — `readdir`'s bulk-inserted children stay at nlookup=0 until a
-    /// later `lookup()` bumps them, which is where the `find` workload
-    /// eternally pins InodeTable memory without this path.
+    /// Drop up to `max` oldest file entries. With `force=false` only touches
+    /// entries the kernel has already released (`nlookup==0`); safe, no FUSE
+    /// invariants broken. With `force=true` ignores `nlookup` — the next
+    /// kernel access will see ENOENT and re-lookup.
+    ///
+    /// The `force` mode is the only thing that binds memory under a
+    /// crawler workload: during an active `find`, the kernel holds a
+    /// dentry for every looked-up entry, so `nlookup > 0` on the whole
+    /// table and the polite path evicts nothing. Without forced eviction,
+    /// an unbounded readdir can OOM the container before the kernel
+    /// decides to shed dentries.
+    ///
+    /// Dirty files and pending-deletes are still preserved (forcing them
+    /// out would lose user data).
     ///
     /// Returns the number of entries removed. Caller holds the write lock.
-    pub(crate) fn evict_unreferenced(&mut self, max: usize) -> usize {
+    pub(crate) fn evict_unreferenced(&mut self, max: usize, force: bool) -> usize {
         if max == 0 {
             return 0;
         }
@@ -328,8 +337,10 @@ impl InodeTable {
                 || e.nlink == 0
                 || e.is_dirty()
                 || !e.pending_deletes.is_empty()
-                || e.nlookup.load(Ordering::Relaxed) != 0
             {
+                continue;
+            }
+            if !force && e.nlookup.load(Ordering::Relaxed) != 0 {
                 continue;
             }
             heap.push((e.last_touched.load(Ordering::Relaxed), e.inode));
@@ -483,15 +494,23 @@ impl InodeTable {
         );
 
         // Backpressure: if we're over the LRU cap, free room synchronously
-        // BEFORE adding the new entry. Under a full-tree crawl, readdir
-        // bulk-inserts faster than the background sweep can invalidate, so
-        // the periodic sweep alone can't bind memory.
+        // BEFORE adding the new entry. Two-stage:
+        //   1. Try polite eviction (`nlookup==0` only). Handles the normal
+        //      case where entries have aged out.
+        //   2. If still over a hard ceiling (2× cap), force-evict even
+        //      entries the kernel has cached — during a sustained `find`
+        //      every entry stays nlookup>0 and the polite path evicts 0.
+        //      The force path may make a racing kernel access see ENOENT;
+        //      the kernel handles that by re-looking up, which re-inserts.
         let cap = self.soft_limit.load(Ordering::Relaxed);
         if cap > 0 && self.inodes.len() >= cap {
-            // Target 90% of cap to get some headroom and avoid evict-on-every-insert.
             let target = cap.saturating_sub(cap / 10);
             let overflow = self.inodes.len().saturating_sub(target);
-            self.evict_unreferenced(overflow);
+            let polite = self.evict_unreferenced(overflow, false);
+            if polite < overflow && self.inodes.len() > cap.saturating_mul(2) {
+                let still_over = self.inodes.len().saturating_sub(target);
+                self.evict_unreferenced(still_over, true);
+            }
         }
 
         let now = SystemTime::now();
