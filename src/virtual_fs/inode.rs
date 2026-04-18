@@ -333,11 +333,18 @@ impl InodeTable {
         }
         let mut heap: BinaryHeap<(u64, u64)> = BinaryHeap::with_capacity(max + 1);
         for e in self.inodes.values() {
-            if e.kind != InodeKind::File
+            if e.inode == ROOT_INODE
                 || e.nlink == 0
                 || e.is_dirty()
                 || !e.pending_deletes.is_empty()
             {
+                continue;
+            }
+            // Leaf-only for dirs: evicting a dir that still has children in
+            // our table would orphan them (HashMap keeps the child entries
+            // but `path_to_inode` lookups by absolute path would miss the
+            // parent chain). Files and symlinks are always leaves.
+            if e.kind == InodeKind::Directory && !e.children.is_empty() {
                 continue;
             }
             if !force && e.nlookup.load(Ordering::Relaxed) != 0 {
@@ -355,6 +362,11 @@ impl InodeTable {
                 if let Some(parent) = self.inodes.get_mut(&entry.parent) {
                     parent.children.retain(|c| c.ino != ino);
                     parent.children_loaded = false;
+                    if entry.kind == InodeKind::Directory {
+                        // POSIX: removing a subdirectory drops the parent's
+                        // ".." nlink. Mirror the bookkeeping in `remove()`.
+                        parent.nlink = parent.nlink.saturating_sub(1);
+                    }
                 }
                 removed += 1;
             }
