@@ -5,6 +5,18 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 pub const ROOT_INODE: u64 = 1;
 
+/// After evicting, target this fraction *below* the soft limit. A bit of
+/// headroom means we don't re-evict on the very next insert.
+const EVICT_TARGET_HEADROOM_DENOM: usize = 10;
+/// Don't run the insert-time evictor until the table is at least this many
+/// entries over the soft limit. Without it, every insert past cap triggers
+/// an O(N) table scan — under a bulk readdir that's O(N²) for nothing when
+/// the polite pass can't find any `nlookup==0` candidates.
+const EVICT_TRIGGER_OVERAGE: usize = 256;
+/// Above `soft_limit * this`, fall back to force-evict (drops entries even
+/// with live kernel dentries — kernel re-lookups on next access).
+const HARD_CEILING_MULTIPLIER: usize = 2;
+
 /// Build a child's full path given the parent's full_path and child name.
 pub fn child_path(parent_path: &str, name: &str) -> String {
     if parent_path.is_empty() {
@@ -359,15 +371,7 @@ impl InodeTable {
         for (_, ino) in heap.into_iter() {
             if let Some(entry) = self.inodes.remove(&ino) {
                 self.path_to_inode.remove(&*entry.full_path);
-                if let Some(parent) = self.inodes.get_mut(&entry.parent) {
-                    parent.children.retain(|c| c.ino != ino);
-                    parent.children_loaded = false;
-                    if entry.kind == InodeKind::Directory {
-                        // POSIX: removing a subdirectory drops the parent's
-                        // ".." nlink. Mirror the bookkeeping in `remove()`.
-                        parent.nlink = parent.nlink.saturating_sub(1);
-                    }
-                }
+                self.detach_from_parent(entry.parent, ino, entry.kind, true);
                 removed += 1;
             }
         }
@@ -505,21 +509,21 @@ impl InodeTable {
             full_path
         );
 
-        // Backpressure: if we're over the LRU cap, free room synchronously
-        // BEFORE adding the new entry. Two-stage:
-        //   1. Try polite eviction (`nlookup==0` only). Handles the normal
-        //      case where entries have aged out.
-        //   2. If still over a hard ceiling (2× cap), force-evict even
-        //      entries the kernel has cached — during a sustained `find`
-        //      every entry stays nlookup>0 and the polite path evicts 0.
-        //      The force path may make a racing kernel access see ENOENT;
-        //      the kernel handles that by re-looking up, which re-inserts.
+        // Two-stage eviction: polite (nlookup==0 only) then force. Gated by
+        // `EVICT_TRIGGER_OVERAGE` so bulk-readdir doesn't pay an O(N) scan
+        // on every insert past the cap when the polite pass can't find any
+        // candidate (under a live crawl every entry has nlookup>0). The
+        // force path intentionally breaks FUSE consistency: a racing kernel
+        // op sees ENOENT and re-looks up.
         let cap = self.soft_limit.load(Ordering::Relaxed);
-        if cap > 0 && self.inodes.len() >= cap {
-            let target = cap.saturating_sub(cap / 10);
+        let trigger = cap.saturating_add(EVICT_TRIGGER_OVERAGE);
+        if cap > 0 && self.inodes.len() >= trigger {
+            let target = cap.saturating_sub(cap / EVICT_TARGET_HEADROOM_DENOM);
             let overflow = self.inodes.len().saturating_sub(target);
             let polite = self.evict_unreferenced(overflow, false);
-            if polite < overflow && self.inodes.len() > cap.saturating_mul(2) {
+            if polite < overflow
+                && self.inodes.len() > cap.saturating_mul(HARD_CEILING_MULTIPLIER)
+            {
                 let still_over = self.inodes.len().saturating_sub(target);
                 self.evict_unreferenced(still_over, true);
             }
@@ -720,21 +724,36 @@ impl InodeTable {
         }
     }
 
+    /// Detach `child_ino` from its parent's `children` list and fix up
+    /// POSIX bookkeeping. If `invalidate_children_loaded` is true, the
+    /// parent will re-fetch on next readdir (the caller removed the child
+    /// preemptively so the parent's cached listing is now stale).
+    fn detach_from_parent(
+        &mut self,
+        parent_ino: u64,
+        child_ino: u64,
+        child_kind: InodeKind,
+        invalidate_children_loaded: bool,
+    ) {
+        if let Some(parent) = self.inodes.get_mut(&parent_ino) {
+            parent.children.retain(|c| c.ino != child_ino);
+            if invalidate_children_loaded {
+                parent.children_loaded = false;
+            }
+            // POSIX: removing a subdirectory drops the parent's ".." nlink.
+            if child_kind == InodeKind::Directory {
+                parent.nlink = parent.nlink.saturating_sub(1);
+            }
+        }
+    }
+
     /// Remove an inode from the table (also removes from parent's children list).
     /// If the inode is a directory, all descendants are removed recursively to
     /// prevent orphaned entries in the table.
     pub fn remove(&mut self, inode: u64) -> Option<InodeEntry> {
         let entry = self.inodes.remove(&inode)?;
         self.path_to_inode.remove(&*entry.full_path);
-
-        // Remove from parent's children
-        if let Some(parent) = self.inodes.get_mut(&entry.parent) {
-            parent.children.retain(|c| c.ino != inode);
-            // POSIX: removing a directory removes its ".." link to the parent
-            if entry.kind == InodeKind::Directory {
-                parent.nlink = parent.nlink.saturating_sub(1);
-            }
-        }
+        self.detach_from_parent(entry.parent, inode, entry.kind, false);
 
         // Recursively remove all descendants to avoid orphans
         let mut stack: Vec<u64> = entry.children.iter().map(|c| c.ino).collect();
