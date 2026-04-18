@@ -1,8 +1,27 @@
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::{BinaryHeap, HashMap};
+use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicUsize, AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+/// Callback that answers "does this inode have a live open file handle?"
+/// `InodeTable` doesn't know about `open_files` (that lives on `VirtualFs`),
+/// so the table calls this through `open_handle_checker` during eviction
+/// to protect anything currently being read/written.
+pub(crate) type OpenHandleChecker = Box<dyn Fn(u64) -> bool + Send + Sync>;
+
 pub const ROOT_INODE: u64 = 1;
+
+/// After evicting, target this fraction *below* the soft limit. A bit of
+/// headroom means we don't re-evict on the very next insert.
+const EVICT_TARGET_HEADROOM_DENOM: usize = 10;
+/// Don't run the insert-time evictor until the table is at least this many
+/// entries over the soft limit. Without it, every insert past cap triggers
+/// an O(N) table scan — under a bulk readdir that's O(N²) for nothing when
+/// the polite pass can't find any `nlookup==0` candidates.
+const EVICT_TRIGGER_OVERAGE: usize = 256;
+/// Above `soft_limit * this`, fall back to force-evict (drops entries even
+/// with live kernel dentries — kernel re-lookups on next access).
+const HARD_CEILING_MULTIPLIER: usize = 2;
 
 /// Build a child's full path given the parent's full_path and child name.
 pub fn child_path(parent_path: &str, name: &str) -> String {
@@ -27,12 +46,15 @@ pub struct DirChild {
     pub name: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct InodeEntry {
     pub inode: u64,
     pub parent: u64,
     pub name: String,
-    pub full_path: String,
+    /// Full path from the mount root. Stored as `Arc<str>` so the same
+    /// allocation is shared between `InodeEntry.full_path` and the
+    /// `path_to_inode` HashMap key — cuts per-entry path storage in half.
+    pub full_path: Arc<str>,
     pub kind: InodeKind,
     pub size: u64,
     pub mtime: SystemTime,
@@ -58,6 +80,58 @@ pub struct InodeEntry {
     /// When this inode's metadata was last validated against the remote (via HEAD).
     /// Used to avoid redundant HEAD requests within the revalidation TTL.
     pub last_revalidated: Option<Instant>,
+    /// Kernel lookup refcount (FUSE `nlookup`). Bumped on every `reply.entry()` /
+    /// `reply.created()`; dropped by the value the kernel passes to `forget()`.
+    /// Atomic so callers only need a shared lock on the inode table — keeps the
+    /// FUSE hot path off the writer queue. A future evictor MUST refuse to drop
+    /// any inode with `nlookup > 0`: the kernel still holds a dentry and a race
+    /// would corrupt subsequent getattr/read.
+    pub nlookup: AtomicU64,
+    /// Snapshot of `InodeTable.touch_counter` at last lookup/getattr.
+    /// Atomic so the FUSE hot path only needs a read lock on the table.
+    pub last_touched: AtomicU64,
+    /// Set when `forget()` wanted to evict but an open handle blocked it.
+    /// Checked by `release()` after the last handle closes so the entry
+    /// isn't pinned forever (the kernel has already given up on it and
+    /// won't send another `forget`).
+    pub evict_pending: AtomicBool,
+    /// True for entries that don't exist on the remote (local `mkdir`,
+    /// `symlink`, or freshly-`create`d files before their first flush).
+    /// Evicting one would lose user data because a re-lookup can't
+    /// reconstruct it from the Hub. Flush clears the pin.
+    pub pinned: AtomicBool,
+}
+
+impl Clone for InodeEntry {
+    fn clone(&self) -> Self {
+        Self {
+            inode:            self.inode,
+            parent:           self.parent,
+            name:             self.name.clone(),
+            full_path:        self.full_path.clone(),
+            kind:             self.kind,
+            size:             self.size,
+            mtime:            self.mtime,
+            mode:             self.mode,
+            uid:              self.uid,
+            gid:              self.gid,
+            atime:            self.atime,
+            ctime:            self.ctime,
+            nlink:            self.nlink,
+            symlink_target:   self.symlink_target.clone(),
+            xet_hash:         self.xet_hash.clone(),
+            etag:             self.etag.clone(),
+            dirty_generation: self.dirty_generation,
+            children_loaded:  self.children_loaded,
+            children:         self.children.clone(),
+            pending_deletes:  self.pending_deletes.clone(),
+            last_revalidated: self.last_revalidated,
+            nlookup:          AtomicU64::new(self.nlookup.load(Ordering::Relaxed)),
+            last_touched:     AtomicU64::new(self.last_touched.load(Ordering::Relaxed)),
+            evict_pending:    AtomicBool::new(self.evict_pending.load(Ordering::Relaxed)),
+            pinned:           AtomicBool::new(self.pinned.load(Ordering::Relaxed)),
+        }
+    }
 }
 
 impl InodeEntry {
@@ -101,12 +175,58 @@ impl InodeEntry {
         // for the duration of metadata_ttl (we just committed this exact hash).
         self.last_revalidated = Some(Instant::now());
     }
+
+    /// Bump the kernel lookup refcount. Shared-ref access via `AtomicU64` so
+    /// FUSE hot paths (lookup, create, mkdir, symlink) only need a read lock
+    /// on the inode table.
+    pub(crate) fn bump_nlookup(&self) {
+        // Relaxed is sufficient: the refcount only gates eviction, which is
+        // guarded separately by the inode table's write lock.
+        self.nlookup.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Drop the kernel lookup refcount by `n`, saturating at 0. Returns true
+    /// if the refcount reached 0 (safe-to-evict).
+    pub(crate) fn drop_nlookup(&self, n: u64) -> bool {
+        let prev = self
+            .nlookup
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| Some(cur.saturating_sub(n)))
+            .expect("fetch_update closure always returns Some");
+        // A forget(n) larger than the current count is a kernel- or us-side
+        // protocol bug. Surface it in debug builds without crashing prod.
+        debug_assert!(n <= prev, "drop_nlookup({n}) exceeded current {prev}");
+        prev.saturating_sub(n) == 0
+    }
 }
 
 pub struct InodeTable {
     inodes: HashMap<u64, InodeEntry>,
-    path_to_inode: HashMap<String, u64>,
+    /// Path → inode lookup. The key is an `Arc<str>` that's cloned (cheap
+    /// refcount bump) from the matching `InodeEntry.full_path`, so the path
+    /// string is allocated exactly once per inode.
+    path_to_inode: HashMap<Arc<str>, u64>,
     next_inode: AtomicU64,
+    /// Monotonic counter snapshotted into `InodeEntry.last_touched` — used
+    /// by the LRU evictor to order entries by recency without a wall-clock
+    /// syscall on the hot path.
+    touch_counter: AtomicU64,
+    /// Target size for the LRU evictor. 0 = disabled. When non-zero,
+    /// `insert()` evicts oldest `nlookup==0` entries *before* inserting to
+    /// keep the table under the cap — the only path that binds under a
+    /// crawler workload where `readdir` bulk-inserts entries the kernel
+    /// never looks up individually.
+    soft_limit: AtomicUsize,
+    /// Sticky bit set when the last polite pass returned 0 evictable
+    /// candidates. Subsequent over-cap inserts skip the O(N) scan until
+    /// `drop_nlookup` hits 0 on any inode (re-arming polite-eligibility).
+    /// Without this, a sustained crawl with all entries held by the
+    /// kernel would rescan the full table on every insert for nothing.
+    polite_exhausted: AtomicBool,
+    /// Reports whether an inode has a live open FUSE file handle.
+    /// Force-evict consults this to avoid dropping an inode out from
+    /// under a write() / read() — losing dirty state would be silent
+    /// data loss. `VirtualFs` wires this via `set_open_handle_checker`.
+    open_handle_checker: Arc<Mutex<Option<OpenHandleChecker>>>,
 }
 
 impl Default for InodeTable {
@@ -121,14 +241,19 @@ impl InodeTable {
             inodes: HashMap::new(),
             path_to_inode: HashMap::new(),
             next_inode: AtomicU64::new(2),
+            touch_counter: AtomicU64::new(0),
+            soft_limit: AtomicUsize::new(0),
+            polite_exhausted: AtomicBool::new(false),
+            open_handle_checker: Arc::new(Mutex::new(None)),
         };
 
         // Create root inode
+        let root_path: Arc<str> = Arc::from("");
         let root = InodeEntry {
             inode: ROOT_INODE,
             parent: ROOT_INODE,
             name: String::new(),
-            full_path: String::new(),
+            full_path: root_path.clone(),
             kind: InodeKind::Directory,
             size: 0,
             mtime: UNIX_EPOCH,
@@ -146,9 +271,13 @@ impl InodeTable {
             children: Vec::new(),
             pending_deletes: Vec::new(),
             last_revalidated: None,
+            nlookup: AtomicU64::new(0),
+            last_touched: AtomicU64::new(0),
+            evict_pending: AtomicBool::new(false),
+            pinned: AtomicBool::new(true),
         };
         table.inodes.insert(ROOT_INODE, root);
-        table.path_to_inode.insert(String::new(), ROOT_INODE);
+        table.path_to_inode.insert(root_path, ROOT_INODE);
 
         table
     }
@@ -159,6 +288,251 @@ impl InodeTable {
 
     pub fn get_mut(&mut self, inode: u64) -> Option<&mut InodeEntry> {
         self.inodes.get_mut(&inode)
+    }
+
+    /// Bump the kernel lookup refcount on `inode`. Shared `&self` because the
+    /// refcount itself is atomic. Calling this on an unknown inode is a bug
+    /// (we just returned that ino to the kernel), but a missing entry here
+    /// would be a race we can't recover from, so we log+return.
+    pub(crate) fn bump_nlookup(&self, inode: u64) {
+        match self.inodes.get(&inode) {
+            Some(entry) => entry.bump_nlookup(),
+            None => debug_assert!(false, "bump_nlookup: unknown inode {inode}"),
+        }
+    }
+
+    /// Drop the kernel lookup refcount on `inode` by `n`. Returns true if the
+    /// refcount reached 0 (safe-to-evict); false if unknown / still held.
+    /// Clears the polite-exhausted sticky bit on a 0-transition so the next
+    /// over-cap insert will retry the polite scan.
+    pub(crate) fn drop_nlookup(&self, inode: u64, n: u64) -> bool {
+        let reached_zero = self.inodes.get(&inode).map(|e| e.drop_nlookup(n)).unwrap_or(false);
+        if reached_zero {
+            self.polite_exhausted.store(false, Ordering::Relaxed);
+        }
+        reached_zero
+    }
+
+    /// Mark an inode as "pinned" — never evictable regardless of mode.
+    /// Used for entries that exist only in memory (local mkdir/symlink,
+    /// freshly created files before flush). Cleared after a successful
+    /// remote flush / upload.
+    pub(crate) fn set_pinned(&self, inode: u64, pinned: bool) {
+        if let Some(entry) = self.inodes.get(&inode) {
+            entry.pinned.store(pinned, Ordering::Relaxed);
+        }
+    }
+
+    /// Register a callback used by eviction to skip inodes with live
+    /// FUSE file handles. Wired by `VirtualFs` post-construction.
+    pub(crate) fn set_open_handle_checker(&self, f: OpenHandleChecker) {
+        *self.open_handle_checker
+            .lock()
+            .expect("open_handle_checker poisoned") = Some(f);
+    }
+
+    pub fn len(&self) -> usize {
+        self.inodes.len()
+    }
+
+    /// Configure the LRU eviction cap. 0 disables all eviction hooks
+    /// (common prod config). Called once at startup from `VirtualFs::new`.
+    pub(crate) fn enable_lru(&self, soft_limit: usize) {
+        self.soft_limit.store(soft_limit, Ordering::Relaxed);
+    }
+
+    /// Snapshot a fresh counter value onto `inode.last_touched`. Atomic so
+    /// the FUSE reader pool never contends a writer. Early-out when LRU is
+    /// disabled so the common prod config pays nothing.
+    pub(crate) fn touch(&self, inode: u64) {
+        if self.soft_limit.load(Ordering::Relaxed) == 0 {
+            return;
+        }
+        if let Some(entry) = self.inodes.get(&inode) {
+            let seq = self.touch_counter.fetch_add(1, Ordering::Relaxed);
+            entry.last_touched.store(seq, Ordering::Relaxed);
+        }
+    }
+
+    /// Mark an inode as "wanted to evict but blocked" so `release()` can
+    /// finish the job once the last open handle closes. No-op on unknown
+    /// inode (the entry may have been removed on a racing path).
+    pub(crate) fn mark_evict_pending(&self, ino: u64) {
+        if let Some(entry) = self.inodes.get(&ino) {
+            entry.evict_pending.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Atomically test-and-clear the flag. Returns true if the caller now
+    /// owns the deferred eviction.
+    pub(crate) fn take_evict_pending(&self, ino: u64) -> bool {
+        self.inodes
+            .get(&ino)
+            .is_some_and(|e| e.evict_pending.swap(false, Ordering::Relaxed))
+    }
+
+    /// Drop up to `max` oldest file entries. With `force=false` only touches
+    /// entries the kernel has already released (`nlookup==0`); safe, no FUSE
+    /// invariants broken. With `force=true` ignores `nlookup` — the next
+    /// kernel access will see ENOENT and re-lookup.
+    ///
+    /// The `force` mode is the only thing that binds memory under a
+    /// crawler workload: during an active `find`, the kernel holds a
+    /// dentry for every looked-up entry, so `nlookup > 0` on the whole
+    /// table and the polite path evicts nothing. Without forced eviction,
+    /// an unbounded readdir can OOM the container before the kernel
+    /// decides to shed dentries.
+    ///
+    /// Dirty files and pending-deletes are still preserved (forcing them
+    /// out would lose user data).
+    ///
+    /// Returns the number of entries removed. Caller holds the write lock.
+    pub(crate) fn evict_unreferenced(&mut self, max: usize, force: bool) -> usize {
+        if max == 0 {
+            return 0;
+        }
+        // Hold the mutex guard for the whole scan; eviction runs under
+        // the table's write lock so this can't contend with itself.
+        let checker_guard = self.open_handle_checker
+            .lock()
+            .expect("open_handle_checker poisoned");
+        let has_open_handle = checker_guard.as_ref();
+
+        let mut heap: BinaryHeap<(u64, u64)> = BinaryHeap::with_capacity(max + 1);
+        let mut polite_candidates_found = 0usize;
+        for e in self.inodes.values() {
+            if e.inode == ROOT_INODE
+                || e.nlink == 0
+                || e.is_dirty()
+                || !e.pending_deletes.is_empty()
+                || e.pinned.load(Ordering::Relaxed)
+            {
+                continue;
+            }
+            // Leaf-only for dirs: evicting a dir that still has children in
+            // our table would orphan them. Files and symlinks are leaves.
+            if e.kind == InodeKind::Directory && !e.children.is_empty() {
+                continue;
+            }
+            // Never drop an inode with a live FUSE handle: a racing
+            // write() would see ENOENT and silently lose dirty state.
+            if let Some(cb) = has_open_handle
+                && cb(e.inode)
+            {
+                continue;
+            }
+            if e.nlookup.load(Ordering::Relaxed) == 0 {
+                polite_candidates_found += 1;
+            } else if !force {
+                continue;
+            }
+            heap.push((e.last_touched.load(Ordering::Relaxed), e.inode));
+            if heap.len() > max {
+                heap.pop();
+            }
+        }
+        drop(checker_guard);
+
+        // Cache the exhaustion signal so the next insert doesn't re-scan
+        // when we already know there's nothing polite to evict.
+        if !force {
+            self.polite_exhausted
+                .store(polite_candidates_found == 0, Ordering::Relaxed);
+        }
+
+        let mut removed = 0usize;
+        for (_, ino) in heap.into_iter() {
+            if let Some(entry) = self.inodes.remove(&ino) {
+                self.path_to_inode.remove(&*entry.full_path);
+                self.detach_from_parent(entry.parent, ino, entry.kind, true);
+                removed += 1;
+            }
+        }
+        removed
+    }
+
+    /// True when the last polite pass found zero candidates. Consulted by
+    /// `insert()` to skip the rescan until something changes (a forget
+    /// takes `nlookup` to 0, or the table shrinks below the trigger).
+    pub(crate) fn polite_exhausted(&self) -> bool {
+        self.polite_exhausted.load(Ordering::Relaxed)
+    }
+
+    /// Return up to `max` oldest-touched file inodes eligible for eviction
+    /// (regular files with `nlink > 0`, clean, no pending renames). The
+    /// caller hands these `(parent, name)` pairs to `inval_entry`; the
+    /// kernel drops its dentry, `forget()` fires, and `evict_if_safe`
+    /// reclaims the inode.
+    ///
+    /// Uses a bounded max-heap so we only clone names for the `max` entries
+    /// we actually return — O(N log max) with max cloned Strings, vs the
+    /// naive sort-and-truncate that allocates for every filter-passing
+    /// entry before discarding most of them.
+    pub(crate) fn lru_candidates(&self, max: usize) -> Vec<(u64, String)> {
+        if max == 0 {
+            return Vec::new();
+        }
+        // BinaryHeap is a max-heap on the first tuple element (timestamp).
+        // Keep size ≤ max by popping the newest when we overflow, so what
+        // remains is the `max` oldest.
+        let mut heap: BinaryHeap<(u64, u64)> = BinaryHeap::with_capacity(max + 1);
+        for e in self.inodes.values() {
+            if e.kind != InodeKind::File || e.nlink == 0 || e.is_dirty() || !e.pending_deletes.is_empty() {
+                continue;
+            }
+            heap.push((e.last_touched.load(Ordering::Relaxed), e.inode));
+            if heap.len() > max {
+                heap.pop();
+            }
+        }
+        // Resolve names in a second pass (oldest-first). One allocation
+        // per returned candidate, not per table entry.
+        let mut picks: Vec<(u64, u64)> = heap.into_vec();
+        picks.sort_by_key(|&(ts, _)| ts);
+        picks
+            .into_iter()
+            .filter_map(|(_, ino)| self.inodes.get(&ino).map(|e| (e.parent, e.name.clone())))
+            .collect()
+    }
+
+    /// Evict a file inode from the table if it's safe to do so. Returns true
+    /// if evicted. Mirrors mountpoint-s3's forget-driven eviction: only files
+    /// (directories hold children_loaded state we can't easily restore),
+    /// only when the kernel has fully released the dentry (`nlookup == 0`),
+    /// only when there's no unflushed data (`!is_dirty`) and no pending
+    /// rename-delete (`pending_deletes.is_empty`).
+    ///
+    /// Caller is responsible for checking that no open file handles reference
+    /// this inode (see `VirtualFs::has_open_handles`).
+    ///
+    /// After eviction the parent directory is marked `children_loaded = false`
+    /// so a subsequent `readdir`/`lookup` re-fetches the listing and
+    /// re-materializes the inode.
+    pub(crate) fn evict_if_safe(&mut self, ino: u64) -> bool {
+        let should_evict = self.inodes.get(&ino).is_some_and(|e| {
+            e.kind == InodeKind::File
+                && e.nlookup.load(Ordering::Relaxed) == 0
+                && !e.is_dirty()
+                && e.pending_deletes.is_empty()
+                && e.nlink > 0
+        });
+        if !should_evict {
+            return false;
+        }
+
+        let Some(entry) = self.inodes.remove(&ino) else {
+            return false;
+        };
+        self.path_to_inode.remove(&*entry.full_path);
+
+        if let Some(parent) = self.inodes.get_mut(&entry.parent) {
+            parent.children.retain(|c| c.ino != ino);
+            // Force readdir to re-fetch so the inode can be re-materialized
+            // on next access. Without this the kernel would ask for a child
+            // that no longer exists in our in-memory tree.
+            parent.children_loaded = false;
+        }
+        true
     }
 
     pub fn get_by_path(&self, path: &str) -> Option<&InodeEntry> {
@@ -195,7 +569,7 @@ impl InodeTable {
         gid: u32,
     ) -> u64 {
         // Check if already exists
-        if let Some(&existing_ino) = self.path_to_inode.get(&full_path) {
+        if let Some(&existing_ino) = self.path_to_inode.get(full_path.as_str()) {
             debug_assert!(
                 self.inodes.get(&existing_ino).map(|e| e.kind) == Some(kind),
                 "insert(): path '{}' exists with different kind",
@@ -215,6 +589,38 @@ impl InodeTable {
             full_path
         );
 
+        // Two-stage eviction: polite (nlookup==0 only) then force.
+        //
+        // Gating: skip unless we're at least EVICT_TRIGGER_OVERAGE past
+        // the cap. Otherwise every insert past cap pays an O(N) scan.
+        //
+        // Caching: if the previous polite pass found zero candidates,
+        // skip polite this time too. drop_nlookup() clears the bit when
+        // something becomes evictable again.
+        //
+        // Force path (trade correctness for memory): above
+        // `cap * HARD_CEILING_MULTIPLIER`, evict even entries with
+        // `nlookup > 0`. A racing kernel op gets ENOENT and re-lookups.
+        // `pinned` entries and entries with open file handles are still
+        // protected so writes never silently lose data.
+        let cap = self.soft_limit.load(Ordering::Relaxed);
+        let trigger = cap.saturating_add(EVICT_TRIGGER_OVERAGE);
+        if cap > 0 && self.inodes.len() >= trigger {
+            let target = cap.saturating_sub(cap / EVICT_TARGET_HEADROOM_DENOM);
+            let overflow = self.inodes.len().saturating_sub(target);
+            let polite = if self.polite_exhausted() {
+                0
+            } else {
+                self.evict_unreferenced(overflow, false)
+            };
+            if polite < overflow
+                && self.inodes.len() > cap.saturating_mul(HARD_CEILING_MULTIPLIER)
+            {
+                let still_over = self.inodes.len().saturating_sub(target);
+                self.evict_unreferenced(still_over, true);
+            }
+        }
+
         let now = SystemTime::now();
         let nlink = match kind {
             InodeKind::Directory => 2,
@@ -222,12 +628,16 @@ impl InodeTable {
         };
 
         let inode = self.next_inode.fetch_add(1, Ordering::Relaxed);
+        let touch_seq = self.touch_counter.fetch_add(1, Ordering::Relaxed);
         let child_name = name.clone();
+        // Allocate the path once; the InodeEntry and path_to_inode share the
+        // same Arc so the string is stored in memory exactly once per inode.
+        let full_path_arc: Arc<str> = Arc::from(full_path);
         let entry = InodeEntry {
             inode,
             parent,
             name,
-            full_path: full_path.clone(),
+            full_path: full_path_arc.clone(),
             kind,
             size,
             mtime,
@@ -245,10 +655,14 @@ impl InodeTable {
             children: Vec::new(),
             pending_deletes: Vec::new(),
             last_revalidated: Some(Instant::now()),
+            nlookup: AtomicU64::new(0),
+            last_touched: AtomicU64::new(touch_seq),
+            evict_pending: AtomicBool::new(false),
+            pinned: AtomicBool::new(false),
         };
 
         self.inodes.insert(inode, entry);
-        self.path_to_inode.insert(full_path, inode);
+        self.path_to_inode.insert(full_path_arc, inode);
 
         // Add to parent's children
         if let Some(parent_entry) = self.inodes.get_mut(&parent) {
@@ -272,7 +686,7 @@ impl InodeTable {
 
     /// Insert a path → inode mapping.
     pub fn insert_path(&mut self, path: String, inode: u64) {
-        self.path_to_inode.insert(path, inode);
+        self.path_to_inode.insert(Arc::from(path), inode);
     }
 
     /// Return inodes of all dirty files (excludes symlinks — they have no content to flush).
@@ -293,7 +707,7 @@ impl InodeTable {
             .map(|e| {
                 (
                     e.inode,
-                    e.full_path.clone(),
+                    e.full_path.to_string(),
                     e.xet_hash.clone(),
                     e.etag.clone(),
                     e.size,
@@ -360,7 +774,7 @@ impl InodeTable {
         self.inodes
             .values()
             .filter(|e| e.kind == InodeKind::Directory && e.children_loaded)
-            .map(|e| e.full_path.clone())
+            .map(|e| e.full_path.to_string())
             .collect()
     }
 
@@ -379,16 +793,18 @@ impl InodeTable {
     /// Hard-linked inodes whose full_path doesn't match their expected position in the tree
     /// are skipped (they belong elsewhere and their canonical path must not be rewritten).
     pub fn update_subtree_paths(&mut self, inode: u64, new_full_path: String) {
-        // Remove old path mapping
+        // Remove old path mapping (&*Arc<str> borrows as &str for the HashMap).
         if let Some(entry) = self.inodes.get(&inode) {
-            let old_path = entry.full_path.clone();
-            self.path_to_inode.remove(&old_path);
+            let old_path: Arc<str> = entry.full_path.clone();
+            self.path_to_inode.remove(&*old_path);
         }
 
-        // Update this inode's path
+        // Allocate the new path once and share its Arc between the entry and
+        // the path_to_inode key.
+        let new_full_path_arc: Arc<str> = Arc::from(new_full_path.as_str());
         let children = if let Some(entry) = self.inodes.get_mut(&inode) {
-            entry.full_path = new_full_path.clone();
-            self.path_to_inode.insert(new_full_path.clone(), inode);
+            entry.full_path = new_full_path_arc.clone();
+            self.path_to_inode.insert(new_full_path_arc, inode);
             entry.children.clone()
         } else {
             return;
@@ -401,27 +817,42 @@ impl InodeTable {
         }
     }
 
+    /// Detach `child_ino` from its parent's `children` list and fix up
+    /// POSIX bookkeeping. If `invalidate_children_loaded` is true, the
+    /// parent will re-fetch on next readdir (the caller removed the child
+    /// preemptively so the parent's cached listing is now stale).
+    fn detach_from_parent(
+        &mut self,
+        parent_ino: u64,
+        child_ino: u64,
+        child_kind: InodeKind,
+        invalidate_children_loaded: bool,
+    ) {
+        if let Some(parent) = self.inodes.get_mut(&parent_ino) {
+            parent.children.retain(|c| c.ino != child_ino);
+            if invalidate_children_loaded {
+                parent.children_loaded = false;
+            }
+            // POSIX: removing a subdirectory drops the parent's ".." nlink.
+            if child_kind == InodeKind::Directory {
+                parent.nlink = parent.nlink.saturating_sub(1);
+            }
+        }
+    }
+
     /// Remove an inode from the table (also removes from parent's children list).
     /// If the inode is a directory, all descendants are removed recursively to
     /// prevent orphaned entries in the table.
     pub fn remove(&mut self, inode: u64) -> Option<InodeEntry> {
         let entry = self.inodes.remove(&inode)?;
-        self.path_to_inode.remove(&entry.full_path);
-
-        // Remove from parent's children
-        if let Some(parent) = self.inodes.get_mut(&entry.parent) {
-            parent.children.retain(|c| c.ino != inode);
-            // POSIX: removing a directory removes its ".." link to the parent
-            if entry.kind == InodeKind::Directory {
-                parent.nlink = parent.nlink.saturating_sub(1);
-            }
-        }
+        self.path_to_inode.remove(&*entry.full_path);
+        self.detach_from_parent(entry.parent, inode, entry.kind, false);
 
         // Recursively remove all descendants to avoid orphans
         let mut stack: Vec<u64> = entry.children.iter().map(|c| c.ino).collect();
         while let Some(child_ino) = stack.pop() {
             if let Some(child) = self.inodes.remove(&child_ino) {
-                self.path_to_inode.remove(&child.full_path);
+                self.path_to_inode.remove(&*child.full_path);
                 stack.extend(child.children.iter().map(|c| c.ino));
             }
         }
@@ -448,8 +879,8 @@ impl InodeTable {
             parent_entry.children.remove(pos);
         }
 
-        // Remove path mapping
-        self.path_to_inode.remove(&full_path);
+        // Remove path mapping (HashMap<Arc<str>, _> borrows &str via Borrow).
+        self.path_to_inode.remove(full_path.as_str());
 
         // Decrement nlink
         let entry_snapshot = {
@@ -549,7 +980,7 @@ mod tests {
         let found = found.unwrap();
         assert_eq!(found.inode, ino);
         assert_eq!(found.name, "hello.txt");
-        assert_eq!(found.full_path, "hello.txt");
+        assert_eq!(found.full_path.as_ref(), "hello.txt");
         assert_eq!(found.kind, InodeKind::File);
         assert_eq!(found.size, 42);
         assert_eq!(found.xet_hash, Some("abc123".to_string()));
@@ -869,10 +1300,10 @@ mod tests {
         table.update_subtree_paths(dir_ino, "new_dir".to_string());
 
         // Verify all paths updated
-        assert_eq!(table.get(dir_ino).unwrap().full_path, "new_dir");
-        assert_eq!(table.get(child_ino).unwrap().full_path, "new_dir/child.txt");
-        assert_eq!(table.get(subdir_ino).unwrap().full_path, "new_dir/subdir");
-        assert_eq!(table.get(deep_ino).unwrap().full_path, "new_dir/subdir/deep.txt");
+        assert_eq!(table.get(dir_ino).unwrap().full_path.as_ref(), "new_dir");
+        assert_eq!(table.get(child_ino).unwrap().full_path.as_ref(), "new_dir/child.txt");
+        assert_eq!(table.get(subdir_ino).unwrap().full_path.as_ref(), "new_dir/subdir");
+        assert_eq!(table.get(deep_ino).unwrap().full_path.as_ref(), "new_dir/subdir/deep.txt");
 
         // Verify path_to_inode updated (old paths gone, new paths work)
         assert!(table.get_by_path("old_dir").is_none());
@@ -1550,5 +1981,618 @@ mod tests {
         table.remove_orphan(file_ino);
         assert!(table.get(file_ino).is_none());
         assert!(table.get_by_path(&path).is_none(), "path_to_inode should be cleaned up");
+    }
+
+    #[test]
+    fn test_nlookup_starts_at_zero() {
+        let mut table = InodeTable::new();
+        let ino = table.insert(
+            ROOT_INODE,
+            "f.txt".to_string(),
+            "f.txt".to_string(),
+            InodeKind::File,
+            0,
+            UNIX_EPOCH,
+            None,
+            0o644,
+            0,
+            0,
+        );
+        assert_eq!(table.get(ino).unwrap().nlookup.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_nlookup_bump_drop() {
+        let mut table = InodeTable::new();
+        let ino = table.insert(
+            ROOT_INODE,
+            "f.txt".to_string(),
+            "f.txt".to_string(),
+            InodeKind::File,
+            0,
+            UNIX_EPOCH,
+            None,
+            0o644,
+            0,
+            0,
+        );
+
+        table.bump_nlookup(ino);
+        table.bump_nlookup(ino);
+        table.bump_nlookup(ino);
+        assert_eq!(table.get(ino).unwrap().nlookup.load(Ordering::Relaxed), 3);
+
+        assert!(!table.drop_nlookup(ino, 1));
+        assert_eq!(table.get(ino).unwrap().nlookup.load(Ordering::Relaxed), 2);
+
+        // Reaching zero returns true.
+        assert!(table.drop_nlookup(ino, 2));
+        assert_eq!(table.get(ino).unwrap().nlookup.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_nlookup_saturates_on_underflow() {
+        // debug_assert! fires in debug builds, so we can only exercise the
+        // saturation branch in release.
+        if cfg!(debug_assertions) {
+            return;
+        }
+        let mut table = InodeTable::new();
+        let ino = table.insert(
+            ROOT_INODE,
+            "f.txt".to_string(),
+            "f.txt".to_string(),
+            InodeKind::File,
+            0,
+            UNIX_EPOCH,
+            None,
+            0o644,
+            0,
+            0,
+        );
+
+        assert!(table.drop_nlookup(ino, 42));
+        assert_eq!(table.get(ino).unwrap().nlookup.load(Ordering::Relaxed), 0);
+
+        table.bump_nlookup(ino);
+        assert!(table.drop_nlookup(ino, 1000));
+        assert_eq!(table.get(ino).unwrap().nlookup.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_nlookup_unknown_inode_drop_returns_false() {
+        let table = InodeTable::new();
+        assert!(!table.drop_nlookup(9999, 1));
+    }
+
+    #[test]
+    fn test_evict_if_safe_removes_clean_file() {
+        let mut table = InodeTable::new();
+        let ino = table.insert(
+            ROOT_INODE,
+            "f.txt".to_string(),
+            "f.txt".to_string(),
+            InodeKind::File,
+            10,
+            UNIX_EPOCH,
+            None,
+            0o644,
+            0,
+            0,
+        );
+
+        // Default nlookup is 0, not dirty, no pending deletes → safe to evict.
+        assert!(table.evict_if_safe(ino));
+        assert!(table.get(ino).is_none());
+        assert!(table.get_by_path("f.txt").is_none());
+
+        // Parent's children_loaded is reset so readdir will re-fetch.
+        let root = table.get(ROOT_INODE).unwrap();
+        assert!(!root.children_loaded);
+        assert!(!root.children.iter().any(|c| c.ino == ino));
+    }
+
+    #[test]
+    fn test_evict_if_safe_refuses_when_nlookup_held() {
+        let mut table = InodeTable::new();
+        let ino = table.insert(
+            ROOT_INODE,
+            "f.txt".to_string(),
+            "f.txt".to_string(),
+            InodeKind::File,
+            10,
+            UNIX_EPOCH,
+            None,
+            0o644,
+            0,
+            0,
+        );
+        table.bump_nlookup(ino);
+
+        assert!(!table.evict_if_safe(ino));
+        assert!(table.get(ino).is_some(), "entry must survive when kernel still holds dentry");
+    }
+
+    #[test]
+    fn test_evict_if_safe_refuses_when_dirty() {
+        let mut table = InodeTable::new();
+        let ino = table.insert(
+            ROOT_INODE,
+            "f.txt".to_string(),
+            "f.txt".to_string(),
+            InodeKind::File,
+            10,
+            UNIX_EPOCH,
+            None,
+            0o644,
+            0,
+            0,
+        );
+        table.get_mut(ino).unwrap().set_dirty();
+
+        assert!(!table.evict_if_safe(ino));
+        assert!(table.get(ino).is_some(), "dirty entry must not be evicted — unflushed data");
+    }
+
+    #[test]
+    fn test_evict_if_safe_refuses_when_pending_deletes() {
+        let mut table = InodeTable::new();
+        let ino = table.insert(
+            ROOT_INODE,
+            "f.txt".to_string(),
+            "f.txt".to_string(),
+            InodeKind::File,
+            10,
+            UNIX_EPOCH,
+            None,
+            0o644,
+            0,
+            0,
+        );
+        table.get_mut(ino).unwrap().pending_deletes.push("old_path".to_string());
+
+        assert!(!table.evict_if_safe(ino));
+        assert!(table.get(ino).is_some());
+    }
+
+    #[test]
+    fn test_evict_if_safe_refuses_directory() {
+        let mut table = InodeTable::new();
+        let ino = table.insert(
+            ROOT_INODE,
+            "d".to_string(),
+            "d".to_string(),
+            InodeKind::Directory,
+            0,
+            UNIX_EPOCH,
+            None,
+            0o755,
+            0,
+            0,
+        );
+
+        assert!(!table.evict_if_safe(ino), "directories must never be evicted");
+        assert!(table.get(ino).is_some());
+    }
+
+    #[test]
+    fn test_evict_if_safe_refuses_unlinked_orphan() {
+        // An unlinked-but-still-open file (nlink == 0) must stay in the table
+        // until release() cleans it up via remove_orphan — evicting it would
+        // drop the xet_hash / path a racing read still needs.
+        let mut table = InodeTable::new();
+        let ino = table.insert(
+            ROOT_INODE,
+            "doomed.txt".to_string(),
+            "doomed.txt".to_string(),
+            InodeKind::File,
+            10,
+            UNIX_EPOCH,
+            None,
+            0o644,
+            0,
+            0,
+        );
+        table.unlink_one(ROOT_INODE, "doomed.txt");
+        assert_eq!(table.get(ino).unwrap().nlink, 0);
+
+        assert!(!table.evict_if_safe(ino));
+        assert!(table.get(ino).is_some());
+    }
+
+    #[test]
+    fn test_evict_if_safe_unknown_inode() {
+        let mut table = InodeTable::new();
+        assert!(!table.evict_if_safe(9999));
+    }
+
+    // ── evict_unreferenced ──────────────────────────────────────────
+
+    fn mk_table_with_soft_limit(soft: usize) -> InodeTable {
+        let t = InodeTable::new();
+        t.enable_lru(soft);
+        t
+    }
+
+    fn mk_file(table: &mut InodeTable, name: &str) -> u64 {
+        table.insert(
+            ROOT_INODE,
+            name.to_string(),
+            name.to_string(),
+            InodeKind::File,
+            1,
+            UNIX_EPOCH,
+            None,
+            0o644,
+            0,
+            0,
+        )
+    }
+
+    #[test]
+    fn test_evict_unreferenced_polite_skips_nlookup_held() {
+        let mut table = InodeTable::new();
+        let held = mk_file(&mut table, "held.txt");
+        let free = mk_file(&mut table, "free.txt");
+        table.bump_nlookup(held);
+
+        assert_eq!(table.evict_unreferenced(10, false), 1);
+        assert!(table.get(held).is_some(), "held entry stays");
+        assert!(table.get(free).is_none(), "free entry gone");
+    }
+
+    #[test]
+    fn test_evict_unreferenced_force_ignores_nlookup() {
+        let mut table = InodeTable::new();
+        let a = mk_file(&mut table, "a.txt");
+        let b = mk_file(&mut table, "b.txt");
+        table.bump_nlookup(a);
+        table.bump_nlookup(b);
+
+        assert_eq!(table.evict_unreferenced(10, true), 2);
+        assert!(table.get(a).is_none());
+        assert!(table.get(b).is_none());
+    }
+
+    #[test]
+    fn test_evict_unreferenced_preserves_dirty_even_with_force() {
+        let mut table = InodeTable::new();
+        let clean = mk_file(&mut table, "clean.txt");
+        let dirty = mk_file(&mut table, "dirty.txt");
+        table.get_mut(dirty).unwrap().set_dirty();
+
+        assert_eq!(table.evict_unreferenced(10, true), 1);
+        assert!(table.get(clean).is_none());
+        assert!(table.get(dirty).is_some(), "dirty entry never evicted");
+    }
+
+    #[test]
+    fn test_evict_unreferenced_preserves_pending_deletes() {
+        let mut table = InodeTable::new();
+        let pending = mk_file(&mut table, "pending.txt");
+        table.get_mut(pending).unwrap().pending_deletes.push("old".into());
+
+        assert_eq!(table.evict_unreferenced(10, true), 0);
+        assert!(table.get(pending).is_some());
+    }
+
+    #[test]
+    fn test_evict_unreferenced_never_touches_root() {
+        let mut table = mk_table_with_soft_limit(0);
+        let _ = mk_file(&mut table, "f.txt");
+        assert_eq!(table.evict_unreferenced(10, true), 1);
+        assert!(table.get(ROOT_INODE).is_some(), "root must not be evicted");
+    }
+
+    #[test]
+    fn test_evict_unreferenced_drops_symlinks() {
+        let mut table = InodeTable::new();
+        let sym = table.insert(
+            ROOT_INODE,
+            "link".to_string(),
+            "link".to_string(),
+            InodeKind::Symlink,
+            0,
+            UNIX_EPOCH,
+            None,
+            0o777,
+            0,
+            0,
+        );
+        assert_eq!(table.evict_unreferenced(10, false), 1);
+        assert!(table.get(sym).is_none());
+    }
+
+    #[test]
+    fn test_evict_unreferenced_keeps_non_leaf_directory() {
+        let mut table = InodeTable::new();
+        let dir = table.insert(
+            ROOT_INODE,
+            "d".to_string(),
+            "d".to_string(),
+            InodeKind::Directory,
+            0,
+            UNIX_EPOCH,
+            None,
+            0o755,
+            0,
+            0,
+        );
+        let child = table.insert(
+            dir,
+            "c.txt".to_string(),
+            "d/c.txt".to_string(),
+            InodeKind::File,
+            1,
+            UNIX_EPOCH,
+            None,
+            0o644,
+            0,
+            0,
+        );
+        // The child file is leaf + nlookup==0 → evicted. The dir becomes
+        // a leaf after that but this sweep already collected candidates.
+        // The dir itself must survive this pass because it still had
+        // children when we picked candidates.
+        let removed = table.evict_unreferenced(10, true);
+        assert_eq!(removed, 1, "only the child file goes");
+        assert!(table.get(child).is_none());
+        assert!(table.get(dir).is_some(), "dir survives: had children when selected");
+    }
+
+    #[test]
+    fn test_evict_unreferenced_drops_leaf_directory() {
+        let mut table = InodeTable::new();
+        let dir_ino = table.insert(
+            ROOT_INODE,
+            "empty".to_string(),
+            "empty".to_string(),
+            InodeKind::Directory,
+            0,
+            UNIX_EPOCH,
+            None,
+            0o755,
+            0,
+            0,
+        );
+        let root_nlink_before = table.get(ROOT_INODE).unwrap().nlink;
+        assert_eq!(table.evict_unreferenced(10, true), 1);
+        assert!(table.get(dir_ino).is_none());
+        // POSIX: evicting a subdirectory drops the parent's ".." nlink.
+        assert_eq!(table.get(ROOT_INODE).unwrap().nlink, root_nlink_before - 1);
+    }
+
+    #[test]
+    fn test_evict_unreferenced_marks_parent_children_unloaded() {
+        let mut table = InodeTable::new();
+        let f = mk_file(&mut table, "f.txt");
+        table.get_mut(ROOT_INODE).unwrap().children_loaded = true;
+        table.evict_unreferenced(10, false);
+        assert!(table.get(f).is_none());
+        assert!(
+            !table.get(ROOT_INODE).unwrap().children_loaded,
+            "parent must re-fetch since we pulled a child from under it"
+        );
+    }
+
+    #[test]
+    fn test_evict_unreferenced_picks_oldest_first() {
+        let mut table = InodeTable::new();
+        table.enable_lru(100);
+        let oldest = mk_file(&mut table, "old.txt");
+        let middle = mk_file(&mut table, "mid.txt");
+        let newest = mk_file(&mut table, "new.txt");
+        // Re-touch middle and newest to make them fresher than `oldest`.
+        table.touch(middle);
+        table.touch(newest);
+
+        assert_eq!(table.evict_unreferenced(1, false), 1);
+        assert!(table.get(oldest).is_none(), "oldest evicted first");
+        assert!(table.get(middle).is_some());
+        assert!(table.get(newest).is_some());
+    }
+
+    #[test]
+    fn test_evict_unreferenced_max_zero_is_noop() {
+        let mut table = InodeTable::new();
+        let f = mk_file(&mut table, "f.txt");
+        assert_eq!(table.evict_unreferenced(0, true), 0);
+        assert!(table.get(f).is_some());
+    }
+
+    // ── insert-time eviction gating ─────────────────────────────────
+
+    #[test]
+    fn test_insert_below_trigger_does_not_evict() {
+        // cap=100, trigger = 100 + EVICT_TRIGGER_OVERAGE. Below that, no evict.
+        let mut table = mk_table_with_soft_limit(100);
+        for i in 0..150 {
+            mk_file(&mut table, &format!("f{i}.txt"));
+        }
+        // 150 is < 100 + EVICT_TRIGGER_OVERAGE (256), so nothing was evicted yet.
+        assert_eq!(table.len(), 1 + 150, "no evict below trigger");
+    }
+
+    #[test]
+    fn test_insert_above_trigger_evicts_polite() {
+        // cap=100, all entries with nlookup==0 → polite can evict.
+        let mut table = mk_table_with_soft_limit(100);
+        let trigger = 100 + EVICT_TRIGGER_OVERAGE;
+        for i in 0..(trigger + 5) {
+            mk_file(&mut table, &format!("f{i}.txt"));
+        }
+        assert!(
+            table.len() <= 100,
+            "crossing the trigger must bring us back under soft_limit (got {})",
+            table.len()
+        );
+    }
+
+    #[test]
+    fn test_insert_force_evicts_above_hard_ceiling() {
+        // cap=100, all entries nlookup>0 → polite evicts nothing. The
+        // insert-time gate first triggers at len >= cap + EVICT_TRIGGER_OVERAGE,
+        // and force only fires once len > cap * HARD_CEILING_MULTIPLIER (200).
+        // Since trigger (356) is above hard ceiling (200), every time the
+        // gate fires we're already in force territory and the table
+        // collapses back near the target (90% of cap).
+        let cap = 100;
+        let trigger = cap + EVICT_TRIGGER_OVERAGE;
+        let mut table = mk_table_with_soft_limit(cap);
+        for i in 0..(trigger + 50) {
+            let ino = mk_file(&mut table, &format!("f{i}.txt"));
+            table.bump_nlookup(ino);
+        }
+        // After force fires, table drops to target (~90). Further inserts
+        // accumulate until the gate fires again. End state: somewhere
+        // between target and trigger, never above `trigger` by more than
+        // a handful (because insert-then-check is tight).
+        assert!(
+            table.len() < trigger + 5,
+            "force-evict must bind table below gate (got {} vs trigger={})",
+            table.len(),
+            trigger
+        );
+    }
+
+    #[test]
+    fn test_enable_lru_gates_touch() {
+        // touch() is a no-op when LRU is disabled (soft_limit==0), so the
+        // hot path stays cheap in the common case.
+        let mut table = InodeTable::new();
+        let f = mk_file(&mut table, "f.txt");
+        let before = table.get(f).unwrap().last_touched.load(Ordering::Relaxed);
+        table.touch(f);
+        let after = table.get(f).unwrap().last_touched.load(Ordering::Relaxed);
+        assert_eq!(before, after, "touch without enable_lru must be a no-op");
+
+        table.enable_lru(100);
+        table.touch(f);
+        assert_ne!(
+            table.get(f).unwrap().last_touched.load(Ordering::Relaxed),
+            after,
+            "touch after enable_lru must bump last_touched"
+        );
+    }
+
+    // ── evict_pending (deferred eviction on close) ──────────────────
+
+    #[test]
+    fn test_evict_pending_flag_toggle() {
+        let mut table = InodeTable::new();
+        let f = mk_file(&mut table, "f.txt");
+        assert!(!table.take_evict_pending(f), "flag starts false");
+        table.mark_evict_pending(f);
+        assert!(table.take_evict_pending(f), "flag now true");
+        assert!(!table.take_evict_pending(f), "take() clears the flag");
+    }
+
+    #[test]
+    fn test_evict_pending_unknown_inode() {
+        let mut table = InodeTable::new();
+        table.mark_evict_pending(9999); // no-op, must not panic
+        assert!(!table.take_evict_pending(9999));
+    }
+
+    // ── pinned flag ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_pinned_entry_never_evicted_even_under_force() {
+        let mut table = InodeTable::new();
+        let pinned = mk_file(&mut table, "local.txt");
+        table.set_pinned(pinned, true);
+
+        assert_eq!(table.evict_unreferenced(10, true), 0);
+        assert!(table.get(pinned).is_some(), "pinned must survive force");
+    }
+
+    #[test]
+    fn test_pin_then_unpin_restores_eviction() {
+        let mut table = InodeTable::new();
+        let ino = mk_file(&mut table, "f.txt");
+        table.set_pinned(ino, true);
+        assert_eq!(table.evict_unreferenced(10, true), 0);
+        table.set_pinned(ino, false);
+        assert_eq!(table.evict_unreferenced(10, true), 1);
+    }
+
+    #[test]
+    fn test_pin_root_always_honored() {
+        // Root is pinned at construction. Even if a buggy caller unpins it,
+        // evict_unreferenced still bails because of the explicit ROOT_INODE
+        // check (defence in depth).
+        let mut table = InodeTable::new();
+        table.set_pinned(ROOT_INODE, false);
+        let _ = mk_file(&mut table, "f.txt");
+        assert_eq!(table.evict_unreferenced(10, true), 1);
+        assert!(table.get(ROOT_INODE).is_some());
+    }
+
+    // ── open handle checker ────────────────────────────────────────
+
+    #[test]
+    fn test_open_handle_checker_protects_inode_from_force() {
+        use std::sync::atomic::{AtomicU64 as Au64, Ordering as O};
+        let mut table = InodeTable::new();
+        let busy = mk_file(&mut table, "busy.txt");
+        let _idle = mk_file(&mut table, "idle.txt");
+
+        let busy_shared = std::sync::Arc::new(Au64::new(busy));
+        let b = busy_shared.clone();
+        table.set_open_handle_checker(Box::new(move |ino| ino == b.load(O::Relaxed)));
+
+        // Force mode: should evict idle but skip busy.
+        assert_eq!(table.evict_unreferenced(10, true), 1);
+        assert!(table.get(busy).is_some(), "inode with open handle must survive force");
+    }
+
+    // ── polite_exhausted cache ──────────────────────────────────────
+
+    #[test]
+    fn test_polite_exhausted_set_when_no_candidates() {
+        let mut table = InodeTable::new();
+        let held = mk_file(&mut table, "held.txt");
+        table.bump_nlookup(held);
+        assert!(!table.polite_exhausted(), "starts false");
+
+        assert_eq!(table.evict_unreferenced(10, false), 0);
+        assert!(table.polite_exhausted(), "no nlookup==0 candidates → set");
+    }
+
+    #[test]
+    fn test_polite_exhausted_cleared_on_drop_nlookup_to_zero() {
+        let mut table = InodeTable::new();
+        let held = mk_file(&mut table, "held.txt");
+        table.bump_nlookup(held);
+        assert_eq!(table.evict_unreferenced(10, false), 0);
+        assert!(table.polite_exhausted());
+
+        // Simulate a forget that brings the entry back to nlookup==0.
+        assert!(table.drop_nlookup(held, 1));
+        assert!(!table.polite_exhausted(), "drop_nlookup clears the cache");
+    }
+
+    #[test]
+    fn test_polite_exhausted_not_set_when_candidates_existed() {
+        let mut table = InodeTable::new();
+        let _evictable = mk_file(&mut table, "evictable.txt");
+        assert_eq!(table.evict_unreferenced(10, false), 1);
+        assert!(
+            !table.polite_exhausted(),
+            "polite found candidates, cache stays clear"
+        );
+    }
+
+    #[test]
+    fn test_force_mode_does_not_set_polite_exhausted() {
+        // Force mode is a separate signal — it shouldn't poison the cache.
+        let mut table = InodeTable::new();
+        let held = mk_file(&mut table, "held.txt");
+        table.bump_nlookup(held);
+        assert_eq!(table.evict_unreferenced(10, true), 1);
+        assert!(
+            !table.polite_exhausted(),
+            "force pass must not touch the polite cache"
+        );
     }
 }
