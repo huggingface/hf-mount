@@ -272,28 +272,38 @@ async fn test_xfstests_generic() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    // Parse "Failed X of Y tests" line for reliable pass/fail counts.
+    // xfstests prints either "Passed all N tests" (everything green) or
+    // "Failed X of Y tests" + "Failures: ..." (otherwise).
+    let passed_all_line = combined.lines().find(|l| l.starts_with("Passed all"));
     let failed_line = combined
         .lines()
         .find(|l| l.starts_with("Failed"))
         .unwrap_or("Failed 0 of 0 tests");
     let failures_line = combined.lines().find(|l| l.starts_with("Failures:")).unwrap_or("");
 
-    // Extract passed = total - failed from "Failed X of Y tests"
-    let (failed_count, total_count) = {
+    let passed_count = if let Some(line) = passed_all_line {
+        // "Passed all 588 tests"
+        line.split_whitespace()
+            .nth(2)
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(0)
+    } else {
         let parts: Vec<&str> = failed_line.split_whitespace().collect();
         let failed = parts.get(1).and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
         let total = parts.get(3).and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
-        (failed, total)
+        total.saturating_sub(failed)
     };
-    let passed_count = total_count.saturating_sub(failed_count);
 
     eprintln!("\n============================================================");
     eprintln!("  xfstests generic/quick Results");
     eprintln!("------------------------------------------------------------");
-    eprintln!("  {}", failed_line);
-    if !failures_line.is_empty() {
-        eprintln!("  {}", failures_line);
+    if let Some(line) = passed_all_line {
+        eprintln!("  {}", line);
+    } else {
+        eprintln!("  {}", failed_line);
+        if !failures_line.is_empty() {
+            eprintln!("  {}", failures_line);
+        }
     }
     eprintln!("============================================================");
 
