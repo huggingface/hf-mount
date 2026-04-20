@@ -11,6 +11,7 @@ use xet_data::processing::XetFileInfo;
 
 use crate::error::{Error, Result};
 use crate::hub_api::{BatchOp, HeadFileInfo, HubOps, SourceKind, TreeEntry};
+use crate::overlay::OverlayBacking;
 use crate::xet::{DownloadStreamOps, StagingDir, StreamingWriterOps, XetOps};
 
 // ── MockHub ───────────────────────────────────────────────────────────
@@ -436,6 +437,7 @@ impl DownloadStreamOps for MockDownloadStream {
 pub struct TestOpts {
     pub read_only: bool,
     pub advanced_writes: bool,
+    pub overlay: bool,
     pub serve_lookup_from_cache: bool,
     pub metadata_ttl: Duration,
 }
@@ -445,8 +447,39 @@ impl Default for TestOpts {
         Self {
             read_only: false,
             advanced_writes: false,
+            overlay: false,
             serve_lookup_from_cache: false,
             metadata_ttl: Duration::from_secs(1),
+        }
+    }
+}
+
+/// Return value from `make_overlay_test_vfs_with_root`.
+/// Includes the overlay root path so tests can pre-populate or inspect local files.
+pub struct OverlayTestVfs {
+    pub runtime: tokio::runtime::Runtime,
+    pub vfs: Arc<crate::virtual_fs::VirtualFs>,
+    pub overlay_root: std::path::PathBuf,
+}
+
+fn fresh_test_dir(prefix: &str) -> std::path::PathBuf {
+    static TEST_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    loop {
+        let unique_suffix = format!(
+            "{}_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time before unix epoch")
+                .as_nanos(),
+            TEST_DIR_COUNTER.fetch_add(1, Ordering::Relaxed)
+        );
+        let path = std::env::temp_dir().join(format!("{prefix}_{unique_suffix}"));
+        match std::fs::create_dir(&path) {
+            Ok(()) => return path,
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => panic!("failed to create temp test dir: {err}"),
         }
     }
 }
@@ -459,11 +492,20 @@ pub fn make_test_vfs(
     opts: TestOpts,
     runtime: &tokio::runtime::Runtime,
 ) -> Arc<crate::virtual_fs::VirtualFs> {
+    let effective_advanced_writes = opts.advanced_writes || opts.overlay;
+
+    let overlay_backing = if opts.overlay {
+        let overlay_root = fresh_test_dir("hf_mount_overlay");
+        let fd = std::fs::File::open(&overlay_root).expect("failed to open overlay root dir");
+        Some(OverlayBacking::new(fd))
+    } else {
+        None
+    };
+
     // Repos need a staging dir for HTTP download cache (open_readonly),
     // even when advanced_writes is disabled (mirrors setup.rs logic).
-    let staging_dir = if opts.advanced_writes || hub.is_repo() {
-        let path = std::env::temp_dir().join(format!("hf_mount_test_{}", std::process::id()));
-        std::fs::create_dir_all(&path).expect("failed to create temp staging dir");
+    let staging_dir = if effective_advanced_writes || hub.is_repo() {
+        let path = fresh_test_dir("hf_mount_test");
         Some(StagingDir::new(&path))
     } else {
         None
@@ -474,9 +516,11 @@ pub fn make_test_vfs(
         hub,
         xet,
         staging_dir,
+        overlay_backing,
         crate::virtual_fs::VfsConfig {
             read_only: opts.read_only,
             advanced_writes: opts.advanced_writes,
+            overlay: opts.overlay,
             uid: 1000,
             gid: 1000,
             poll_interval_secs: 0,
@@ -488,4 +532,49 @@ pub fn make_test_vfs(
             flush_max_batch_window: Duration::from_secs(1),
         },
     )
+}
+
+/// Build a VFS with overlay mode for testing. The given `overlay_root`
+/// is used as the overlay directory, allowing tests to pre-populate
+/// files before VFS creation.
+pub fn make_overlay_test_vfs_with_root(
+    hub: Arc<MockHub>,
+    xet: Arc<MockXet>,
+    overlay_root: std::path::PathBuf,
+) -> OverlayTestVfs {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let cache_dir = fresh_test_dir("hf_mount_test");
+    let fd = std::fs::File::open(&overlay_root).expect("failed to open overlay root dir");
+    let staging_dir = Some(StagingDir::new(&cache_dir));
+    let overlay_backing = Some(OverlayBacking::new(fd));
+
+    let vfs = crate::virtual_fs::VirtualFs::new(
+        rt.handle().clone(),
+        hub,
+        xet,
+        staging_dir,
+        overlay_backing,
+        crate::virtual_fs::VfsConfig {
+            read_only: false,
+            advanced_writes: false,
+            overlay: true,
+            uid: 1000,
+            gid: 1000,
+            poll_interval_secs: 0,
+            metadata_ttl: Duration::from_secs(1),
+            serve_lookup_from_cache: false,
+            filter_os_files: true,
+            direct_io: false,
+            flush_debounce: Duration::from_millis(100),
+            flush_max_batch_window: Duration::from_secs(1),
+        },
+    );
+    OverlayTestVfs {
+        runtime: rt,
+        vfs,
+        overlay_root,
+    }
 }

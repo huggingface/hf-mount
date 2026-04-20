@@ -34,7 +34,7 @@ pub(crate) struct FlushManager {
 impl FlushManager {
     pub(crate) fn new(
         xet_sessions: Arc<dyn XetOps>,
-        staging_dir: StagingDir,
+        staging_dir: Arc<StagingDir>,
         hub_client: Arc<dyn HubOps>,
         inodes: Arc<RwLock<InodeTable>>,
         runtime: &tokio::runtime::Handle,
@@ -166,7 +166,7 @@ fn run_blocking<F: FnOnce()>(f: F) {
 async fn flush_loop(
     mut rx: mpsc::UnboundedReceiver<FlushSignal>,
     xet_sessions: Arc<dyn XetOps>,
-    staging_dir: StagingDir,
+    staging_dir: Arc<StagingDir>,
     hub_client: Arc<dyn HubOps>,
     inodes: Arc<RwLock<InodeTable>>,
     flush_errors: Arc<Mutex<HashMap<u64, String>>>,
