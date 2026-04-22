@@ -388,8 +388,24 @@ impl InodeTable {
             }
             // Leaf-only for dirs: evicting a dir that still has children in
             // our table would orphan them. Files are leaves.
+            //
+            // NOTE: empty directories are evictable, including ones the user
+            // just created via `mkdir`. The Hub has no representation for a
+            // dir with no children, so an evicted empty `mkdir` can't be
+            // re-materialized via re-lookup — it's lost. Trade-off accepted:
+            // populated dirs are protected by the non-empty rule above, and
+            // once any child file has been flushed the dir becomes
+            // reconstructible from the Hub listing. Orphaned empty mkdirs
+            // are rare and the user can retry.
             if e.kind == InodeKind::Directory && !e.children.is_empty() {
                 continue;
+            }
+            if e.kind == InodeKind::Directory {
+                tracing::debug!(
+                    ino = e.inode,
+                    path = %e.full_path,
+                    "evicting empty directory (will be lost if user-created and never populated)"
+                );
             }
             if e.eviction.nlookup.load(Ordering::Relaxed) == 0 {
                 polite_candidates_found += 1;
