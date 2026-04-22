@@ -58,11 +58,6 @@ pub struct EvictionState {
     /// isn't pinned forever (the kernel has already given up on it and
     /// won't send another `forget`).
     pub evict_pending: AtomicBool,
-    /// True for entries that don't exist on the remote (local `mkdir`,
-    /// `symlink`, or freshly-`create`d files before their first flush).
-    /// Evicting one would lose user data because a re-lookup can't
-    /// reconstruct it from the Hub. Flush clears the pin.
-    pub pinned: AtomicBool,
     /// Number of live FUSE file handles referencing this inode. Bumped by
     /// `open`/`create`, dropped by `release`. Eviction refuses any entry
     /// with `open_handles > 0` — a racing read/write would silently lose
@@ -76,7 +71,6 @@ impl Clone for EvictionState {
             nlookup: AtomicU64::new(self.nlookup.load(Ordering::Relaxed)),
             last_touched: AtomicU64::new(self.last_touched.load(Ordering::Relaxed)),
             evict_pending: AtomicBool::new(self.evict_pending.load(Ordering::Relaxed)),
-            pinned: AtomicBool::new(self.pinned.load(Ordering::Relaxed)),
             open_handles: AtomicU32::new(self.open_handles.load(Ordering::Relaxed)),
         }
     }
@@ -248,11 +242,7 @@ impl InodeTable {
             children: Vec::new(),
             pending_deletes: Vec::new(),
             last_revalidated: None,
-            // Root is always pinned — evicting it would break the entire tree.
-            eviction: EvictionState {
-                pinned: AtomicBool::new(true),
-                ..Default::default()
-            },
+            eviction: EvictionState::default(),
         };
         table.inodes.insert(ROOT_INODE, root);
         table.path_to_inode.insert(root_path, ROOT_INODE);
@@ -293,16 +283,6 @@ impl InodeTable {
             self.polite_exhausted.store(false, Ordering::Relaxed);
         }
         reached_zero
-    }
-
-    /// Mark an inode as "pinned" — never evictable regardless of mode.
-    /// Used for entries that exist only in memory (local mkdir/symlink,
-    /// freshly created files before flush). Cleared after a successful
-    /// remote flush / upload.
-    pub(crate) fn set_pinned(&self, inode: u64, pinned: bool) {
-        if let Some(entry) = self.inodes.get(&inode) {
-            entry.eviction.pinned.store(pinned, Ordering::Relaxed);
-        }
     }
 
     /// Bump the per-inode open-handle refcount. Called on every `open` /
@@ -397,7 +377,9 @@ impl InodeTable {
                 || e.nlink == 0
                 || e.is_dirty()
                 || !e.pending_deletes.is_empty()
-                || e.eviction.pinned.load(Ordering::Relaxed)
+                // Symlinks live only in this entry (no Hub representation);
+                // evicting them loses the target.
+                || e.kind == InodeKind::Symlink
                 // Never drop an inode with a live FUSE handle: a racing
                 // write() would see ENOENT and silently lose dirty state.
                 || e.eviction.open_handles.load(Ordering::Relaxed) > 0
@@ -405,7 +387,7 @@ impl InodeTable {
                 continue;
             }
             // Leaf-only for dirs: evicting a dir that still has children in
-            // our table would orphan them. Files and symlinks are leaves.
+            // our table would orphan them. Files are leaves.
             if e.kind == InodeKind::Directory && !e.children.is_empty() {
                 continue;
             }
@@ -2273,7 +2255,9 @@ mod tests {
     }
 
     #[test]
-    fn test_evict_unreferenced_drops_symlinks() {
+    fn test_evict_unreferenced_keeps_symlinks() {
+        // Symlinks are local-only (no Hub representation) so eviction
+        // must refuse them under both polite and force modes.
         let mut table = InodeTable::new();
         let sym = table.insert(
             ROOT_INODE,
@@ -2287,8 +2271,9 @@ mod tests {
             0,
             0,
         );
-        assert_eq!(table.evict_unreferenced(10, false), 1);
-        assert!(table.get(sym).is_none());
+        assert_eq!(table.evict_unreferenced(10, false), 0);
+        assert_eq!(table.evict_unreferenced(10, true), 0);
+        assert!(table.get(sym).is_some());
     }
 
     #[test]
@@ -2482,38 +2467,35 @@ mod tests {
         assert!(!table.take_evict_pending(9999));
     }
 
-    // ── pinned flag ─────────────────────────────────────────────────
+    // ── root / symlink: never evictable ─────────────────────────────
 
     #[test]
-    fn test_pinned_entry_never_evicted_even_under_force() {
+    fn test_root_never_evicted_even_under_force() {
         let mut table = InodeTable::new();
-        let pinned = mk_file(&mut table, "local.txt");
-        table.set_pinned(pinned, true);
-
-        assert_eq!(table.evict_unreferenced(10, true), 0);
-        assert!(table.get(pinned).is_some(), "pinned must survive force");
-    }
-
-    #[test]
-    fn test_pin_then_unpin_restores_eviction() {
-        let mut table = InodeTable::new();
-        let ino = mk_file(&mut table, "f.txt");
-        table.set_pinned(ino, true);
-        assert_eq!(table.evict_unreferenced(10, true), 0);
-        table.set_pinned(ino, false);
-        assert_eq!(table.evict_unreferenced(10, true), 1);
-    }
-
-    #[test]
-    fn test_pin_root_always_honored() {
-        // Root is pinned at construction. Even if a buggy caller unpins it,
-        // evict_unreferenced still bails because of the explicit ROOT_INODE
-        // check (defence in depth).
-        let mut table = InodeTable::new();
-        table.set_pinned(ROOT_INODE, false);
         let _ = mk_file(&mut table, "f.txt");
         assert_eq!(table.evict_unreferenced(10, true), 1);
-        assert!(table.get(ROOT_INODE).is_some());
+        assert!(table.get(ROOT_INODE).is_some(), "root must never be evicted");
+    }
+
+    #[test]
+    fn test_symlink_never_evicted_even_under_force() {
+        // Symlinks live only in the inode (no Hub representation), so
+        // evicting them would lose the target irrecoverably.
+        let mut table = InodeTable::new();
+        let sym = table.insert(
+            ROOT_INODE,
+            "link".to_string(),
+            "link".to_string(),
+            InodeKind::Symlink,
+            0,
+            UNIX_EPOCH,
+            None,
+            0o777,
+            0,
+            0,
+        );
+        assert_eq!(table.evict_unreferenced(10, true), 0);
+        assert!(table.get(sym).is_some(), "symlink must survive force");
     }
 
     // ── open handles refcount ──────────────────────────────────────

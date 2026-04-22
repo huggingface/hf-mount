@@ -2116,11 +2116,6 @@ impl VirtualFs {
             if let Some(entry) = inodes.get_mut(ino) {
                 entry.children_loaded = true;
             }
-            // Pin: a local mkdir is not persisted to the Hub, so evicting
-            // it would lose the user's directory permanently. Unpinning
-            // only makes sense once the dir gets a remote representation
-            // (e.g. via a flush of a child file) — for now keep pinned.
-            inodes.set_pinned(ino, true);
             // nlink already incremented by insert()
             inodes.touch_parent(parent, now);
             (ino, full_path)
@@ -2256,10 +2251,6 @@ impl VirtualFs {
             if let Some(entry) = inodes.get_mut(ino) {
                 entry.symlink_target = Some(target.to_string());
             }
-            // Pin: the symlink target lives only in this entry — evicting
-            // would lose the link because a re-lookup can't reconstruct it
-            // from the Hub (no remote representation for local symlinks).
-            inodes.set_pinned(ino, true);
             inodes.touch_parent(parent, now);
             (ino, full_path)
         };
