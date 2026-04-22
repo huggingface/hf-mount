@@ -14,7 +14,6 @@ impl super::VirtualFs {
     pub(super) async fn poll_remote_changes(
         hub_client: Arc<dyn HubOps>,
         inodes: Arc<RwLock<InodeTable>>,
-        open_files: Arc<RwLock<HashMap<u64, super::OpenFile>>>,
         negative_cache: Arc<RwLock<HashMap<String, Instant>>>,
         invalidator: Invalidator,
         interval: Duration,
@@ -60,14 +59,7 @@ impl super::VirtualFs {
                     }
                 }
             }
-            Self::apply_poll_diff(
-                all_entries,
-                &polled_prefixes,
-                &inodes,
-                &open_files,
-                &negative_cache,
-                &invalidator,
-            );
+            Self::apply_poll_diff(all_entries, &polled_prefixes, &inodes, &negative_cache, &invalidator);
         }
     }
 
@@ -82,7 +74,6 @@ impl super::VirtualFs {
         remote_entries: Vec<crate::hub_api::TreeEntry>,
         polled_prefixes: &HashSet<String>,
         inodes: &Arc<RwLock<InodeTable>>,
-        _open_files: &Arc<RwLock<HashMap<u64, super::OpenFile>>>,
         negative_cache: &Arc<RwLock<HashMap<String, Instant>>>,
         invalidator: &Invalidator,
     ) {

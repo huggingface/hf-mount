@@ -181,7 +181,6 @@ impl VirtualFs {
         let poll_handle = if config.poll_interval_secs > 0 {
             let bg_hub = hub_client.clone();
             let bg_inodes = inodes.clone();
-            let bg_open_files = open_files.clone();
             let bg_neg_cache = negative_cache.clone();
             let bg_invalidator = invalidator.clone();
             let interval = Duration::from_secs(config.poll_interval_secs);
@@ -189,7 +188,6 @@ impl VirtualFs {
             Some(runtime.spawn(Self::poll_remote_changes(
                 bg_hub,
                 bg_inodes,
-                bg_open_files,
                 bg_neg_cache,
                 bg_invalidator,
                 interval,

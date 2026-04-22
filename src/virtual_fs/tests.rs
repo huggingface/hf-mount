@@ -2121,14 +2121,7 @@ fn poll_skips_unloaded_directories() {
             remote.extend(hub.list_tree(prefix).await.unwrap());
         }
         let polled: std::collections::HashSet<String> = prefixes.into_iter().collect();
-        VirtualFs::apply_poll_diff(
-            remote,
-            &polled,
-            &vfs.inode_table,
-            &vfs.open_files,
-            &vfs.negative_cache,
-            &vfs.invalidator,
-        );
+        VirtualFs::apply_poll_diff(remote, &polled, &vfs.inode_table, &vfs.negative_cache, &vfs.invalidator);
 
         // Dir "a" should still NOT have children_loaded set (unchanged).
         // Root should still be loaded (not invalidated).
@@ -2168,14 +2161,7 @@ fn poll_invalidates_loaded_dir_with_new_file() {
             remote.extend(hub.list_tree(prefix).await.unwrap());
         }
         let polled: std::collections::HashSet<String> = prefixes.into_iter().collect();
-        VirtualFs::apply_poll_diff(
-            remote,
-            &polled,
-            &vfs.inode_table,
-            &vfs.open_files,
-            &vfs.negative_cache,
-            &vfs.invalidator,
-        );
+        VirtualFs::apply_poll_diff(remote, &polled, &vfs.inode_table, &vfs.negative_cache, &vfs.invalidator);
 
         // Root should be invalidated because it's loaded and has a new file.
         assert!(
@@ -2207,14 +2193,7 @@ fn poll_detects_file_update_in_loaded_dir() {
             remote.extend(hub.list_tree(prefix).await.unwrap());
         }
         let polled: std::collections::HashSet<String> = prefixes.into_iter().collect();
-        VirtualFs::apply_poll_diff(
-            remote,
-            &polled,
-            &vfs.inode_table,
-            &vfs.open_files,
-            &vfs.negative_cache,
-            &vfs.invalidator,
-        );
+        VirtualFs::apply_poll_diff(remote, &polled, &vfs.inode_table, &vfs.negative_cache, &vfs.invalidator);
 
         let inodes = vfs.inode_table.read().unwrap();
         let entry = inodes.get(ino).unwrap();
@@ -2245,14 +2224,7 @@ fn poll_detects_file_deletion_in_loaded_dir() {
             remote.extend(hub.list_tree(prefix).await.unwrap());
         }
         let polled: std::collections::HashSet<String> = prefixes.into_iter().collect();
-        VirtualFs::apply_poll_diff(
-            remote,
-            &polled,
-            &vfs.inode_table,
-            &vfs.open_files,
-            &vfs.negative_cache,
-            &vfs.invalidator,
-        );
+        VirtualFs::apply_poll_diff(remote, &polled, &vfs.inode_table, &vfs.negative_cache, &vfs.invalidator);
 
         // ephemeral.txt should be gone, keeper.txt should remain.
         assert_eq!(vfs.lookup(ROOT_INODE, "ephemeral.txt").await.unwrap_err(), libc::ENOENT);
@@ -2286,14 +2258,7 @@ fn poll_skips_deletion_with_open_handles() {
             remote.extend(hub.list_tree(prefix).await.unwrap());
         }
         let polled: std::collections::HashSet<String> = prefixes.into_iter().collect();
-        VirtualFs::apply_poll_diff(
-            remote,
-            &polled,
-            &vfs.inode_table,
-            &vfs.open_files,
-            &vfs.negative_cache,
-            &vfs.invalidator,
-        );
+        VirtualFs::apply_poll_diff(remote, &polled, &vfs.inode_table, &vfs.negative_cache, &vfs.invalidator);
 
         // closed.txt should be deleted (no open handles)
         assert_eq!(vfs.lookup(ROOT_INODE, "closed.txt").await.unwrap_err(), libc::ENOENT);
@@ -2353,14 +2318,7 @@ fn poll_multiple_loaded_dirs() {
             remote.extend(hub.list_tree(prefix).await.unwrap());
         }
         let polled: std::collections::HashSet<String> = prefixes.into_iter().collect();
-        VirtualFs::apply_poll_diff(
-            remote,
-            &polled,
-            &vfs.inode_table,
-            &vfs.open_files,
-            &vfs.negative_cache,
-            &vfs.invalidator,
-        );
+        VirtualFs::apply_poll_diff(remote, &polled, &vfs.inode_table, &vfs.negative_cache, &vfs.invalidator);
 
         // sub/nested.txt should be updated.
         let nested_ino = vfs.lookup(sub.ino, "nested.txt").await.unwrap().ino;
@@ -2393,7 +2351,6 @@ fn poll_failed_prefix_no_spurious_deletion() {
             root_entries,
             &polled,
             &vfs.inode_table,
-            &vfs.open_files,
             &vfs.negative_cache,
             &vfs.invalidator,
         );
@@ -2424,14 +2381,7 @@ fn poll_after_invalidation_no_spurious_deletion() {
             remote.extend(hub.list_tree(prefix).await.unwrap());
         }
         let polled: std::collections::HashSet<String> = prefixes.into_iter().collect();
-        VirtualFs::apply_poll_diff(
-            remote,
-            &polled,
-            &vfs.inode_table,
-            &vfs.open_files,
-            &vfs.negative_cache,
-            &vfs.invalidator,
-        );
+        VirtualFs::apply_poll_diff(remote, &polled, &vfs.inode_table, &vfs.negative_cache, &vfs.invalidator);
 
         // Root is now invalidated (children_loaded=false).
         // Second poll: root is NOT in loaded_dir_prefixes anymore.
@@ -2445,7 +2395,6 @@ fn poll_after_invalidation_no_spurious_deletion() {
             remote2,
             &polled2,
             &vfs.inode_table,
-            &vfs.open_files,
             &vfs.negative_cache,
             &vfs.invalidator,
         );
@@ -2489,7 +2438,6 @@ fn poll_detects_deleted_subdirectory() {
             root_entries,
             &polled,
             &vfs.inode_table,
-            &vfs.open_files,
             &vfs.negative_cache,
             &vfs.invalidator,
         );
