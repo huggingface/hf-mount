@@ -648,6 +648,19 @@ pub fn mount_fuse(
         };
     }
 
+    // `--force-fusermount`: skip the direct `open("/dev/fuse") + mount(2)`
+    // path and go through the setuid `fusermount` helper instead. fuser
+    // special-cases `AutoUnmount` to always take the fusermount path, so
+    // we just piggy-back on that. `clone_fd` is also disabled because it
+    // re-opens `/dev/fuse` under the hood — the same thing we're avoiding.
+    // Scoped to Linux because `fusermount` is a Linux concept (macOS uses
+    // macFUSE's own mount helper via `mount(2)`).
+    #[cfg(target_os = "linux")]
+    if setup.force_fusermount && fuse_fds.is_empty() {
+        config.mount_options.push(fuser::MountOption::AutoUnmount);
+        config.clone_fd = false;
+    }
+
     let session = if fuse_fds.is_empty() {
         fuser::Session::new(adapter, mount_point, &config).inspect_err(|e| {
             if e.kind() == io::ErrorKind::PermissionDenied {

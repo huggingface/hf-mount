@@ -164,6 +164,15 @@ pub struct MountOptions {
     /// when `--inode-soft-limit > 0`.
     #[arg(long, default_value_t = 5_000)]
     pub lru_sweep_interval_ms: u64,
+
+    /// Perform the FUSE mount via the setuid `fusermount` helper instead
+    /// of the direct `mount(2)` syscall (FUSE only, Linux only). Useful
+    /// in unprivileged containers where `/dev/fuse` isn't directly
+    /// accessible but a (possibly proxied) `fusermount` is. Implies
+    /// auto-unmount semantics: the mount is cleaned up when this
+    /// process exits.
+    #[arg(long, default_value_t = false)]
+    pub force_fusermount: bool,
 }
 
 /// CLI args for the foreground FUSE/NFS binaries.
@@ -193,6 +202,7 @@ pub struct MountSetup {
     pub max_threads: usize,
     pub metadata_ttl_ms: u64,
     pub fuse_owner_only: bool,
+    pub force_fusermount: bool,
 }
 
 // ── Tracing + env vars (no threads) ──────────────────────────────────
@@ -459,6 +469,7 @@ pub fn build_with_runtime(
         max_threads: options.max_threads,
         metadata_ttl_ms: options.metadata_ttl_ms,
         fuse_owner_only: options.fuse_owner_only,
+        force_fusermount: options.force_fusermount,
     }
 }
 
