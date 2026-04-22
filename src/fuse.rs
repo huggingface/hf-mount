@@ -595,6 +595,19 @@ pub fn mount_fuse(
         config.n_threads = Some(setup.max_threads);
     }
 
+    // `--force-fusermount`: skip the direct `open("/dev/fuse") + mount(2)`
+    // path and go through the setuid `fusermount` helper instead. fuser
+    // special-cases `AutoUnmount` to always take the fusermount path, so
+    // we just piggy-back on that. `clone_fd` is also disabled because it
+    // re-opens `/dev/fuse` under the hood — the same thing we're avoiding.
+    // Scoped to Linux because `fusermount` is a Linux concept (macOS uses
+    // macFUSE's own mount helper via `mount(2)`).
+    #[cfg(target_os = "linux")]
+    if setup.force_fusermount && fuse_fd.is_none() {
+        config.mount_options.push(fuser::MountOption::AutoUnmount);
+        config.clone_fd = false;
+    }
+
     let session = if let Some(owned_fd) = fuse_fd {
         info!("Using pre-opened FUSE fd={:?}", owned_fd);
         fuser::Session::from_fd(adapter, owned_fd, config.acl, config)?
