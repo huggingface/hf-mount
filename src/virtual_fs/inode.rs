@@ -109,9 +109,7 @@ pub struct InodeEntry {
     pub inode: u64,
     pub parent: u64,
     pub name: String,
-    /// Full path from the mount root. Stored as `Arc<str>` so the same
-    /// allocation is shared between `InodeEntry.full_path` and the
-    /// `path_to_inode` HashMap key — cuts per-entry path storage in half.
+    /// Full path from the mount root.
     pub full_path: Arc<str>,
     pub kind: InodeKind,
     pub size: u64,
@@ -187,9 +185,8 @@ impl InodeEntry {
 
 pub struct InodeTable {
     inodes: HashMap<u64, InodeEntry>,
-    /// Path → inode lookup. The key is an `Arc<str>` that's cloned (cheap
-    /// refcount bump) from the matching `InodeEntry.full_path`, so the path
-    /// string is allocated exactly once per inode.
+    /// Path → inode reverse lookup. Key is shared with `InodeEntry.full_path`
+    /// (same `Arc`) so each path is allocated once.
     path_to_inode: HashMap<Arc<str>, u64>,
     next_inode: AtomicU64,
     /// Monotonic counter snapshotted into `InodeEntry.last_touched` — used
@@ -615,8 +612,6 @@ impl InodeTable {
         let inode = self.next_inode.fetch_add(1, Ordering::Relaxed);
         let touch_seq = self.touch_counter.fetch_add(1, Ordering::Relaxed);
         let child_name = name.clone();
-        // Allocate the path once; the InodeEntry and path_to_inode share the
-        // same Arc so the string is stored in memory exactly once per inode.
         let full_path_arc: Arc<str> = Arc::from(full_path);
         let entry = InodeEntry {
             inode,
@@ -778,14 +773,11 @@ impl InodeTable {
     /// Hard-linked inodes whose full_path doesn't match their expected position in the tree
     /// are skipped (they belong elsewhere and their canonical path must not be rewritten).
     pub fn update_subtree_paths(&mut self, inode: u64, new_full_path: String) {
-        // Remove old path mapping (&*Arc<str> borrows as &str for the HashMap).
         if let Some(entry) = self.inodes.get(&inode) {
             let old_path: Arc<str> = entry.full_path.clone();
             self.path_to_inode.remove(&*old_path);
         }
 
-        // Allocate the new path once and share its Arc between the entry and
-        // the path_to_inode key.
         let new_full_path_arc: Arc<str> = Arc::from(new_full_path.as_str());
         let children = if let Some(entry) = self.inodes.get_mut(&inode) {
             entry.full_path = new_full_path_arc.clone();
@@ -864,7 +856,6 @@ impl InodeTable {
             parent_entry.children.remove(pos);
         }
 
-        // Remove path mapping (HashMap<Arc<str>, _> borrows &str via Borrow).
         self.path_to_inode.remove(full_path.as_str());
 
         // Decrement nlink
