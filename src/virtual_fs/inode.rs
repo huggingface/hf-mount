@@ -1,6 +1,6 @@
 use std::collections::{BinaryHeap, HashMap};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicBool, AtomicUsize, AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 /// Callback that answers "does this inode have a live open file handle?"
@@ -46,7 +46,65 @@ pub struct DirChild {
     pub name: String,
 }
 
-#[derive(Debug)]
+/// Eviction-control bookkeeping. All atomics so the FUSE hot path can
+/// update them under a read lock on `InodeTable` — no writer contention
+/// on `lookup`/`getattr`/`forget`.
+#[derive(Debug, Default)]
+pub struct EvictionState {
+    /// Kernel lookup refcount (FUSE `nlookup`). Bumped on every
+    /// `reply.entry()` / `reply.created()`; dropped by the value the
+    /// kernel passes to `forget()`. `> 0` means the kernel still holds
+    /// a dentry — polite eviction must invalidate it first.
+    pub nlookup: AtomicU64,
+    /// Snapshot of `InodeTable.touch_counter` at last lookup/getattr.
+    /// LRU recency key — oldest values evict first.
+    pub last_touched: AtomicU64,
+    /// Set when `forget()` wanted to evict but an open handle blocked it.
+    /// Checked by `release()` after the last handle closes so the entry
+    /// isn't pinned forever (the kernel has already given up on it and
+    /// won't send another `forget`).
+    pub evict_pending: AtomicBool,
+    /// True for entries that don't exist on the remote (local `mkdir`,
+    /// `symlink`, or freshly-`create`d files before their first flush).
+    /// Evicting one would lose user data because a re-lookup can't
+    /// reconstruct it from the Hub. Flush clears the pin.
+    pub pinned: AtomicBool,
+}
+
+impl Clone for EvictionState {
+    fn clone(&self) -> Self {
+        Self {
+            nlookup: AtomicU64::new(self.nlookup.load(Ordering::Relaxed)),
+            last_touched: AtomicU64::new(self.last_touched.load(Ordering::Relaxed)),
+            evict_pending: AtomicBool::new(self.evict_pending.load(Ordering::Relaxed)),
+            pinned: AtomicBool::new(self.pinned.load(Ordering::Relaxed)),
+        }
+    }
+}
+
+impl EvictionState {
+    /// Bump the kernel lookup refcount. Relaxed is sufficient: the refcount
+    /// only gates eviction, which is guarded separately by the inode table's
+    /// write lock.
+    pub(crate) fn bump_nlookup(&self) {
+        self.nlookup.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Drop the kernel lookup refcount by `n`, saturating at 0. Returns true
+    /// if the refcount reached 0 (safe-to-evict).
+    pub(crate) fn drop_nlookup(&self, n: u64) -> bool {
+        let prev = self
+            .nlookup
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| Some(cur.saturating_sub(n)))
+            .expect("fetch_update closure always returns Some");
+        // A forget(n) larger than the current count is a kernel- or us-side
+        // protocol bug. Surface it in debug builds without crashing prod.
+        debug_assert!(n <= prev, "drop_nlookup({n}) exceeded current {prev}");
+        prev.saturating_sub(n) == 0
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct InodeEntry {
     pub inode: u64,
     pub parent: u64,
@@ -80,58 +138,8 @@ pub struct InodeEntry {
     /// When this inode's metadata was last validated against the remote (via HEAD).
     /// Used to avoid redundant HEAD requests within the revalidation TTL.
     pub last_revalidated: Option<Instant>,
-    /// Kernel lookup refcount (FUSE `nlookup`). Bumped on every `reply.entry()` /
-    /// `reply.created()`; dropped by the value the kernel passes to `forget()`.
-    /// Atomic so callers only need a shared lock on the inode table — keeps the
-    /// FUSE hot path off the writer queue. A future evictor MUST refuse to drop
-    /// any inode with `nlookup > 0`: the kernel still holds a dentry and a race
-    /// would corrupt subsequent getattr/read.
-    pub nlookup: AtomicU64,
-    /// Snapshot of `InodeTable.touch_counter` at last lookup/getattr.
-    /// Atomic so the FUSE hot path only needs a read lock on the table.
-    pub last_touched: AtomicU64,
-    /// Set when `forget()` wanted to evict but an open handle blocked it.
-    /// Checked by `release()` after the last handle closes so the entry
-    /// isn't pinned forever (the kernel has already given up on it and
-    /// won't send another `forget`).
-    pub evict_pending: AtomicBool,
-    /// True for entries that don't exist on the remote (local `mkdir`,
-    /// `symlink`, or freshly-`create`d files before their first flush).
-    /// Evicting one would lose user data because a re-lookup can't
-    /// reconstruct it from the Hub. Flush clears the pin.
-    pub pinned: AtomicBool,
-}
-
-impl Clone for InodeEntry {
-    fn clone(&self) -> Self {
-        Self {
-            inode:            self.inode,
-            parent:           self.parent,
-            name:             self.name.clone(),
-            full_path:        self.full_path.clone(),
-            kind:             self.kind,
-            size:             self.size,
-            mtime:            self.mtime,
-            mode:             self.mode,
-            uid:              self.uid,
-            gid:              self.gid,
-            atime:            self.atime,
-            ctime:            self.ctime,
-            nlink:            self.nlink,
-            symlink_target:   self.symlink_target.clone(),
-            xet_hash:         self.xet_hash.clone(),
-            etag:             self.etag.clone(),
-            dirty_generation: self.dirty_generation,
-            children_loaded:  self.children_loaded,
-            children:         self.children.clone(),
-            pending_deletes:  self.pending_deletes.clone(),
-            last_revalidated: self.last_revalidated,
-            nlookup:          AtomicU64::new(self.nlookup.load(Ordering::Relaxed)),
-            last_touched:     AtomicU64::new(self.last_touched.load(Ordering::Relaxed)),
-            evict_pending:    AtomicBool::new(self.evict_pending.load(Ordering::Relaxed)),
-            pinned:           AtomicBool::new(self.pinned.load(Ordering::Relaxed)),
-        }
-    }
+    /// Eviction bookkeeping (kernel refcount, LRU recency, pending flag, pinning).
+    pub eviction: EvictionState,
 }
 
 impl InodeEntry {
@@ -174,28 +182,6 @@ impl InodeEntry {
         // Mark as recently validated so subsequent lookups skip HEAD revalidation
         // for the duration of metadata_ttl (we just committed this exact hash).
         self.last_revalidated = Some(Instant::now());
-    }
-
-    /// Bump the kernel lookup refcount. Shared-ref access via `AtomicU64` so
-    /// FUSE hot paths (lookup, create, mkdir, symlink) only need a read lock
-    /// on the inode table.
-    pub(crate) fn bump_nlookup(&self) {
-        // Relaxed is sufficient: the refcount only gates eviction, which is
-        // guarded separately by the inode table's write lock.
-        self.nlookup.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Drop the kernel lookup refcount by `n`, saturating at 0. Returns true
-    /// if the refcount reached 0 (safe-to-evict).
-    pub(crate) fn drop_nlookup(&self, n: u64) -> bool {
-        let prev = self
-            .nlookup
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| Some(cur.saturating_sub(n)))
-            .expect("fetch_update closure always returns Some");
-        // A forget(n) larger than the current count is a kernel- or us-side
-        // protocol bug. Surface it in debug builds without crashing prod.
-        debug_assert!(n <= prev, "drop_nlookup({n}) exceeded current {prev}");
-        prev.saturating_sub(n) == 0
     }
 }
 
@@ -271,10 +257,11 @@ impl InodeTable {
             children: Vec::new(),
             pending_deletes: Vec::new(),
             last_revalidated: None,
-            nlookup: AtomicU64::new(0),
-            last_touched: AtomicU64::new(0),
-            evict_pending: AtomicBool::new(false),
-            pinned: AtomicBool::new(true),
+            // Root is always pinned — evicting it would break the entire tree.
+            eviction: EvictionState {
+                pinned: AtomicBool::new(true),
+                ..Default::default()
+            },
         };
         table.inodes.insert(ROOT_INODE, root);
         table.path_to_inode.insert(root_path, ROOT_INODE);
@@ -296,7 +283,7 @@ impl InodeTable {
     /// would be a race we can't recover from, so we log+return.
     pub(crate) fn bump_nlookup(&self, inode: u64) {
         match self.inodes.get(&inode) {
-            Some(entry) => entry.bump_nlookup(),
+            Some(entry) => entry.eviction.bump_nlookup(),
             None => debug_assert!(false, "bump_nlookup: unknown inode {inode}"),
         }
     }
@@ -306,7 +293,11 @@ impl InodeTable {
     /// Clears the polite-exhausted sticky bit on a 0-transition so the next
     /// over-cap insert will retry the polite scan.
     pub(crate) fn drop_nlookup(&self, inode: u64, n: u64) -> bool {
-        let reached_zero = self.inodes.get(&inode).map(|e| e.drop_nlookup(n)).unwrap_or(false);
+        let reached_zero = self
+            .inodes
+            .get(&inode)
+            .map(|e| e.eviction.drop_nlookup(n))
+            .unwrap_or(false);
         if reached_zero {
             self.polite_exhausted.store(false, Ordering::Relaxed);
         }
@@ -319,16 +310,14 @@ impl InodeTable {
     /// remote flush / upload.
     pub(crate) fn set_pinned(&self, inode: u64, pinned: bool) {
         if let Some(entry) = self.inodes.get(&inode) {
-            entry.pinned.store(pinned, Ordering::Relaxed);
+            entry.eviction.pinned.store(pinned, Ordering::Relaxed);
         }
     }
 
     /// Register a callback used by eviction to skip inodes with live
     /// FUSE file handles. Wired by `VirtualFs` post-construction.
     pub(crate) fn set_open_handle_checker(&self, f: OpenHandleChecker) {
-        *self.open_handle_checker
-            .lock()
-            .expect("open_handle_checker poisoned") = Some(f);
+        *self.open_handle_checker.lock().expect("open_handle_checker poisoned") = Some(f);
     }
 
     pub fn len(&self) -> usize {
@@ -350,7 +339,7 @@ impl InodeTable {
         }
         if let Some(entry) = self.inodes.get(&inode) {
             let seq = self.touch_counter.fetch_add(1, Ordering::Relaxed);
-            entry.last_touched.store(seq, Ordering::Relaxed);
+            entry.eviction.last_touched.store(seq, Ordering::Relaxed);
         }
     }
 
@@ -359,7 +348,7 @@ impl InodeTable {
     /// inode (the entry may have been removed on a racing path).
     pub(crate) fn mark_evict_pending(&self, ino: u64) {
         if let Some(entry) = self.inodes.get(&ino) {
-            entry.evict_pending.store(true, Ordering::Relaxed);
+            entry.eviction.evict_pending.store(true, Ordering::Relaxed);
         }
     }
 
@@ -368,7 +357,7 @@ impl InodeTable {
     pub(crate) fn take_evict_pending(&self, ino: u64) -> bool {
         self.inodes
             .get(&ino)
-            .is_some_and(|e| e.evict_pending.swap(false, Ordering::Relaxed))
+            .is_some_and(|e| e.eviction.evict_pending.swap(false, Ordering::Relaxed))
     }
 
     /// Drop up to `max` oldest file entries. With `force=false` only touches
@@ -393,9 +382,7 @@ impl InodeTable {
         }
         // Hold the mutex guard for the whole scan; eviction runs under
         // the table's write lock so this can't contend with itself.
-        let checker_guard = self.open_handle_checker
-            .lock()
-            .expect("open_handle_checker poisoned");
+        let checker_guard = self.open_handle_checker.lock().expect("open_handle_checker poisoned");
         let has_open_handle = checker_guard.as_ref();
 
         let mut heap: BinaryHeap<(u64, u64)> = BinaryHeap::with_capacity(max + 1);
@@ -405,7 +392,7 @@ impl InodeTable {
                 || e.nlink == 0
                 || e.is_dirty()
                 || !e.pending_deletes.is_empty()
-                || e.pinned.load(Ordering::Relaxed)
+                || e.eviction.pinned.load(Ordering::Relaxed)
             {
                 continue;
             }
@@ -421,12 +408,12 @@ impl InodeTable {
             {
                 continue;
             }
-            if e.nlookup.load(Ordering::Relaxed) == 0 {
+            if e.eviction.nlookup.load(Ordering::Relaxed) == 0 {
                 polite_candidates_found += 1;
             } else if !force {
                 continue;
             }
-            heap.push((e.last_touched.load(Ordering::Relaxed), e.inode));
+            heap.push((e.eviction.last_touched.load(Ordering::Relaxed), e.inode));
             if heap.len() > max {
                 heap.pop();
             }
@@ -480,7 +467,7 @@ impl InodeTable {
             if e.kind != InodeKind::File || e.nlink == 0 || e.is_dirty() || !e.pending_deletes.is_empty() {
                 continue;
             }
-            heap.push((e.last_touched.load(Ordering::Relaxed), e.inode));
+            heap.push((e.eviction.last_touched.load(Ordering::Relaxed), e.inode));
             if heap.len() > max {
                 heap.pop();
             }
@@ -511,7 +498,7 @@ impl InodeTable {
     pub(crate) fn evict_if_safe(&mut self, ino: u64) -> bool {
         let should_evict = self.inodes.get(&ino).is_some_and(|e| {
             e.kind == InodeKind::File
-                && e.nlookup.load(Ordering::Relaxed) == 0
+                && e.eviction.nlookup.load(Ordering::Relaxed) == 0
                 && !e.is_dirty()
                 && e.pending_deletes.is_empty()
                 && e.nlink > 0
@@ -613,9 +600,7 @@ impl InodeTable {
             } else {
                 self.evict_unreferenced(overflow, false)
             };
-            if polite < overflow
-                && self.inodes.len() > cap.saturating_mul(HARD_CEILING_MULTIPLIER)
-            {
+            if polite < overflow && self.inodes.len() > cap.saturating_mul(HARD_CEILING_MULTIPLIER) {
                 let still_over = self.inodes.len().saturating_sub(target);
                 self.evict_unreferenced(still_over, true);
             }
@@ -655,10 +640,10 @@ impl InodeTable {
             children: Vec::new(),
             pending_deletes: Vec::new(),
             last_revalidated: Some(Instant::now()),
-            nlookup: AtomicU64::new(0),
-            last_touched: AtomicU64::new(touch_seq),
-            evict_pending: AtomicBool::new(false),
-            pinned: AtomicBool::new(false),
+            eviction: EvictionState {
+                last_touched: AtomicU64::new(touch_seq),
+                ..Default::default()
+            },
         };
 
         self.inodes.insert(inode, entry);
@@ -1303,7 +1288,10 @@ mod tests {
         assert_eq!(table.get(dir_ino).unwrap().full_path.as_ref(), "new_dir");
         assert_eq!(table.get(child_ino).unwrap().full_path.as_ref(), "new_dir/child.txt");
         assert_eq!(table.get(subdir_ino).unwrap().full_path.as_ref(), "new_dir/subdir");
-        assert_eq!(table.get(deep_ino).unwrap().full_path.as_ref(), "new_dir/subdir/deep.txt");
+        assert_eq!(
+            table.get(deep_ino).unwrap().full_path.as_ref(),
+            "new_dir/subdir/deep.txt"
+        );
 
         // Verify path_to_inode updated (old paths gone, new paths work)
         assert!(table.get_by_path("old_dir").is_none());
@@ -1998,7 +1986,7 @@ mod tests {
             0,
             0,
         );
-        assert_eq!(table.get(ino).unwrap().nlookup.load(Ordering::Relaxed), 0);
+        assert_eq!(table.get(ino).unwrap().eviction.nlookup.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -2020,14 +2008,14 @@ mod tests {
         table.bump_nlookup(ino);
         table.bump_nlookup(ino);
         table.bump_nlookup(ino);
-        assert_eq!(table.get(ino).unwrap().nlookup.load(Ordering::Relaxed), 3);
+        assert_eq!(table.get(ino).unwrap().eviction.nlookup.load(Ordering::Relaxed), 3);
 
         assert!(!table.drop_nlookup(ino, 1));
-        assert_eq!(table.get(ino).unwrap().nlookup.load(Ordering::Relaxed), 2);
+        assert_eq!(table.get(ino).unwrap().eviction.nlookup.load(Ordering::Relaxed), 2);
 
         // Reaching zero returns true.
         assert!(table.drop_nlookup(ino, 2));
-        assert_eq!(table.get(ino).unwrap().nlookup.load(Ordering::Relaxed), 0);
+        assert_eq!(table.get(ino).unwrap().eviction.nlookup.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -2052,11 +2040,11 @@ mod tests {
         );
 
         assert!(table.drop_nlookup(ino, 42));
-        assert_eq!(table.get(ino).unwrap().nlookup.load(Ordering::Relaxed), 0);
+        assert_eq!(table.get(ino).unwrap().eviction.nlookup.load(Ordering::Relaxed), 0);
 
         table.bump_nlookup(ino);
         assert!(table.drop_nlookup(ino, 1000));
-        assert_eq!(table.get(ino).unwrap().nlookup.load(Ordering::Relaxed), 0);
+        assert_eq!(table.get(ino).unwrap().eviction.nlookup.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -2110,7 +2098,10 @@ mod tests {
         table.bump_nlookup(ino);
 
         assert!(!table.evict_if_safe(ino));
-        assert!(table.get(ino).is_some(), "entry must survive when kernel still holds dentry");
+        assert!(
+            table.get(ino).is_some(),
+            "entry must survive when kernel still holds dentry"
+        );
     }
 
     #[test]
@@ -2131,7 +2122,10 @@ mod tests {
         table.get_mut(ino).unwrap().set_dirty();
 
         assert!(!table.evict_if_safe(ino));
-        assert!(table.get(ino).is_some(), "dirty entry must not be evicted — unflushed data");
+        assert!(
+            table.get(ino).is_some(),
+            "dirty entry must not be evicted — unflushed data"
+        );
     }
 
     #[test]
@@ -2461,15 +2455,15 @@ mod tests {
         // hot path stays cheap in the common case.
         let mut table = InodeTable::new();
         let f = mk_file(&mut table, "f.txt");
-        let before = table.get(f).unwrap().last_touched.load(Ordering::Relaxed);
+        let before = table.get(f).unwrap().eviction.last_touched.load(Ordering::Relaxed);
         table.touch(f);
-        let after = table.get(f).unwrap().last_touched.load(Ordering::Relaxed);
+        let after = table.get(f).unwrap().eviction.last_touched.load(Ordering::Relaxed);
         assert_eq!(before, after, "touch without enable_lru must be a no-op");
 
         table.enable_lru(100);
         table.touch(f);
         assert_ne!(
-            table.get(f).unwrap().last_touched.load(Ordering::Relaxed),
+            table.get(f).unwrap().eviction.last_touched.load(Ordering::Relaxed),
             after,
             "touch after enable_lru must bump last_touched"
         );
@@ -2577,10 +2571,7 @@ mod tests {
         let mut table = InodeTable::new();
         let _evictable = mk_file(&mut table, "evictable.txt");
         assert_eq!(table.evict_unreferenced(10, false), 1);
-        assert!(
-            !table.polite_exhausted(),
-            "polite found candidates, cache stays clear"
-        );
+        assert!(!table.polite_exhausted(), "polite found candidates, cache stays clear");
     }
 
     #[test]
@@ -2590,9 +2581,6 @@ mod tests {
         let held = mk_file(&mut table, "held.txt");
         table.bump_nlookup(held);
         assert_eq!(table.evict_unreferenced(10, true), 1);
-        assert!(
-            !table.polite_exhausted(),
-            "force pass must not touch the polite cache"
-        );
+        assert!(!table.polite_exhausted(), "force pass must not touch the polite cache");
     }
 }
