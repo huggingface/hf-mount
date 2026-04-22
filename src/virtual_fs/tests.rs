@@ -2264,14 +2264,15 @@ fn poll_skips_deletion_with_open_handles() {
         assert_eq!(vfs.lookup(ROOT_INODE, "closed.txt").await.unwrap_err(), libc::ENOENT);
 
         // open.txt: inode survives as orphan (nlink=0), but path is unlinked
-        let inodes = vfs.inode_table.read().unwrap();
-        let entry = inodes.get(open_attr.ino).expect("orphan inode should survive");
-        assert_eq!(entry.nlink, 0, "inode should be orphaned (nlink=0)");
-        assert!(
-            inodes.lookup_child(ROOT_INODE, "open.txt").is_none(),
-            "open.txt should not be visible by name"
-        );
-        drop(inodes);
+        {
+            let inodes = vfs.inode_table.read().unwrap();
+            let entry = inodes.get(open_attr.ino).expect("orphan inode should survive");
+            assert_eq!(entry.nlink, 0, "inode should be orphaned (nlink=0)");
+            assert!(
+                inodes.lookup_child(ROOT_INODE, "open.txt").is_none(),
+                "open.txt should not be visible by name"
+            );
+        }
 
         // Release the handle: release() cleans up the orphan
         vfs.release(fh).await.unwrap();

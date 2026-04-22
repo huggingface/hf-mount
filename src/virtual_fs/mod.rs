@@ -30,14 +30,16 @@ const NEG_CACHE_CAPACITY: usize = 10_000;
 /// How long a negative-cache entry stays valid before being re-checked.
 const NEG_CACHE_TTL: Duration = Duration::from_secs(30);
 
-type Invalidator = Arc<OnceLock<Box<dyn Fn(u64) + Send + Sync>>>;
+type InvalidatorFn = Box<dyn Fn(u64) + Send + Sync>;
 /// `(parent, name) -> Ok/Err` maps to `fuse_notify_inval_entry`. Returns
 /// false when the FUSE notify channel is saturated (EAGAIN/ENOMEM) so the
 /// sweep can back off instead of burning CPU on a full queue. Separate
-/// from `Invalidator` because cgroup-bound memory pressure doesn't
+/// from `InvalidatorFn` because cgroup-bound memory pressure doesn't
 /// propagate to the host's dentry shrinker, so the LRU sweep has to push
 /// dentry drops instead of waiting for the kernel to pull them.
-type EntryInvalidator = Arc<OnceLock<Box<dyn Fn(u64, &str) -> bool + Send + Sync>>>;
+type EntryInvalidatorFn = Box<dyn Fn(u64, &str) -> bool + Send + Sync>;
+type Invalidator = Arc<OnceLock<InvalidatorFn>>;
+type EntryInvalidator = Arc<OnceLock<EntryInvalidatorFn>>;
 
 /// Hard cap on `inval_entry` calls per sweep. Prevents the sweep from
 /// bursting tens of thousands of notifications at the FUSE channel after
@@ -267,12 +269,12 @@ impl VirtualFs {
     /// Set the kernel cache invalidation callback. Called after mount setup
     /// so the poll loop can actively invalidate stale inodes on remote changes.
     /// First call wins; later calls are no-ops.
-    pub fn set_invalidator(&self, f: Box<dyn Fn(u64) + Send + Sync>) {
+    pub fn set_invalidator(&self, f: InvalidatorFn) {
         let _ = self.invalidator.set(f);
     }
 
     /// First call wins; later calls are no-ops.
-    pub fn set_entry_invalidator(&self, f: Box<dyn Fn(u64, &str) -> bool + Send + Sync>) {
+    pub fn set_entry_invalidator(&self, f: EntryInvalidatorFn) {
         let _ = self.entry_invalidator.set(f);
     }
 
@@ -969,7 +971,9 @@ impl VirtualFs {
     /// Must be called after every `reply.entry()` / `reply.created()`, or
     /// the kernel and our `nlookup` will drift and a later `forget()` will
     /// underflow. Also touches for LRU so actively-looked-up inodes aren't
-    /// immediately evicted.
+    /// immediately evicted. Only the FUSE adapter calls this — dead when
+    /// the `fuse` feature is disabled.
+    #[allow(dead_code)]
     pub(crate) fn bump_nlookup(&self, ino: u64) {
         let inodes = self.inode_table.read().expect("inodes poisoned");
         inodes.bump_nlookup(ino);
@@ -980,6 +984,7 @@ impl VirtualFs {
     /// and evict the inode if it's now safe (kernel no longer holds the
     /// dentry, no open handles, nothing dirty). Eviction keeps `InodeTable`
     /// bounded — without it the table grows for every file ever looked up.
+    #[allow(dead_code)]
     pub(crate) fn forget(&self, ino: u64, nlookup: u64) {
         debug!("forget: ino={} nlookup={}", ino, nlookup);
 

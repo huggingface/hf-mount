@@ -330,6 +330,10 @@ impl InodeTable {
         self.inodes.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.inodes.is_empty()
+    }
+
     /// Configure the LRU eviction cap. 0 disables all eviction hooks
     /// (common prod config). Called once at startup from `VirtualFs::new`.
     pub(crate) fn enable_lru(&self, soft_limit: usize) {
@@ -2484,7 +2488,7 @@ mod tests {
 
     #[test]
     fn test_evict_pending_unknown_inode() {
-        let mut table = InodeTable::new();
+        let table = InodeTable::new();
         table.mark_evict_pending(9999); // no-op, must not panic
         assert!(!table.take_evict_pending(9999));
     }

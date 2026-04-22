@@ -70,15 +70,15 @@ impl FuseAdapter {
     }
 
     /// Same as `reply_entry_tracked` for `ReplyCreate`.
-    fn reply_created_tracked(
-        &self,
-        reply: fuser::ReplyCreate,
-        attr: &VirtualFsAttr,
-        fh: u64,
-        oflags: FopenFlags,
-    ) {
+    fn reply_created_tracked(&self, reply: fuser::ReplyCreate, attr: &VirtualFsAttr, fh: u64, oflags: FopenFlags) {
         self.virtual_fs.bump_nlookup(attr.ino);
-        reply.created(&self.metadata_ttl, &vfs_attr_to_fuse(attr), GENERATION, FileHandle(fh), oflags);
+        reply.created(
+            &self.metadata_ttl,
+            &vfs_attr_to_fuse(attr),
+            GENERATION,
+            FileHandle(fh),
+            oflags,
+        );
     }
 }
 
