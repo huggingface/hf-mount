@@ -33,6 +33,23 @@ pub enum InodeKind {
     Symlink,
 }
 
+/// How aggressively `evict_unreferenced` should evict.
+///
+/// `Polite` only drops entries the kernel has already released
+/// (`nlookup == 0`); safe, no FUSE invariants broken.
+///
+/// `Force` ignores `nlookup` — the kernel's next op on a stale ino
+/// gets ENOENT and re-lookups. The only mode that binds memory under
+/// a crawler that keeps every looked-up dentry pinned.
+///
+/// Both modes still refuse dirty, pinned-by-open-handle, and
+/// pending-rename entries (forcing them out would lose user data).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvictionMode {
+    Polite,
+    Force,
+}
+
 /// A directory child entry: stores the name on the parent→child edge.
 #[derive(Debug, Clone)]
 pub struct DirChild {
@@ -349,26 +366,15 @@ impl InodeTable {
             .is_some_and(|e| e.eviction.evict_pending.swap(false, Ordering::Relaxed))
     }
 
-    /// Drop up to `max` oldest file entries. With `force=false` only touches
-    /// entries the kernel has already released (`nlookup==0`); safe, no FUSE
-    /// invariants broken. With `force=true` ignores `nlookup` — the next
-    /// kernel access will see ENOENT and re-lookup.
-    ///
-    /// The `force` mode is the only thing that binds memory under a
-    /// crawler workload: during an active `find`, the kernel holds a
-    /// dentry for every looked-up entry, so `nlookup > 0` on the whole
-    /// table and the polite path evicts nothing. Without forced eviction,
-    /// an unbounded readdir can OOM the container before the kernel
-    /// decides to shed dentries.
-    ///
-    /// Dirty files and pending-deletes are still preserved (forcing them
-    /// out would lose user data).
+    /// Drop up to `max` oldest file entries. See [`EvictionMode`] for the
+    /// Polite/Force semantics.
     ///
     /// Returns the number of entries removed. Caller holds the write lock.
-    pub(crate) fn evict_unreferenced(&mut self, max: usize, force: bool) -> usize {
+    pub(crate) fn evict_unreferenced(&mut self, max: usize, mode: EvictionMode) -> usize {
         if max == 0 {
             return 0;
         }
+        let force = mode == EvictionMode::Force;
 
         let mut heap: BinaryHeap<(u64, u64)> = BinaryHeap::with_capacity(max + 1);
         let mut polite_candidates_found = 0usize;
@@ -596,11 +602,11 @@ impl InodeTable {
             let polite = if self.polite_exhausted() {
                 0
             } else {
-                self.evict_unreferenced(overflow, false)
+                self.evict_unreferenced(overflow, EvictionMode::Polite)
             };
             if polite < overflow && self.inodes.len() > cap.saturating_mul(HARD_CEILING_MULTIPLIER) {
                 let still_over = self.inodes.len().saturating_sub(target);
-                self.evict_unreferenced(still_over, true);
+                self.evict_unreferenced(still_over, EvictionMode::Force);
             }
         }
 
@@ -2222,7 +2228,7 @@ mod tests {
         let free = mk_file(&mut table, "free.txt");
         table.bump_nlookup(held);
 
-        assert_eq!(table.evict_unreferenced(10, false), 1);
+        assert_eq!(table.evict_unreferenced(10, EvictionMode::Polite), 1);
         assert!(table.get(held).is_some(), "held entry stays");
         assert!(table.get(free).is_none(), "free entry gone");
     }
@@ -2235,7 +2241,7 @@ mod tests {
         table.bump_nlookup(a);
         table.bump_nlookup(b);
 
-        assert_eq!(table.evict_unreferenced(10, true), 2);
+        assert_eq!(table.evict_unreferenced(10, EvictionMode::Force), 2);
         assert!(table.get(a).is_none());
         assert!(table.get(b).is_none());
     }
@@ -2247,7 +2253,7 @@ mod tests {
         let dirty = mk_file(&mut table, "dirty.txt");
         table.get_mut(dirty).unwrap().set_dirty();
 
-        assert_eq!(table.evict_unreferenced(10, true), 1);
+        assert_eq!(table.evict_unreferenced(10, EvictionMode::Force), 1);
         assert!(table.get(clean).is_none());
         assert!(table.get(dirty).is_some(), "dirty entry never evicted");
     }
@@ -2258,7 +2264,7 @@ mod tests {
         let pending = mk_file(&mut table, "pending.txt");
         table.get_mut(pending).unwrap().pending_deletes.push("old".into());
 
-        assert_eq!(table.evict_unreferenced(10, true), 0);
+        assert_eq!(table.evict_unreferenced(10, EvictionMode::Force), 0);
         assert!(table.get(pending).is_some());
     }
 
@@ -2266,7 +2272,7 @@ mod tests {
     fn test_evict_unreferenced_never_touches_root() {
         let mut table = mk_table_with_soft_limit(0);
         let _ = mk_file(&mut table, "f.txt");
-        assert_eq!(table.evict_unreferenced(10, true), 1);
+        assert_eq!(table.evict_unreferenced(10, EvictionMode::Force), 1);
         assert!(table.get(ROOT_INODE).is_some(), "root must not be evicted");
     }
 
@@ -2287,8 +2293,8 @@ mod tests {
             0,
             0,
         );
-        assert_eq!(table.evict_unreferenced(10, false), 0);
-        assert_eq!(table.evict_unreferenced(10, true), 0);
+        assert_eq!(table.evict_unreferenced(10, EvictionMode::Polite), 0);
+        assert_eq!(table.evict_unreferenced(10, EvictionMode::Force), 0);
         assert!(table.get(sym).is_some());
     }
 
@@ -2323,7 +2329,7 @@ mod tests {
         // a leaf after that but this sweep already collected candidates.
         // The dir itself must survive this pass because it still had
         // children when we picked candidates.
-        let removed = table.evict_unreferenced(10, true);
+        let removed = table.evict_unreferenced(10, EvictionMode::Force);
         assert_eq!(removed, 1, "only the child file goes");
         assert!(table.get(child).is_none());
         assert!(table.get(dir).is_some(), "dir survives: had children when selected");
@@ -2345,7 +2351,7 @@ mod tests {
             0,
         );
         let root_nlink_before = table.get(ROOT_INODE).unwrap().nlink;
-        assert_eq!(table.evict_unreferenced(10, true), 1);
+        assert_eq!(table.evict_unreferenced(10, EvictionMode::Force), 1);
         assert!(table.get(dir_ino).is_none());
         // POSIX: evicting a subdirectory drops the parent's ".." nlink.
         assert_eq!(table.get(ROOT_INODE).unwrap().nlink, root_nlink_before - 1);
@@ -2356,7 +2362,7 @@ mod tests {
         let mut table = InodeTable::new();
         let f = mk_file(&mut table, "f.txt");
         table.get_mut(ROOT_INODE).unwrap().children_loaded = true;
-        table.evict_unreferenced(10, false);
+        table.evict_unreferenced(10, EvictionMode::Polite);
         assert!(table.get(f).is_none());
         assert!(
             !table.get(ROOT_INODE).unwrap().children_loaded,
@@ -2375,7 +2381,7 @@ mod tests {
         table.touch(middle);
         table.touch(newest);
 
-        assert_eq!(table.evict_unreferenced(1, false), 1);
+        assert_eq!(table.evict_unreferenced(1, EvictionMode::Polite), 1);
         assert!(table.get(oldest).is_none(), "oldest evicted first");
         assert!(table.get(middle).is_some());
         assert!(table.get(newest).is_some());
@@ -2385,7 +2391,7 @@ mod tests {
     fn test_evict_unreferenced_max_zero_is_noop() {
         let mut table = InodeTable::new();
         let f = mk_file(&mut table, "f.txt");
-        assert_eq!(table.evict_unreferenced(0, true), 0);
+        assert_eq!(table.evict_unreferenced(0, EvictionMode::Force), 0);
         assert!(table.get(f).is_some());
     }
 
@@ -2489,7 +2495,7 @@ mod tests {
     fn test_root_never_evicted_even_under_force() {
         let mut table = InodeTable::new();
         let _ = mk_file(&mut table, "f.txt");
-        assert_eq!(table.evict_unreferenced(10, true), 1);
+        assert_eq!(table.evict_unreferenced(10, EvictionMode::Force), 1);
         assert!(table.get(ROOT_INODE).is_some(), "root must never be evicted");
     }
 
@@ -2510,7 +2516,7 @@ mod tests {
             0,
             0,
         );
-        assert_eq!(table.evict_unreferenced(10, true), 0);
+        assert_eq!(table.evict_unreferenced(10, EvictionMode::Force), 0);
         assert!(table.get(sym).is_some(), "symlink must survive force");
     }
 
@@ -2526,13 +2532,13 @@ mod tests {
         assert!(table.has_open_handles(busy));
 
         // Force mode: should evict idle but skip busy.
-        assert_eq!(table.evict_unreferenced(10, true), 1);
+        assert_eq!(table.evict_unreferenced(10, EvictionMode::Force), 1);
         assert!(table.get(busy).is_some(), "inode with open handle must survive force");
 
         // Release the handle; now busy can be evicted.
         table.drop_open_handles(busy);
         assert!(!table.has_open_handles(busy));
-        assert_eq!(table.evict_unreferenced(10, true), 1);
+        assert_eq!(table.evict_unreferenced(10, EvictionMode::Force), 1);
         assert!(table.get(busy).is_none());
     }
 
@@ -2545,7 +2551,7 @@ mod tests {
         table.bump_nlookup(held);
         assert!(!table.polite_exhausted(), "starts false");
 
-        assert_eq!(table.evict_unreferenced(10, false), 0);
+        assert_eq!(table.evict_unreferenced(10, EvictionMode::Polite), 0);
         assert!(table.polite_exhausted(), "no nlookup==0 candidates → set");
     }
 
@@ -2554,7 +2560,7 @@ mod tests {
         let mut table = InodeTable::new();
         let held = mk_file(&mut table, "held.txt");
         table.bump_nlookup(held);
-        assert_eq!(table.evict_unreferenced(10, false), 0);
+        assert_eq!(table.evict_unreferenced(10, EvictionMode::Polite), 0);
         assert!(table.polite_exhausted());
 
         // Simulate a forget that brings the entry back to nlookup==0.
@@ -2566,7 +2572,7 @@ mod tests {
     fn test_polite_exhausted_not_set_when_candidates_existed() {
         let mut table = InodeTable::new();
         let _evictable = mk_file(&mut table, "evictable.txt");
-        assert_eq!(table.evict_unreferenced(10, false), 1);
+        assert_eq!(table.evict_unreferenced(10, EvictionMode::Polite), 1);
         assert!(!table.polite_exhausted(), "polite found candidates, cache stays clear");
     }
 
@@ -2576,7 +2582,7 @@ mod tests {
         let mut table = InodeTable::new();
         let held = mk_file(&mut table, "held.txt");
         table.bump_nlookup(held);
-        assert_eq!(table.evict_unreferenced(10, true), 1);
+        assert_eq!(table.evict_unreferenced(10, EvictionMode::Force), 1);
         assert!(!table.polite_exhausted(), "force pass must not touch the polite cache");
     }
 }
