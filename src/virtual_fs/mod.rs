@@ -246,17 +246,10 @@ impl VirtualFs {
         // Spawn LRU evictor if configured. `Weak` so the task exits when
         // the outer Arc is dropped; still aborted in shutdown() for determinism.
         if config.inode_soft_limit > 0 {
-            {
-                let inodes = vfs.inode_table.read().expect("inodes poisoned");
-                inodes.enable_lru(config.inode_soft_limit);
-                // Hook eviction safety: never drop an inode that still has
-                // a live FUSE file handle. Prevents silent data loss on a
-                // racing write() whose inode just got force-evicted.
-                let open_files = vfs.open_files.clone();
-                inodes.set_open_handle_checker(Box::new(move |ino| {
-                    has_open_handles_for(&open_files, ino)
-                }));
-            }
+            vfs.inode_table
+                .read()
+                .expect("inodes poisoned")
+                .enable_lru(config.inode_soft_limit);
             let weak = Arc::downgrade(&vfs);
             let soft_limit = config.inode_soft_limit;
             let sweep_interval = config.lru_sweep_interval;
@@ -606,7 +599,7 @@ impl VirtualFs {
                 .collect();
             for ino in stale {
                 // Don't remove if the inode or any descendant is dirty or has open handles.
-                let has_dirty_or_open = inodes.has_dirty_descendants(ino) || self.has_open_handles(ino);
+                let has_dirty_or_open = inodes.has_dirty_descendants(ino) || inodes.has_open_handles(ino);
                 if !has_dirty_or_open {
                     inodes.remove(ino);
                 }
@@ -648,7 +641,7 @@ impl VirtualFs {
 
     /// Check if any open file handle references the given inode.
     fn has_open_handles(&self, ino: u64) -> bool {
-        has_open_handles_for(&self.open_files, ino)
+        self.inode_table.read().expect("inodes poisoned").has_open_handles(ino)
     }
 
     /// Get or create a per-directory lock for serializing ensure_children_loaded().
@@ -767,6 +760,7 @@ impl VirtualFs {
         match File::open(path) {
             Ok(file) => {
                 let file_handle = self.alloc_file_handle();
+                self.inode_table.read().expect("inodes poisoned").bump_open_handles(ino);
                 self.open_files.write().expect("open_files poisoned").insert(
                     file_handle,
                     OpenFile::Local {
@@ -1153,6 +1147,7 @@ impl VirtualFs {
         }
 
         let file_handle = self.alloc_file_handle();
+        self.inode_table.read().expect("inodes poisoned").bump_open_handles(ino);
         self.open_files.write().expect("open_files poisoned").insert(
             file_handle,
             OpenFile::Local {
@@ -1199,6 +1194,7 @@ impl VirtualFs {
             }
         }
 
+        self.inode_table.read().expect("inodes poisoned").bump_open_handles(ino);
         self.open_files
             .write()
             .expect("open_files poisoned")
@@ -1271,6 +1267,7 @@ impl VirtualFs {
             self.direct_io,
         )));
         let file_handle = self.alloc_file_handle();
+        self.inode_table.read().expect("inodes poisoned").bump_open_handles(ino);
         self.open_files
             .write()
             .expect("open_files poisoned")
@@ -1726,6 +1723,9 @@ impl VirtualFs {
             | Some(OpenFile::Streaming { ino, .. }) => Some(*ino),
             _ => None,
         };
+        if let Some(ino) = released_ino {
+            self.inode_table.read().expect("inodes poisoned").drop_open_handles(ino);
+        }
 
         let mut release_error: Option<i32> = None;
 
@@ -2019,6 +2019,8 @@ impl VirtualFs {
             {
                 Ok(file) => {
                     let file_handle = self.alloc_file_handle();
+                    let inodes = self.inode_table.read().expect("inodes poisoned");
+                    inodes.bump_open_handles(ino);
                     self.open_files.write().expect("open_files poisoned").insert(
                         file_handle,
                         OpenFile::Local {
@@ -2028,7 +2030,6 @@ impl VirtualFs {
                         },
                     );
 
-                    let inodes = self.inode_table.read().expect("inodes poisoned");
                     let attr = self.make_vfs_attr(inodes.get(ino).ok_or(libc::ENOENT)?);
                     Ok((attr, file_handle))
                 }
@@ -2055,12 +2056,13 @@ impl VirtualFs {
                 }
             };
 
+            let inodes = self.inode_table.read().expect("inodes poisoned");
+            inodes.bump_open_handles(ino);
             self.open_files
                 .write()
                 .expect("open_files poisoned")
                 .insert(file_handle, OpenFile::Streaming { ino, channel });
 
-            let inodes = self.inode_table.read().expect("inodes poisoned");
             let attr = self.make_vfs_attr(inodes.get(ino).ok_or(libc::ENOENT)?);
             Ok((attr, file_handle))
         }
@@ -2192,7 +2194,7 @@ impl VirtualFs {
             let now = SystemTime::now();
             inodes.touch_parent(parent, now);
             // If last link gone and no open handles, remove the orphan immediately
-            if last_link && !self.has_open_handles(ino) {
+            if last_link && !inodes.has_open_handles(ino) {
                 inodes.remove_orphan(ino);
             }
             last_link
@@ -2639,7 +2641,7 @@ impl VirtualFs {
                 inodes.remove(existing_ino);
             } else {
                 inodes.unlink_one(newparent, newname);
-                if !self.has_open_handles(existing_ino) {
+                if !inodes.has_open_handles(existing_ino) {
                     inodes.remove_orphan(existing_ino);
                 }
             }
@@ -3035,19 +3037,6 @@ enum ReadTarget {
     Remote {
         prefetch: Arc<tokio::sync::Mutex<PrefetchState>>,
     },
-}
-
-/// Check if any open file handle references the given inode.
-fn has_open_handles_for(open_files: &RwLock<HashMap<u64, OpenFile>>, ino: u64) -> bool {
-    open_files
-        .read()
-        .expect("open_files poisoned")
-        .values()
-        .any(|of| match of {
-            OpenFile::Local { ino: i, .. } | OpenFile::Lazy { ino: i, .. } | OpenFile::Streaming { ino: i, .. } => {
-                *i == ino
-            }
-        })
 }
 
 #[cfg(test)]

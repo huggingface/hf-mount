@@ -1,13 +1,7 @@
 use std::collections::{BinaryHeap, HashMap};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
-
-/// Callback that answers "does this inode have a live open file handle?"
-/// `InodeTable` doesn't know about `open_files` (that lives on `VirtualFs`),
-/// so the table calls this through `open_handle_checker` during eviction
-/// to protect anything currently being read/written.
-pub(crate) type OpenHandleChecker = Box<dyn Fn(u64) -> bool + Send + Sync>;
 
 pub const ROOT_INODE: u64 = 1;
 
@@ -69,6 +63,11 @@ pub struct EvictionState {
     /// Evicting one would lose user data because a re-lookup can't
     /// reconstruct it from the Hub. Flush clears the pin.
     pub pinned: AtomicBool,
+    /// Number of live FUSE file handles referencing this inode. Bumped by
+    /// `open`/`create`, dropped by `release`. Eviction refuses any entry
+    /// with `open_handles > 0` — a racing read/write would silently lose
+    /// data if the inode disappeared under it.
+    pub open_handles: AtomicU32,
 }
 
 impl Clone for EvictionState {
@@ -78,6 +77,7 @@ impl Clone for EvictionState {
             last_touched: AtomicU64::new(self.last_touched.load(Ordering::Relaxed)),
             evict_pending: AtomicBool::new(self.evict_pending.load(Ordering::Relaxed)),
             pinned: AtomicBool::new(self.pinned.load(Ordering::Relaxed)),
+            open_handles: AtomicU32::new(self.open_handles.load(Ordering::Relaxed)),
         }
     }
 }
@@ -205,11 +205,6 @@ pub struct InodeTable {
     /// Without this, a sustained crawl with all entries held by the
     /// kernel would rescan the full table on every insert for nothing.
     polite_exhausted: AtomicBool,
-    /// Reports whether an inode has a live open FUSE file handle.
-    /// Force-evict consults this to avoid dropping an inode out from
-    /// under a write() / read() — losing dirty state would be silent
-    /// data loss. `VirtualFs` wires this via `set_open_handle_checker`.
-    open_handle_checker: Arc<Mutex<Option<OpenHandleChecker>>>,
 }
 
 impl Default for InodeTable {
@@ -227,7 +222,6 @@ impl InodeTable {
             touch_counter: AtomicU64::new(0),
             soft_limit: AtomicUsize::new(0),
             polite_exhausted: AtomicBool::new(false),
-            open_handle_checker: Arc::new(Mutex::new(None)),
         };
 
         // Create root inode
@@ -311,10 +305,28 @@ impl InodeTable {
         }
     }
 
-    /// Register a callback used by eviction to skip inodes with live
-    /// FUSE file handles. Wired by `VirtualFs` post-construction.
-    pub(crate) fn set_open_handle_checker(&self, f: OpenHandleChecker) {
-        *self.open_handle_checker.lock().expect("open_handle_checker poisoned") = Some(f);
+    /// Bump the per-inode open-handle refcount. Called on every `open` /
+    /// `create` to pin the entry against eviction for as long as a FUSE
+    /// file handle references it.
+    pub(crate) fn bump_open_handles(&self, ino: u64) {
+        if let Some(entry) = self.inodes.get(&ino) {
+            entry.eviction.open_handles.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Drop the per-inode open-handle refcount. Called on `release` once
+    /// the handle has been removed from `VirtualFs::open_files`.
+    pub(crate) fn drop_open_handles(&self, ino: u64) {
+        if let Some(entry) = self.inodes.get(&ino) {
+            entry.eviction.open_handles.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Is there at least one live FUSE file handle on this inode?
+    pub(crate) fn has_open_handles(&self, ino: u64) -> bool {
+        self.inodes
+            .get(&ino)
+            .is_some_and(|e| e.eviction.open_handles.load(Ordering::Relaxed) > 0)
     }
 
     pub fn len(&self) -> usize {
@@ -377,10 +389,6 @@ impl InodeTable {
         if max == 0 {
             return 0;
         }
-        // Hold the mutex guard for the whole scan; eviction runs under
-        // the table's write lock so this can't contend with itself.
-        let checker_guard = self.open_handle_checker.lock().expect("open_handle_checker poisoned");
-        let has_open_handle = checker_guard.as_ref();
 
         let mut heap: BinaryHeap<(u64, u64)> = BinaryHeap::with_capacity(max + 1);
         let mut polite_candidates_found = 0usize;
@@ -390,19 +398,15 @@ impl InodeTable {
                 || e.is_dirty()
                 || !e.pending_deletes.is_empty()
                 || e.eviction.pinned.load(Ordering::Relaxed)
+                // Never drop an inode with a live FUSE handle: a racing
+                // write() would see ENOENT and silently lose dirty state.
+                || e.eviction.open_handles.load(Ordering::Relaxed) > 0
             {
                 continue;
             }
             // Leaf-only for dirs: evicting a dir that still has children in
             // our table would orphan them. Files and symlinks are leaves.
             if e.kind == InodeKind::Directory && !e.children.is_empty() {
-                continue;
-            }
-            // Never drop an inode with a live FUSE handle: a racing
-            // write() would see ENOENT and silently lose dirty state.
-            if let Some(cb) = has_open_handle
-                && cb(e.inode)
-            {
                 continue;
             }
             if e.eviction.nlookup.load(Ordering::Relaxed) == 0 {
@@ -415,7 +419,6 @@ impl InodeTable {
                 heap.pop();
             }
         }
-        drop(checker_guard);
 
         // Cache the exhaustion signal so the next insert doesn't re-scan
         // when we already know there's nothing polite to evict.
@@ -2513,22 +2516,26 @@ mod tests {
         assert!(table.get(ROOT_INODE).is_some());
     }
 
-    // ── open handle checker ────────────────────────────────────────
+    // ── open handles refcount ──────────────────────────────────────
 
     #[test]
-    fn test_open_handle_checker_protects_inode_from_force() {
-        use std::sync::atomic::{AtomicU64 as Au64, Ordering as O};
+    fn test_open_handles_refcount_protects_from_force() {
         let mut table = InodeTable::new();
         let busy = mk_file(&mut table, "busy.txt");
         let _idle = mk_file(&mut table, "idle.txt");
 
-        let busy_shared = std::sync::Arc::new(Au64::new(busy));
-        let b = busy_shared.clone();
-        table.set_open_handle_checker(Box::new(move |ino| ino == b.load(O::Relaxed)));
+        table.bump_open_handles(busy);
+        assert!(table.has_open_handles(busy));
 
         // Force mode: should evict idle but skip busy.
         assert_eq!(table.evict_unreferenced(10, true), 1);
         assert!(table.get(busy).is_some(), "inode with open handle must survive force");
+
+        // Release the handle; now busy can be evicted.
+        table.drop_open_handles(busy);
+        assert!(!table.has_open_handles(busy));
+        assert_eq!(table.evict_unreferenced(10, true), 1);
+        assert!(table.get(busy).is_none());
     }
 
     // ── polite_exhausted cache ──────────────────────────────────────

@@ -82,7 +82,7 @@ impl super::VirtualFs {
         remote_entries: Vec<crate::hub_api::TreeEntry>,
         polled_prefixes: &HashSet<String>,
         inodes: &Arc<RwLock<InodeTable>>,
-        open_files: &Arc<RwLock<HashMap<u64, super::OpenFile>>>,
+        _open_files: &Arc<RwLock<HashMap<u64, super::OpenFile>>>,
         negative_cache: &Arc<RwLock<HashMap<String, Instant>>>,
         invalidator: &Invalidator,
     ) {
@@ -181,7 +181,7 @@ impl super::VirtualFs {
                     Some(entry) => (entry.parent, entry.name.clone()),
                     None => continue,
                 };
-                if super::has_open_handles_for(open_files, *ino) {
+                if inode_table.has_open_handles(*ino) {
                     // Unlink the pathname but keep the inode as orphan (nlink=0)
                     // so open handles can still read/fstat. release() will clean
                     // up the orphan. Without this, the file stays visible by name
