@@ -3,7 +3,7 @@ use std::fs::{File, OpenOptions};
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::{Bytes, BytesMut};
@@ -30,14 +30,14 @@ const NEG_CACHE_CAPACITY: usize = 10_000;
 /// How long a negative-cache entry stays valid before being re-checked.
 const NEG_CACHE_TTL: Duration = Duration::from_secs(30);
 
-type Invalidator = Arc<Mutex<Option<Box<dyn Fn(u64) + Send + Sync>>>>;
+type Invalidator = Arc<OnceLock<Box<dyn Fn(u64) + Send + Sync>>>;
 /// `(parent, name) -> Ok/Err` maps to `fuse_notify_inval_entry`. Returns
 /// false when the FUSE notify channel is saturated (EAGAIN/ENOMEM) so the
 /// sweep can back off instead of burning CPU on a full queue. Separate
 /// from `Invalidator` because cgroup-bound memory pressure doesn't
 /// propagate to the host's dentry shrinker, so the LRU sweep has to push
 /// dentry drops instead of waiting for the kernel to pull them.
-type EntryInvalidator = Arc<Mutex<Option<Box<dyn Fn(u64, &str) -> bool + Send + Sync>>>>;
+type EntryInvalidator = Arc<OnceLock<Box<dyn Fn(u64, &str) -> bool + Send + Sync>>>;
 
 /// Hard cap on `inval_entry` calls per sweep. Prevents the sweep from
 /// bursting tens of thousands of notifications at the FUSE channel after
@@ -177,7 +177,7 @@ impl VirtualFs {
         let open_files: Arc<RwLock<HashMap<u64, OpenFile>>> = Arc::new(RwLock::new(HashMap::new()));
 
         // Spawn remote change polling task (if interval > 0)
-        let invalidator: Invalidator = Arc::new(Mutex::new(None));
+        let invalidator: Invalidator = Arc::new(OnceLock::new());
         let poll_handle = if config.poll_interval_secs > 0 {
             let bg_hub = hub_client.clone();
             let bg_inodes = inodes.clone();
@@ -196,7 +196,7 @@ impl VirtualFs {
             None
         };
 
-        let entry_invalidator: EntryInvalidator = Arc::new(Mutex::new(None));
+        let entry_invalidator: EntryInvalidator = Arc::new(OnceLock::new());
         let vfs = Arc::new(Self {
             runtime,
             hub_client,
@@ -266,12 +266,14 @@ impl VirtualFs {
 
     /// Set the kernel cache invalidation callback. Called after mount setup
     /// so the poll loop can actively invalidate stale inodes on remote changes.
+    /// First call wins; later calls are no-ops.
     pub fn set_invalidator(&self, f: Box<dyn Fn(u64) + Send + Sync>) {
-        *self.invalidator.lock().expect("invalidator poisoned") = Some(f);
+        let _ = self.invalidator.set(f);
     }
 
+    /// First call wins; later calls are no-ops.
     pub fn set_entry_invalidator(&self, f: Box<dyn Fn(u64, &str) -> bool + Send + Sync>) {
-        *self.entry_invalidator.lock().expect("entry_invalidator poisoned") = Some(f);
+        let _ = self.entry_invalidator.set(f);
     }
 
     async fn lru_sweep_loop(weak: std::sync::Weak<Self>, soft_limit: usize, interval: Duration) {
@@ -302,19 +304,14 @@ impl VirtualFs {
             let overflow = (len - soft_limit).min(LRU_MAX_INVALS_PER_SWEEP);
             inodes.lru_candidates(overflow)
         };
-        let guard = self.entry_invalidator.lock().expect("entry_invalidator poisoned");
-        let Some(cb) = guard.as_ref() else { return 0 };
-        let mut sent = 0usize;
-        for (parent, name) in candidates {
-            if !cb(parent, &name) {
-                // FUSE notify channel refused us — stop bursting. Next sweep
-                // retries with the same oldest entries (their last_touched
-                // hasn't moved), so nothing is lost.
-                break;
-            }
-            sent += 1;
-        }
-        sent
+        let Some(cb) = self.entry_invalidator.get() else {
+            return 0;
+        };
+        // take_while stops at the first `false` return (FUSE notify channel
+        // saturated) without consuming that element — same semantics as the
+        // prior explicit break. Next sweep retries with the same oldest
+        // entries (their last_touched hasn't moved), so nothing is lost.
+        candidates.into_iter().take_while(|(p, n)| cb(*p, n)).count()
     }
 
     /// Graceful shutdown: abort polling, drain flush queue, wait for completion.
@@ -399,7 +396,7 @@ impl VirtualFs {
                 let mut inodes = self.inode_table.write().expect("inodes poisoned");
                 if let Some(entry) = inodes.get(ino) {
                     let parent_ino = entry.parent;
-                    if let Some(invalidate) = self.invalidator.lock().expect("invalidator poisoned").as_ref() {
+                    if let Some(invalidate) = self.invalidator.get() {
                         invalidate(parent_ino);
                         invalidate(ino);
                     }
@@ -437,7 +434,7 @@ impl VirtualFs {
                         remote_size,
                         remote_mtime,
                     );
-                    if let Some(invalidate) = self.invalidator.lock().expect("invalidator poisoned").as_ref() {
+                    if let Some(invalidate) = self.invalidator.get() {
                         invalidate(ino);
                     }
                 } else {

@@ -251,7 +251,7 @@ impl super::VirtualFs {
         }
 
         // Phase 4: Invalidate kernel page cache (outside lock scope)
-        if let Some(invalidate) = invalidator.lock().expect("invalidator poisoned").as_ref() {
+        if let Some(invalidate) = invalidator.get() {
             for ino in &inos_to_invalidate {
                 invalidate(*ino);
             }
