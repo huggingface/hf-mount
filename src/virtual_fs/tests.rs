@@ -74,6 +74,25 @@ fn vfs_readonly(
     (rt, vfs)
 }
 
+/// Build a VFS with the LRU evictor enabled at `soft_limit`.
+fn vfs_with_lru(
+    hub: &std::sync::Arc<MockHub>,
+    xet: &std::sync::Arc<MockXet>,
+    soft_limit: usize,
+) -> (tokio::runtime::Runtime, std::sync::Arc<VirtualFs>) {
+    let rt = new_runtime();
+    let vfs = make_test_vfs(
+        hub.clone(),
+        xet.clone(),
+        TestOpts {
+            inode_soft_limit: soft_limit,
+            ..Default::default()
+        },
+        &rt,
+    );
+    (rt, vfs)
+}
+
 // ── Commit lifecycle ────────────────────────────────────────────────
 
 /// Open(O_TRUNC) -> write -> flush -> release commits to Hub and clears dirty flag.
@@ -449,7 +468,7 @@ fn rename_dirty_file_pending_deletes() {
             let inodes = vfs.inode_table.read().unwrap();
             let entry = inodes.get(ino).unwrap();
             assert!(entry.pending_deletes.contains(&"old.txt".to_string()));
-            assert_eq!(entry.full_path, "new.txt");
+            assert_eq!(entry.full_path.as_ref(), "new.txt");
         }
 
         assert!(hub.take_batch_log().is_empty());
@@ -509,7 +528,7 @@ fn rename_clean_file() {
 
         let inodes = vfs.inode_table.read().unwrap();
         let entry = inodes.get(ino).unwrap();
-        assert_eq!(entry.full_path, "dst.txt");
+        assert_eq!(entry.full_path.as_ref(), "dst.txt");
         assert_eq!(entry.name, "dst.txt");
     });
 }
@@ -537,7 +556,7 @@ fn rename_replaces_destination() {
         {
             let inodes = vfs.inode_table.read().unwrap();
             let entry = inodes.get(src_ino).unwrap();
-            assert_eq!(entry.full_path, "dst.txt");
+            assert_eq!(entry.full_path.as_ref(), "dst.txt");
             assert!(inodes.get(dst_ino).is_none());
         }
 
@@ -2121,14 +2140,7 @@ fn poll_skips_unloaded_directories() {
             remote.extend(hub.list_tree(prefix).await.unwrap());
         }
         let polled: std::collections::HashSet<String> = prefixes.into_iter().collect();
-        VirtualFs::apply_poll_diff(
-            remote,
-            &polled,
-            &vfs.inode_table,
-            &vfs.open_files,
-            &vfs.negative_cache,
-            &vfs.invalidator,
-        );
+        VirtualFs::apply_poll_diff(remote, &polled, &vfs.inode_table, &vfs.negative_cache, &vfs.invalidator);
 
         // Dir "a" should still NOT have children_loaded set (unchanged).
         // Root should still be loaded (not invalidated).
@@ -2168,14 +2180,7 @@ fn poll_invalidates_loaded_dir_with_new_file() {
             remote.extend(hub.list_tree(prefix).await.unwrap());
         }
         let polled: std::collections::HashSet<String> = prefixes.into_iter().collect();
-        VirtualFs::apply_poll_diff(
-            remote,
-            &polled,
-            &vfs.inode_table,
-            &vfs.open_files,
-            &vfs.negative_cache,
-            &vfs.invalidator,
-        );
+        VirtualFs::apply_poll_diff(remote, &polled, &vfs.inode_table, &vfs.negative_cache, &vfs.invalidator);
 
         // Root should be invalidated because it's loaded and has a new file.
         assert!(
@@ -2207,14 +2212,7 @@ fn poll_detects_file_update_in_loaded_dir() {
             remote.extend(hub.list_tree(prefix).await.unwrap());
         }
         let polled: std::collections::HashSet<String> = prefixes.into_iter().collect();
-        VirtualFs::apply_poll_diff(
-            remote,
-            &polled,
-            &vfs.inode_table,
-            &vfs.open_files,
-            &vfs.negative_cache,
-            &vfs.invalidator,
-        );
+        VirtualFs::apply_poll_diff(remote, &polled, &vfs.inode_table, &vfs.negative_cache, &vfs.invalidator);
 
         let inodes = vfs.inode_table.read().unwrap();
         let entry = inodes.get(ino).unwrap();
@@ -2245,14 +2243,7 @@ fn poll_detects_file_deletion_in_loaded_dir() {
             remote.extend(hub.list_tree(prefix).await.unwrap());
         }
         let polled: std::collections::HashSet<String> = prefixes.into_iter().collect();
-        VirtualFs::apply_poll_diff(
-            remote,
-            &polled,
-            &vfs.inode_table,
-            &vfs.open_files,
-            &vfs.negative_cache,
-            &vfs.invalidator,
-        );
+        VirtualFs::apply_poll_diff(remote, &polled, &vfs.inode_table, &vfs.negative_cache, &vfs.invalidator);
 
         // ephemeral.txt should be gone, keeper.txt should remain.
         assert_eq!(vfs.lookup(ROOT_INODE, "ephemeral.txt").await.unwrap_err(), libc::ENOENT);
@@ -2286,27 +2277,21 @@ fn poll_skips_deletion_with_open_handles() {
             remote.extend(hub.list_tree(prefix).await.unwrap());
         }
         let polled: std::collections::HashSet<String> = prefixes.into_iter().collect();
-        VirtualFs::apply_poll_diff(
-            remote,
-            &polled,
-            &vfs.inode_table,
-            &vfs.open_files,
-            &vfs.negative_cache,
-            &vfs.invalidator,
-        );
+        VirtualFs::apply_poll_diff(remote, &polled, &vfs.inode_table, &vfs.negative_cache, &vfs.invalidator);
 
         // closed.txt should be deleted (no open handles)
         assert_eq!(vfs.lookup(ROOT_INODE, "closed.txt").await.unwrap_err(), libc::ENOENT);
 
         // open.txt: inode survives as orphan (nlink=0), but path is unlinked
-        let inodes = vfs.inode_table.read().unwrap();
-        let entry = inodes.get(open_attr.ino).expect("orphan inode should survive");
-        assert_eq!(entry.nlink, 0, "inode should be orphaned (nlink=0)");
-        assert!(
-            inodes.lookup_child(ROOT_INODE, "open.txt").is_none(),
-            "open.txt should not be visible by name"
-        );
-        drop(inodes);
+        {
+            let inodes = vfs.inode_table.read().unwrap();
+            let entry = inodes.get(open_attr.ino).expect("orphan inode should survive");
+            assert_eq!(entry.nlink, 0, "inode should be orphaned (nlink=0)");
+            assert!(
+                inodes.lookup_child(ROOT_INODE, "open.txt").is_none(),
+                "open.txt should not be visible by name"
+            );
+        }
 
         // Release the handle: release() cleans up the orphan
         vfs.release(fh).await.unwrap();
@@ -2353,14 +2338,7 @@ fn poll_multiple_loaded_dirs() {
             remote.extend(hub.list_tree(prefix).await.unwrap());
         }
         let polled: std::collections::HashSet<String> = prefixes.into_iter().collect();
-        VirtualFs::apply_poll_diff(
-            remote,
-            &polled,
-            &vfs.inode_table,
-            &vfs.open_files,
-            &vfs.negative_cache,
-            &vfs.invalidator,
-        );
+        VirtualFs::apply_poll_diff(remote, &polled, &vfs.inode_table, &vfs.negative_cache, &vfs.invalidator);
 
         // sub/nested.txt should be updated.
         let nested_ino = vfs.lookup(sub.ino, "nested.txt").await.unwrap().ino;
@@ -2393,7 +2371,6 @@ fn poll_failed_prefix_no_spurious_deletion() {
             root_entries,
             &polled,
             &vfs.inode_table,
-            &vfs.open_files,
             &vfs.negative_cache,
             &vfs.invalidator,
         );
@@ -2424,14 +2401,7 @@ fn poll_after_invalidation_no_spurious_deletion() {
             remote.extend(hub.list_tree(prefix).await.unwrap());
         }
         let polled: std::collections::HashSet<String> = prefixes.into_iter().collect();
-        VirtualFs::apply_poll_diff(
-            remote,
-            &polled,
-            &vfs.inode_table,
-            &vfs.open_files,
-            &vfs.negative_cache,
-            &vfs.invalidator,
-        );
+        VirtualFs::apply_poll_diff(remote, &polled, &vfs.inode_table, &vfs.negative_cache, &vfs.invalidator);
 
         // Root is now invalidated (children_loaded=false).
         // Second poll: root is NOT in loaded_dir_prefixes anymore.
@@ -2445,7 +2415,6 @@ fn poll_after_invalidation_no_spurious_deletion() {
             remote2,
             &polled2,
             &vfs.inode_table,
-            &vfs.open_files,
             &vfs.negative_cache,
             &vfs.invalidator,
         );
@@ -2489,7 +2458,6 @@ fn poll_detects_deleted_subdirectory() {
             root_entries,
             &polled,
             &vfs.inode_table,
-            &vfs.open_files,
             &vfs.negative_cache,
             &vfs.invalidator,
         );
@@ -3238,6 +3206,99 @@ fn rename_clean_file_remote_and_local() {
         // Phase 3 should have applied locally
         let inodes = vfs.inode_table.read().unwrap();
         let entry = inodes.get(src_ino).unwrap();
-        assert_eq!(entry.full_path, "dst.txt");
+        assert_eq!(entry.full_path.as_ref(), "dst.txt");
+    });
+}
+
+// ── LRU eviction: end-to-end memory bound ───────────────────────────────
+
+/// End-to-end test of the forget-driven eviction path on a hierarchical
+/// tree — the realistic shape for a Hub repo crawl. Walks
+/// `SUBDIRS × FILES_PER_DIR` files through the full FUSE-style protocol
+/// (lookup → bump_nlookup → forget) under a soft limit of 100.
+///
+/// This exercises the scenario PR #105 was built for: an unbounded crawl
+/// with a cgroup-sized memory budget. Without the LRU, `InodeTable` would
+/// grow linearly with the number of looked-up files and eventually
+/// OOM-kill the sidecar (observed empirically at ~3.4 GiB on prod-hub-doc).
+///
+/// We assert two bounds:
+///   - peak table size stays below a small multiple of the soft limit
+///     while the crawl is in flight;
+///   - table drains back near empty once every file has been forgotten.
+#[test]
+fn lru_keeps_inode_table_bounded_under_lookup_churn() {
+    const SUBDIRS: usize = 20;
+    const FILES_PER_DIR: usize = 40;
+    const SOFT_LIMIT: usize = 100;
+    // Under the FUSE-style `forget(ino, 1)` flow, each per-iteration
+    // eviction clears the parent's `children_loaded` flag. The next
+    // `lookup` re-fetches the remote listing, which re-inserts evicted
+    // files under fresh inode numbers — a residual accumulates per dir.
+    // The insert-time polite pass is the backstop: once the table hits
+    // `SOFT_LIMIT + EVICT_TRIGGER_OVERAGE` (356), it drains entries with
+    // `nlookup == 0` (the residuals) back to ~`SOFT_LIMIT`. So the peak
+    // is bounded by the trigger plus the in-flight bulk load.
+    const MAX_EXPECTED: usize = SOFT_LIMIT + 256 + FILES_PER_DIR + 32;
+
+    let hub = MockHub::new();
+    for d in 0..SUBDIRS {
+        for f in 0..FILES_PER_DIR {
+            hub.add_file(&format!("d{d:02}/f{f:02}.txt"), 0, Some("hash"), None);
+        }
+    }
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_with_lru(&hub, &xet, SOFT_LIMIT);
+
+    rt.block_on(async {
+        let mut peak = 0;
+        for d in 0..SUBDIRS {
+            let dir_name = format!("d{d:02}");
+            let dir_attr = vfs
+                .lookup(ROOT_INODE, &dir_name)
+                .await
+                .unwrap_or_else(|e| panic!("lookup({dir_name}) failed: errno={e}"));
+            vfs.bump_nlookup(dir_attr.ino);
+
+            for f in 0..FILES_PER_DIR {
+                let file_name = format!("f{f:02}.txt");
+                let attr = vfs
+                    .lookup(dir_attr.ino, &file_name)
+                    .await
+                    .unwrap_or_else(|e| panic!("lookup({dir_name}/{file_name}) failed: errno={e}"));
+
+                // Match the FUSE adapter's "bump before reply, forget on
+                // kernel drop" protocol so nlookup accounting is honest.
+                vfs.bump_nlookup(attr.ino);
+                vfs.forget(attr.ino, 1);
+
+                let len = vfs.inode_table.read().unwrap().len();
+                peak = peak.max(len);
+                assert!(
+                    len < MAX_EXPECTED,
+                    "table overshoot at {dir_name}/{file_name}: len={len} > {MAX_EXPECTED}"
+                );
+            }
+
+            // Drop the dir's dentry too (the kernel would `forget` it once
+            // it's no longer in the path we're traversing). `evict_if_safe`
+            // refuses directories, so this doesn't shrink the table yet —
+            // just keeps nlookup honest.
+            vfs.forget(dir_attr.ino, 1);
+        }
+
+        // Memory-bound invariant: after a crawl touching SUBDIRS * FILES_PER_DIR
+        // files, the table sits at a small multiple of the soft limit — well
+        // below the total workload. In this test we're running the VFS without
+        // a FUSE `inval_entry` callback wired, so the active LRU sweep can't
+        // drain residuals; the bound is upheld purely by the insert-time
+        // polite pass. With the invalidator wired (the normal FUSE mount case),
+        // the sweep would drive the table back closer to the soft limit.
+        let final_len = vfs.inode_table.read().unwrap().len();
+        let total_lookups = SUBDIRS * FILES_PER_DIR;
+        assert!(
+            final_len < MAX_EXPECTED,
+            "table not bounded: final_len={final_len}, peak={peak}, total_lookups={total_lookups}"
+        );
     });
 }

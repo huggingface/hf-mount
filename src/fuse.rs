@@ -60,6 +60,26 @@ impl FuseAdapter {
             FopenFlags::empty()
         }
     }
+
+    /// Return a `VirtualFsAttr` to the kernel while bumping the inode's
+    /// `nlookup` refcount. The bump MUST happen before `reply.entry()` so a
+    /// racing `forget` cannot observe a stale zero refcount.
+    fn reply_entry_tracked(&self, reply: ReplyEntry, attr: &VirtualFsAttr) {
+        self.virtual_fs.bump_nlookup(attr.ino);
+        reply.entry(&self.metadata_ttl, &vfs_attr_to_fuse(attr), GENERATION);
+    }
+
+    /// Same as `reply_entry_tracked` for `ReplyCreate`.
+    fn reply_created_tracked(&self, reply: fuser::ReplyCreate, attr: &VirtualFsAttr, fh: u64, oflags: FopenFlags) {
+        self.virtual_fs.bump_nlookup(attr.ino);
+        reply.created(
+            &self.metadata_ttl,
+            &vfs_attr_to_fuse(attr),
+            GENERATION,
+            FileHandle(fh),
+            oflags,
+        );
+    }
 }
 
 fn vfs_attr_to_fuse(attr: &VirtualFsAttr) -> FileAttr {
@@ -156,9 +176,15 @@ impl Filesystem for FuseAdapter {
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         let name = os_to_str!(name, reply);
         match self.runtime.block_on(self.virtual_fs.lookup(parent.0, name)) {
-            Ok(attr) => reply.entry(&self.metadata_ttl, &vfs_attr_to_fuse(&attr), GENERATION),
+            Ok(attr) => self.reply_entry_tracked(reply, &attr),
             Err(e) => reply.error(Errno::from_i32(e)),
         }
+    }
+
+    /// Balances the `bump_nlookup` issued by `reply_entry_tracked` /
+    /// `reply_created_tracked` in lookup, create, mkdir and symlink.
+    fn forget(&self, _req: &Request, ino: INodeNo, nlookup: u64) {
+        self.virtual_fs.forget(ino.0, nlookup);
     }
 
     /// Get file/directory attributes (stat).
@@ -323,13 +349,7 @@ impl Filesystem for FuseAdapter {
                 } else {
                     self.open_flags()
                 };
-                reply.created(
-                    &self.metadata_ttl,
-                    &vfs_attr_to_fuse(&attr),
-                    GENERATION,
-                    FileHandle(file_handle),
-                    oflags,
-                );
+                self.reply_created_tracked(reply, &attr, file_handle, oflags);
             }
             Err(e) => reply.error(Errno::from_i32(e)),
         }
@@ -343,7 +363,7 @@ impl Filesystem for FuseAdapter {
             self.virtual_fs
                 .mkdir(parent.0, name, effective_mode, req.uid(), req.gid()),
         ) {
-            Ok(attr) => reply.entry(&self.metadata_ttl, &vfs_attr_to_fuse(&attr), GENERATION),
+            Ok(attr) => self.reply_entry_tracked(reply, &attr),
             Err(e) => reply.error(Errno::from_i32(e)),
         }
     }
@@ -371,7 +391,7 @@ impl Filesystem for FuseAdapter {
             self.virtual_fs
                 .symlink(parent.0, link_name, target, 0o777, req.uid(), req.gid()),
         ) {
-            Ok(attr) => reply.entry(&self.metadata_ttl, &vfs_attr_to_fuse(&attr), GENERATION),
+            Ok(attr) => self.reply_entry_tracked(reply, &attr),
             Err(e) => reply.error(Errno::from_i32(e)),
         }
     }
@@ -475,6 +495,10 @@ impl Filesystem for FuseAdapter {
     fn opendir(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
         match self.virtual_fs.getattr(ino.0) {
             Ok(attr) if attr.kind == InodeKind::Directory => {
+                // Pin the dir against eviction until the matching releasedir.
+                // Otherwise a concurrent force-evict could drop the inode
+                // between opendir and the readdir that follows.
+                self.virtual_fs.bump_open_handles(ino.0);
                 reply.opened(FileHandle(self.virtual_fs.alloc_file_handle()), FopenFlags::empty());
             }
             Ok(_) => reply.error(Errno::ENOTDIR),
@@ -482,8 +506,9 @@ impl Filesystem for FuseAdapter {
         }
     }
 
-    /// Release a directory handle (no-op).
-    fn releasedir(&self, _req: &Request, _ino: INodeNo, _fh: FileHandle, _flags: OpenFlags, reply: ReplyEmpty) {
+    /// Release a directory handle. Drops the refcount bumped by `opendir`.
+    fn releasedir(&self, _req: &Request, ino: INodeNo, _fh: FileHandle, _flags: OpenFlags, reply: ReplyEmpty) {
+        self.virtual_fs.drop_open_handles(ino.0);
         reply.ok();
     }
 
@@ -610,9 +635,29 @@ pub fn mount_fuse(
         })?
     };
     let notifier = session.notifier();
+    let notifier_for_inode = notifier.clone();
     setup.virtual_fs.set_invalidator(Box::new(move |ino| {
-        if let Err(e) = notifier.inval_inode(fuser::INodeNo(ino), 0, -1) {
+        if let Err(e) = notifier_for_inode.inval_inode(fuser::INodeNo(ino), 0, -1) {
             tracing::debug!("inval_inode({}) failed: {}", ino, e);
+        }
+    }));
+    setup.virtual_fs.set_entry_invalidator(Box::new(move |parent, name| {
+        let name_os = std::ffi::OsStr::new(name);
+        match notifier.inval_entry(fuser::INodeNo(parent), name_os) {
+            Ok(()) => true,
+            // ENOENT means the kernel already released the dentry — nothing
+            // went wrong, keep sweeping.
+            Err(e) if e.raw_os_error() == Some(libc::ENOENT) => true,
+            // EAGAIN / ENOMEM: FUSE notify channel is full. Stop the sweep so
+            // we don't waste CPU on a queue the kernel hasn't drained.
+            Err(e) if matches!(e.raw_os_error(), Some(libc::EAGAIN) | Some(libc::ENOMEM)) => {
+                tracing::warn!("inval_entry backpressure: {} — stopping sweep", e);
+                false
+            }
+            Err(e) => {
+                tracing::debug!("inval_entry(parent={}, name={:?}) failed: {}", parent, name, e);
+                true
+            }
         }
     }));
     let bg = session.spawn()?;

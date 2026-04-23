@@ -316,7 +316,7 @@ async fn flush_batch(
                 }
                 Some(FlushItem {
                     ino,
-                    full_path: entry.full_path.clone(),
+                    full_path: entry.full_path.to_string(),
                     staging_path,
                     pending_deletes: entry.pending_deletes.clone(),
                     dirty_generation: entry.dirty_generation,

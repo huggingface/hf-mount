@@ -438,6 +438,7 @@ pub struct TestOpts {
     pub advanced_writes: bool,
     pub serve_lookup_from_cache: bool,
     pub metadata_ttl: Duration,
+    pub inode_soft_limit: usize,
 }
 
 impl Default for TestOpts {
@@ -447,6 +448,7 @@ impl Default for TestOpts {
             advanced_writes: false,
             serve_lookup_from_cache: false,
             metadata_ttl: Duration::from_secs(1),
+            inode_soft_limit: 0,
         }
     }
 }
@@ -486,6 +488,8 @@ pub fn make_test_vfs(
             direct_io: false,
             flush_debounce: Duration::from_millis(100),
             flush_max_batch_window: Duration::from_secs(1),
+            inode_soft_limit: opts.inode_soft_limit,
+            lru_sweep_interval: Duration::from_millis(50),
         },
     )
 }

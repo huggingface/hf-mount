@@ -14,7 +14,6 @@ impl super::VirtualFs {
     pub(super) async fn poll_remote_changes(
         hub_client: Arc<dyn HubOps>,
         inodes: Arc<RwLock<InodeTable>>,
-        open_files: Arc<RwLock<HashMap<u64, super::OpenFile>>>,
         negative_cache: Arc<RwLock<HashMap<String, Instant>>>,
         invalidator: Invalidator,
         interval: Duration,
@@ -60,14 +59,7 @@ impl super::VirtualFs {
                     }
                 }
             }
-            Self::apply_poll_diff(
-                all_entries,
-                &polled_prefixes,
-                &inodes,
-                &open_files,
-                &negative_cache,
-                &invalidator,
-            );
+            Self::apply_poll_diff(all_entries, &polled_prefixes, &inodes, &negative_cache, &invalidator);
         }
     }
 
@@ -82,7 +74,6 @@ impl super::VirtualFs {
         remote_entries: Vec<crate::hub_api::TreeEntry>,
         polled_prefixes: &HashSet<String>,
         inodes: &Arc<RwLock<InodeTable>>,
-        open_files: &Arc<RwLock<HashMap<u64, super::OpenFile>>>,
         negative_cache: &Arc<RwLock<HashMap<String, Instant>>>,
         invalidator: &Invalidator,
     ) {
@@ -181,7 +172,7 @@ impl super::VirtualFs {
                     Some(entry) => (entry.parent, entry.name.clone()),
                     None => continue,
                 };
-                if super::has_open_handles_for(open_files, *ino) {
+                if inode_table.has_open_handles(*ino) {
                     // Unlink the pathname but keep the inode as orphan (nlink=0)
                     // so open handles can still read/fstat. release() will clean
                     // up the orphan. Without this, the file stays visible by name
@@ -260,7 +251,7 @@ impl super::VirtualFs {
         }
 
         // Phase 4: Invalidate kernel page cache (outside lock scope)
-        if let Some(invalidate) = invalidator.lock().expect("invalidator poisoned").as_ref() {
+        if let Some(invalidate) = invalidator.get() {
             for ino in &inos_to_invalidate {
                 invalidate(*ino);
             }

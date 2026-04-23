@@ -78,8 +78,8 @@ async fn bench_xorb_reconstruction_cache() {
             FILE_SIZE / (1024 * 1024)
         );
         eprintln!(
-            "  {:>6}  {:>10}  {:>10}  {:>10}  {}",
-            "Open#", "TTFB (ms)", "Total (s)", "MB/s", "cache"
+            "  {:>6}  {:>10}  {:>10}  {:>10}  cache",
+            "Open#", "TTFB (ms)", "Total (s)", "MB/s"
         );
         eprintln!("  {:-<6}  {:-<10}  {:-<10}  {:-<10}  {:-<5}", "", "", "", "", "");
 

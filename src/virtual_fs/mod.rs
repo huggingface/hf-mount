@@ -3,7 +3,7 @@ use std::fs::{File, OpenOptions};
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::{Bytes, BytesMut};
@@ -30,7 +30,22 @@ const NEG_CACHE_CAPACITY: usize = 10_000;
 /// How long a negative-cache entry stays valid before being re-checked.
 const NEG_CACHE_TTL: Duration = Duration::from_secs(30);
 
-type Invalidator = Arc<Mutex<Option<Box<dyn Fn(u64) + Send + Sync>>>>;
+type InvalidatorFn = Box<dyn Fn(u64) + Send + Sync>;
+/// `(parent, name) -> Ok/Err` maps to `fuse_notify_inval_entry`. Returns
+/// false when the FUSE notify channel is saturated (EAGAIN/ENOMEM) so the
+/// sweep can back off instead of burning CPU on a full queue. Separate
+/// from `InvalidatorFn` because cgroup-bound memory pressure doesn't
+/// propagate to the host's dentry shrinker, so the LRU sweep has to push
+/// dentry drops instead of waiting for the kernel to pull them.
+type EntryInvalidatorFn = Box<dyn Fn(u64, &str) -> bool + Send + Sync>;
+type Invalidator = Arc<OnceLock<InvalidatorFn>>;
+type EntryInvalidator = Arc<OnceLock<EntryInvalidatorFn>>;
+
+/// Hard cap on `inval_entry` calls per sweep. Prevents the sweep from
+/// bursting tens of thousands of notifications at the FUSE channel after
+/// a long-running crawl — empirically the kernel processes them serially,
+/// so a burst just wastes CPU and queues up stale work.
+const LRU_MAX_INVALS_PER_SWEEP: usize = 1024;
 type CommitHookTx = tokio::sync::watch::Sender<Option<Result<(), i32>>>;
 type CommitHookRx = tokio::sync::watch::Receiver<Option<Result<(), i32>>>;
 
@@ -57,6 +72,9 @@ pub struct VfsConfig {
     pub direct_io: bool,
     pub flush_debounce: Duration,
     pub flush_max_batch_window: Duration,
+    /// 0 disables the LRU evictor.
+    pub inode_soft_limit: usize,
+    pub lru_sweep_interval: Duration,
 }
 
 /// Lock ordering (acquire in this order to prevent deadlocks):
@@ -112,6 +130,9 @@ pub struct VirtualFs {
     /// The poll loop calls this to actively invalidate stale inodes when remote changes
     /// are detected, allowing the kernel page cache to be used instead of DIRECT_IO.
     invalidator: Invalidator,
+    entry_invalidator: EntryInvalidator,
+    /// Background LRU evictor handle, aborted in `shutdown()`.
+    lru_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// How long a file's metadata is trusted before re-checking via HEAD.
     /// Matches the kernel metadata TTL so HEAD is called at most once per TTL window.
     metadata_ttl: Duration,
@@ -134,7 +155,7 @@ impl VirtualFs {
         staging_dir: Option<StagingDir>,
         config: VfsConfig,
     ) -> Arc<Self> {
-        let inodes = Arc::new(RwLock::new(InodeTable::new()));
+        let inodes = Arc::new(RwLock::new(InodeTable::new(config.inode_soft_limit)));
         let negative_cache = Arc::new(RwLock::new(HashMap::new()));
 
         let flush_manager = if !config.read_only && config.advanced_writes {
@@ -158,11 +179,10 @@ impl VirtualFs {
         let open_files: Arc<RwLock<HashMap<u64, OpenFile>>> = Arc::new(RwLock::new(HashMap::new()));
 
         // Spawn remote change polling task (if interval > 0)
-        let invalidator: Invalidator = Arc::new(Mutex::new(None));
+        let invalidator: Invalidator = Arc::new(OnceLock::new());
         let poll_handle = if config.poll_interval_secs > 0 {
             let bg_hub = hub_client.clone();
             let bg_inodes = inodes.clone();
-            let bg_open_files = open_files.clone();
             let bg_neg_cache = negative_cache.clone();
             let bg_invalidator = invalidator.clone();
             let interval = Duration::from_secs(config.poll_interval_secs);
@@ -170,7 +190,6 @@ impl VirtualFs {
             Some(runtime.spawn(Self::poll_remote_changes(
                 bg_hub,
                 bg_inodes,
-                bg_open_files,
                 bg_neg_cache,
                 bg_invalidator,
                 interval,
@@ -179,6 +198,7 @@ impl VirtualFs {
             None
         };
 
+        let entry_invalidator: EntryInvalidator = Arc::new(OnceLock::new());
         let vfs = Arc::new(Self {
             runtime,
             hub_client,
@@ -198,6 +218,8 @@ impl VirtualFs {
             flush_manager,
             poll_handle: Mutex::new(poll_handle),
             invalidator,
+            entry_invalidator,
+            lru_handle: Mutex::new(None),
             metadata_ttl: config.metadata_ttl,
             serve_lookup_from_cache: config.serve_lookup_from_cache,
             filter_os_files: config.filter_os_files,
@@ -215,10 +237,28 @@ impl VirtualFs {
             }
         }
 
-        // Pre-load root directory so `ls /mount` is instant.
+        // Pre-load root directory so `ls /mount` is instant. The LRU cap is
+        // armed at `InodeTable::new(soft_limit)` above, so a flat root with
+        // thousands of direct children won't blow past the budget here.
         // Subdirectories are lazy-loaded on first access.
         if let Err(e) = vfs.runtime.block_on(vfs.ensure_children_loaded(inode::ROOT_INODE)) {
             error!("Failed to pre-load root directory: errno={}", e);
+        }
+
+        // Spawn LRU evictor. `Weak` so the task exits when the outer Arc is
+        // dropped; still aborted in shutdown() for determinism.
+        if config.inode_soft_limit > 0 {
+            let weak = Arc::downgrade(&vfs);
+            let soft_limit = config.inode_soft_limit;
+            let sweep_interval = config.lru_sweep_interval;
+            let handle = vfs
+                .runtime
+                .spawn(Self::lru_sweep_loop(weak, soft_limit, sweep_interval));
+            *vfs.lru_handle.lock().expect("lru_handle poisoned") = Some(handle);
+            info!(
+                "LRU evictor enabled: soft_limit={} inodes, sweep every {:?}",
+                soft_limit, sweep_interval
+            );
         }
 
         vfs
@@ -226,8 +266,52 @@ impl VirtualFs {
 
     /// Set the kernel cache invalidation callback. Called after mount setup
     /// so the poll loop can actively invalidate stale inodes on remote changes.
-    pub fn set_invalidator(&self, f: Box<dyn Fn(u64) + Send + Sync>) {
-        *self.invalidator.lock().expect("invalidator poisoned") = Some(f);
+    /// First call wins; later calls are no-ops.
+    pub fn set_invalidator(&self, f: InvalidatorFn) {
+        let _ = self.invalidator.set(f);
+    }
+
+    /// First call wins; later calls are no-ops.
+    pub fn set_entry_invalidator(&self, f: EntryInvalidatorFn) {
+        let _ = self.entry_invalidator.set(f);
+    }
+
+    async fn lru_sweep_loop(weak: std::sync::Weak<Self>, soft_limit: usize, interval: Duration) {
+        loop {
+            tokio::time::sleep(interval).await;
+            let Some(vfs) = weak.upgrade() else { return };
+            let table_len = vfs.inode_table.read().expect("inodes poisoned").len();
+            let evicted = vfs.lru_evict_sweep(soft_limit);
+            if evicted > 0 || table_len > soft_limit {
+                info!(
+                    "lru_sweep: table={} soft_limit={} invalidated={}",
+                    table_len, soft_limit, evicted
+                );
+            }
+        }
+    }
+
+    /// Candidates are collected under a read lock, then the lock is dropped
+    /// before invoking the callback — the callback writes to the FUSE
+    /// channel and can block under backpressure.
+    fn lru_evict_sweep(&self, soft_limit: usize) -> usize {
+        let candidates = {
+            let inodes = self.inode_table.read().expect("inodes poisoned");
+            let len = inodes.len();
+            if len <= soft_limit {
+                return 0;
+            }
+            let overflow = (len - soft_limit).min(LRU_MAX_INVALS_PER_SWEEP);
+            inodes.lru_candidates(overflow)
+        };
+        let Some(cb) = self.entry_invalidator.get() else {
+            return 0;
+        };
+        // take_while stops at the first `false` return (FUSE notify channel
+        // saturated) without consuming that element — same semantics as the
+        // prior explicit break. Next sweep retries with the same oldest
+        // entries (their last_touched hasn't moved), so nothing is lost.
+        candidates.into_iter().take_while(|(p, n)| cb(*p, n)).count()
     }
 
     /// Graceful shutdown: abort polling, drain flush queue, wait for completion.
@@ -235,6 +319,9 @@ impl VirtualFs {
         info!("Shutting down VFS, flushing pending writes...");
         // Abort background tasks.
         if let Some(handle) = self.poll_handle.lock().expect("poll_handle poisoned").take() {
+            handle.abort();
+        }
+        if let Some(handle) = self.lru_handle.lock().expect("lru_handle poisoned").take() {
             handle.abort();
         }
         // Flush all dirty files + queued deletes.
@@ -309,7 +396,7 @@ impl VirtualFs {
                 let mut inodes = self.inode_table.write().expect("inodes poisoned");
                 if let Some(entry) = inodes.get(ino) {
                     let parent_ino = entry.parent;
-                    if let Some(invalidate) = self.invalidator.lock().expect("invalidator poisoned").as_ref() {
+                    if let Some(invalidate) = self.invalidator.get() {
                         invalidate(parent_ino);
                         invalidate(ino);
                     }
@@ -347,7 +434,7 @@ impl VirtualFs {
                         remote_size,
                         remote_mtime,
                     );
-                    if let Some(invalidate) = self.invalidator.lock().expect("invalidator poisoned").as_ref() {
+                    if let Some(invalidate) = self.invalidator.get() {
                         invalidate(ino);
                     }
                 } else {
@@ -394,7 +481,7 @@ impl VirtualFs {
             match inodes.get(parent_ino) {
                 Some(e) if e.kind != InodeKind::Directory => return Err(libc::ENOTDIR),
                 Some(e) if e.children_loaded => return Ok(()),
-                Some(e) => e.full_path.clone(),
+                Some(e) => e.full_path.to_string(),
                 None => return Err(libc::ENOENT),
             }
         };
@@ -507,7 +594,7 @@ impl VirtualFs {
                 .collect();
             for ino in stale {
                 // Don't remove if the inode or any descendant is dirty or has open handles.
-                let has_dirty_or_open = inodes.has_dirty_descendants(ino) || self.has_open_handles(ino);
+                let has_dirty_or_open = inodes.has_dirty_descendants(ino) || inodes.has_open_handles(ino);
                 if !has_dirty_or_open {
                     inodes.remove(ino);
                 }
@@ -547,9 +634,22 @@ impl VirtualFs {
         self.next_file_handle.fetch_add(1, Ordering::Relaxed)
     }
 
+    /// Bump the per-inode open-handle refcount. Used by the FUSE adapter
+    /// on `opendir` so a directory with an active readdir can't be evicted.
+    #[cfg(any(feature = "fuse", test))]
+    pub(crate) fn bump_open_handles(&self, ino: u64) {
+        self.inode_table.read().expect("inodes poisoned").bump_open_handles(ino);
+    }
+
+    /// Counterpart to `bump_open_handles`, called from `releasedir`.
+    #[cfg(any(feature = "fuse", test))]
+    pub(crate) fn drop_open_handles(&self, ino: u64) {
+        self.inode_table.read().expect("inodes poisoned").drop_open_handles(ino);
+    }
+
     /// Check if any open file handle references the given inode.
     fn has_open_handles(&self, ino: u64) -> bool {
-        has_open_handles_for(&self.open_files, ino)
+        self.inode_table.read().expect("inodes poisoned").has_open_handles(ino)
     }
 
     /// Get or create a per-directory lock for serializing ensure_children_loaded().
@@ -668,6 +768,7 @@ impl VirtualFs {
         match File::open(path) {
             Ok(file) => {
                 let file_handle = self.alloc_file_handle();
+                self.inode_table.read().expect("inodes poisoned").bump_open_handles(ino);
                 self.open_files.write().expect("open_files poisoned").insert(
                     file_handle,
                     OpenFile::Local {
@@ -759,7 +860,7 @@ impl VirtualFs {
                     if entry.kind == InodeKind::File && !entry.is_dirty() {
                         FastResult::NeedsRevalidation {
                             ino: entry.inode,
-                            full_path: entry.full_path.clone(),
+                            full_path: entry.full_path.to_string(),
                             current_hash: entry.xet_hash.clone(),
                             current_etag: entry.etag.clone(),
                         }
@@ -870,9 +971,61 @@ impl VirtualFs {
 
         let inodes = self.inode_table.read().expect("inodes poisoned");
         match inodes.get(ino) {
-            Some(entry) => Ok(self.make_vfs_attr(entry)),
+            Some(entry) => {
+                inodes.touch(ino);
+                Ok(self.make_vfs_attr(entry))
+            }
             None => Err(libc::ENOENT),
         }
+    }
+
+    /// Must be called after every `reply.entry()` / `reply.created()`, or
+    /// the kernel and our `nlookup` will drift and a later `forget()` will
+    /// underflow. Also touches for LRU so actively-looked-up inodes aren't
+    /// immediately evicted.
+    #[cfg(any(feature = "fuse", test))]
+    pub(crate) fn bump_nlookup(&self, ino: u64) {
+        let inodes = self.inode_table.read().expect("inodes poisoned");
+        inodes.bump_nlookup(ino);
+        inodes.touch(ino);
+    }
+
+    /// Handle a FUSE `forget(ino, nlookup)`: drop the refcount by `nlookup`,
+    /// and evict the inode if it's now safe (kernel no longer holds the
+    /// dentry, no open handles, nothing dirty). Eviction keeps `InodeTable`
+    /// bounded — without it the table grows for every file ever looked up.
+    #[cfg(any(feature = "fuse", test))]
+    pub(crate) fn forget(&self, ino: u64, nlookup: u64) {
+        debug!("forget: ino={} nlookup={}", ino, nlookup);
+
+        // Shared lock for the hot path: dropping the refcount is an atomic op,
+        // so readers (lookup/getattr/read) aren't blocked on the common case
+        // where the refcount stays > 0.
+        let reached_zero = {
+            let inodes = self.inode_table.read().expect("inodes poisoned");
+            inodes.drop_nlookup(ino, nlookup)
+        };
+        if !reached_zero {
+            return;
+        }
+
+        // A racing open() would insert into `open_files` before calling
+        // `bump_nlookup`, so checking handles here (after the refcount hit 0)
+        // is safe: any concurrent lookup will re-bump the count, and any
+        // concurrent read/write holds an open handle we'll see.
+        if self.has_open_handles(ino) {
+            // The kernel has given up the dentry but our handle keeps the
+            // inode alive. Mark it so `release()` finishes the eviction
+            // once the last handle closes — otherwise it would leak.
+            self.inode_table
+                .read()
+                .expect("inodes poisoned")
+                .mark_evict_pending(ino);
+            return;
+        }
+
+        let mut inodes = self.inode_table.write().expect("inodes poisoned");
+        inodes.evict_if_safe(ino);
     }
 
     pub async fn readdir(&self, ino: u64) -> VirtualFsResult<Vec<VirtualFsDirEntry>> {
@@ -1004,6 +1157,7 @@ impl VirtualFs {
         }
 
         let file_handle = self.alloc_file_handle();
+        self.inode_table.read().expect("inodes poisoned").bump_open_handles(ino);
         self.open_files.write().expect("open_files poisoned").insert(
             file_handle,
             OpenFile::Local {
@@ -1050,6 +1204,7 @@ impl VirtualFs {
             }
         }
 
+        self.inode_table.read().expect("inodes poisoned").bump_open_handles(ino);
         self.open_files
             .write()
             .expect("open_files poisoned")
@@ -1122,6 +1277,7 @@ impl VirtualFs {
             self.direct_io,
         )));
         let file_handle = self.alloc_file_handle();
+        self.inode_table.read().expect("inodes poisoned").bump_open_handles(ino);
         self.open_files
             .write()
             .expect("open_files poisoned")
@@ -1577,6 +1733,9 @@ impl VirtualFs {
             | Some(OpenFile::Streaming { ino, .. }) => Some(*ino),
             _ => None,
         };
+        if let Some(ino) = released_ino {
+            self.inode_table.read().expect("inodes poisoned").drop_open_handles(ino);
+        }
 
         let mut release_error: Option<i32> = None;
 
@@ -1653,11 +1812,16 @@ impl VirtualFs {
         }
 
         // Clean up orphan inodes (nlink == 0) when no more handles reference them.
+        // Also finish any eviction that `forget()` had to defer because we were
+        // still holding an open handle at the time.
         if let Some(ino) = released_ino
             && !self.has_open_handles(ino)
         {
             let mut inodes = self.inode_table.write().expect("inodes poisoned");
             inodes.remove_orphan(ino);
+            if inodes.take_evict_pending(ino) {
+                inodes.evict_if_safe(ino);
+            }
         }
 
         // staging_locks entries are intentionally not cleaned up here: removing
@@ -1742,7 +1906,7 @@ impl VirtualFs {
         let (full_path, pending_deletes) = {
             let inodes = self.inode_table.read().expect("inodes poisoned");
             let entry = inodes.get(ino).ok_or(libc::ENOENT)?;
-            (entry.full_path.clone(), entry.pending_deletes.clone())
+            (entry.full_path.to_string(), entry.pending_deletes.clone())
         };
 
         let mtime_ms = SystemTime::now()
@@ -1865,6 +2029,8 @@ impl VirtualFs {
             {
                 Ok(file) => {
                     let file_handle = self.alloc_file_handle();
+                    let inodes = self.inode_table.read().expect("inodes poisoned");
+                    inodes.bump_open_handles(ino);
                     self.open_files.write().expect("open_files poisoned").insert(
                         file_handle,
                         OpenFile::Local {
@@ -1874,7 +2040,6 @@ impl VirtualFs {
                         },
                     );
 
-                    let inodes = self.inode_table.read().expect("inodes poisoned");
                     let attr = self.make_vfs_attr(inodes.get(ino).ok_or(libc::ENOENT)?);
                     Ok((attr, file_handle))
                 }
@@ -1901,12 +2066,13 @@ impl VirtualFs {
                 }
             };
 
+            let inodes = self.inode_table.read().expect("inodes poisoned");
+            inodes.bump_open_handles(ino);
             self.open_files
                 .write()
                 .expect("open_files poisoned")
                 .insert(file_handle, OpenFile::Streaming { ino, channel });
 
-            let inodes = self.inode_table.read().expect("inodes poisoned");
             let attr = self.make_vfs_attr(inodes.get(ino).ok_or(libc::ENOENT)?);
             Ok((attr, file_handle))
         }
@@ -1991,7 +2157,7 @@ impl VirtualFs {
             };
             // Remote delete only when last link is removed and file exists on the hub
             let needs_remote = entry.xet_hash.is_some() && entry.nlink <= 1;
-            (entry.inode, entry.full_path.clone(), needs_remote)
+            (entry.inode, entry.full_path.to_string(), needs_remote)
         };
 
         // In streaming mode, block unlink while the file has any open handles.
@@ -2033,7 +2199,7 @@ impl VirtualFs {
             let now = SystemTime::now();
             inodes.touch_parent(parent, now);
             // If last link gone and no open handles, remove the orphan immediately
-            if last_link && !self.has_open_handles(ino) {
+            if last_link && !inodes.has_open_handles(ino) {
                 inodes.remove_orphan(ino);
             }
             last_link
@@ -2330,7 +2496,7 @@ impl VirtualFs {
                             match child.kind {
                                 InodeKind::File if !child.is_dirty() && child.xet_hash.is_some() => {
                                     files.push((
-                                        child.full_path.clone(),
+                                        child.full_path.to_string(),
                                         child.xet_hash.clone().expect("checked is_some above"),
                                     ));
                                 }
@@ -2348,7 +2514,7 @@ impl VirtualFs {
 
         Ok(RenameInfo {
             ino: src.inode,
-            old_path: src.full_path.clone(),
+            old_path: src.full_path.to_string(),
             kind: src.kind,
             xet_hash: src.xet_hash.clone(),
             is_dirty: src.is_dirty(),
@@ -2476,7 +2642,7 @@ impl VirtualFs {
                 inodes.remove(existing_ino);
             } else {
                 inodes.unlink_one(newparent, newname);
-                if !self.has_open_handles(existing_ino) {
+                if !inodes.has_open_handles(existing_ino) {
                     inodes.remove_orphan(existing_ino);
                 }
             }
@@ -2502,7 +2668,7 @@ impl VirtualFs {
                     if let Some(child) = inodes.get(child_ref.ino) {
                         match child.kind {
                             InodeKind::File if child.is_dirty() && child.xet_hash.is_some() => {
-                                let old_path = child.full_path.clone();
+                                let old_path = child.full_path.to_string();
                                 if let Some(child_mut) = inodes.get_mut(child_ref.ino) {
                                     child_mut.pending_deletes.push(old_path);
                                 }
@@ -2678,7 +2844,7 @@ impl VirtualFs {
             xet_hash: entry.xet_hash.clone().unwrap_or_default(),
             size: entry.size,
             is_dirty: entry.is_dirty(),
-            full_path: entry.full_path.clone(),
+            full_path: entry.full_path.to_string(),
         })
     }
 }
@@ -2872,19 +3038,6 @@ enum ReadTarget {
     Remote {
         prefetch: Arc<tokio::sync::Mutex<PrefetchState>>,
     },
-}
-
-/// Check if any open file handle references the given inode.
-fn has_open_handles_for(open_files: &RwLock<HashMap<u64, OpenFile>>, ino: u64) -> bool {
-    open_files
-        .read()
-        .expect("open_files poisoned")
-        .values()
-        .any(|of| match of {
-            OpenFile::Local { ino: i, .. } | OpenFile::Lazy { ino: i, .. } | OpenFile::Streaming { ino: i, .. } => {
-                *i == ino
-            }
-        })
 }
 
 #[cfg(test)]
