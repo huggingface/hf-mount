@@ -155,7 +155,7 @@ impl VirtualFs {
         staging_dir: Option<StagingDir>,
         config: VfsConfig,
     ) -> Arc<Self> {
-        let inodes = Arc::new(RwLock::new(InodeTable::new()));
+        let inodes = Arc::new(RwLock::new(InodeTable::new(config.inode_soft_limit)));
         let negative_cache = Arc::new(RwLock::new(HashMap::new()));
 
         let flush_manager = if !config.read_only && config.advanced_writes {
@@ -237,17 +237,9 @@ impl VirtualFs {
             }
         }
 
-        // Arm the LRU cap *before* the root preload so a flat root directory
-        // with tens of thousands of direct children doesn't blow past the
-        // budget in one bulk insert.
-        if config.inode_soft_limit > 0 {
-            vfs.inode_table
-                .read()
-                .expect("inodes poisoned")
-                .enable_lru(config.inode_soft_limit);
-        }
-
-        // Pre-load root directory so `ls /mount` is instant.
+        // Pre-load root directory so `ls /mount` is instant. The LRU cap is
+        // armed at `InodeTable::new(soft_limit)` above, so a flat root with
+        // thousands of direct children won't blow past the budget here.
         // Subdirectories are lazy-loaded on first access.
         if let Err(e) = vfs.runtime.block_on(vfs.ensure_children_loaded(inode::ROOT_INODE)) {
             error!("Failed to pre-load root directory: errno={}", e);
