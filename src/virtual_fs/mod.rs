@@ -237,19 +237,25 @@ impl VirtualFs {
             }
         }
 
+        // Arm the LRU cap *before* the root preload so a flat root directory
+        // with tens of thousands of direct children doesn't blow past the
+        // budget in one bulk insert.
+        if config.inode_soft_limit > 0 {
+            vfs.inode_table
+                .read()
+                .expect("inodes poisoned")
+                .enable_lru(config.inode_soft_limit);
+        }
+
         // Pre-load root directory so `ls /mount` is instant.
         // Subdirectories are lazy-loaded on first access.
         if let Err(e) = vfs.runtime.block_on(vfs.ensure_children_loaded(inode::ROOT_INODE)) {
             error!("Failed to pre-load root directory: errno={}", e);
         }
 
-        // Spawn LRU evictor if configured. `Weak` so the task exits when
-        // the outer Arc is dropped; still aborted in shutdown() for determinism.
+        // Spawn LRU evictor. `Weak` so the task exits when the outer Arc is
+        // dropped; still aborted in shutdown() for determinism.
         if config.inode_soft_limit > 0 {
-            vfs.inode_table
-                .read()
-                .expect("inodes poisoned")
-                .enable_lru(config.inode_soft_limit);
             let weak = Arc::downgrade(&vfs);
             let soft_limit = config.inode_soft_limit;
             let sweep_interval = config.lru_sweep_interval;
@@ -638,13 +644,13 @@ impl VirtualFs {
 
     /// Bump the per-inode open-handle refcount. Used by the FUSE adapter
     /// on `opendir` so a directory with an active readdir can't be evicted.
-    #[cfg(feature = "fuse")]
+    #[cfg(any(feature = "fuse", test))]
     pub(crate) fn bump_open_handles(&self, ino: u64) {
         self.inode_table.read().expect("inodes poisoned").bump_open_handles(ino);
     }
 
     /// Counterpart to `bump_open_handles`, called from `releasedir`.
-    #[cfg(feature = "fuse")]
+    #[cfg(any(feature = "fuse", test))]
     pub(crate) fn drop_open_handles(&self, ino: u64) {
         self.inode_table.read().expect("inodes poisoned").drop_open_handles(ino);
     }
@@ -985,7 +991,7 @@ impl VirtualFs {
     /// the kernel and our `nlookup` will drift and a later `forget()` will
     /// underflow. Also touches for LRU so actively-looked-up inodes aren't
     /// immediately evicted.
-    #[cfg(feature = "fuse")]
+    #[cfg(any(feature = "fuse", test))]
     pub(crate) fn bump_nlookup(&self, ino: u64) {
         let inodes = self.inode_table.read().expect("inodes poisoned");
         inodes.bump_nlookup(ino);
@@ -996,7 +1002,7 @@ impl VirtualFs {
     /// and evict the inode if it's now safe (kernel no longer holds the
     /// dentry, no open handles, nothing dirty). Eviction keeps `InodeTable`
     /// bounded — without it the table grows for every file ever looked up.
-    #[cfg(feature = "fuse")]
+    #[cfg(any(feature = "fuse", test))]
     pub(crate) fn forget(&self, ino: u64, nlookup: u64) {
         debug!("forget: ino={} nlookup={}", ino, nlookup);
 
