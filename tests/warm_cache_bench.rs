@@ -132,7 +132,6 @@ async fn bench_xorb_reconstruction_cache() {
 
     std::fs::remove_dir_all(&mount).ok();
     std::fs::remove_dir_all(&cache).ok();
-    drop(guard);
 
     let results = match result {
         Ok(r) => r,

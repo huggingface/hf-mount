@@ -92,9 +92,6 @@ async fn test_bench() {
     std::fs::remove_dir_all(&nfs_mount).ok();
     std::fs::remove_dir_all(&nfs_cache).ok();
 
-    // Cleanup (BucketGuard deletes bucket on drop)
-    drop(guard);
-
     // --- Extract results ---
     let (fuse_reads, fuse_writes) = match fuse_result {
         Ok((reads, writes)) => (reads, writes),

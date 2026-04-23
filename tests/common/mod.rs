@@ -21,9 +21,9 @@ pub fn endpoint() -> String {
 /// RAII guard that deletes the bucket when dropped. Cleanup runs even if the test
 /// panics, so we don't leak buckets on production Hub.
 pub struct BucketGuard {
-    pub token: String,
     pub bucket_id: String,
     pub hub: Arc<hf_mount::hub_api::HubApiClient>,
+    token: String,
     endpoint: String,
 }
 
@@ -130,7 +130,13 @@ pub async fn create_bucket(endpoint: &str, token: &str, bucket_id: &str) {
 
 /// Delete a bucket from the Hub.
 pub async fn delete_bucket(endpoint: &str, token: &str, bucket_id: &str) {
-    match Client::new()
+    // Bounded timeout so BucketGuard's Drop can't block the test thread
+    // indefinitely if the Hub is slow or unreachable.
+    let client = Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("build delete_bucket client");
+    match client
         .delete(format!("{}/api/buckets/{}", endpoint, bucket_id))
         .bearer_auth(token)
         .send()

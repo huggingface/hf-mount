@@ -284,7 +284,6 @@ async fn test_pjdfstest() {
     print_results(&results);
 
     common::unmount(&mount_point, child, 5);
-    drop(guard);
     std::fs::remove_dir_all(&mount_point).ok();
     std::fs::remove_dir_all(&cache_dir).ok();
 

@@ -79,7 +79,6 @@ async fn run_fsx(test_name: &str, fsx_args: &[&str]) -> bool {
 
     std::fs::remove_file(&test_file).ok();
     common::unmount(&mount_point, child, 10);
-    drop(guard);
     std::fs::remove_dir_all(&mount_point).ok();
     std::fs::remove_dir_all(&cache_dir).ok();
 

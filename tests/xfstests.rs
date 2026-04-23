@@ -310,10 +310,8 @@ async fn test_xfstests_generic() {
     // Print full output for CI
     eprintln!("{}", combined);
 
-    // Cleanup
     common::unmount(&test_dir, child_test, 5);
     common::unmount(&scratch_dir, child_scratch, 5);
-    drop(guard);
     std::fs::remove_dir_all(&test_dir).ok();
     std::fs::remove_dir_all(&scratch_dir).ok();
     std::fs::remove_dir_all(&cache_dir).ok();

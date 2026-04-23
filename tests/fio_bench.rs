@@ -248,9 +248,6 @@ async fn test_fio_compare() {
     std::fs::remove_dir_all(&nfs_mount).ok();
     std::fs::remove_dir_all(&nfs_cache).ok();
 
-    // Cleanup (BucketGuard deletes bucket on drop)
-    drop(guard);
-
     let fuse_results = match fuse_result {
         Ok(r) => r,
         Err(e) => std::panic::resume_unwind(e),
