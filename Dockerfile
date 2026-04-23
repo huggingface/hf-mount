@@ -1,5 +1,5 @@
 # Build hf-mount binaries (Rust)
-FROM rust:1.89-bookworm AS builder
+FROM rust:1.95-bookworm AS builder
 WORKDIR /build
 COPY . .
 RUN cargo build --release --no-default-features --features fuse,vendored-openssl \
