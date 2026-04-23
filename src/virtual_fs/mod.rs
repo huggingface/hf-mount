@@ -1024,8 +1024,26 @@ impl VirtualFs {
             return;
         }
 
-        let mut inodes = self.inode_table.write().expect("inodes poisoned");
-        inodes.evict_if_safe(ino);
+        let evicted = {
+            let mut inodes = self.inode_table.write().expect("inodes poisoned");
+            inodes.evict_if_safe(ino)
+        };
+        if evicted {
+            self.drop_staging(ino);
+        }
+    }
+
+    /// Remove any on-disk staging file for `ino`. Safe to call for inodes that
+    /// never had a staging file — NotFound is ignored.
+    fn drop_staging(&self, ino: u64) {
+        if let Some(ref sd) = self.staging_dir {
+            let path = sd.path(ino);
+            if let Err(e) = std::fs::remove_file(&path)
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                warn!("Failed to remove staging file for ino={}: {}", ino, e);
+            }
+        }
     }
 
     pub async fn readdir(&self, ino: u64) -> VirtualFsResult<Vec<VirtualFsDirEntry>> {
@@ -1817,10 +1835,14 @@ impl VirtualFs {
         if let Some(ino) = released_ino
             && !self.has_open_handles(ino)
         {
-            let mut inodes = self.inode_table.write().expect("inodes poisoned");
-            inodes.remove_orphan(ino);
-            if inodes.take_evict_pending(ino) {
-                inodes.evict_if_safe(ino);
+            let removed = {
+                let mut inodes = self.inode_table.write().expect("inodes poisoned");
+                let orphan = inodes.remove_orphan(ino);
+                let evicted = inodes.take_evict_pending(ino) && inodes.evict_if_safe(ino);
+                orphan || evicted
+            };
+            if removed {
+                self.drop_staging(ino);
             }
         }
 
@@ -2206,13 +2228,8 @@ impl VirtualFs {
         };
 
         // Clean up staging file only if inode was fully removed (no remaining hard links)
-        if inode_removed && let Some(ref staging_dir) = self.staging_dir {
-            let staging_path = staging_dir.path(ino);
-            if let Err(e) = std::fs::remove_file(&staging_path)
-                && e.kind() != std::io::ErrorKind::NotFound
-            {
-                warn!("Failed to remove staging file for ino={}: {}", ino, e);
-            }
+        if inode_removed {
+            self.drop_staging(ino);
         }
 
         info!("Deleted file: {}", full_path);
@@ -2635,6 +2652,7 @@ impl VirtualFs {
         } else {
             None
         };
+        let mut replaced_staging_ino: Option<u64> = None;
         if let Some((existing_ino, existing_kind)) = replace_target {
             if existing_kind == InodeKind::Directory {
                 // Directories can't be hard-linked, so remove() is correct
@@ -2642,8 +2660,8 @@ impl VirtualFs {
                 inodes.remove(existing_ino);
             } else {
                 inodes.unlink_one(newparent, newname);
-                if !inodes.has_open_handles(existing_ino) {
-                    inodes.remove_orphan(existing_ino);
+                if !inodes.has_open_handles(existing_ino) && inodes.remove_orphan(existing_ino) {
+                    replaced_staging_ino = Some(existing_ino);
                 }
             }
         }
@@ -2696,6 +2714,11 @@ impl VirtualFs {
         // Update source ctime (POSIX: inode metadata changed)
         if let Some(e) = inodes.get_mut(info.ino) {
             e.ctime = now;
+        }
+        drop(inodes);
+
+        if let Some(ino) = replaced_staging_ino {
+            self.drop_staging(ino);
         }
 
         Ok(())

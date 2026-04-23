@@ -3114,6 +3114,46 @@ fn bulk_create_delete_no_open_files_leak() {
     });
 }
 
+/// When an inode is LRU-evicted via forget(), its staging file must be removed
+/// too. Otherwise a long-lived mount accumulates orphaned staging files on disk.
+#[test]
+fn staging_file_removed_on_inode_eviction() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_advanced(&hub, &xet);
+
+    rt.block_on(async {
+        let (attr, fh) = vfs
+            .create(ROOT_INODE, "evict_me.txt", 0o644, 1000, 1000, None)
+            .await
+            .unwrap();
+        let ino = attr.ino;
+        write_blocking(&vfs, ino, fh, 0, b"staging data").await.unwrap();
+
+        let staging_path = vfs.staging_dir.as_ref().unwrap().path(ino);
+        assert!(staging_path.exists(), "staging file should exist after write");
+
+        vfs.release(fh).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        let is_clean = vfs.inode_table.read().unwrap().get(ino).is_some_and(|e| !e.is_dirty());
+        assert!(is_clean, "inode should be clean after flush");
+
+        // Simulate the FUSE kernel dropping the dentry, triggering LRU eviction.
+        vfs.bump_nlookup(ino);
+        vfs.forget(ino, 1);
+
+        assert!(
+            vfs.inode_table.read().unwrap().get(ino).is_none(),
+            "inode should be evicted after forget"
+        );
+        assert!(
+            !staging_path.exists(),
+            "staging file should be removed when the inode is evicted"
+        );
+    });
+}
+
 /// Rename overwriting a destination cleans up the destination inode.
 #[test]
 fn rename_overwrite_cleans_destination() {
