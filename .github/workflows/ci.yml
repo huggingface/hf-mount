@@ -64,8 +64,8 @@ jobs:
       group: hf-mount-ci-pub
     needs: lint-test
     env:
-      HF_TOKEN: ${{ secrets.HF_TOKEN_HUB_CI }}
-      HF_ENDPOINT: https://hub-ci.huggingface.co
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      HF_ENDPOINT: https://huggingface.co
     steps:
       - uses: actions/checkout@v4
 
@@ -86,8 +86,6 @@ jobs:
         run: cargo test --release --test fuse_ops --test nfs_ops -- --test-threads=1 --nocapture
 
       - name: Integration tests (repo mount)
-        env:
-          HF_ENDPOINT: https://huggingface.co
         run: unset HF_TOKEN && cargo test --release --test repo_ops -- --test-threads=1 --nocapture
 
   fsx:
@@ -140,8 +138,8 @@ jobs:
       group: hf-mount-ci-pub
     needs: lint-test
     env:
-      HF_TOKEN: ${{ secrets.HF_TOKEN_HUB_CI }}
-      HF_ENDPOINT: https://hub-ci.huggingface.co
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      HF_ENDPOINT: https://huggingface.co
     steps:
       - uses: actions/checkout@v4
 
@@ -206,8 +204,8 @@ jobs:
       group: hf-mount-ci-pub
     needs: lint-test
     env:
-      HF_TOKEN: ${{ secrets.HF_TOKEN_HUB_CI }}
-      HF_ENDPOINT: https://hub-ci.huggingface.co
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      HF_ENDPOINT: https://huggingface.co
     steps:
       - uses: actions/checkout@v4
 
