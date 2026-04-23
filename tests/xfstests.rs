@@ -193,8 +193,8 @@ async fn test_xfstests_generic() {
         return;
     }
 
-    let (token, bucket_id, _hub) = match common::setup_bucket("xfstests").await {
-        Some(cfg) => cfg,
+    let guard = match common::setup_bucket("xfstests").await {
+        Some(g) => g,
         None => return,
     };
 
@@ -204,9 +204,9 @@ async fn test_xfstests_generic() {
     let cache_dir = format!("/tmp/hf-xfstests-cache-{}", pid);
 
     // Mount test + scratch
-    let child_test = common::mount_bucket(&bucket_id, &test_dir, &cache_dir, &["--advanced-writes"]);
+    let child_test = common::mount_bucket(&guard.bucket_id, &test_dir, &cache_dir, &["--advanced-writes"]);
     let child_scratch = common::mount_bucket(
-        &bucket_id,
+        &guard.bucket_id,
         &scratch_dir,
         &format!("{}-scratch", cache_dir),
         &["--advanced-writes"],
@@ -221,7 +221,7 @@ async fn test_xfstests_generic() {
         .unwrap()
         .join("hf-mount-fuse");
     // SAFETY: single-threaded test, no concurrent env access
-    unsafe { std::env::set_var("HF_XFSTESTS_BUCKET", &bucket_id) };
+    unsafe { std::env::set_var("HF_XFSTESTS_BUCKET", &guard.bucket_id) };
     create_mount_wrapper(&binary);
 
     // Write xfstests config
@@ -310,10 +310,8 @@ async fn test_xfstests_generic() {
     // Print full output for CI
     eprintln!("{}", combined);
 
-    // Cleanup
     common::unmount(&test_dir, child_test, 5);
     common::unmount(&scratch_dir, child_scratch, 5);
-    common::delete_bucket(&common::endpoint(), &token, &bucket_id).await;
     std::fs::remove_dir_all(&test_dir).ok();
     std::fs::remove_dir_all(&scratch_dir).ok();
     std::fs::remove_dir_all(&cache_dir).ok();
