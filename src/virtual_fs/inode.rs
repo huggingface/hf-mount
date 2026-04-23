@@ -2550,6 +2550,39 @@ mod tests {
         assert!(table.get(busy).is_none());
     }
 
+    #[test]
+    fn test_open_handles_protect_empty_directory_from_force() {
+        // Mirrors the FUSE opendir/releasedir pin: an empty directory with a
+        // live dir handle (opendir in flight, readdir not yet issued) must
+        // survive a force-eviction sweep — otherwise the follow-up readdir
+        // would return ENOENT.
+        let mut table = InodeTable::new();
+        let dir_ino = table.insert(
+            ROOT_INODE,
+            "d".to_string(),
+            "d".to_string(),
+            InodeKind::Directory,
+            0,
+            UNIX_EPOCH,
+            None,
+            0o755,
+            0,
+            0,
+        );
+        table.bump_open_handles(dir_ino);
+
+        assert_eq!(table.evict_unreferenced(10, EvictionMode::Force), 0);
+        assert!(
+            table.get(dir_ino).is_some(),
+            "empty dir with open handle must survive force eviction"
+        );
+
+        // releasedir drops the pin → dir becomes evictable again.
+        table.drop_open_handles(dir_ino);
+        assert_eq!(table.evict_unreferenced(10, EvictionMode::Force), 1);
+        assert!(table.get(dir_ino).is_none());
+    }
+
     // ── polite_exhausted cache ──────────────────────────────────────
 
     #[test]
