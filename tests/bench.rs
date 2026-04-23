@@ -9,8 +9,8 @@ const BENCH_SIZES: &[(usize, &str)] = &[
 #[tokio::test]
 async fn test_bench() {
     // Upload files of each size to the same bucket
-    let (token, bucket_id, hub) = match common::setup_bucket("bench").await {
-        Some(cfg) => cfg,
+    let guard = match common::setup_bucket("bench").await {
+        Some(g) => g,
         None => return,
     };
 
@@ -18,7 +18,7 @@ async fn test_bench() {
     for &(size, label) in BENCH_SIZES {
         let filename = format!("bench_{}.bin", label);
         let data = common::generate_pattern(size);
-        let write_config = common::build_write_config(&hub).await;
+        let write_config = common::build_write_config(&guard.hub).await;
 
         let tmp_dir = std::env::temp_dir().join(format!("hf-mount-bench-setup-{}", label));
         std::fs::create_dir_all(&tmp_dir).ok();
@@ -34,14 +34,16 @@ async fn test_bench() {
             .unwrap_or_default()
             .as_millis() as u64;
 
-        hub.batch_operations(&[hf_mount::hub_api::BatchOp::AddFile {
-            path: filename.clone(),
-            xet_hash,
-            mtime: mtime_ms,
-            content_type: None,
-        }])
-        .await
-        .expect("batch add failed");
+        guard
+            .hub
+            .batch_operations(&[hf_mount::hub_api::BatchOp::AddFile {
+                path: filename.clone(),
+                xet_hash,
+                mtime: mtime_ms,
+                content_type: None,
+            }])
+            .await
+            .expect("batch add failed");
 
         std::fs::remove_dir_all(&tmp_dir).ok();
         files.push((filename, data));
@@ -54,7 +56,7 @@ async fn test_bench() {
     let fuse_cache = format!("/tmp/hf-bench-fuse-cache-{}", pid);
 
     let fuse_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let child = common::mount_bucket(&bucket_id, &fuse_mount, &fuse_cache, &[]);
+        let child = common::mount_bucket(&guard.bucket_id, &fuse_mount, &fuse_cache, &[]);
 
         let mut reads = Vec::new();
         for (filename, expected) in &files {
@@ -78,7 +80,7 @@ async fn test_bench() {
     let nfs_cache = format!("/tmp/hf-bench-nfs-cache-{}", pid);
 
     let nfs_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let child = common::mount_bucket_nfs(&bucket_id, &nfs_mount, &nfs_cache, &["--read-only"]);
+        let child = common::mount_bucket_nfs(&guard.bucket_id, &nfs_mount, &nfs_cache, &["--read-only"]);
         let mut reads = Vec::new();
         for (filename, expected) in &files {
             reads.push(common::bench::run_read_benchmarks(&nfs_mount, filename, expected));
@@ -90,8 +92,8 @@ async fn test_bench() {
     std::fs::remove_dir_all(&nfs_mount).ok();
     std::fs::remove_dir_all(&nfs_cache).ok();
 
-    // Cleanup
-    common::delete_bucket(&common::endpoint(), &token, &bucket_id).await;
+    // Cleanup (BucketGuard deletes bucket on drop)
+    drop(guard);
 
     // --- Extract results ---
     let (fuse_reads, fuse_writes) = match fuse_result {

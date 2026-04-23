@@ -18,9 +18,37 @@ pub fn endpoint() -> String {
     std::env::var("HF_ENDPOINT").unwrap_or_else(|_| "https://huggingface.co".to_string())
 }
 
-/// Create a bucket and return (token, bucket_id, hub). Returns None if HF_TOKEN not set.
+/// RAII guard that deletes the bucket when dropped. Cleanup runs even if the test
+/// panics, so we don't leak buckets on production Hub.
+pub struct BucketGuard {
+    pub token: String,
+    pub bucket_id: String,
+    pub hub: Arc<hf_mount::hub_api::HubApiClient>,
+    endpoint: String,
+}
+
+impl Drop for BucketGuard {
+    fn drop(&mut self) {
+        let endpoint = self.endpoint.clone();
+        let token = self.token.clone();
+        let bucket_id = self.bucket_id.clone();
+        // Drop may run from a tokio worker; spawn a thread with a fresh runtime
+        // so we can block_on the async delete without nested-runtime panics.
+        let _ = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build cleanup runtime");
+            rt.block_on(delete_bucket(&endpoint, &token, &bucket_id));
+        })
+        .join();
+    }
+}
+
+/// Create a bucket and return a guard that auto-deletes on drop.
+/// Returns None if HF_TOKEN not set.
 /// Use this for multi-file setups (e.g. fio benchmarks) where you upload files yourself.
-pub async fn setup_bucket(test_name: &str) -> Option<(String, String, Arc<hf_mount::hub_api::HubApiClient>)> {
+pub async fn setup_bucket(test_name: &str) -> Option<BucketGuard> {
     let token = match std::env::var("HF_TOKEN") {
         Ok(t) => t,
         Err(_) => {
@@ -37,18 +65,19 @@ pub async fn setup_bucket(test_name: &str) -> Option<(String, String, Arc<hf_mou
     eprintln!("Created bucket: {}", bucket_id);
 
     let hub = hf_mount::hub_api::HubApiClient::new(&ep, Some(&token), &bucket_id, "test");
-    Some((token, bucket_id, hub))
+    Some(BucketGuard {
+        token,
+        bucket_id,
+        hub,
+        endpoint: ep,
+    })
 }
 
-/// Create a bucket, upload a single file, return (token, bucket_id, hub).
+/// Create a bucket, upload a single file, return a guard that auto-deletes on drop.
 /// For multi-file setups, use `setup_bucket` + `upload_file` directly.
-pub async fn setup_bucket_with_file(
-    test_name: &str,
-    filename: &str,
-    content: &[u8],
-) -> Option<(String, String, Arc<hf_mount::hub_api::HubApiClient>)> {
-    let (token, bucket_id, hub) = setup_bucket(test_name).await?;
-    let write_config = build_write_config(&hub).await;
+pub async fn setup_bucket_with_file(test_name: &str, filename: &str, content: &[u8]) -> Option<BucketGuard> {
+    let guard = setup_bucket(test_name).await?;
+    let write_config = build_write_config(&guard.hub).await;
 
     let tmp_dir = std::env::temp_dir().join(format!("hf-mount-{}-setup", test_name));
     std::fs::create_dir_all(&tmp_dir).ok();
@@ -64,18 +93,20 @@ pub async fn setup_bucket_with_file(
         .unwrap_or_default()
         .as_millis() as u64;
 
-    hub.batch_operations(&[hf_mount::hub_api::BatchOp::AddFile {
-        path: filename.to_string(),
-        xet_hash,
-        mtime: mtime_ms,
-        content_type: None,
-    }])
-    .await
-    .expect("batch add failed");
+    guard
+        .hub
+        .batch_operations(&[hf_mount::hub_api::BatchOp::AddFile {
+            path: filename.to_string(),
+            xet_hash,
+            mtime: mtime_ms,
+            content_type: None,
+        }])
+        .await
+        .expect("batch add failed");
 
     std::fs::remove_dir_all(&tmp_dir).ok();
 
-    Some((token, bucket_id, hub))
+    Some(guard)
 }
 
 /// Create a bucket on the Hub. Ignores 409 (already exists).

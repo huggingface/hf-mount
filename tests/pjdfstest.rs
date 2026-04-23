@@ -268,8 +268,8 @@ async fn test_pjdfstest() {
         return;
     }
 
-    let (token, bucket_id, _hub) = match common::setup_bucket("pjdfs").await {
-        Some(cfg) => cfg,
+    let guard = match common::setup_bucket("pjdfs").await {
+        Some(g) => g,
         None => return,
     };
 
@@ -277,14 +277,14 @@ async fn test_pjdfstest() {
     let mount_point = format!("/tmp/hf-pjdfs-{}", pid);
     let cache_dir = format!("/tmp/hf-pjdfs-cache-{}", pid);
 
-    let child = common::mount_bucket(&bucket_id, &mount_point, &cache_dir, &["--advanced-writes"]);
+    let child = common::mount_bucket(&guard.bucket_id, &mount_point, &cache_dir, &["--advanced-writes"]);
 
     let results = run_prove(&mount_point);
 
     print_results(&results);
 
     common::unmount(&mount_point, child, 5);
-    common::delete_bucket(&common::endpoint(), &token, &bucket_id).await;
+    drop(guard);
     std::fs::remove_dir_all(&mount_point).ok();
     std::fs::remove_dir_all(&cache_dir).ok();
 

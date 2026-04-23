@@ -166,12 +166,12 @@ async fn test_fio_compare() {
         return;
     }
 
-    let (token, bucket_id, hub) = match common::setup_bucket("fio-cmp").await {
-        Some(cfg) => cfg,
+    let guard = match common::setup_bucket("fio-cmp").await {
+        Some(g) => g,
         None => return,
     };
 
-    let write_config = common::build_write_config(&hub).await;
+    let write_config = common::build_write_config(&guard.hub).await;
 
     let pid = std::process::id();
     let tmp_dir = std::env::temp_dir().join(format!("hf-fio-cmp-setup-{}", pid));
@@ -214,7 +214,7 @@ async fn test_fio_compare() {
         });
     }
 
-    hub.batch_operations(&batch_ops).await.expect("batch add failed");
+    guard.hub.batch_operations(&batch_ops).await.expect("batch add failed");
     eprintln!("All files committed to bucket");
     std::fs::remove_dir_all(&tmp_dir).ok();
 
@@ -224,7 +224,7 @@ async fn test_fio_compare() {
 
     eprintln!("\nRunning fio suite on FUSE...");
     let fuse_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let child = common::mount_bucket(&bucket_id, &fuse_mount, &fuse_cache, &["--read-only"]);
+        let child = common::mount_bucket(&guard.bucket_id, &fuse_mount, &fuse_cache, &["--read-only"]);
         let results = run_fio_suite(&fuse_mount);
         common::unmount(&fuse_mount, child, 5);
         results
@@ -239,7 +239,7 @@ async fn test_fio_compare() {
 
     eprintln!("\nRunning fio suite on NFS...");
     let nfs_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let child = common::mount_bucket_nfs(&bucket_id, &nfs_mount, &nfs_cache, &["--read-only"]);
+        let child = common::mount_bucket_nfs(&guard.bucket_id, &nfs_mount, &nfs_cache, &["--read-only"]);
         let results = run_fio_suite(&nfs_mount);
         common::unmount_nfs(&nfs_mount, child, 5);
         results
@@ -248,8 +248,8 @@ async fn test_fio_compare() {
     std::fs::remove_dir_all(&nfs_mount).ok();
     std::fs::remove_dir_all(&nfs_cache).ok();
 
-    // Cleanup
-    common::delete_bucket(&common::endpoint(), &token, &bucket_id).await;
+    // Cleanup (BucketGuard deletes bucket on drop)
+    drop(guard);
 
     let fuse_results = match fuse_result {
         Ok(r) => r,

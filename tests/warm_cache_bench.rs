@@ -20,14 +20,14 @@ const READ_CHUNK: usize = 4 * 1024 * 1024; // 4 MB per read syscall
 
 #[tokio::test]
 async fn bench_xorb_reconstruction_cache() {
-    let (token, bucket_id, hub) = match common::setup_bucket("warm-cache-bench").await {
-        Some(cfg) => cfg,
+    let guard = match common::setup_bucket("warm-cache-bench").await {
+        Some(g) => g,
         None => return,
     };
 
     let filename = "seq_100mb.bin";
     let data = common::generate_pattern(FILE_SIZE);
-    let write_config = common::build_write_config(&hub).await;
+    let write_config = common::build_write_config(&guard.hub).await;
 
     let tmp = std::env::temp_dir().join(format!("hf-warm-bench-{}", std::process::id()));
     std::fs::create_dir_all(&tmp).ok();
@@ -44,17 +44,19 @@ async fn bench_xorb_reconstruction_cache() {
     );
     std::fs::remove_dir_all(&tmp).ok();
 
-    hub.batch_operations(&[hf_mount::hub_api::BatchOp::AddFile {
-        path: filename.to_string(),
-        xet_hash,
-        mtime: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64,
-        content_type: None,
-    }])
-    .await
-    .expect("batch add");
+    guard
+        .hub
+        .batch_operations(&[hf_mount::hub_api::BatchOp::AddFile {
+            path: filename.to_string(),
+            xet_hash,
+            mtime: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+            content_type: None,
+        }])
+        .await
+        .expect("batch add");
 
     let pid = std::process::id();
     let mount = format!("/tmp/hf-warm-bench-{}", pid);
@@ -69,7 +71,7 @@ async fn bench_xorb_reconstruction_cache() {
     eprintln!("Cache dir: {}", cache);
 
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let child = common::mount_bucket(&bucket_id, &mount, &cache, &["--read-only"]);
+        let child = common::mount_bucket(&guard.bucket_id, &mount, &cache, &["--read-only"]);
         let file_path = format!("{}/{}", mount, filename);
         let size_mb = FILE_SIZE as f64 / (1024.0 * 1024.0);
 
@@ -130,7 +132,7 @@ async fn bench_xorb_reconstruction_cache() {
 
     std::fs::remove_dir_all(&mount).ok();
     std::fs::remove_dir_all(&cache).ok();
-    common::delete_bucket(&common::endpoint(), &token, &bucket_id).await;
+    drop(guard);
 
     let results = match result {
         Ok(r) => r,

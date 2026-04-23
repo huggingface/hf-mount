@@ -45,8 +45,8 @@ async fn run_fsx(test_name: &str, fsx_args: &[&str]) -> bool {
         return true; // skip, not fail
     }
 
-    let (token, bucket_id, _hub) = match common::setup_bucket(test_name).await {
-        Some(cfg) => cfg,
+    let guard = match common::setup_bucket(test_name).await {
+        Some(g) => g,
         None => return true, // skip
     };
 
@@ -55,7 +55,7 @@ async fn run_fsx(test_name: &str, fsx_args: &[&str]) -> bool {
     let cache_dir = format!("/tmp/hf-fsx-{}-cache-{}", test_name, pid);
     let test_file = format!("{}/fsx_{}", mount_point, pid);
 
-    let child = common::mount_bucket(&bucket_id, &mount_point, &cache_dir, &["--advanced-writes"]);
+    let child = common::mount_bucket(&guard.bucket_id, &mount_point, &cache_dir, &["--advanced-writes"]);
 
     eprintln!("fsx-{}: file={}, args={:?}", test_name, test_file, fsx_args);
 
@@ -79,7 +79,7 @@ async fn run_fsx(test_name: &str, fsx_args: &[&str]) -> bool {
 
     std::fs::remove_file(&test_file).ok();
     common::unmount(&mount_point, child, 10);
-    common::delete_bucket(&common::endpoint(), &token, &bucket_id).await;
+    drop(guard);
     std::fs::remove_dir_all(&mount_point).ok();
     std::fs::remove_dir_all(&cache_dir).ok();
 
