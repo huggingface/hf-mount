@@ -636,6 +636,19 @@ impl VirtualFs {
         self.next_file_handle.fetch_add(1, Ordering::Relaxed)
     }
 
+    /// Bump the per-inode open-handle refcount. Used by the FUSE adapter
+    /// on `opendir` so a directory with an active readdir can't be evicted.
+    #[cfg(feature = "fuse")]
+    pub(crate) fn bump_open_handles(&self, ino: u64) {
+        self.inode_table.read().expect("inodes poisoned").bump_open_handles(ino);
+    }
+
+    /// Counterpart to `bump_open_handles`, called from `releasedir`.
+    #[cfg(feature = "fuse")]
+    pub(crate) fn drop_open_handles(&self, ino: u64) {
+        self.inode_table.read().expect("inodes poisoned").drop_open_handles(ino);
+    }
+
     /// Check if any open file handle references the given inode.
     fn has_open_handles(&self, ino: u64) -> bool {
         self.inode_table.read().expect("inodes poisoned").has_open_handles(ino)

@@ -495,6 +495,10 @@ impl Filesystem for FuseAdapter {
     fn opendir(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
         match self.virtual_fs.getattr(ino.0) {
             Ok(attr) if attr.kind == InodeKind::Directory => {
+                // Pin the dir against eviction until the matching releasedir.
+                // Otherwise a concurrent force-evict could drop the inode
+                // between opendir and the readdir that follows.
+                self.virtual_fs.bump_open_handles(ino.0);
                 reply.opened(FileHandle(self.virtual_fs.alloc_file_handle()), FopenFlags::empty());
             }
             Ok(_) => reply.error(Errno::ENOTDIR),
@@ -502,8 +506,9 @@ impl Filesystem for FuseAdapter {
         }
     }
 
-    /// Release a directory handle (no-op).
-    fn releasedir(&self, _req: &Request, _ino: INodeNo, _fh: FileHandle, _flags: OpenFlags, reply: ReplyEmpty) {
+    /// Release a directory handle. Drops the refcount bumped by `opendir`.
+    fn releasedir(&self, _req: &Request, ino: INodeNo, _fh: FileHandle, _flags: OpenFlags, reply: ReplyEmpty) {
+        self.virtual_fs.drop_open_handles(ino.0);
         reply.ok();
     }
 

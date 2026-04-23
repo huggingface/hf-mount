@@ -406,7 +406,11 @@ pub fn build(source: Source, options: MountOptions, is_nfs: bool) -> MountSetup 
             direct_io: options.direct_io && !is_nfs,
             flush_debounce: std::time::Duration::from_millis(options.flush_debounce_ms),
             flush_max_batch_window: std::time::Duration::from_millis(options.flush_max_batch_window_ms),
-            inode_soft_limit: options.inode_soft_limit,
+            // NFS clients use inode numbers as stable file IDs; evicting an
+            // inode the client still holds would surface as NFS3ERR_STALE on
+            // its next RPC. The eviction safety hooks (forget / inval_entry)
+            // only exist on the FUSE side, so force the limit off here.
+            inode_soft_limit: if is_nfs { 0 } else { options.inode_soft_limit },
             lru_sweep_interval: std::time::Duration::from_millis(options.lru_sweep_interval_ms),
         },
     );
