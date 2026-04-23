@@ -93,6 +93,7 @@ impl Clone for EvictionState {
     }
 }
 
+#[cfg(any(feature = "fuse", test))]
 impl EvictionState {
     /// Bump the kernel lookup refcount. Relaxed is sufficient: the refcount
     /// only gates eviction, which is guarded separately by the inode table's
@@ -279,6 +280,7 @@ impl InodeTable {
     /// refcount itself is atomic. Calling this on an unknown inode is a bug
     /// (we just returned that ino to the kernel), but a missing entry here
     /// would be a race we can't recover from, so we log+return.
+    #[cfg(any(feature = "fuse", test))]
     pub(crate) fn bump_nlookup(&self, inode: u64) {
         match self.inodes.get(&inode) {
             Some(entry) => entry.eviction.bump_nlookup(),
@@ -290,6 +292,7 @@ impl InodeTable {
     /// refcount reached 0 (safe-to-evict); false if unknown / still held.
     /// Clears the polite-exhausted sticky bit on a 0-transition so the next
     /// over-cap insert will retry the polite scan.
+    #[cfg(any(feature = "fuse", test))]
     pub(crate) fn drop_nlookup(&self, inode: u64, n: u64) -> bool {
         let reached_zero = self
             .inodes
@@ -356,6 +359,7 @@ impl InodeTable {
     /// Mark an inode as "wanted to evict but blocked" so `release()` can
     /// finish the job once the last open handle closes. No-op on unknown
     /// inode (the entry may have been removed on a racing path).
+    #[cfg(any(feature = "fuse", test))]
     pub(crate) fn mark_evict_pending(&self, ino: u64) {
         if let Some(entry) = self.inodes.get(&ino) {
             entry.eviction.evict_pending.store(true, Ordering::Relaxed);

@@ -971,9 +971,8 @@ impl VirtualFs {
     /// Must be called after every `reply.entry()` / `reply.created()`, or
     /// the kernel and our `nlookup` will drift and a later `forget()` will
     /// underflow. Also touches for LRU so actively-looked-up inodes aren't
-    /// immediately evicted. Only the FUSE adapter calls this — dead when
-    /// the `fuse` feature is disabled.
-    #[allow(dead_code)]
+    /// immediately evicted.
+    #[cfg(feature = "fuse")]
     pub(crate) fn bump_nlookup(&self, ino: u64) {
         let inodes = self.inode_table.read().expect("inodes poisoned");
         inodes.bump_nlookup(ino);
@@ -984,7 +983,7 @@ impl VirtualFs {
     /// and evict the inode if it's now safe (kernel no longer holds the
     /// dentry, no open handles, nothing dirty). Eviction keeps `InodeTable`
     /// bounded — without it the table grows for every file ever looked up.
-    #[allow(dead_code)]
+    #[cfg(feature = "fuse")]
     pub(crate) fn forget(&self, ino: u64, nlookup: u64) {
         debug!("forget: ino={} nlookup={}", ino, nlookup);
 
