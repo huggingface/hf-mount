@@ -448,7 +448,13 @@ pub async fn mount_nfs(
     // Platform-specific mount command
     #[cfg(target_os = "macos")]
     {
-        let mut opts = format!("nolocks,vers=3,tcp,rsize=1048576,actimeo={actimeo},port={port},mountport={port}");
+        // `locallocks` (not `nolocks`): macOS mount_nfs treats `nolocks` as
+        // "advisory locking unsupported" and returns ENOTSUP on flock/fcntl,
+        // which breaks Python `filelock`, `huggingface_hub`, `datasets`, …
+        // `locallocks` keeps lock handling inside the client kernel (no NLM
+        // round-trip to the server). `nfsserve` does not implement NLM, so
+        // local locking is the only viable option anyway.
+        let mut opts = format!("locallocks,vers=3,tcp,rsize=1048576,actimeo={actimeo},port={port},mountport={port}");
         if read_only {
             opts = format!("rdonly,{opts}");
         } else {
