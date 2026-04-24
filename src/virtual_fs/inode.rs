@@ -380,6 +380,26 @@ impl InodeTable {
             .collect()
     }
 
+    /// Return file inodes that are clean, have no open handles, and no
+    /// pending renames, sorted by `last_touched` ascending. Used by the
+    /// staging GC to reclaim the oldest-accessed staging files first.
+    pub(crate) fn staging_gc_candidates(&self) -> Vec<u64> {
+        let mut picks: Vec<(u64, u64)> = self
+            .inodes
+            .values()
+            .filter(|e| {
+                e.kind == InodeKind::File
+                    && e.nlink > 0
+                    && !e.is_dirty()
+                    && e.pending_deletes.is_empty()
+                    && e.eviction.open_handles.load(Ordering::Relaxed) == 0
+            })
+            .map(|e| (e.eviction.last_touched.load(Ordering::Relaxed), e.inode))
+            .collect();
+        picks.sort_by_key(|&(ts, _)| ts);
+        picks.into_iter().map(|(_, ino)| ino).collect()
+    }
+
     /// Evict a file inode from the table if it's safe to do so. Returns true
     /// if evicted. Mirrors mountpoint-s3's forget-driven eviction: only files
     /// (directories hold children_loaded state we can't easily restore),

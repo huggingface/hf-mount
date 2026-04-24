@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -63,25 +63,23 @@ impl StagingCoordinator {
         still_clean && dir.try_remove(ino)
     }
 
-    /// Reclaim staging files for a batch of candidate inodes. Skips inodes
-    /// with open writable handles (long-lived NFS handles must survive across
-    /// flush cycles). No-op when under the disk budget.
-    pub(crate) async fn gc(&self, inos: &[u64], inodes: &RwLock<InodeTable>) -> usize {
+    /// Reclaim staging files by least-recently-touched order until the disk
+    /// budget is satisfied. Ranks eligible inodes (clean, no open handles,
+    /// no pending renames) by `last_touched` ascending so actively-accessed
+    /// files stay cached. No-op when under the budget.
+    pub(crate) async fn gc(&self, inodes: &RwLock<InodeTable>) -> usize {
         let Some(dir) = self.dir() else { return 0 };
         if !dir.is_over_limit() {
             return 0;
         }
-        let skip_open: HashSet<u64> = {
-            let table = inodes.read().expect("inodes poisoned");
-            inos.iter()
-                .copied()
-                .filter(|&ino| table.has_open_handles(ino))
-                .collect()
-        };
+        let candidates = inodes.read().expect("inodes poisoned").staging_gc_candidates();
         let mut count = 0;
-        for &ino in inos {
-            if skip_open.contains(&ino) {
-                debug!("staging GC: skipping ino={} (open handles)", ino);
+        for ino in candidates {
+            if !dir.is_over_limit() {
+                break;
+            }
+            // Only pay the try_remove cost if this inode actually has a staging file.
+            if dir.file_size(ino) == 0 {
                 continue;
             }
             if self.gc_one(ino, inodes).await {

@@ -290,7 +290,6 @@ async fn flush_batch(
     debug!("flush_batch: deduped inos = {:?}", deduped);
 
     // Snapshot dirty_generation so we only clear dirty if no concurrent writer advanced it.
-    let mut stale_gc = Vec::new();
     let to_flush: Vec<FlushItem> = {
         let inode_table = inodes.read().expect("inodes poisoned");
         deduped
@@ -308,8 +307,6 @@ async fn flush_batch(
                     return None;
                 }
                 if !entry.is_dirty() {
-                    // Defer GC: needs the async staging_lock, which we can't take under the read lock.
-                    stale_gc.push(ino);
                     debug!("flush: ino={} path={} not dirty, skipping", ino, entry.full_path);
                     return None;
                 }
@@ -332,9 +329,9 @@ async fn flush_batch(
             .collect()
     };
 
-    staging.gc(&stale_gc, inodes).await;
-
     if to_flush.is_empty() {
+        // Still reclaim if other clean staging files pushed us over budget.
+        staging.gc(inodes).await;
         return;
     }
 
@@ -433,8 +430,7 @@ async fn flush_batch(
     ops.append(&mut delete_ops);
 
     if ops.is_empty() {
-        let gc_inos: Vec<u64> = to_flush.iter().map(|item| item.ino).collect();
-        let gc_count = staging.gc(&gc_inos, inodes).await;
+        let gc_count = staging.gc(inodes).await;
         info!(
             "Batch flush: all {} file(s) unchanged, no Hub commit needed, {} staging file(s) reclaimed",
             to_flush.len(),
@@ -470,8 +466,7 @@ async fn flush_batch(
         }
     }
 
-    let gc_inos: Vec<u64> = to_flush.iter().map(|item| item.ino).collect();
-    let gc_count = staging.gc(&gc_inos, inodes).await;
+    let gc_count = staging.gc(inodes).await;
 
     let changed_count = unchanged.iter().filter(|u| !**u).count();
     let unchanged_count = unchanged.len() - changed_count;
