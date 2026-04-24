@@ -210,45 +210,36 @@ impl StagingDir {
 
 // ── StagingCoordinator ────────────────────────────────────────────────
 
-/// Bundles the on-disk staging area with the per-inode locks that serialize
-/// access to it. Wrapped in `Arc` so subsystems outside `VirtualFs` (e.g. the
-/// flush-path GC) can share ownership and take the same per-inode lock that
-/// `open_advanced_write` and `setattr(truncate)` use to prepare staging files.
-///
-/// The outer `std::Mutex` guards the HashMap only during lookup/insert; the
-/// inner `tokio::Mutex<()>` is the actual per-inode critical section held
-/// across awaits (download, unlink).
-pub struct StagingCoordinator {
+/// Bundles the on-disk staging area with per-inode async locks so subsystems
+/// outside `VirtualFs` (e.g. flush-path GC) can take the same lock as
+/// `open_advanced_write` / `setattr(truncate)` to serialize staging I/O.
+pub(crate) struct StagingCoordinator {
     dir: Option<StagingDir>,
     locks: Mutex<HashMap<u64, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl StagingCoordinator {
-    pub fn new(dir: Option<StagingDir>) -> Arc<Self> {
-        Arc::new(Self {
+    pub(crate) fn new(dir: Option<StagingDir>) -> Self {
+        Self {
             dir,
             locks: Mutex::new(HashMap::new()),
-        })
+        }
     }
 
-    /// The underlying staging directory, if advanced writes are enabled.
-    /// Simple (append-only) mode uses the coordinator only for per-inode
-    /// locks, not for on-disk staging.
-    pub fn dir(&self) -> Option<&StagingDir> {
+    pub(crate) fn dir(&self) -> Option<&StagingDir> {
         self.dir.as_ref()
     }
 
-    /// Get or create the per-inode async lock. Acquire before any I/O that
-    /// touches `dir.path(ino)` to serialize with concurrent opens and GC.
-    ///
-    /// Entries are never removed: dropping one while another caller holds an
-    /// `Arc` clone would produce two distinct mutex instances for the same
-    /// inode, defeating the serialization. The overhead is one `Arc` per
-    /// inode that has ever been staged in this session.
-    pub fn lock(&self, ino: u64) -> Arc<tokio::sync::Mutex<()>> {
+    pub(crate) fn path(&self, ino: u64) -> Option<PathBuf> {
+        self.dir.as_ref().map(|sd| sd.path(ino))
+    }
+
+    /// Get or create the per-inode async lock. Held across awaits (download,
+    /// unlink) so concurrent opens and flush-path GC can't interleave.
+    pub(crate) fn lock(&self, ino: u64) -> Arc<tokio::sync::Mutex<()>> {
         self.locks
             .lock()
-            .expect("staging_locks poisoned")
+            .expect("staging locks poisoned")
             .entry(ino)
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone()

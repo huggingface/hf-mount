@@ -161,7 +161,7 @@ impl VirtualFs {
         let inodes = Arc::new(RwLock::new(InodeTable::new(config.inode_soft_limit)));
         let negative_cache = Arc::new(RwLock::new(HashMap::new()));
 
-        let staging = StagingCoordinator::new(staging_dir);
+        let staging = Arc::new(StagingCoordinator::new(staging_dir));
 
         let flush_manager = if !config.read_only && config.advanced_writes {
             let dir = staging.dir().expect("--advanced-writes requires a staging directory");
@@ -664,11 +664,6 @@ impl VirtualFs {
             .clone()
     }
 
-    /// Get or create a per-inode lock for staging file preparation.
-    fn staging_lock(&self, ino: u64) -> Arc<tokio::sync::Mutex<()>> {
-        self.staging.lock(ino)
-    }
-
     /// Install a pending commit watch hook on a streaming channel.
     /// Called in flush() before commit or deferral so open() can await the result.
     /// No-op if a hook is already installed (prevents replacing a receiver that
@@ -1033,13 +1028,11 @@ impl VirtualFs {
     /// Remove any on-disk staging file for `ino`. Safe to call for inodes that
     /// never had a staging file — NotFound is ignored.
     fn drop_staging(&self, ino: u64) {
-        if let Some(sd) = self.staging.dir() {
-            let path = sd.path(ino);
-            if let Err(e) = std::fs::remove_file(&path)
-                && e.kind() != std::io::ErrorKind::NotFound
-            {
-                warn!("Failed to remove staging file for ino={}: {}", ino, e);
-            }
+        if let Some(path) = self.staging.path(ino)
+            && let Err(e) = std::fs::remove_file(&path)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            warn!("Failed to remove staging file for ino={}: {}", ino, e);
         }
     }
 
@@ -1087,7 +1080,7 @@ impl VirtualFs {
         }
 
         let file_entry = self.get_file_entry(ino)?;
-        let staging_path = self.staging.dir().map(|sd| sd.path(ino));
+        let staging_path = self.staging.path(ino);
 
         if writable && self.advanced_writes {
             // Staging file + async flush (supports random writes and seek)
@@ -1113,10 +1106,10 @@ impl VirtualFs {
         staging_path: Option<PathBuf>,
         truncate: bool,
     ) -> VirtualFsResult<u64> {
-        let staging_path = staging_path.expect("staging required for advanced writes");
+        let staging_path = staging_path.expect("staging directory required for advanced writes");
 
         // Serialize staging preparation per inode (prevents concurrent download races)
-        let staging_mutex = self.staging_lock(ino);
+        let staging_mutex = self.staging.lock(ino);
         let _staging_guard = staging_mutex.lock().await;
 
         // Reuse the staging file when either (a) it has pending dirty writes,
@@ -1209,7 +1202,7 @@ impl VirtualFs {
         // Wait for any in-flight commit to complete before starting a new writer.
         self.await_pending_commit(ino).await?;
 
-        let staging_mutex = self.staging_lock(ino);
+        let staging_mutex = self.staging.lock(ino);
         let _staging_guard = staging_mutex.lock().await;
 
         // Capture inode snapshot before mutation (for revert on commit failure)
@@ -1284,7 +1277,7 @@ impl VirtualFs {
                 };
                 let dest = staging.root().join(format!("http_{:x}", path_hash));
                 {
-                    let lock = self.staging_lock(ino);
+                    let lock = self.staging.lock(ino);
                     let _guard = lock.lock().await;
                     // download_file_http uses ETag-based conditional requests,
                     // so this is cheap when the cached file is still valid (304).
@@ -2056,9 +2049,8 @@ impl VirtualFs {
             // Advanced mode: staging file on disk + async flush
             let staging_path = self
                 .staging
-                .dir()
-                .expect("staging required for advanced writes")
-                .path(ino);
+                .path(ino)
+                .expect("staging directory required for advanced writes");
             match OpenOptions::new()
                 .create(true)
                 .truncate(true)
@@ -2775,14 +2767,13 @@ impl VirtualFs {
                 // Real truncation goes through open(O_TRUNC) which is handled separately.
             } else {
                 // Advanced mode: truncation is applied to the staging file on disk
-                let staging_mutex = self.staging_lock(ino);
+                let staging_mutex = self.staging.lock(ino);
                 let _staging_guard = staging_mutex.lock().await;
 
                 let staging_path = self
                     .staging
-                    .dir()
-                    .expect("staging required for advanced writes")
-                    .path(ino);
+                    .path(ino)
+                    .expect("staging directory required for advanced writes");
 
                 // Phase 1: ensure staging file exists (may download, async).
                 if new_size > 0 && !staging_path.exists() {
