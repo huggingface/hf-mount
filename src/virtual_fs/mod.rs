@@ -41,11 +41,6 @@ type EntryInvalidatorFn = Box<dyn Fn(u64, &str) -> bool + Send + Sync>;
 type Invalidator = Arc<OnceLock<InvalidatorFn>>;
 type EntryInvalidator = Arc<OnceLock<EntryInvalidatorFn>>;
 
-/// Hard cap on `inval_entry` calls per sweep. Prevents the sweep from
-/// bursting tens of thousands of notifications at the FUSE channel after
-/// a long-running crawl — empirically the kernel processes them serially,
-/// so a burst just wastes CPU and queues up stale work.
-const LRU_MAX_INVALS_PER_SWEEP: usize = 1024;
 type CommitHookTx = tokio::sync::watch::Sender<Option<Result<(), i32>>>;
 type CommitHookRx = tokio::sync::watch::Receiver<Option<Result<(), i32>>>;
 
@@ -296,6 +291,12 @@ impl VirtualFs {
     /// Candidates are collected under a read lock, then the lock is dropped
     /// before invoking the callback — the callback writes to the FUSE
     /// channel and can block under backpressure.
+    ///
+    /// Batch size equals the full overflow: when the table is 3× the soft
+    /// limit, a capped batch can't catch up (the table grows faster than the
+    /// sweep evicts). The `take_while` below stops at the first `false` from
+    /// `cb` (EAGAIN/ENOMEM on the FUSE notify channel), which is the natural
+    /// throttle — no artificial cap needed.
     fn lru_evict_sweep(&self, soft_limit: usize) -> usize {
         let candidates = {
             let inodes = self.inode_table.read().expect("inodes poisoned");
@@ -303,16 +304,16 @@ impl VirtualFs {
             if len <= soft_limit {
                 return 0;
             }
-            let overflow = (len - soft_limit).min(LRU_MAX_INVALS_PER_SWEEP);
+            let overflow = len - soft_limit;
             inodes.lru_candidates(overflow)
         };
         let Some(cb) = self.entry_invalidator.get() else {
             return 0;
         };
         // take_while stops at the first `false` return (FUSE notify channel
-        // saturated) without consuming that element — same semantics as the
-        // prior explicit break. Next sweep retries with the same oldest
-        // entries (their last_touched hasn't moved), so nothing is lost.
+        // saturated) without consuming that element. Next sweep retries with
+        // the same oldest entries (their last_touched hasn't moved), so
+        // nothing is lost.
         candidates.into_iter().take_while(|(p, n)| cb(*p, n)).count()
     }
 
