@@ -3139,6 +3139,86 @@ fn staging_gc_after_fsync_then_release() {
     });
 }
 
+/// Partial reclaim: GC stops as soon as usage drops back under the limit
+/// instead of evicting every candidate. Validates the "while over_limit"
+/// loop, not a blanket sweep.
+#[test]
+fn staging_gc_stops_once_under_limit() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    let rt = new_runtime();
+    // 10-byte budget; each file below is 8 bytes — room for exactly one.
+    let vfs = make_test_vfs(
+        hub.clone(),
+        xet.clone(),
+        TestOpts {
+            advanced_writes: true,
+            max_staging_size: 10,
+            ..Default::default()
+        },
+        &rt,
+    );
+
+    rt.block_on(async {
+        for i in 0..3 {
+            let name = format!("f{i}.txt");
+            let (attr, fh) = vfs.create(ROOT_INODE, &name, 0o644, 1000, 1000, None).await.unwrap();
+            write_blocking(&vfs, attr.ino, fh, 0, b"xxxxxxxx").await.unwrap();
+            vfs.release(fh).await.unwrap();
+        }
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        let sd = vfs.staging.dir().unwrap();
+        assert!(
+            sd.bytes_used() <= 10,
+            "usage should be at or below budget, got {}",
+            sd.bytes_used()
+        );
+        assert!(
+            sd.bytes_used() > 0,
+            "GC should have stopped once under budget, not evicted everything"
+        );
+    });
+}
+
+/// LRU order: oldest-touched files are reclaimed first. Creates three files
+/// sequentially (each successive `create` bumps the touch counter), flushes,
+/// and verifies that only the most-recently-created staging file survives
+/// under a one-file budget.
+#[test]
+fn staging_gc_evicts_least_recently_touched_first() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    let rt = new_runtime();
+    let vfs = make_test_vfs(
+        hub.clone(),
+        xet.clone(),
+        TestOpts {
+            advanced_writes: true,
+            max_staging_size: 10,
+            ..Default::default()
+        },
+        &rt,
+    );
+
+    rt.block_on(async {
+        let mut inos = Vec::new();
+        for i in 0..3 {
+            let name = format!("f{i}.txt");
+            let (attr, fh) = vfs.create(ROOT_INODE, &name, 0o644, 1000, 1000, None).await.unwrap();
+            write_blocking(&vfs, attr.ino, fh, 0, b"xxxxxxxx").await.unwrap();
+            vfs.release(fh).await.unwrap();
+            inos.push(attr.ino);
+        }
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        let sd = vfs.staging.dir().unwrap();
+        assert!(!sd.path(inos[0]).exists(), "oldest (f0) should be reclaimed");
+        assert!(!sd.path(inos[1]).exists(), "middle (f1) should be reclaimed");
+        assert!(sd.path(inos[2]).exists(), "newest (f2) should survive");
+    });
+}
+
 /// Sequential reads should pass `end=None` (unbounded stream), while seek reads
 /// should pass `end=Some(offset+size)` (bounded range). Validates that the mock
 /// correctly records and respects the `end` parameter.
