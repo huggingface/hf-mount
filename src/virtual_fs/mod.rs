@@ -16,9 +16,11 @@ mod flush;
 pub mod inode;
 mod poll;
 mod prefetch;
-use crate::xet::{StagingCoordinator, StagingDir, StreamingWriterOps, XetOps};
+mod staging;
+use crate::xet::{StagingDir, StreamingWriterOps, XetOps};
 use inode::{InodeEntry, InodeKind, InodeTable};
 use prefetch::{FetchPlan, PrefetchState};
+use staging::StagingCoordinator;
 
 // ── Constants ──────────────────────────────────────────────────────────
 
@@ -169,10 +171,10 @@ impl VirtualFs {
         let staging = Arc::new(StagingCoordinator::new(staging_dir));
 
         let flush_manager = if !config.read_only && config.advanced_writes {
-            let dir = staging.dir().expect("--advanced-writes requires a staging directory");
+            staging.dir().expect("--advanced-writes requires a staging directory");
             Some(flush::FlushManager::new(
                 xet_sessions.clone(),
-                dir.clone(),
+                staging.clone(),
                 hub_client.clone(),
                 inodes.clone(),
                 &runtime,
@@ -1204,13 +1206,11 @@ impl VirtualFs {
     }
 
     /// Remove any on-disk staging file for `ino`. Safe to call for inodes that
-    /// never had a staging file — NotFound is ignored.
+    /// never had a staging file — NotFound is ignored. Keeps `StagingDir`'s
+    /// byte budget accurate via `try_remove`.
     fn drop_staging(&self, ino: u64) {
-        if let Some(path) = self.staging.path(ino)
-            && let Err(e) = std::fs::remove_file(&path)
-            && e.kind() != std::io::ErrorKind::NotFound
-        {
-            warn!("Failed to remove staging file for ino={}: {}", ino, e);
+        if let Some(sd) = self.staging.dir() {
+            sd.try_remove(ino);
         }
     }
 
@@ -1307,8 +1307,10 @@ impl VirtualFs {
             if let Some(entry) = self.inode_table.write().expect("inodes poisoned").get_mut(ino) {
                 entry.staging_is_current = false;
             }
+            // A cached clean staging file from a previous open may exist under budget.
+            let old_size = self.staging.dir().map(|sd| sd.file_size(ino)).unwrap_or(0);
             let needs_download = !truncate && !xet_hash.is_empty() && size > 0;
-            if needs_download {
+            let new_size = if needs_download {
                 self.xet_sessions
                     .download_to_file(xet_hash, size, &staging_path)
                     .await
@@ -1316,11 +1318,17 @@ impl VirtualFs {
                         error!("Failed to download file for write: {}", e);
                         libc::EIO
                     })?;
+                size
             } else {
                 File::create(&staging_path).map_err(|e| {
                     error!("Failed to create staging file: {}", e);
                     libc::EIO
                 })?;
+                0
+            };
+            if let Some(sd) = self.staging.dir() {
+                sd.sub_bytes(old_size);
+                sd.add_bytes(new_size);
             }
             // Flag the cache as current only when the staging actually mirrors
             // the remote. Cases to exclude:
@@ -1420,6 +1428,14 @@ impl VirtualFs {
 
     /// Open a file for reading. Dispatches based on where the content lives.
     async fn open_readonly(&self, ino: u64, fe: FileEntry, staging_path: Option<PathBuf>) -> VirtualFsResult<u64> {
+        // If the dirty snapshot pointed at a now-missing staging file, the
+        // flush-path GC may have raced: the inode was flushed clean and its
+        // staging reclaimed between the snapshot and here. Re-read the entry
+        // so we dispatch on current state instead of returning EIO.
+        let fe = match (fe.is_dirty, &staging_path) {
+            (true, Some(p)) if !p.exists() => self.get_file_entry(ino)?,
+            _ => fe,
+        };
         match (fe.is_dirty, &staging_path) {
             // Advanced write in progress — read from local staging file.
             (true, Some(path)) if path.exists() => self.open_local_readonly(ino, path),
@@ -1797,6 +1813,9 @@ impl VirtualFs {
                     let mut inodes = self.inode_table.write().expect("inodes poisoned");
                     if let Some(entry) = inodes.get_mut(handle_ino) {
                         if new_end > entry.size {
+                            if let Some(sd) = self.staging.dir() {
+                                sd.add_bytes(new_end - entry.size);
+                            }
                             entry.size = new_end;
                         }
                         entry.set_dirty();
@@ -2017,20 +2036,21 @@ impl VirtualFs {
             _ => {}
         }
 
-        // Clean up orphan inodes (nlink == 0) when no more handles reference them.
-        // Also finish any eviction that `forget()` had to defer because we were
-        // still holding an open handle at the time.
         if let Some(ino) = released_ino
             && !self.has_open_handles(ino)
         {
-            let removed = {
+            let (removed, is_clean) = {
                 let mut inodes = self.inode_table.write().expect("inodes poisoned");
                 let orphan = inodes.remove_orphan(ino);
                 let evicted = inodes.take_evict_pending(ino) && inodes.evict_if_safe(ino);
-                orphan || evicted
+                let removed = orphan || evicted;
+                let is_clean = !removed && inodes.get(ino).is_some_and(|entry| !entry.is_dirty());
+                (removed, is_clean)
             };
             if removed {
                 self.drop_staging(ino);
+            } else if is_clean && self.staging.gc_one(ino, &self.inode_table).await {
+                debug!("staging GC: removed ino={} on release", ino);
             }
         }
 
@@ -2948,10 +2968,15 @@ impl VirtualFs {
                 let staging_mutex = self.staging.lock(ino);
                 let _staging_guard = staging_mutex.lock().await;
 
-                let staging_path = self
+                let sd = self
                     .staging
-                    .path(ino)
+                    .dir()
                     .expect("staging directory required for advanced writes");
+                let staging_path = sd.path(ino);
+                // Snapshot staging bytes before any mutation; drives the delta
+                // applied at the end. Files that were never staged start at 0,
+                // so truncating them doesn't spuriously debit the budget.
+                let old_staging_size = sd.file_size(ino);
 
                 // Phase 1: ensure staging file exists (may download, async).
                 if new_size > 0 && !staging_path.exists() {
@@ -2993,6 +3018,10 @@ impl VirtualFs {
                         error!("Failed to set staging file length: {}", e);
                         return Err(libc::EIO);
                     }
+                }
+                if let Some(sd) = self.staging.dir() {
+                    sd.sub_bytes(old_staging_size);
+                    sd.add_bytes(sd.file_size(ino));
                 }
                 if let Some(entry) = inodes.get_mut(ino) {
                     entry.size = new_size;

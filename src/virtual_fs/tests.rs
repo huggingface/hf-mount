@@ -1358,6 +1358,33 @@ fn setattr_advanced_truncate_zero() {
     });
 }
 
+/// Regression: truncating an unstaged remote file to 0 must not debit the
+/// staging budget for bytes that were never added (it was never staged).
+#[test]
+fn setattr_truncate_unstaged_does_not_debit_budget() {
+    let hub = MockHub::new();
+    hub.add_file("file.txt", 100, Some("hash1"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_advanced(&hub, &xet);
+
+    rt.block_on(async {
+        let sd = vfs.staging.dir().unwrap();
+        // Simulate other live staging files consuming budget.
+        sd.add_bytes(500);
+        assert_eq!(sd.bytes_used(), 500);
+
+        let attr = vfs.lookup(ROOT_INODE, "file.txt").await.unwrap();
+        // Truncate to 0 without ever staging the remote file.
+        vfs.setattr(attr.ino, Some(0), None, None, None, None, None)
+            .await
+            .unwrap();
+
+        // The 500 bytes belonging to other files must remain accounted; this
+        // inode's 100 bytes were never added so they must not be subtracted.
+        assert_eq!(sd.bytes_used(), 500);
+    });
+}
+
 /// setattr on a read-only VFS returns EROFS.
 #[test]
 fn setattr_readonly_erofs() {
@@ -3013,6 +3040,103 @@ fn shutdown_flushes_dirty() {
     // After shutdown, batch log should show the flush
     let logs = hub.take_batch_log();
     assert!(!logs.is_empty());
+}
+
+/// Helper: create VFS with advanced writes + staging GC enabled (low limit).
+fn vfs_advanced_with_gc(
+    hub: &std::sync::Arc<MockHub>,
+    xet: &std::sync::Arc<MockXet>,
+) -> (tokio::runtime::Runtime, std::sync::Arc<VirtualFs>) {
+    let rt = new_runtime();
+    let vfs = make_test_vfs(
+        hub.clone(),
+        xet.clone(),
+        TestOpts {
+            advanced_writes: true,
+            max_staging_size: 1, // 1 byte = always over limit, GC always runs
+            ..Default::default()
+        },
+        &rt,
+    );
+    (rt, vfs)
+}
+
+/// After a successful flush, the staging file for a clean inode should be
+/// garbage-collected (deleted from disk).
+#[test]
+fn staging_gc_after_flush() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_advanced_with_gc(&hub, &xet);
+
+    rt.block_on(async {
+        let (attr, fh) = vfs
+            .create(ROOT_INODE, "gc_test.txt", 0o644, 1000, 1000, None)
+            .await
+            .unwrap();
+        let ino = attr.ino;
+
+        write_blocking(&vfs, ino, fh, 0, b"some data").await.unwrap();
+
+        // Staging file should exist before release
+        let staging_path = vfs.staging.dir().unwrap().path(ino);
+        assert!(staging_path.exists(), "staging file should exist after write");
+
+        vfs.release(fh).await.unwrap();
+
+        // Wait for flush debounce (100ms) + processing
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        // After flush, inode should be clean
+        let is_clean = vfs.inode_table.read().unwrap().get(ino).is_some_and(|e| !e.is_dirty());
+        assert!(is_clean, "inode should be clean after flush");
+
+        // Staging file should have been GC'd
+        assert!(
+            !staging_path.exists(),
+            "staging file should be deleted after successful flush"
+        );
+    });
+}
+
+/// After fsync schedules a commit and the handle is released, the staging file
+/// should be GC'd once the background flush completes (inode becomes clean).
+#[test]
+fn staging_gc_after_fsync_then_release() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_advanced_with_gc(&hub, &xet);
+
+    rt.block_on(async {
+        let (attr, fh) = vfs
+            .create(ROOT_INODE, "fsync_gc.txt", 0o644, 1000, 1000, None)
+            .await
+            .unwrap();
+        let ino = attr.ino;
+
+        write_blocking(&vfs, ino, fh, 0, b"fsync data").await.unwrap();
+
+        let staging_path = vfs.staging.dir().unwrap().path(ino);
+        assert!(staging_path.exists(), "staging file should exist after write");
+
+        // fsync is async (schedules a flush); staging must survive while the handle is open.
+        vfs.fsync(ino, fh, None).await.unwrap();
+        assert!(
+            staging_path.exists(),
+            "staging file should survive fsync (handle still open)"
+        );
+
+        // Release the handle and wait for the background flush + GC to complete.
+        vfs.release(fh).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        let is_clean = vfs.inode_table.read().unwrap().get(ino).is_some_and(|e| !e.is_dirty());
+        assert!(is_clean, "inode should be clean after flush");
+        assert!(
+            !staging_path.exists(),
+            "staging file should be GC'd after flush completes"
+        );
+    });
 }
 
 /// Sequential reads should pass `end=None` (unbounded stream), while seek reads
