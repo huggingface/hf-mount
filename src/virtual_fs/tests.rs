@@ -3323,29 +3323,23 @@ fn rename_clean_file_remote_and_local() {
 /// `SUBDIRS × FILES_PER_DIR` files through the full FUSE-style protocol
 /// (lookup → bump_nlookup → forget) under a soft limit of 100.
 ///
-/// This exercises the scenario PR #105 was built for: an unbounded crawl
-/// with a cgroup-sized memory budget. Without the LRU, `InodeTable` would
-/// grow linearly with the number of looked-up files and eventually
-/// OOM-kill the sidecar (observed empirically at ~3.4 GiB on prod-hub-doc).
+/// Exercises the production reclamation chain: async LRU sweep →
+/// `inval_entry` callback → kernel drops the dentry → `forget()` →
+/// `evict_if_safe` removes the inode. The `inval_entry` callback is
+/// simulated here (no real FUSE), but it drives `forget` synchronously,
+/// which is the only part of the kernel's behavior the table depends on.
 ///
-/// We assert two bounds:
-///   - peak table size stays below a small multiple of the soft limit
-///     while the crawl is in flight;
-///   - table drains back near empty once every file has been forgotten.
+/// We drive one sweep per dir to keep the test deterministic — in prod
+/// the sweep runs on an interval and the table overshoots between ticks.
 #[test]
 fn lru_keeps_inode_table_bounded_under_lookup_churn() {
     const SUBDIRS: usize = 20;
     const FILES_PER_DIR: usize = 40;
     const SOFT_LIMIT: usize = 100;
-    // Under the FUSE-style `forget(ino, 1)` flow, each per-iteration
-    // eviction clears the parent's `children_loaded` flag. The next
-    // `lookup` re-fetches the remote listing, which re-inserts evicted
-    // files under fresh inode numbers — a residual accumulates per dir.
-    // The insert-time polite pass is the backstop: once the table hits
-    // `SOFT_LIMIT + EVICT_TRIGGER_OVERAGE` (356), it drains entries with
-    // `nlookup == 0` (the residuals) back to ~`SOFT_LIMIT`. So the peak
-    // is bounded by the trigger plus the in-flight bulk load.
-    const MAX_EXPECTED: usize = SOFT_LIMIT + 256 + FILES_PER_DIR + 32;
+    // Peak = steady state after a sweep (~SOFT_LIMIT) + one bulk dir
+    // load + headroom for the trailing dir entries the sweep can't
+    // evict (non-leaf dirs are protected).
+    const MAX_EXPECTED: usize = SOFT_LIMIT + FILES_PER_DIR + SUBDIRS + 32;
 
     let hub = MockHub::new();
     for d in 0..SUBDIRS {
@@ -3355,6 +3349,30 @@ fn lru_keeps_inode_table_bounded_under_lookup_churn() {
     }
     let xet = MockXet::new();
     let (rt, vfs) = vfs_with_lru(&hub, &xet, SOFT_LIMIT);
+
+    // Simulate the FUSE kernel's response to `inval_entry`: look up the
+    // (parent, name) pair, drop its nlookup refcount. `forget` then runs
+    // `evict_if_safe` and, if the nlookup hit 0, removes the inode.
+    let vfs_cb = vfs.clone();
+    vfs.set_entry_invalidator(Box::new(move |parent, name| {
+        use std::sync::atomic::Ordering;
+        let ino_and_lookup = {
+            let inodes = vfs_cb.inode_table.read().expect("inodes poisoned");
+            inodes.get(parent).and_then(|dir| {
+                dir.children.iter().find(|c| c.name == name).and_then(|c| {
+                    inodes
+                        .get(c.ino)
+                        .map(|e| (c.ino, e.eviction.nlookup.load(Ordering::Relaxed)))
+                })
+            })
+        };
+        if let Some((ino, nlookup)) = ino_and_lookup
+            && nlookup > 0
+        {
+            vfs_cb.forget(ino, nlookup);
+        }
+        true
+    }));
 
     rt.block_on(async {
         let mut peak = 0;
@@ -3372,34 +3390,24 @@ fn lru_keeps_inode_table_bounded_under_lookup_churn() {
                     .lookup(dir_attr.ino, &file_name)
                     .await
                     .unwrap_or_else(|e| panic!("lookup({dir_name}/{file_name}) failed: errno={e}"));
-
-                // Match the FUSE adapter's "bump before reply, forget on
-                // kernel drop" protocol so nlookup accounting is honest.
                 vfs.bump_nlookup(attr.ino);
-                vfs.forget(attr.ino, 1);
-
-                let len = vfs.inode_table.read().unwrap().len();
-                peak = peak.max(len);
-                assert!(
-                    len < MAX_EXPECTED,
-                    "table overshoot at {dir_name}/{file_name}: len={len} > {MAX_EXPECTED}"
-                );
             }
 
-            // Drop the dir's dentry too (the kernel would `forget` it once
-            // it's no longer in the path we're traversing). `evict_if_safe`
-            // refuses directories, so this doesn't shrink the table yet —
-            // just keeps nlookup honest.
-            vfs.forget(dir_attr.ino, 1);
+            // Drive one sweep per completed directory, matching the prod
+            // cadence (sweep runs on an interval, not per insert).
+            vfs.lru_evict_sweep(SOFT_LIMIT);
+
+            let len = vfs.inode_table.read().unwrap().len();
+            peak = peak.max(len);
+            assert!(
+                len < MAX_EXPECTED,
+                "table overshoot after {dir_name}: len={len} > {MAX_EXPECTED}"
+            );
         }
 
-        // Memory-bound invariant: after a crawl touching SUBDIRS * FILES_PER_DIR
-        // files, the table sits at a small multiple of the soft limit — well
-        // below the total workload. In this test we're running the VFS without
-        // a FUSE `inval_entry` callback wired, so the active LRU sweep can't
-        // drain residuals; the bound is upheld purely by the insert-time
-        // polite pass. With the invalidator wired (the normal FUSE mount case),
-        // the sweep would drive the table back closer to the soft limit.
+        // After every file has been looked up and the sweep has run,
+        // the table sits near the soft limit — well below the total
+        // workload.
         let final_len = vfs.inode_table.read().unwrap().len();
         let total_lookups = SUBDIRS * FILES_PER_DIR;
         assert!(
