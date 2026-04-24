@@ -974,6 +974,43 @@ fn lookup_replaces_stale_directory_with_file_via_head() {
     });
 }
 
+/// If the stale cached directory has an open file handle on one of its
+/// descendants, the HEAD path must NOT evict it — doing so would drop
+/// local state still referenced by FUSE. Fall through to list_tree
+/// instead, which mirrors the same skip-on-dirty-or-open semantics.
+#[test]
+fn lookup_preserves_stale_directory_with_open_descendant() {
+    let hub = MockHub::new();
+    hub.add_file("swap/child.txt", 5, Some("h_inner"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let swap_dir = vfs.lookup(ROOT_INODE, "swap").await.unwrap();
+        let _ = vfs.readdir(swap_dir.ino).await.unwrap();
+
+        // Keep a file handle on a descendant of the cached dir.
+        let child = vfs.lookup(swap_dir.ino, "child.txt").await.unwrap();
+        let fh = vfs.open(child.ino, false, false, None).await.unwrap();
+
+        // Remote swap: dir → file.
+        hub.remove_file("swap/child.txt");
+        hub.add_file("swap", 99, Some("h_file"), None);
+
+        // Invalidate root's listing so lookup hits the slow path.
+        if let Some(e) = vfs.inode_table.write().unwrap().get_mut(ROOT_INODE) {
+            e.children_loaded = false;
+        }
+
+        let attr = vfs.lookup(ROOT_INODE, "swap").await.unwrap();
+        // Fallback to list_tree, which keeps the stale dir alive because
+        // descendants are still open — safer than losing the open handle.
+        assert_eq!(attr.kind, InodeKind::Directory);
+
+        vfs.release(fh).await.unwrap();
+    });
+}
+
 /// When the HEAD probe returns 404 the name could be a directory — fall
 /// back to a full listing so dir traversal still works.
 #[test]

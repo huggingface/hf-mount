@@ -916,7 +916,10 @@ impl VirtualFs {
             // and expose a zero-byte file. Fall back to list_tree which has
             // the authoritative size from the tree index.
             Ok(Some(head)) if head.size.is_some() => {
-                return self.insert_file_from_head(parent, name, &full_path, head);
+                if let Some(res) = self.insert_file_from_head(parent, name, &full_path, head) {
+                    return res;
+                }
+                // Unsafe to replace a dirty/open stale entry — defer to list_tree.
             }
             // 404 may mean "doesn't exist" or "it's a directory" (the resolve
             // endpoint only handles files), so the listing has the final word.
@@ -941,13 +944,17 @@ impl VirtualFs {
     /// Used by the lookup slow path to avoid listing the whole parent dir
     /// when only one file is needed. The parent's `children_loaded` stays
     /// `false` so a later `readdir` still triggers a full listing.
+    ///
+    /// Returns `None` when the caller should fall back to `list_tree` —
+    /// specifically, when a stale directory entry at this path has dirty
+    /// descendants or open handles we cannot safely evict.
     fn insert_file_from_head(
         &self,
         parent: u64,
         name: &str,
         full_path: &str,
         head: crate::hub_api::HeadFileInfo,
-    ) -> VirtualFsResult<VirtualFsAttr> {
+    ) -> Option<VirtualFsResult<VirtualFsAttr>> {
         let size = head.size.unwrap_or(0);
         let mtime = head
             .last_modified
@@ -957,19 +964,22 @@ impl VirtualFs {
 
         let mut inodes = self.inode_table.write().expect("inodes poisoned");
         match inodes.get(parent) {
-            None => return Err(libc::ENOENT),
-            Some(e) if e.kind != InodeKind::Directory => return Err(libc::ENOTDIR),
+            None => return Some(Err(libc::ENOENT)),
+            Some(e) if e.kind != InodeKind::Directory => return Some(Err(libc::ENOTDIR)),
             Some(_) => {}
         }
         // A cached entry at this name is only trustworthy if it's also a file
         // (concurrent HEAD lookup may have inserted it). A stale directory
-        // there means the remote replaced a directory with a file — evict it
-        // (and its descendants) before inserting the new inode.
+        // means the remote replaced a directory with a file — evict it
+        // before inserting. Bail out if local state would be lost.
         if let Some(existing) = inodes.lookup_child(parent, name) {
             if existing.kind == InodeKind::File {
-                return Ok(self.make_vfs_attr(existing));
+                return Some(Ok(self.make_vfs_attr(existing)));
             }
             let stale_ino = existing.inode;
+            if inodes.has_dirty_descendants(stale_ino) || inodes.has_open_descendants(stale_ino) {
+                return None;
+            }
             inodes.remove(stale_ino);
         }
         let ino = inodes.insert(
@@ -989,8 +999,11 @@ impl VirtualFs {
         {
             entry.etag = Some(etag);
         }
-        let entry = inodes.get(ino).ok_or(libc::EIO)?;
-        Ok(self.make_vfs_attr(entry))
+        let result = match inodes.get(ino) {
+            Some(entry) => Ok(self.make_vfs_attr(entry)),
+            None => Err(libc::EIO),
+        };
+        Some(result)
     }
 
     pub fn default_uid(&self) -> u32 {

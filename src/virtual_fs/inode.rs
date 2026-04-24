@@ -615,6 +615,22 @@ impl InodeTable {
         false
     }
 
+    /// Check whether an inode or any of its descendants has an open FUSE file handle.
+    pub fn has_open_descendants(&self, ino: u64) -> bool {
+        let mut stack = vec![ino];
+        while let Some(current) = stack.pop() {
+            if let Some(entry) = self.inodes.get(&current) {
+                if entry.eviction.open_handles.load(Ordering::Relaxed) > 0 {
+                    return true;
+                }
+                for child in &entry.children {
+                    stack.push(child.ino);
+                }
+            }
+        }
+        false
+    }
+
     /// Return the full_path of every directory whose children have been loaded.
     /// Used by the poll loop to only re-fetch directories the user has visited.
     pub fn loaded_dir_prefixes(&self) -> Vec<String> {
