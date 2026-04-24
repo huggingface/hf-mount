@@ -976,8 +976,9 @@ fn lookup_replaces_stale_directory_with_file_via_head() {
 
 /// If the stale cached directory has an open file handle on one of its
 /// descendants, the HEAD path must NOT evict it — doing so would drop
-/// local state still referenced by FUSE. Fall through to list_tree
-/// instead, which mirrors the same skip-on-dirty-or-open semantics.
+/// local state still referenced by FUSE. The lookup returns the stale
+/// directory entry in place; correctness yields to data safety in this
+/// narrow race.
 #[test]
 fn lookup_preserves_stale_directory_with_open_descendant() {
     let hub = MockHub::new();
