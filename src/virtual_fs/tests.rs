@@ -873,6 +873,72 @@ fn lookup_uses_head_not_list_tree() {
     });
 }
 
+/// HEAD responses without size can't be trusted for the inode (open_readonly
+/// would take the empty-file shortcut), so fall back to list_tree which has
+/// the authoritative size from the tree index.
+#[test]
+fn lookup_falls_back_to_list_when_head_has_no_size() {
+    let hub = MockHub::new();
+    hub.add_file("sub/sized.txt", 42, Some("h"), None);
+    hub.set_head(
+        "sub/sized.txt",
+        Some(HeadFileInfo {
+            xet_hash: Some("h".to_string()),
+            etag: None,
+            size: None,
+            last_modified: None,
+        }),
+    );
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let sub = vfs.lookup(ROOT_INODE, "sub").await.unwrap();
+        let pre_list = hub.list_tree_call_count();
+        let attr = vfs.lookup(sub.ino, "sized.txt").await.unwrap();
+        assert_eq!(attr.size, 42, "size must come from the listing, not the HEAD");
+        assert_eq!(
+            hub.list_tree_call_count(),
+            pre_list + 1,
+            "HEAD without size should trigger a list_tree"
+        );
+    });
+}
+
+/// A cached directory entry under an unloaded parent must be re-resolved
+/// rather than served from memory — without a fresh listing we can't tell
+/// whether the dir was removed or replaced remotely.
+#[test]
+fn lookup_rechecks_cached_directory_when_parent_unloaded() {
+    let hub = MockHub::new();
+    hub.add_file("area/nested/file.txt", 10, Some("h"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let area = vfs.lookup(ROOT_INODE, "area").await.unwrap();
+        // Prime `area`'s children so `nested` is in the table.
+        let _ = vfs.readdir(area.ino).await.unwrap();
+        assert!(vfs.inode_table.read().unwrap().is_children_loaded(area.ino));
+
+        // Invalidate the parent's listing (mirrors what LRU eviction does).
+        if let Some(e) = vfs.inode_table.write().unwrap().get_mut(area.ino) {
+            e.children_loaded = false;
+        }
+
+        let pre_list = hub.list_tree_call_count();
+        let pre_head = hub.head_file_call_count();
+
+        let nested = vfs.lookup(area.ino, "nested").await.unwrap();
+        assert_eq!(nested.kind, InodeKind::Directory);
+
+        // Must re-resolve via the slow path: one HEAD probe (404, it's a dir)
+        // and one list_tree to confirm.
+        assert_eq!(hub.head_file_call_count(), pre_head + 1);
+        assert_eq!(hub.list_tree_call_count(), pre_list + 1);
+    });
+}
+
 /// When the HEAD probe returns 404 the name could be a directory — fall
 /// back to a full listing so dir traversal still works.
 #[test]

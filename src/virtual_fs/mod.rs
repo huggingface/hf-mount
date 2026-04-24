@@ -841,28 +841,33 @@ impl VirtualFs {
             // Try in-memory first regardless of `children_loaded`: an inode
             // inserted via the HEAD point-lookup path or still present after
             // a partial eviction can be served without a full re-list.
-            if let Some(entry) = inodes.lookup_child(parent, name) {
-                if entry.kind == InodeKind::File && !entry.is_dirty() {
-                    FastResult::NeedsRevalidation {
-                        ino: entry.inode,
-                        full_path: entry.full_path.to_string(),
-                        current_hash: entry.xet_hash.clone(),
-                        current_etag: entry.etag.clone(),
-                    }
-                } else {
+            //
+            // For directories we still require `children_loaded` to trust the
+            // cached entry: without the parent listing, we can't tell whether
+            // the dir was removed or replaced remotely (files revalidate
+            // individually via HEAD, dirs don't).
+            match inodes.lookup_child(parent, name) {
+                Some(entry) if entry.kind == InodeKind::File && !entry.is_dirty() => FastResult::NeedsRevalidation {
+                    ino: entry.inode,
+                    full_path: entry.full_path.to_string(),
+                    current_hash: entry.xet_hash.clone(),
+                    current_etag: entry.etag.clone(),
+                },
+                Some(entry) if entry.kind == InodeKind::File || parent_entry.children_loaded => {
                     FastResult::Hit(self.make_vfs_attr(entry))
                 }
-            } else if parent_entry.children_loaded {
-                // Authoritative miss: we listed the parent and the name isn't there.
-                let parent_path = &parent_entry.full_path;
-                let full_path = if parent_path.is_empty() {
-                    name.to_string()
-                } else {
-                    format!("{}/{}", parent_path, name)
-                };
-                FastResult::Miss(full_path)
-            } else {
-                FastResult::NotLoaded
+                // Directory cached under an unloaded parent → re-resolve.
+                Some(_) => FastResult::NotLoaded,
+                None if parent_entry.children_loaded => {
+                    let parent_path = &parent_entry.full_path;
+                    let full_path = if parent_path.is_empty() {
+                        name.to_string()
+                    } else {
+                        format!("{}/{}", parent_path, name)
+                    };
+                    FastResult::Miss(full_path)
+                }
+                None => FastResult::NotLoaded,
             }
         }; // inodes lock dropped here
 
@@ -907,10 +912,15 @@ impl VirtualFs {
         // whole parent — for point-access workloads (no `readdir`) this keeps
         // the inode table scoped to what the caller actually touches.
         match self.hub_client.head_file(&full_path).await {
-            Ok(Some(head)) => return self.insert_file_from_head(parent, name, &full_path, head),
+            // Without size, `open_readonly` would take the empty-file shortcut
+            // and expose a zero-byte file. Fall back to list_tree which has
+            // the authoritative size from the tree index.
+            Ok(Some(head)) if head.size.is_some() => {
+                return self.insert_file_from_head(parent, name, &full_path, head);
+            }
             // 404 may mean "doesn't exist" or "it's a directory" (the resolve
             // endpoint only handles files), so the listing has the final word.
-            Ok(None) => {}
+            Ok(_) => {}
             Err(e) => debug!("HEAD lookup {} failed, falling back to list: {}", full_path, e),
         }
 
