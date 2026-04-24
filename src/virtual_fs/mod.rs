@@ -961,8 +961,16 @@ impl VirtualFs {
             Some(e) if e.kind != InodeKind::Directory => return Err(libc::ENOTDIR),
             Some(_) => {}
         }
+        // A cached entry at this name is only trustworthy if it's also a file
+        // (concurrent HEAD lookup may have inserted it). A stale directory
+        // there means the remote replaced a directory with a file — evict it
+        // (and its descendants) before inserting the new inode.
         if let Some(existing) = inodes.lookup_child(parent, name) {
-            return Ok(self.make_vfs_attr(existing));
+            if existing.kind == InodeKind::File {
+                return Ok(self.make_vfs_attr(existing));
+            }
+            let stale_ino = existing.inode;
+            inodes.remove(stale_ino);
         }
         let ino = inodes.insert(
             parent,

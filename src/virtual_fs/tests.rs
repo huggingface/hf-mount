@@ -939,6 +939,41 @@ fn lookup_rechecks_cached_directory_when_parent_unloaded() {
     });
 }
 
+/// If a previously-cached directory has been replaced by a file on the
+/// remote, the HEAD slow path must evict the stale dir and expose the new
+/// file instead of returning the old cached entry.
+#[test]
+fn lookup_replaces_stale_directory_with_file_via_head() {
+    let hub = MockHub::new();
+    hub.add_file("swap/child.txt", 1, Some("h_inner"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        // Cache `swap` as a directory + one child.
+        let swap_dir = vfs.lookup(ROOT_INODE, "swap").await.unwrap();
+        assert_eq!(swap_dir.kind, InodeKind::Directory);
+        let _ = vfs.readdir(swap_dir.ino).await.unwrap();
+
+        // Remote replaces the directory with a file at the same path.
+        hub.remove_file("swap/child.txt");
+        hub.add_file("swap", 99, Some("h_file"), None);
+
+        // Invalidate root's listing so lookup takes the slow path.
+        if let Some(e) = vfs.inode_table.write().unwrap().get_mut(ROOT_INODE) {
+            e.children_loaded = false;
+        }
+
+        let attr = vfs.lookup(ROOT_INODE, "swap").await.unwrap();
+        assert_eq!(
+            attr.kind,
+            InodeKind::File,
+            "stale directory must be replaced by the file"
+        );
+        assert_eq!(attr.size, 99);
+    });
+}
+
 /// When the HEAD probe returns 404 the name could be a directory — fall
 /// back to a full listing so dir traversal still works.
 #[test]
