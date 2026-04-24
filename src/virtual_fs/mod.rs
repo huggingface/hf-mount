@@ -838,28 +838,29 @@ impl VirtualFs {
                 return Err(libc::ENOTDIR);
             }
 
-            if parent_entry.children_loaded {
-                if let Some(entry) = inodes.lookup_child(parent, name) {
-                    // Revalidate remote files via HEAD (xet-backed and plain git/LFS).
-                    if entry.kind == InodeKind::File && !entry.is_dirty() {
-                        FastResult::NeedsRevalidation {
-                            ino: entry.inode,
-                            full_path: entry.full_path.to_string(),
-                            current_hash: entry.xet_hash.clone(),
-                            current_etag: entry.etag.clone(),
-                        }
-                    } else {
-                        FastResult::Hit(self.make_vfs_attr(entry))
+            // Try in-memory first regardless of `children_loaded`: an inode
+            // inserted via the HEAD point-lookup path or still present after
+            // a partial eviction can be served without a full re-list.
+            if let Some(entry) = inodes.lookup_child(parent, name) {
+                if entry.kind == InodeKind::File && !entry.is_dirty() {
+                    FastResult::NeedsRevalidation {
+                        ino: entry.inode,
+                        full_path: entry.full_path.to_string(),
+                        current_hash: entry.xet_hash.clone(),
+                        current_etag: entry.etag.clone(),
                     }
                 } else {
-                    let parent_path = &parent_entry.full_path;
-                    let full_path = if parent_path.is_empty() {
-                        name.to_string()
-                    } else {
-                        format!("{}/{}", parent_path, name)
-                    };
-                    FastResult::Miss(full_path)
+                    FastResult::Hit(self.make_vfs_attr(entry))
                 }
+            } else if parent_entry.children_loaded {
+                // Authoritative miss: we listed the parent and the name isn't there.
+                let parent_path = &parent_entry.full_path;
+                let full_path = if parent_path.is_empty() {
+                    name.to_string()
+                } else {
+                    format!("{}/{}", parent_path, name)
+                };
+                FastResult::Miss(full_path)
             } else {
                 FastResult::NotLoaded
             }
@@ -902,6 +903,24 @@ impl VirtualFs {
             return Err(libc::ENOENT);
         }
 
+        // Point-lookup fast path: probe the specific path via HEAD before
+        // falling back to a full children listing. Most read-only workloads
+        // (e.g. doc serving) are sequences of `readFile(absolute_path)` where
+        // `readdir` is never called. Listing the whole parent to resolve a
+        // single name wastes Hub bandwidth and bloats the inode table with
+        // tens of thousands of siblings that will be evicted almost
+        // immediately, triggering a re-list on the next lookup.
+        match self.hub_client.head_file(&full_path).await {
+            Ok(Some(head)) => return self.insert_file_from_head(parent, name, &full_path, head),
+            Ok(None) => {
+                // 404: either missing, or the path is a directory (the resolve
+                // endpoint only handles files). Fall through to the listing.
+            }
+            Err(e) => {
+                debug!("HEAD lookup {} failed, falling back to list: {}", full_path, e);
+            }
+        }
+
         self.ensure_children_loaded(parent).await?;
 
         let inodes = self.inode_table.read().expect("inodes poisoned");
@@ -913,6 +932,54 @@ impl VirtualFs {
                 Err(libc::ENOENT)
             }
         }
+    }
+
+    /// Insert a file inode resolved via HEAD, without touching its siblings.
+    /// Used by the lookup slow path to avoid listing the whole parent dir
+    /// when only one file is needed. The parent's `children_loaded` stays
+    /// `false` so a later `readdir` still triggers a full listing.
+    fn insert_file_from_head(
+        &self,
+        parent: u64,
+        name: &str,
+        full_path: &str,
+        head: crate::hub_api::HeadFileInfo,
+    ) -> VirtualFsResult<VirtualFsAttr> {
+        let size = head.size.unwrap_or(0);
+        let mtime = head
+            .last_modified
+            .as_deref()
+            .map(crate::hub_api::mtime_from_http_date)
+            .unwrap_or_else(|| self.hub_client.default_mtime());
+
+        let mut inodes = self.inode_table.write().expect("inodes poisoned");
+        match inodes.get(parent) {
+            Some(e) if e.kind != InodeKind::Directory => return Err(libc::ENOTDIR),
+            None => return Err(libc::ENOENT),
+            _ => {}
+        }
+        if let Some(existing) = inodes.lookup_child(parent, name) {
+            return Ok(self.make_vfs_attr(existing));
+        }
+        let ino = inodes.insert(
+            parent,
+            name.to_string(),
+            full_path.to_string(),
+            InodeKind::File,
+            size,
+            mtime,
+            head.xet_hash,
+            0o644,
+            self.uid,
+            self.gid,
+        );
+        if let Some(etag) = head.etag
+            && let Some(entry) = inodes.get_mut(ino)
+        {
+            entry.etag = Some(etag);
+        }
+        let entry = inodes.get(ino).ok_or(libc::EIO)?;
+        Ok(self.make_vfs_attr(entry))
     }
 
     pub fn default_uid(&self) -> u32 {

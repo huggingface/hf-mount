@@ -830,6 +830,71 @@ fn lookup_ttl_skips_head_within_window() {
     });
 }
 
+/// A `lookup(parent, name)` under an unloaded directory resolves the single
+/// file via HEAD without listing its siblings — the doc-site workload never
+/// calls `readdir`, so paying for a list_tree on every cold lookup would
+/// bloat the table with sibling inodes the caller never asked for.
+#[test]
+fn lookup_uses_head_not_list_tree() {
+    let hub = MockHub::new();
+    for i in 0..50 {
+        hub.add_file(&format!("subdir/file_{i:02}.txt"), 10, Some(&format!("h{i}")), None);
+    }
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        // Root is materialized at startup; `subdir` is a lazy directory child.
+        let subdir = vfs.lookup(ROOT_INODE, "subdir").await.unwrap();
+        assert_eq!(subdir.kind, InodeKind::Directory);
+
+        let pre_list = hub.list_tree_call_count();
+        let pre_head = hub.head_file_call_count();
+        let pre_len = vfs.inode_table.read().unwrap().len();
+
+        let attr = vfs.lookup(subdir.ino, "file_07.txt").await.unwrap();
+        assert_eq!(attr.size, 10);
+
+        assert_eq!(
+            hub.list_tree_call_count(),
+            pre_list,
+            "lookup under an unloaded dir must not trigger list_tree"
+        );
+        assert_eq!(hub.head_file_call_count(), pre_head + 1, "one HEAD for the point lookup");
+        assert_eq!(
+            vfs.inode_table.read().unwrap().len(),
+            pre_len + 1,
+            "only the requested file should be materialized"
+        );
+    });
+}
+
+/// When the HEAD probe returns 404 the name could be a directory — fall
+/// back to a full listing so dir traversal still works.
+#[test]
+fn lookup_falls_back_to_list_for_directory() {
+    let hub = MockHub::new();
+    hub.add_file("outer/inner/file.txt", 10, Some("h"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let outer = vfs.lookup(ROOT_INODE, "outer").await.unwrap();
+        let pre_list = hub.list_tree_call_count();
+        let pre_head = hub.head_file_call_count();
+
+        let inner = vfs.lookup(outer.ino, "inner").await.unwrap();
+        assert_eq!(inner.kind, InodeKind::Directory);
+
+        assert_eq!(hub.head_file_call_count(), pre_head + 1, "HEAD probed first");
+        assert_eq!(
+            hub.list_tree_call_count(),
+            pre_list + 1,
+            "404 on HEAD falls back to a single list_tree"
+        );
+    });
+}
+
 /// Lookup of nonexistent path returns ENOENT and populates the negative cache.
 #[test]
 fn negative_cache_insert() {
@@ -2314,10 +2379,13 @@ fn poll_multiple_loaded_dirs() {
     let (rt, vfs) = vfs_repo(&hub, &xet);
 
     rt.block_on(async {
-        // Load both root and sub directory.
-        let _ = vfs.lookup(ROOT_INODE, "root.txt").await.unwrap();
+        // Load both root and sub directory via readdir — lookup alone no
+        // longer populates the full children listing (it uses HEAD for point
+        // resolution), but the poll loop only watches dirs that have been
+        // readdir'd.
+        let _ = vfs.readdir(ROOT_INODE).await.unwrap();
         let sub = vfs.lookup(ROOT_INODE, "sub").await.unwrap();
-        let _ = vfs.lookup(sub.ino, "nested.txt").await.unwrap();
+        let _ = vfs.readdir(sub.ino).await.unwrap();
 
         // Both dirs should be loaded.
         {
