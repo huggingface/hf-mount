@@ -281,7 +281,7 @@ impl VirtualFs {
             let evicted = vfs.lru_evict_sweep(soft_limit);
             if evicted > 0 || table_len > soft_limit {
                 info!(
-                    "lru_sweep: table={} soft_limit={} invalidated={}",
+                    "lru_sweep: table={} soft_limit={} evicted={}",
                     table_len, soft_limit, evicted
                 );
             }
@@ -290,9 +290,12 @@ impl VirtualFs {
 
     /// Candidates are collected under a read lock, then released before
     /// invoking `cb` — `cb` writes to the FUSE notify channel and returns
-    /// `false` on EAGAIN/ENOMEM, which `take_while` uses as the batch
-    /// throttle. Unacked candidates aren't lost: their `last_touched`
-    /// doesn't move, so the next sweep picks them up again.
+    /// `false` on EAGAIN/ENOMEM, which acts as the natural batch throttle.
+    ///
+    /// After `inval_entry`, we also evict our own table entry if `evict_if_safe`
+    /// lets us: when the inode was materialized from a readdir the kernel
+    /// never cached a dentry for it (nlookup stays at 0), so no `forget()`
+    /// will ever come back. Waiting on one leaks the entry forever.
     fn lru_evict_sweep(&self, soft_limit: usize) -> usize {
         let candidates = {
             let inodes = self.inode_table.read().expect("inodes poisoned");
@@ -305,7 +308,20 @@ impl VirtualFs {
         let Some(cb) = self.entry_invalidator.get() else {
             return 0;
         };
-        candidates.into_iter().take_while(|(p, n)| cb(*p, n)).count()
+
+        let mut to_evict = Vec::with_capacity(candidates.len());
+        for (ino, parent, name) in candidates {
+            if !cb(parent, &name) {
+                break;
+            }
+            to_evict.push(ino);
+        }
+
+        if to_evict.is_empty() {
+            return 0;
+        }
+        let mut inodes = self.inode_table.write().expect("inodes poisoned");
+        to_evict.into_iter().filter(|&ino| inodes.evict_if_safe(ino)).count()
     }
 
     /// Graceful shutdown: abort polling, drain flush queue, wait for completion.

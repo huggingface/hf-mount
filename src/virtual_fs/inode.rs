@@ -344,7 +344,7 @@ impl InodeTable {
     /// we actually return — O(N log max) with max cloned Strings, vs the
     /// naive sort-and-truncate that allocates for every filter-passing
     /// entry before discarding most of them.
-    pub(crate) fn lru_candidates(&self, max: usize) -> Vec<(u64, String)> {
+    pub(crate) fn lru_candidates(&self, max: usize) -> Vec<(u64, u64, String)> {
         if max == 0 {
             return Vec::new();
         }
@@ -353,7 +353,12 @@ impl InodeTable {
         // remains is the `max` oldest.
         let mut heap: BinaryHeap<(u64, u64)> = BinaryHeap::with_capacity(max + 1);
         for e in self.inodes.values() {
-            if e.kind != InodeKind::File || e.nlink == 0 || e.is_dirty() || !e.pending_deletes.is_empty() {
+            if e.kind != InodeKind::File
+                || e.nlink == 0
+                || e.is_dirty()
+                || !e.pending_deletes.is_empty()
+                || e.eviction.open_handles.load(Ordering::Relaxed) > 0
+            {
                 continue;
             }
             heap.push((e.eviction.last_touched.load(Ordering::Relaxed), e.inode));
@@ -367,7 +372,7 @@ impl InodeTable {
         picks.sort_by_key(|&(ts, _)| ts);
         picks
             .into_iter()
-            .filter_map(|(_, ino)| self.inodes.get(&ino).map(|e| (e.parent, e.name.clone())))
+            .filter_map(|(_, ino)| self.inodes.get(&ino).map(|e| (ino, e.parent, e.name.clone())))
             .collect()
     }
 
