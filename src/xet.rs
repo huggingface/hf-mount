@@ -1,5 +1,6 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use ulid::Ulid;
@@ -204,6 +205,44 @@ impl StagingDir {
     /// Deterministic within a session but unpredictable from outside.
     pub fn path(&self, inode: u64) -> PathBuf {
         self.dir.join(format!("ino_{:x}_{:016x}", inode, self.session_key))
+    }
+}
+
+// ── StagingCoordinator ────────────────────────────────────────────────
+
+/// Bundles the on-disk staging area with per-inode async locks so subsystems
+/// outside `VirtualFs` (e.g. flush-path GC) can take the same lock as
+/// `open_advanced_write` / `setattr(truncate)` to serialize staging I/O.
+pub(crate) struct StagingCoordinator {
+    dir: Option<StagingDir>,
+    locks: Mutex<HashMap<u64, Arc<tokio::sync::Mutex<()>>>>,
+}
+
+impl StagingCoordinator {
+    pub(crate) fn new(dir: Option<StagingDir>) -> Self {
+        Self {
+            dir,
+            locks: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub(crate) fn dir(&self) -> Option<&StagingDir> {
+        self.dir.as_ref()
+    }
+
+    pub(crate) fn path(&self, ino: u64) -> Option<PathBuf> {
+        self.dir.as_ref().map(|sd| sd.path(ino))
+    }
+
+    /// Get or create the per-inode async lock. Held across awaits (download,
+    /// unlink) so concurrent opens and flush-path GC can't interleave.
+    pub(crate) fn lock(&self, ino: u64) -> Arc<tokio::sync::Mutex<()>> {
+        self.locks
+            .lock()
+            .expect("staging locks poisoned")
+            .entry(ino)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
     }
 }
 

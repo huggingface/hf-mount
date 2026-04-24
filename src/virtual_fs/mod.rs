@@ -16,7 +16,7 @@ mod flush;
 pub mod inode;
 mod poll;
 mod prefetch;
-use crate::xet::{StagingDir, StreamingWriterOps, XetOps};
+use crate::xet::{StagingCoordinator, StagingDir, StreamingWriterOps, XetOps};
 use inode::{InodeEntry, InodeKind, InodeTable};
 use prefetch::{FetchPlan, PrefetchState};
 
@@ -82,7 +82,7 @@ pub struct VfsConfig {
 ///   dir_loading_locks[ino]      (tokio::sync::Mutex, per-directory)
 ///     → inode_table             (RwLock, read or write)
 ///
-///   staging_locks[ino]          (tokio::sync::Mutex, per-inode)
+///   staging.lock(ino)           (tokio::sync::Mutex, per-inode)
 ///     → inode_table             (RwLock, read or write)
 ///         → open_files          (RwLock, read only — via has_open_handles)
 ///         → negative_cache      (RwLock, write — in poll_remote_changes)
@@ -91,7 +91,7 @@ pub struct VfsConfig {
 ///     → pending_commits          (Mutex)
 ///
 /// General discipline: locks are held briefly and never across await points
-/// (except tokio::sync::Mutex in staging_locks). Most paths acquire a lock,
+/// (except the per-inode tokio::sync::Mutex from StagingCoordinator). Most paths acquire a lock,
 /// extract data, drop the lock, perform async I/O, then re-acquire to apply.
 ///
 /// Exception: setattr(truncate) holds inode_table.write() across File::create
@@ -101,7 +101,12 @@ pub struct VirtualFs {
     runtime: tokio::runtime::Handle,
     hub_client: Arc<dyn HubOps>,
     xet_sessions: Arc<dyn XetOps>,
-    staging_dir: Option<StagingDir>,
+    /// Staging area + per-inode locks. The per-inode locks are always
+    /// present (used even in simple mode to serialize streaming writer
+    /// creation); the staging directory is `None` outside advanced writes.
+    /// Shared via `Arc` so flush-path subsystems can take the same per-inode
+    /// lock as `open_advanced_write`.
+    staging: Arc<StagingCoordinator>,
     read_only: bool,
     advanced_writes: bool,
     inode_table: Arc<RwLock<InodeTable>>,
@@ -112,8 +117,6 @@ pub struct VirtualFs {
     gid: u32,
     /// Negative lookup cache: paths known to not exist (TTL-based).
     negative_cache: Arc<RwLock<HashMap<String, Instant>>>,
-    /// Per-inode locks for staging file preparation (prevents concurrent open races).
-    staging_locks: Mutex<HashMap<u64, Arc<tokio::sync::Mutex<()>>>>,
     /// Per-directory loading locks: serializes concurrent ensure_children_loaded() calls
     /// for the same directory so only one HTTP request is made (prevents thundering herd
     /// when Finder/Spotlight send many lookups on mount).
@@ -158,13 +161,13 @@ impl VirtualFs {
         let inodes = Arc::new(RwLock::new(InodeTable::new(config.inode_soft_limit)));
         let negative_cache = Arc::new(RwLock::new(HashMap::new()));
 
+        let staging = Arc::new(StagingCoordinator::new(staging_dir));
+
         let flush_manager = if !config.read_only && config.advanced_writes {
-            let sd = staging_dir
-                .as_ref()
-                .expect("--advanced-writes requires a staging directory");
+            let dir = staging.dir().expect("--advanced-writes requires a staging directory");
             Some(flush::FlushManager::new(
                 xet_sessions.clone(),
-                sd.clone(),
+                dir.clone(),
                 hub_client.clone(),
                 inodes.clone(),
                 &runtime,
@@ -203,7 +206,7 @@ impl VirtualFs {
             runtime,
             hub_client,
             xet_sessions,
-            staging_dir,
+            staging,
             read_only: config.read_only,
             advanced_writes: config.advanced_writes,
             inode_table: inodes,
@@ -212,7 +215,6 @@ impl VirtualFs {
             uid: config.uid,
             gid: config.gid,
             negative_cache,
-            staging_locks: Mutex::new(HashMap::new()),
             dir_loading_locks: Mutex::new(HashMap::new()),
             pending_commits: Mutex::new(HashMap::new()),
             flush_manager,
@@ -662,16 +664,6 @@ impl VirtualFs {
             .clone()
     }
 
-    /// Get or create a per-inode lock for staging file preparation.
-    fn staging_lock(&self, ino: u64) -> Arc<tokio::sync::Mutex<()>> {
-        self.staging_locks
-            .lock()
-            .expect("staging_locks poisoned")
-            .entry(ino)
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone()
-    }
-
     /// Install a pending commit watch hook on a streaming channel.
     /// Called in flush() before commit or deferral so open() can await the result.
     /// No-op if a hook is already installed (prevents replacing a receiver that
@@ -1036,13 +1028,11 @@ impl VirtualFs {
     /// Remove any on-disk staging file for `ino`. Safe to call for inodes that
     /// never had a staging file — NotFound is ignored.
     fn drop_staging(&self, ino: u64) {
-        if let Some(ref sd) = self.staging_dir {
-            let path = sd.path(ino);
-            if let Err(e) = std::fs::remove_file(&path)
-                && e.kind() != std::io::ErrorKind::NotFound
-            {
-                warn!("Failed to remove staging file for ino={}: {}", ino, e);
-            }
+        if let Some(path) = self.staging.path(ino)
+            && let Err(e) = std::fs::remove_file(&path)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            warn!("Failed to remove staging file for ino={}: {}", ino, e);
         }
     }
 
@@ -1090,7 +1080,7 @@ impl VirtualFs {
         }
 
         let file_entry = self.get_file_entry(ino)?;
-        let staging_path = self.staging_dir.as_ref().map(|sd| sd.path(ino));
+        let staging_path = self.staging.path(ino);
 
         if writable && self.advanced_writes {
             // Staging file + async flush (supports random writes and seek)
@@ -1116,10 +1106,10 @@ impl VirtualFs {
         staging_path: Option<PathBuf>,
         truncate: bool,
     ) -> VirtualFsResult<u64> {
-        let staging_path = staging_path.expect("staging_dir required for advanced writes");
+        let staging_path = staging_path.expect("staging directory required for advanced writes");
 
         // Serialize staging preparation per inode (prevents concurrent download races)
-        let staging_mutex = self.staging_lock(ino);
+        let staging_mutex = self.staging.lock(ino);
         let _staging_guard = staging_mutex.lock().await;
 
         // Reuse the staging file when either (a) it has pending dirty writes,
@@ -1212,7 +1202,7 @@ impl VirtualFs {
         // Wait for any in-flight commit to complete before starting a new writer.
         self.await_pending_commit(ino).await?;
 
-        let staging_mutex = self.staging_lock(ino);
+        let staging_mutex = self.staging.lock(ino);
         let _staging_guard = staging_mutex.lock().await;
 
         // Capture inode snapshot before mutation (for revert on commit failure)
@@ -1274,7 +1264,7 @@ impl VirtualFs {
 
             // Plain LFS/git file without xet hash — HTTP download to staging cache.
             _ if fe.size > 0 => {
-                let staging = self.staging_dir.as_ref().ok_or_else(|| {
+                let staging = self.staging.dir().ok_or_else(|| {
                     error!("No staging dir for HTTP download of ino={}", ino);
                     libc::EIO
                 })?;
@@ -1287,7 +1277,7 @@ impl VirtualFs {
                 };
                 let dest = staging.root().join(format!("http_{:x}", path_hash));
                 {
-                    let lock = self.staging_lock(ino);
+                    let lock = self.staging.lock(ino);
                     let _guard = lock.lock().await;
                     // download_file_http uses ETag-based conditional requests,
                     // so this is cheap when the cached file is still valid (304).
@@ -1866,9 +1856,9 @@ impl VirtualFs {
             }
         }
 
-        // staging_locks entries are intentionally not cleaned up here: removing
-        // while another open() may hold the Arc would break serialization.
-        // Entries are tiny (Arc<Mutex<()>>) and bounded by unique inodes opened.
+        // Per-inode staging locks are intentionally not cleaned up here:
+        // removing while another open() may hold the Arc would break
+        // serialization. Entries are tiny and bounded by inodes ever staged.
 
         match release_error {
             Some(e) => Err(e),
@@ -2058,10 +2048,9 @@ impl VirtualFs {
         if self.advanced_writes {
             // Advanced mode: staging file on disk + async flush
             let staging_path = self
-                .staging_dir
-                .as_ref()
-                .expect("staging_dir required for advanced writes")
-                .path(ino);
+                .staging
+                .path(ino)
+                .expect("staging directory required for advanced writes");
             match OpenOptions::new()
                 .create(true)
                 .truncate(true)
@@ -2778,14 +2767,13 @@ impl VirtualFs {
                 // Real truncation goes through open(O_TRUNC) which is handled separately.
             } else {
                 // Advanced mode: truncation is applied to the staging file on disk
-                let staging_mutex = self.staging_lock(ino);
+                let staging_mutex = self.staging.lock(ino);
                 let _staging_guard = staging_mutex.lock().await;
 
                 let staging_path = self
-                    .staging_dir
-                    .as_ref()
-                    .expect("staging_dir required for advanced writes")
-                    .path(ino);
+                    .staging
+                    .path(ino)
+                    .expect("staging directory required for advanced writes");
 
                 // Phase 1: ensure staging file exists (may download, async).
                 if new_size > 0 && !staging_path.exists() {
