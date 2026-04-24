@@ -188,12 +188,7 @@ pub struct InodeTable {
     /// async sweep in `VirtualFs::lru_sweep_loop` picks the oldest-touched
     /// entries and asks the kernel (via FUSE `inval_entry`) to drop their
     /// dentries; the kernel's subsequent `forget()` then shrinks the table.
-    ///
-    /// `insert()` does *not* evict synchronously — doing so would mean every
-    /// over-cap insert pays an O(N) scan under the inode-table write lock,
-    /// which stalls all concurrent FUSE reads. The async sweep is the sole
-    /// backstop, so the table may temporarily overshoot the cap between
-    /// sweeps.
+    /// The table may temporarily overshoot the cap between sweeps.
     soft_limit: AtomicUsize,
 }
 
@@ -469,11 +464,6 @@ impl InodeTable {
             parent,
             full_path
         );
-
-        // No inline eviction: bounding the table is the async sweep's job
-        // (see `soft_limit` doc). Evicting here would force every over-cap
-        // insert to pay an O(N) scan under the inode-table write lock,
-        // which stalls all concurrent FUSE reads.
 
         let now = SystemTime::now();
         let nlink = match kind {

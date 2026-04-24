@@ -3350,21 +3350,17 @@ fn lru_keeps_inode_table_bounded_under_lookup_churn() {
     let xet = MockXet::new();
     let (rt, vfs) = vfs_with_lru(&hub, &xet, SOFT_LIMIT);
 
-    // Simulate the FUSE kernel's response to `inval_entry`: look up the
-    // (parent, name) pair, drop its nlookup refcount. `forget` then runs
-    // `evict_if_safe` and, if the nlookup hit 0, removes the inode.
+    // Simulate the FUSE kernel's response to `inval_entry`: drop all
+    // outstanding nlookup refs on the child. `forget` then runs
+    // `evict_if_safe` and removes the inode if nothing else holds it.
     let vfs_cb = vfs.clone();
     vfs.set_entry_invalidator(Box::new(move |parent, name| {
         use std::sync::atomic::Ordering;
         let ino_and_lookup = {
             let inodes = vfs_cb.inode_table.read().expect("inodes poisoned");
-            inodes.get(parent).and_then(|dir| {
-                dir.children.iter().find(|c| c.name == name).and_then(|c| {
-                    inodes
-                        .get(c.ino)
-                        .map(|e| (c.ino, e.eviction.nlookup.load(Ordering::Relaxed)))
-                })
-            })
+            inodes
+                .lookup_child(parent, name)
+                .map(|e| (e.inode, e.eviction.nlookup.load(Ordering::Relaxed)))
         };
         if let Some((ino, nlookup)) = ino_and_lookup
             && nlookup > 0
