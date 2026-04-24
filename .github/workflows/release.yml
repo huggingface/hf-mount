@@ -5,6 +5,17 @@ on:
     tags: ["v*"]
     branches-ignore: [main]
   workflow_dispatch:
+    inputs:
+      bump:
+        description: "Version bump type (leave 'auto' to detect from commit messages)"
+        required: true
+        type: choice
+        default: auto
+        options:
+          - auto
+          - patch
+          - minor
+          - major
 
 permissions:
   contents: write
@@ -16,9 +27,106 @@ env:
   IMAGE: ghcr.io/huggingface/hf-mount-fuse
 
 jobs:
+  # Manual dispatch path: bump Cargo.toml, commit, tag, push.
+  # Downstream jobs run in this same workflow run (keyed off needs.bump)
+  # because tag pushes signed by GITHUB_TOKEN don't cascade into a new
+  # workflow run — so we can't rely on the `push: tags` trigger firing.
+  bump:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-22.04
+    outputs:
+      new_tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Detect bump type from commits
+        id: detect
+        run: |
+          LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+          if [ -z "$LAST_TAG" ]; then
+            RANGE="HEAD"
+          else
+            RANGE="${LAST_TAG}..HEAD"
+          fi
+
+          COMMITS=$(git log --pretty=format:"%s" "$RANGE")
+          echo "## Commits since $LAST_TAG:"
+          echo "$COMMITS"
+          echo ""
+
+          BUMP="patch"
+          if echo "$COMMITS" | grep -qiE "^feat(\(.*\))?!:|BREAKING CHANGE"; then
+            BUMP="major"
+          elif echo "$COMMITS" | grep -qiE "^feat(\(.*\))?:"; then
+            BUMP="minor"
+          elif echo "$COMMITS" | grep -qiE "^(fix|perf)(\(.*\))?:"; then
+            BUMP="patch"
+          fi
+
+          echo "detected=$BUMP" >> "$GITHUB_OUTPUT"
+          echo "Detected bump: $BUMP"
+
+      - name: Resolve bump type
+        id: bump
+        run: |
+          if [ "${{ inputs.bump }}" = "auto" ]; then
+            BUMP="${{ steps.detect.outputs.detected }}"
+          else
+            BUMP="${{ inputs.bump }}"
+          fi
+          echo "type=$BUMP" >> "$GITHUB_OUTPUT"
+          echo "Using bump type: $BUMP"
+
+      - name: Compute new version
+        id: version
+        run: |
+          CURRENT=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)"/\1/')
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
+          case "${{ steps.bump.outputs.type }}" in
+            major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
+            minor) MINOR=$((MINOR + 1)); PATCH=0 ;;
+            patch) PATCH=$((PATCH + 1)) ;;
+          esac
+          NEW="${MAJOR}.${MINOR}.${PATCH}"
+          echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
+          echo "new=$NEW" >> "$GITHUB_OUTPUT"
+          echo "tag=v${NEW}" >> "$GITHUB_OUTPUT"
+
+      - name: Summary
+        run: |
+          echo "### Release Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| | |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Current** | v${{ steps.version.outputs.current }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **New** | ${{ steps.version.outputs.tag }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Bump** | ${{ steps.bump.outputs.type }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Auto-detected** | ${{ steps.detect.outputs.detected }} |" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Bump Cargo.toml
+        run: sed -i "0,/^version = \".*\"/s//version = \"${{ steps.version.outputs.new }}\"/" Cargo.toml
+
+      - name: Update Cargo.lock
+        run: cargo generate-lockfile
+
+      - name: Commit, tag, and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock
+          git commit -m "chore: release ${{ steps.version.outputs.tag }}"
+          git tag "${{ steps.version.outputs.tag }}"
+          git push origin main --tags
+
   build-linux:
     name: Build Linux (${{ matrix.target }})
-    if: startsWith(github.ref, 'refs/tags/')
+    needs: [bump]
+    if: |
+      always() &&
+      (startsWith(github.ref, 'refs/tags/') || needs.bump.result == 'success')
     runs-on: ubuntu-22.04
     strategy:
       matrix:
@@ -29,6 +137,8 @@ jobs:
             arch: aarch64
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.bump.outputs.new_tag || github.ref }}
 
       - uses: dtolnay/rust-toolchain@1.95.0
         with:
@@ -69,7 +179,10 @@ jobs:
 
   build-macos:
     name: Build macOS (${{ matrix.arch }})
-    if: startsWith(github.ref, 'refs/tags/')
+    needs: [bump]
+    if: |
+      always() &&
+      (startsWith(github.ref, 'refs/tags/') || needs.bump.result == 'success')
     runs-on: ${{ matrix.runner }}
     strategy:
       matrix:
@@ -79,6 +192,8 @@ jobs:
             runner: macos-14
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.bump.outputs.new_tag || github.ref }}
 
       - uses: dtolnay/rust-toolchain@1.95.0
         with:
@@ -114,9 +229,13 @@ jobs:
 
   docker:
     name: Build & Push Docker
+    needs: [bump]
+    if: always() && needs.bump.result != 'failure'
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.bump.outputs.new_tag || github.ref }}
 
       - uses: docker/login-action@v3
         with:
@@ -127,8 +246,15 @@ jobs:
       - name: Determine tags
         id: tags
         run: |
-          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+          NEW_TAG="${{ needs.bump.outputs.new_tag }}"
+          if [[ -n "$NEW_TAG" ]]; then
+            TAG="$NEW_TAG"
+          elif [[ "${GITHUB_REF}" == refs/tags/* ]]; then
             TAG="${GITHUB_REF#refs/tags/}"
+          else
+            TAG=""
+          fi
+          if [[ -n "$TAG" ]]; then
             TAGS="${{ env.IMAGE }}:${TAG}"
             if [[ "$TAG" != *"-"* ]]; then
               TAGS="${TAGS},${{ env.IMAGE }}:latest"
@@ -146,8 +272,12 @@ jobs:
 
   release:
     name: Create Release
-    if: startsWith(github.ref, 'refs/tags/')
-    needs: [build-linux, build-macos]
+    needs: [bump, build-linux, build-macos]
+    if: |
+      always() &&
+      needs.build-linux.result == 'success' &&
+      needs.build-macos.result == 'success' &&
+      (startsWith(github.ref, 'refs/tags/') || needs.bump.result == 'success')
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/download-artifact@v4
@@ -163,7 +293,8 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create "${{ github.ref_name }}" artifacts/* \
+          TAG="${{ needs.bump.outputs.new_tag || github.ref_name }}"
+          gh release create "$TAG" artifacts/* \
             --repo "${{ github.repository }}" \
-            --title "${{ github.ref_name }}" \
+            --title "$TAG" \
             --generate-notes
