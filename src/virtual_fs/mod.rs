@@ -587,9 +587,7 @@ impl VirtualFs {
                 .map(|c| c.ino)
                 .collect();
             for ino in stale {
-                // Don't remove if the inode or any descendant is dirty or has open handles.
-                let has_dirty_or_open = inodes.has_dirty_descendants(ino) || inodes.has_open_descendants(ino);
-                if !has_dirty_or_open {
+                if !inodes.has_dirty_or_open_descendants(ino) {
                     inodes.remove(ino);
                 }
             }
@@ -973,7 +971,7 @@ impl VirtualFs {
                 return Ok(self.make_vfs_attr(existing));
             }
             let stale_ino = existing.inode;
-            if inodes.has_dirty_descendants(stale_ino) || inodes.has_open_descendants(stale_ino) {
+            if inodes.has_dirty_or_open_descendants(stale_ino) {
                 return Ok(self.make_vfs_attr(existing));
             }
             inodes.remove(stale_ino);
