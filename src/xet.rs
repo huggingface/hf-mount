@@ -241,7 +241,7 @@ impl StagingDir {
         let size = self.file_size(inode);
         match std::fs::remove_file(&path) {
             Ok(()) => {
-                self.sub_bytes(size);
+                self.resize_bytes(size, 0);
                 true
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
@@ -262,17 +262,13 @@ impl StagingDir {
         self.bytes_used.load(Ordering::Relaxed)
     }
 
-    /// Record bytes added to staging (file download or write growth).
-    pub fn add_bytes(&self, n: u64) {
-        self.bytes_used.fetch_add(n, Ordering::Relaxed);
-    }
-
-    /// Record bytes removed from staging (file deletion or truncation).
-    /// Saturates at zero to avoid wrapping on accounting mismatches.
-    pub fn sub_bytes(&self, n: u64) {
+    /// Apply the net change when a staging file goes from `old` to `new` bytes.
+    /// Saturates at zero on shrink to tolerate accounting drift. Covers
+    /// plain add (old=0), plain remove (new=0), and in-place resize.
+    pub fn resize_bytes(&self, old: u64, new: u64) {
         self.bytes_used
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                Some(current.saturating_sub(n))
+                Some(current.saturating_sub(old).saturating_add(new))
             })
             .ok();
     }

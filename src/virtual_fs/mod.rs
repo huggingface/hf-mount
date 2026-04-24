@@ -1327,8 +1327,7 @@ impl VirtualFs {
                 0
             };
             if let Some(sd) = self.staging.dir() {
-                sd.sub_bytes(old_size);
-                sd.add_bytes(new_size);
+                sd.resize_bytes(old_size, new_size);
             }
             // Flag the cache as current only when the staging actually mirrors
             // the remote. Cases to exclude:
@@ -1814,7 +1813,7 @@ impl VirtualFs {
                     if let Some(entry) = inodes.get_mut(handle_ino) {
                         if new_end > entry.size {
                             if let Some(sd) = self.staging.dir() {
-                                sd.add_bytes(new_end - entry.size);
+                                sd.resize_bytes(entry.size, new_end);
                             }
                             entry.size = new_end;
                         }
@@ -3020,8 +3019,7 @@ impl VirtualFs {
                     }
                 }
                 if let Some(sd) = self.staging.dir() {
-                    sd.sub_bytes(old_staging_size);
-                    sd.add_bytes(sd.file_size(ino));
+                    sd.resize_bytes(old_staging_size, sd.file_size(ino));
                 }
                 if let Some(entry) = inodes.get_mut(ino) {
                     entry.size = new_size;

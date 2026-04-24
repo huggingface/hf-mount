@@ -1370,7 +1370,7 @@ fn setattr_truncate_unstaged_does_not_debit_budget() {
     rt.block_on(async {
         let sd = vfs.staging.dir().unwrap();
         // Simulate other live staging files consuming budget.
-        sd.add_bytes(500);
+        sd.resize_bytes(0, 500);
         assert_eq!(sd.bytes_used(), 500);
 
         let attr = vfs.lookup(ROOT_INODE, "file.txt").await.unwrap();
