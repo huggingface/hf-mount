@@ -3154,6 +3154,72 @@ fn staging_file_removed_on_inode_eviction() {
     });
 }
 
+/// Truncating a hashed remote file produces an empty staging file, which does
+/// not match the remote. `staging_is_current` must stay false — otherwise the
+/// next open would reuse empty staging as if it held the remote content.
+#[test]
+fn truncate_open_does_not_flag_staging_current() {
+    let hub = MockHub::new();
+    hub.add_file("dst.txt", 11, Some("remote_hash"), None);
+    let xet = MockXet::new();
+    xet.add_file("remote_hash", b"hello world");
+    let (rt, vfs) = vfs_advanced(&hub, &xet);
+
+    rt.block_on(async {
+        let attr = vfs.lookup(ROOT_INODE, "dst.txt").await.unwrap();
+        let ino = attr.ino;
+
+        let fh = vfs.open(ino, true, true, None).await.unwrap();
+        vfs.release(fh).await.unwrap();
+
+        let flagged = vfs
+            .inode_table
+            .read()
+            .unwrap()
+            .get(ino)
+            .is_some_and(|e| e.staging_is_current);
+        assert!(
+            !flagged,
+            "truncate of a hashed file must not flag empty staging as current"
+        );
+    });
+}
+
+/// After a flush, the staging file is kept on disk and flagged as current.
+/// Reopening the file for write must reuse that staging cache without
+/// issuing a new download.
+#[test]
+fn open_advanced_write_reuses_staging_cache_after_flush() {
+    use std::sync::atomic::Ordering;
+
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_advanced(&hub, &xet);
+
+    rt.block_on(async {
+        let (attr, fh1) = vfs
+            .create(ROOT_INODE, "cache_me.txt", 0o644, 1000, 1000, None)
+            .await
+            .unwrap();
+        let ino = attr.ino;
+        write_blocking(&vfs, ino, fh1, 0, b"hello world").await.unwrap();
+        vfs.release(fh1).await.unwrap();
+
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let is_clean = vfs.inode_table.read().unwrap().get(ino).is_some_and(|e| !e.is_dirty());
+        assert!(is_clean, "inode should be clean after flush");
+
+        let downloads_before = xet.download_to_file_calls.load(Ordering::SeqCst);
+        let fh2 = vfs.open(ino, true, false, None).await.unwrap();
+        let downloads_after = xet.download_to_file_calls.load(Ordering::SeqCst);
+        assert_eq!(
+            downloads_before, downloads_after,
+            "re-opening for write should reuse staging cache, not re-download"
+        );
+        vfs.release(fh2).await.unwrap();
+    });
+}
+
 /// Rename overwriting a destination cleans up the destination inode.
 #[test]
 fn rename_overwrite_cleans_destination() {

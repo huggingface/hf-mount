@@ -244,6 +244,8 @@ pub struct MockXet {
     range_empty_count: AtomicU32,
     /// Log of (offset, end) pairs passed to download_stream_boxed.
     pub stream_calls: Mutex<Vec<(u64, Option<u64>)>>,
+    /// Count of download_to_file calls (used to assert staging cache reuse).
+    pub download_to_file_calls: AtomicU64,
 }
 
 impl MockXet {
@@ -258,6 +260,7 @@ impl MockXet {
             range_fail_count: AtomicU32::new(0),
             range_empty_count: AtomicU32::new(0),
             stream_calls: Mutex::new(Vec::new()),
+            download_to_file_calls: AtomicU64::new(0),
         })
     }
 
@@ -307,6 +310,7 @@ impl XetOps for MockXet {
     }
 
     async fn download_to_file(&self, xet_hash: &str, _file_size: u64, dest: &Path) -> Result<()> {
+        self.download_to_file_calls.fetch_add(1, Ordering::SeqCst);
         if self.download_fail.swap(false, Ordering::SeqCst) {
             return Err(Error::Xet("mock download failure".into()));
         }

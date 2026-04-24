@@ -134,6 +134,11 @@ pub struct InodeEntry {
     pub nlink: u32,
     pub symlink_target: Option<String>,
     pub xet_hash: Option<String>,
+    /// True when the on-disk staging file is known to match the remote at
+    /// `xet_hash`. Set by a successful commit, or by a download whose pre/post
+    /// `xet_hash` matched (so we didn't race with `poll_remote_changes`).
+    /// Cleared whenever poll advances `xet_hash` out of band.
+    pub staging_is_current: bool,
     /// ETag from the last HEAD revalidation (used for non-xet plain git/LFS files).
     pub etag: Option<String>,
     /// Dirty generation counter. 0 = clean. Each mutation increments the counter.
@@ -183,6 +188,9 @@ impl InodeEntry {
             // writer may have advanced the generation with newer content;
             // overwriting size/hash here would clobber the in-progress data.
             self.xet_hash = Some(hash.to_string());
+            // The on-disk staging file is the just-uploaded content — valid
+            // cache for the next write-open.
+            self.staging_is_current = true;
             self.size = size;
             self.pending_deletes.clear();
         }
@@ -254,6 +262,7 @@ impl InodeTable {
             nlink: 2,
             symlink_target: None,
             xet_hash: None,
+            staging_is_current: false,
             etag: None,
             dirty_generation: 0,
             children_loaded: false,
@@ -638,6 +647,7 @@ impl InodeTable {
             nlink,
             symlink_target: None,
             xet_hash,
+            staging_is_current: false,
             etag: None,
             dirty_generation: 0,
             children_loaded: kind != InodeKind::Directory, // only dirs have children to load
@@ -723,6 +733,10 @@ impl InodeTable {
             entry.etag = new_etag;
             entry.size = new_size;
             entry.mtime = new_mtime;
+            // Remote moved under us; the staging cache (if any) no longer
+            // matches xet_hash. An in-flight download observes this under
+            // its post-check and won't re-flag the cache.
+            entry.staging_is_current = false;
             true
         } else {
             false

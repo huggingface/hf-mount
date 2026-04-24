@@ -1122,19 +1122,25 @@ impl VirtualFs {
         let staging_mutex = self.staging_lock(ino);
         let _staging_guard = staging_mutex.lock().await;
 
-        // Re-read dirty state under the staging lock (may have changed since first check)
-        let is_dirty = self
-            .inode_table
-            .read()
-            .expect("inodes poisoned")
-            .get(ino)
-            .ok_or(libc::ENOENT)?
-            .is_dirty();
+        // Reuse the staging file when either (a) it has pending dirty writes,
+        // or (b) it's a clean cache flagged as current. In both cases its
+        // content is the right starting point for this open.
+        let (is_dirty, staging_is_current) = {
+            let inodes = self.inode_table.read().expect("inodes poisoned");
+            let entry = inodes.get(ino).ok_or(libc::ENOENT)?;
+            (entry.is_dirty(), entry.staging_is_current)
+        };
+        let can_reuse_staging = !truncate && (is_dirty || staging_is_current) && staging_path.exists();
 
-        // Reuse existing dirty staging file (unless truncating)
-        if !(is_dirty && staging_path.exists() && !truncate) {
-            if !truncate && !xet_hash.is_empty() && size > 0 {
-                // Download remote content for read-modify-write
+        if !can_reuse_staging {
+            // Clear the flag before touching disk so a partial failure (e.g.
+            // mid-download CAS error, async cancel) never leaves the cache
+            // reusable.
+            if let Some(entry) = self.inode_table.write().expect("inodes poisoned").get_mut(ino) {
+                entry.staging_is_current = false;
+            }
+            let needs_download = !truncate && !xet_hash.is_empty() && size > 0;
+            if needs_download {
                 self.xet_sessions
                     .download_to_file(xet_hash, size, &staging_path)
                     .await
@@ -1143,11 +1149,25 @@ impl VirtualFs {
                         libc::EIO
                     })?;
             } else {
-                // Truncate, new file, or empty remote → empty staging file
                 File::create(&staging_path).map_err(|e| {
                     error!("Failed to create staging file: {}", e);
                     libc::EIO
                 })?;
+            }
+            // Flag the cache as current only when the staging actually mirrors
+            // the remote. Cases to exclude:
+            // - truncated hashed file: empty staging, non-empty xet_hash.
+            // - plain git/LFS with `size > 0` and no xet_hash: File::create
+            //   leaves empty staging, which does not match the remote.
+            // - race with poll: `xet_hash` moved between `open()` reading the
+            //   inode and here, so the downloaded hash is now stale — detected
+            //   by the `entry.xet_hash == xet_hash` post-check.
+            let materializes_remote = needs_download || (xet_hash.is_empty() && size == 0);
+            if materializes_remote
+                && let Some(entry) = self.inode_table.write().expect("inodes poisoned").get_mut(ino)
+                && entry.xet_hash.as_deref().unwrap_or("") == xet_hash
+            {
+                entry.staging_is_current = true;
             }
         }
 
