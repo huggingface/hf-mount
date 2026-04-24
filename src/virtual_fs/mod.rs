@@ -288,15 +288,11 @@ impl VirtualFs {
         }
     }
 
-    /// Candidates are collected under a read lock, then the lock is dropped
-    /// before invoking the callback — the callback writes to the FUSE
-    /// channel and can block under backpressure.
-    ///
-    /// Batch size equals the full overflow: when the table is 3× the soft
-    /// limit, a capped batch can't catch up (the table grows faster than the
-    /// sweep evicts). The `take_while` below stops at the first `false` from
-    /// `cb` (EAGAIN/ENOMEM on the FUSE notify channel), which is the natural
-    /// throttle — no artificial cap needed.
+    /// Candidates are collected under a read lock, then released before
+    /// invoking `cb` — `cb` writes to the FUSE notify channel and returns
+    /// `false` on EAGAIN/ENOMEM, which `take_while` uses as the batch
+    /// throttle. Unacked candidates aren't lost: their `last_touched`
+    /// doesn't move, so the next sweep picks them up again.
     fn lru_evict_sweep(&self, soft_limit: usize) -> usize {
         let candidates = {
             let inodes = self.inode_table.read().expect("inodes poisoned");
@@ -304,16 +300,11 @@ impl VirtualFs {
             if len <= soft_limit {
                 return 0;
             }
-            let overflow = len - soft_limit;
-            inodes.lru_candidates(overflow)
+            inodes.lru_candidates(len - soft_limit)
         };
         let Some(cb) = self.entry_invalidator.get() else {
             return 0;
         };
-        // take_while stops at the first `false` return (FUSE notify channel
-        // saturated) without consuming that element. Next sweep retries with
-        // the same oldest entries (their last_touched hasn't moved), so
-        // nothing is lost.
         candidates.into_iter().take_while(|(p, n)| cb(*p, n)).count()
     }
 
