@@ -1,5 +1,6 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use ulid::Ulid;
@@ -204,6 +205,53 @@ impl StagingDir {
     /// Deterministic within a session but unpredictable from outside.
     pub fn path(&self, inode: u64) -> PathBuf {
         self.dir.join(format!("ino_{:x}_{:016x}", inode, self.session_key))
+    }
+}
+
+// ── StagingCoordinator ────────────────────────────────────────────────
+
+/// Bundles the on-disk staging area with the per-inode locks that serialize
+/// access to it. Wrapped in `Arc` so subsystems outside `VirtualFs` (e.g. the
+/// flush-path GC) can share ownership and take the same per-inode lock that
+/// `open_advanced_write` and `setattr(truncate)` use to prepare staging files.
+///
+/// The outer `std::Mutex` guards the HashMap only during lookup/insert; the
+/// inner `tokio::Mutex<()>` is the actual per-inode critical section held
+/// across awaits (download, unlink).
+pub struct StagingCoordinator {
+    dir: Option<StagingDir>,
+    locks: Mutex<HashMap<u64, Arc<tokio::sync::Mutex<()>>>>,
+}
+
+impl StagingCoordinator {
+    pub fn new(dir: Option<StagingDir>) -> Arc<Self> {
+        Arc::new(Self {
+            dir,
+            locks: Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// The underlying staging directory, if advanced writes are enabled.
+    /// Simple (append-only) mode uses the coordinator only for per-inode
+    /// locks, not for on-disk staging.
+    pub fn dir(&self) -> Option<&StagingDir> {
+        self.dir.as_ref()
+    }
+
+    /// Get or create the per-inode async lock. Acquire before any I/O that
+    /// touches `dir.path(ino)` to serialize with concurrent opens and GC.
+    ///
+    /// Entries are never removed: dropping one while another caller holds an
+    /// `Arc` clone would produce two distinct mutex instances for the same
+    /// inode, defeating the serialization. The overhead is one `Arc` per
+    /// inode that has ever been staged in this session.
+    pub fn lock(&self, ino: u64) -> Arc<tokio::sync::Mutex<()>> {
+        self.locks
+            .lock()
+            .expect("staging_locks poisoned")
+            .entry(ino)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
     }
 }
 

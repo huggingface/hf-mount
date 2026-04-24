@@ -3130,7 +3130,7 @@ fn staging_file_removed_on_inode_eviction() {
         let ino = attr.ino;
         write_blocking(&vfs, ino, fh, 0, b"staging data").await.unwrap();
 
-        let staging_path = vfs.staging_dir.as_ref().unwrap().path(ino);
+        let staging_path = vfs.staging.dir().unwrap().path(ino);
         assert!(staging_path.exists(), "staging file should exist after write");
 
         vfs.release(fh).await.unwrap();
