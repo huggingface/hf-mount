@@ -860,7 +860,11 @@ fn lookup_uses_head_not_list_tree() {
             pre_list,
             "lookup under an unloaded dir must not trigger list_tree"
         );
-        assert_eq!(hub.head_file_call_count(), pre_head + 1, "one HEAD for the point lookup");
+        assert_eq!(
+            hub.head_file_call_count(),
+            pre_head + 1,
+            "one HEAD for the point lookup"
+        );
         assert_eq!(
             vfs.inode_table.read().unwrap().len(),
             pre_len + 1,

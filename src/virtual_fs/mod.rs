@@ -903,22 +903,15 @@ impl VirtualFs {
             return Err(libc::ENOENT);
         }
 
-        // Point-lookup fast path: probe the specific path via HEAD before
-        // falling back to a full children listing. Most read-only workloads
-        // (e.g. doc serving) are sequences of `readFile(absolute_path)` where
-        // `readdir` is never called. Listing the whole parent to resolve a
-        // single name wastes Hub bandwidth and bloats the inode table with
-        // tens of thousands of siblings that will be evicted almost
-        // immediately, triggering a re-list on the next lookup.
+        // Resolve the single requested path via HEAD instead of listing the
+        // whole parent — for point-access workloads (no `readdir`) this keeps
+        // the inode table scoped to what the caller actually touches.
         match self.hub_client.head_file(&full_path).await {
             Ok(Some(head)) => return self.insert_file_from_head(parent, name, &full_path, head),
-            Ok(None) => {
-                // 404: either missing, or the path is a directory (the resolve
-                // endpoint only handles files). Fall through to the listing.
-            }
-            Err(e) => {
-                debug!("HEAD lookup {} failed, falling back to list: {}", full_path, e);
-            }
+            // 404 may mean "doesn't exist" or "it's a directory" (the resolve
+            // endpoint only handles files), so the listing has the final word.
+            Ok(None) => {}
+            Err(e) => debug!("HEAD lookup {} failed, falling back to list: {}", full_path, e),
         }
 
         self.ensure_children_loaded(parent).await?;
@@ -954,9 +947,9 @@ impl VirtualFs {
 
         let mut inodes = self.inode_table.write().expect("inodes poisoned");
         match inodes.get(parent) {
-            Some(e) if e.kind != InodeKind::Directory => return Err(libc::ENOTDIR),
             None => return Err(libc::ENOENT),
-            _ => {}
+            Some(e) if e.kind != InodeKind::Directory => return Err(libc::ENOTDIR),
+            Some(_) => {}
         }
         if let Some(existing) = inodes.lookup_child(parent, name) {
             return Ok(self.make_vfs_attr(existing));
