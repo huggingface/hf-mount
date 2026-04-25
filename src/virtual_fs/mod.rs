@@ -103,6 +103,33 @@ fn is_mmap_friendly(full_path: &str) -> bool {
         || lower.ends_with(".gguf")
 }
 
+/// Background-prefetch helper: stream the byte range `[start, end)` from CAS
+/// into a single `Bytes`. Returns `None` on any error (caller falls back to
+/// the slow path on the next read).
+async fn fetch_tensor_speculative(
+    xet_sessions: &Arc<dyn XetOps>,
+    file_info: &XetFileInfo,
+    start: u64,
+    end: u64,
+) -> Option<Bytes> {
+    let mut stream = xet_sessions.download_stream_boxed(file_info, start, Some(end)).ok()?;
+    let mut buf = BytesMut::with_capacity((end - start) as usize);
+    loop {
+        match stream.next().await {
+            Ok(Some(chunk)) => buf.extend_from_slice(&chunk),
+            Ok(None) => break,
+            Err(e) => {
+                debug!("speculative: stream error at offset {}: {}", start, e);
+                return None;
+            }
+        }
+        if (buf.len() as u64) + start >= end {
+            break;
+        }
+    }
+    Some(buf.freeze())
+}
+
 pub struct VirtualFs {
     runtime: tokio::runtime::Handle,
     hub_client: Arc<dyn HubOps>,
@@ -1719,9 +1746,18 @@ impl VirtualFs {
                     let mut response = BytesMut::with_capacity(to_read);
                     let mut cursor = offset;
 
+                    // Forward → seek → speculative buffer (last resort fast path).
+                    // The speculative buffer is promoted to forward on hit, so a
+                    // partial hit can be completed by the regular slow path.
+                    if state.try_serve_forward(offset, size).is_none()
+                        && state.try_serve_seek(offset, size).is_none()
+                        && state.try_promote_speculative(offset)
+                    {
+                        debug!("prefetch hit (speculative): offset={}", offset);
+                    }
+
                     if let Some(data) = state.try_serve_forward(offset, size) {
                         if data.len() == to_read {
-                            debug!("prefetch hit (forward): offset={}, len={}", offset, data.len());
                             let eof = offset + data.len() as u64 >= file_size;
                             return Ok((data, eof));
                         }
@@ -1729,7 +1765,6 @@ impl VirtualFs {
                         response.extend_from_slice(&data);
                     } else if let Some(data) = state.try_serve_seek(offset, size) {
                         if data.len() == to_read {
-                            debug!("prefetch hit (seek): offset={}, len={}", offset, data.len());
                             let eof = offset + data.len() as u64 >= file_size;
                             return Ok((data, eof));
                         }
@@ -1791,6 +1826,42 @@ impl VirtualFs {
                 }
 
                 let eof = cursor == file_size;
+
+                // Phase 3: speculative prefetch of tensor i+1 if we just
+                // crossed the halfway mark of tensor i. Background, never
+                // blocks the read response.
+                let speculation = {
+                    let state = prefetch.lock().await;
+                    state
+                        .next_tensor_to_prefetch(offset, size)
+                        .map(|(start, end)| (state.xet_hash.clone(), state.file_size, start, end))
+                };
+                if let Some((xet_hash, xet_file_size, spec_start, spec_end)) = speculation {
+                    {
+                        let mut state = prefetch.lock().await;
+                        state.mark_speculative_inflight(spec_start);
+                    }
+                    let prefetch_clone = prefetch.clone();
+                    let xet_sessions = self.xet_sessions.clone();
+                    self.runtime.spawn(async move {
+                        let file_info = XetFileInfo::new(xet_hash, xet_file_size);
+                        let result =
+                            fetch_tensor_speculative(&xet_sessions, &file_info, spec_start, spec_end).await;
+                        let mut state = prefetch_clone.lock().await;
+                        match result {
+                            Some(bytes) => {
+                                debug!(
+                                    "speculative: stored tensor at offset {} ({} KiB)",
+                                    spec_start,
+                                    bytes.len() / 1024
+                                );
+                                state.store_speculative(spec_start, bytes);
+                            }
+                            None => state.clear_speculative_inflight(spec_start),
+                        }
+                    });
+                }
+
                 Ok((response.freeze(), eof))
             }
         }

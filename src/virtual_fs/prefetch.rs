@@ -149,6 +149,20 @@ pub(crate) struct PrefetchState {
     /// `offset`, no more, no less. Avoids both over-fetch into the next
     /// tensor and the per-FUSE-chunk CAS round-trip pattern.
     pub(crate) tensor_layout: Option<Vec<(u64, u64)>>,
+    /// Speculative buffer for tensor i+1, fetched in the background while
+    /// tensor i is being scanned. Matched by absolute offset; promoted to
+    /// the forward buffer on a hit.
+    pub(crate) speculative: Option<SpeculativeBuf>,
+    /// Tensor start currently being prefetched in the background (to avoid
+    /// double-spawn). Cleared when the task stores its result.
+    pub(crate) speculative_inflight: Option<u64>,
+}
+
+/// Background-prefetched bytes for the tensor following the one currently
+/// being scanned.
+pub(crate) struct SpeculativeBuf {
+    pub(crate) start: u64,
+    pub(crate) data: Bytes,
 }
 
 impl PrefetchState {
@@ -167,6 +181,8 @@ impl PrefetchState {
             forward_only,
             mmap_hint,
             tensor_layout: None,
+            speculative: None,
+            speculative_inflight: None,
         }
     }
 
@@ -193,13 +209,92 @@ impl PrefetchState {
     /// region (offset < 8 + header_len, before the first tensor) or when no
     /// layout is available.
     fn tensor_end_for(&self, offset: u64) -> Option<u64> {
+        let (_, end) = self.tensor_for(offset)?;
+        Some(end)
+    }
+
+    /// `(start, end)` of the tensor containing `offset`, or `None`.
+    fn tensor_for(&self, offset: u64) -> Option<(u64, u64)> {
         let layout = self.tensor_layout.as_ref()?;
         let idx = layout.partition_point(|(start, _end)| *start <= offset);
         if idx == 0 {
             return None;
         }
         let (start, end) = layout[idx - 1];
-        if offset >= start && offset < end { Some(end) } else { None }
+        if offset >= start && offset < end { Some((start, end)) } else { None }
+    }
+
+    /// Speculate the next tensor only when (a) the read is past 75 % of the
+    /// current tensor — high confidence the user is scanning, not just
+    /// poking — and (b) the current tensor is itself big enough that a full
+    /// scan amortises a speculative fetch (≥ 4 MiB). Below 4 MiB the user
+    /// usually just reads a config-like tensor and seeks elsewhere.
+    pub(crate) fn next_tensor_to_prefetch(&self, offset: u64, size: u32) -> Option<(u64, u64)> {
+        const SPECULATION_TRIGGER_RATIO: u64 = 4; // 3/4 of the way through
+        const MIN_CUR_TENSOR_FOR_SPEC: u64 = 4 * 1_048_576;
+        const MIN_NEXT_TENSOR_FOR_SPEC: u64 = 1 * 1_048_576;
+
+        let layout = self.tensor_layout.as_ref()?;
+        let (cur_start, cur_end) = self.tensor_for(offset)?;
+        let cur_len = cur_end - cur_start;
+        if cur_len < MIN_CUR_TENSOR_FOR_SPEC {
+            return None;
+        }
+        let trigger = cur_start + cur_len * (SPECULATION_TRIGGER_RATIO - 1) / SPECULATION_TRIGGER_RATIO;
+        if offset + size as u64 <= trigger {
+            return None;
+        }
+        // Find next tensor by index.
+        let idx = layout.partition_point(|(s, _)| *s <= cur_start);
+        let (next_start, next_end) = *layout.get(idx)?;
+        if next_end - next_start < MIN_NEXT_TENSOR_FOR_SPEC {
+            return None;
+        }
+        let capped_end = (next_start + MAX_TENSOR_FETCH).min(next_end);
+        if let Some(spec) = &self.speculative
+            && spec.start == next_start
+        {
+            return None;
+        }
+        if self.speculative_inflight == Some(next_start) {
+            return None;
+        }
+        Some((next_start, capped_end))
+    }
+
+    /// If `offset` lies in the speculative buffer, take ownership of it,
+    /// promote to the forward buffer, and return its bytes range. Caller
+    /// then re-attempts `try_serve_forward`.
+    pub(crate) fn try_promote_speculative(&mut self, offset: u64) -> bool {
+        let Some(spec) = &self.speculative else { return false };
+        let spec_end = spec.start + spec.data.len() as u64;
+        if offset < spec.start || offset >= spec_end {
+            return false;
+        }
+        let spec = self.speculative.take().unwrap();
+        self.seed_forward_buffer(spec.start, spec.data);
+        true
+    }
+
+    /// Mark a tensor as "prefetch in flight" so concurrent readers don't
+    /// double-spawn. Cleared by the spawned task on completion.
+    pub(crate) fn mark_speculative_inflight(&mut self, tensor_start: u64) {
+        self.speculative_inflight = Some(tensor_start);
+    }
+
+    /// Store the result of a background prefetch task.
+    pub(crate) fn store_speculative(&mut self, start: u64, data: Bytes) {
+        self.speculative = Some(SpeculativeBuf { start, data });
+        if self.speculative_inflight == Some(start) {
+            self.speculative_inflight = None;
+        }
+    }
+
+    /// Clear the inflight marker if a prefetch failed without storing.
+    pub(crate) fn clear_speculative_inflight(&mut self, tensor_start: u64) {
+        if self.speculative_inflight == Some(tensor_start) {
+            self.speculative_inflight = None;
+        }
     }
 
     /// Cache miss: drain consumed data, classify access pattern, adjust window,
