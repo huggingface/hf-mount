@@ -1,4 +1,4 @@
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -414,6 +414,46 @@ impl InodeTable {
             parent.children_loaded = false;
         }
         true
+    }
+
+    /// Batched counterpart to `evict_if_safe`. Filters the input through the
+    /// same safety predicate, removes the eligible inodes, then issues a
+    /// single `parent.children.retain()` per parent — collapsing the
+    /// quadratic per-eviction `retain()` into one O(children) pass per
+    /// touched dir. Returns the number of inodes actually evicted.
+    pub(crate) fn evict_batch_if_safe(&mut self, inos: &[u64]) -> usize {
+        let mut by_parent: HashMap<u64, HashSet<u64>> = HashMap::new();
+        for &ino in inos {
+            let eligible = self.inodes.get(&ino).is_some_and(|e| {
+                e.kind == InodeKind::File
+                    && e.eviction.nlookup.load(Ordering::Relaxed) == 0
+                    && !e.is_dirty()
+                    && e.pending_deletes.is_empty()
+                    && e.nlink > 0
+            });
+            if eligible && let Some(e) = self.inodes.get(&ino) {
+                by_parent.entry(e.parent).or_default().insert(ino);
+            }
+        }
+
+        let mut evicted = 0;
+        for set in by_parent.values() {
+            for &ino in set {
+                if let Some(entry) = self.inodes.remove(&ino) {
+                    self.path_to_inode.remove(&*entry.full_path);
+                    evicted += 1;
+                }
+            }
+        }
+        for (parent_ino, evicted_set) in &by_parent {
+            if let Some(parent) = self.inodes.get_mut(parent_ino) {
+                parent.children.retain(|c| !evicted_set.contains(&c.ino));
+                // Force readdir to re-fetch the listing so evicted inodes can
+                // be re-materialized on next access.
+                parent.children_loaded = false;
+            }
+        }
+        evicted
     }
 
     pub fn get_by_path(&self, path: &str) -> Option<&InodeEntry> {
@@ -1945,6 +1985,102 @@ mod tests {
         let root = table.get(ROOT_INODE).unwrap();
         assert!(!root.children_loaded);
         assert!(!root.children.iter().any(|c| c.ino == ino));
+    }
+
+    #[test]
+    fn test_evict_batch_if_safe_groups_by_parent() {
+        let mut table = InodeTable::new(0);
+        // Two parent dirs each with 5 files.
+        let mut all = Vec::new();
+        for parent_name in ["a", "b"] {
+            let parent_ino = table.insert(
+                ROOT_INODE,
+                parent_name.to_string(),
+                parent_name.to_string(),
+                InodeKind::Directory,
+                0,
+                UNIX_EPOCH,
+                None,
+                0o755,
+                0,
+                0,
+            );
+            for i in 0..5 {
+                let ino = table.insert(
+                    parent_ino,
+                    format!("f{i}.txt"),
+                    format!("{parent_name}/f{i}.txt"),
+                    InodeKind::File,
+                    1,
+                    UNIX_EPOCH,
+                    None,
+                    0o644,
+                    0,
+                    0,
+                );
+                all.push((parent_ino, ino));
+            }
+        }
+
+        let inos: Vec<u64> = all.iter().map(|(_, ino)| *ino).collect();
+        assert_eq!(table.evict_batch_if_safe(&inos), 10, "all 10 files should be evicted");
+
+        for (parent_ino, ino) in all {
+            assert!(table.get(ino).is_none(), "evicted ino must be gone");
+            let parent = table.get(parent_ino).unwrap();
+            assert!(parent.children.is_empty(), "parent's children list cleared");
+            assert!(!parent.children_loaded, "children_loaded reset");
+        }
+    }
+
+    #[test]
+    fn test_evict_batch_if_safe_filters_unsafe() {
+        let mut table = InodeTable::new(0);
+        let safe = table.insert(
+            ROOT_INODE,
+            "safe.txt".to_string(),
+            "safe.txt".to_string(),
+            InodeKind::File,
+            1,
+            UNIX_EPOCH,
+            None,
+            0o644,
+            0,
+            0,
+        );
+        let dirty = table.insert(
+            ROOT_INODE,
+            "dirty.txt".to_string(),
+            "dirty.txt".to_string(),
+            InodeKind::File,
+            1,
+            UNIX_EPOCH,
+            None,
+            0o644,
+            0,
+            0,
+        );
+        if let Some(e) = table.get_mut(dirty) {
+            e.set_dirty();
+        }
+        let pinned = table.insert(
+            ROOT_INODE,
+            "pinned.txt".to_string(),
+            "pinned.txt".to_string(),
+            InodeKind::File,
+            1,
+            UNIX_EPOCH,
+            None,
+            0o644,
+            0,
+            0,
+        );
+        table.bump_nlookup(pinned);
+
+        assert_eq!(table.evict_batch_if_safe(&[safe, dirty, pinned]), 1);
+        assert!(table.get(safe).is_none());
+        assert!(table.get(dirty).is_some(), "dirty file must stay");
+        assert!(table.get(pinned).is_some(), "pinned (nlookup>0) must stay");
     }
 
     #[test]

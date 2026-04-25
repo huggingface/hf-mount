@@ -320,8 +320,19 @@ impl VirtualFs {
         if to_evict.is_empty() {
             return 0;
         }
-        let mut inodes = self.inode_table.write().expect("inodes poisoned");
-        to_evict.into_iter().filter(|&ino| inodes.evict_if_safe(ino)).count()
+        // Evict in chunks so the write lock is released between batches —
+        // a single huge batch could hold it for hundreds of ms, stalling
+        // every concurrent lookup / readdir / forget. `evict_batch_if_safe`
+        // also collapses the per-eviction `parent.children.retain()` into
+        // one pass per touched parent, which matters when many evicted
+        // siblings share the same dir.
+        const EVICT_CHUNK: usize = 4096;
+        let mut evicted = 0;
+        for chunk in to_evict.chunks(EVICT_CHUNK) {
+            let mut inodes = self.inode_table.write().expect("inodes poisoned");
+            evicted += inodes.evict_batch_if_safe(chunk);
+        }
+        evicted
     }
 
     /// Graceful shutdown: abort polling, drain flush queue, wait for completion.
