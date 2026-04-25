@@ -299,6 +299,29 @@ fn init_auth_get(
     }
 }
 
+/// Best-effort probe: does `id` resolve as a repo (model, dataset, or space)?
+/// Returns the matching repo type if a 200 response is seen. Any error or
+/// non-200 status is treated as "not this kind" — used only to enrich error
+/// messages, never on a hot path.
+async fn probe_repo(
+    client: &Client,
+    endpoint: &str,
+    id: &str,
+    token: Option<&str>,
+    token_file: &Option<PathBuf>,
+) -> Option<RepoType> {
+    for repo_type in [RepoType::Model, RepoType::Dataset, RepoType::Space] {
+        let url = format!("{endpoint}/api/{}/{id}", repo_type.api_prefix());
+        let Ok(resp) = init_auth_get(client, &url, token, token_file).send().await else {
+            continue;
+        };
+        if resp.status().is_success() {
+            return Some(repo_type);
+        }
+    }
+    None
+}
+
 /// Send an HTTP request with automatic retry on transient errors (408, 429, 5xx, timeouts).
 /// Uses the IETF RateLimit header's t= parameter when present, falls back to exponential backoff (2 retries max).
 /// Set `accept_redirects` to treat 3xx as success (needed for HEAD on /resolve/ endpoints
@@ -396,8 +419,27 @@ impl HubApiClient {
             SourceKind::Bucket { bucket_id } => {
                 let url = format!("{}/api/buckets/{}", endpoint, bucket_id);
                 let context = format!("resolve bucket {bucket_id}");
-                let resp =
-                    send_with_retry(|| init_auth_get(&client, &url, token, &token_file), &context, false).await?;
+                let resp = match send_with_retry(
+                    || init_auth_get(&client, &url, token, &token_file),
+                    &context,
+                    false,
+                )
+                .await
+                {
+                    Ok(r) => r,
+                    Err(err) => {
+                        // Common mistake: user passed a repo id to `bucket`. Probe the
+                        // repo APIs and, if one matches, surface a hint instead of the
+                        // raw 401 from the bucket endpoint.
+                        if let Some(repo_type) = probe_repo(&client, &endpoint, &bucket_id, token, &token_file).await {
+                            return Err(Error::hub(format!(
+                                "{bucket_id} is not a bucket, but it exists as a {repo_type}. \
+                                 Use `repo {bucket_id}` (read-only) instead of `bucket {bucket_id}`."
+                            )));
+                        }
+                        return Err(err);
+                    }
+                };
                 let body: serde_json::Value = resp.json().await?;
                 let last_modified = body["updatedAt"].as_str().map(mtime_from_str).unwrap_or(UNIX_EPOCH);
                 (SourceKind::Bucket { bucket_id }, last_modified)
@@ -1486,5 +1528,34 @@ mod tests {
         let result = send_with_retry(|| client.get(&url), "test", false).await;
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), Error::Hub { status: Some(302), .. }));
+    }
+
+    // ── probe_repo tests ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn probe_repo_identifies_model() {
+        // probe_repo hits /api/models first → 200 means it's a model.
+        let url = mock_server(vec![200]).await;
+        let client = Client::new();
+        let result = probe_repo(&client, &url, "user/thing", None, &None).await;
+        assert_eq!(result, Some(RepoType::Model));
+    }
+
+    #[tokio::test]
+    async fn probe_repo_falls_through_to_dataset() {
+        // models 404 → datasets 200 → identified as dataset.
+        let url = mock_server(vec![404, 200]).await;
+        let client = Client::new();
+        let result = probe_repo(&client, &url, "user/thing", None, &None).await;
+        assert_eq!(result, Some(RepoType::Dataset));
+    }
+
+    #[tokio::test]
+    async fn probe_repo_returns_none_when_no_endpoint_matches() {
+        // All three repo endpoints return 404 → not a repo.
+        let url = mock_server(vec![404, 404, 404]).await;
+        let client = Client::new();
+        let result = probe_repo(&client, &url, "user/thing", None, &None).await;
+        assert_eq!(result, None);
     }
 }
