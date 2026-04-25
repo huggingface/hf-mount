@@ -845,17 +845,25 @@ impl VirtualFs {
             // the dir was removed or replaced remotely (files revalidate
             // individually via HEAD, dirs don't).
             match inodes.lookup_child(parent, name) {
+                // Clean cached file: HEAD-revalidate (gated by `metadata_ttl`)
+                // so size/hash/mtime stay fresh between poll cycles.
                 Some(entry) if entry.kind == InodeKind::File && !entry.is_dirty() => FastResult::NeedsRevalidation {
                     ino: entry.inode,
                     full_path: entry.full_path.to_string(),
                     current_hash: entry.xet_hash.clone(),
                     current_etag: entry.etag.clone(),
                 },
+                // Either a dirty file (local writes win until flushed) or any
+                // entry under a fully-listed parent we can trust as-is.
                 Some(entry) if entry.kind == InodeKind::File || parent_entry.children_loaded => {
                     FastResult::Hit(self.make_vfs_attr(entry))
                 }
-                // Directory cached under an unloaded parent → re-resolve.
+                // Cached non-file under an unloaded parent: we can't HEAD-probe
+                // a directory to check it still exists (resolve endpoint only
+                // serves files), so defer to the slow path which lists.
                 Some(_) => FastResult::NotLoaded,
+                // No cached entry but the parent listing is authoritative →
+                // the name really doesn't exist; populate the negative cache.
                 None if parent_entry.children_loaded => {
                     let parent_path = &parent_entry.full_path;
                     let full_path = if parent_path.is_empty() {
@@ -865,6 +873,7 @@ impl VirtualFs {
                     };
                     FastResult::Miss(full_path)
                 }
+                // No entry, no listing → slow path (HEAD then list_tree).
                 None => FastResult::NotLoaded,
             }
         }; // inodes lock dropped here
