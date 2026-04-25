@@ -3466,7 +3466,10 @@ fn lru_sweep_drops_clean_staging_file() {
             vfs.inode_table.read().unwrap().get(ino).is_some_and(|e| !e.is_dirty()),
             "inode should be clean after flush"
         );
-        assert!(staging_path.exists(), "clean staging file must still be on disk pre-sweep");
+        assert!(
+            staging_path.exists(),
+            "clean staging file must still be on disk pre-sweep"
+        );
 
         // Wire a no-op invalidator so lru_evict_sweep can run.
         vfs.set_entry_invalidator(Box::new(|_, _| true));

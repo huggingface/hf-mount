@@ -305,13 +305,15 @@ impl VirtualFs {
             }
             inodes.lru_candidates(len - soft_limit)
         };
-        let Some(cb) = self.entry_invalidator.get() else {
+        let Some(invalidate_entry) = self.entry_invalidator.get() else {
             return 0;
         };
 
         let mut to_evict = Vec::with_capacity(candidates.len());
         for (ino, parent, name) in candidates {
-            if !cb(parent, &name) {
+            // `invalidate_entry` returns false when the FUSE notify channel
+            // is saturated (EAGAIN/ENOMEM) — backpressure, stop the sweep.
+            if !invalidate_entry(parent, &name) {
                 break;
             }
             to_evict.push(ino);
