@@ -62,3 +62,11 @@ path = "src/bin/hf-mount.rs"
 name = "hf-mount-fuse-sidecar"
 path = "src/bin/hf-mount-fuse-sidecar.rs"
 required-features = ["fuse"]
+
+[dev-dependencies]
+tempfile = "3"
+
+# Pin fuser to the HF fork until cberner/fuser merges Session::from_fds
+# (sidecar with externally pre-cloned fds — see #94).
+[patch.crates-io]
+fuser = { path = "../fuser" }

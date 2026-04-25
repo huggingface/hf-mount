@@ -7,7 +7,7 @@ fn main() {
     let s = setup(false);
     let mut daemon_guard = hf_mount::daemon::DaemonGuard::from_env();
 
-    let session = match mount_fuse(&s, daemon_guard.as_mut(), None) {
+    let session = match mount_fuse(&s, daemon_guard.as_mut(), Vec::new()) {
         Ok(session) => session,
         Err(err) => {
             tracing::error!("FUSE mount failed: {}", err);
