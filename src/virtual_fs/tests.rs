@@ -3441,6 +3441,43 @@ fn staging_file_removed_on_inode_eviction() {
     });
 }
 
+/// LRU sweep variant: a clean staging file must be removed when the sweep
+/// itself evicts the inode (the kernel never sends `forget()` for inodes
+/// that came from a readdir, so the sweep's drop_staging is the only path).
+#[test]
+fn lru_sweep_drops_clean_staging_file() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_advanced(&hub, &xet);
+
+    rt.block_on(async {
+        let (attr, fh) = vfs
+            .create(ROOT_INODE, "swept.txt", 0o644, 1000, 1000, None)
+            .await
+            .unwrap();
+        let ino = attr.ino;
+        write_blocking(&vfs, ino, fh, 0, b"data").await.unwrap();
+        let staging_path = vfs.staging.dir().unwrap().path(ino);
+        assert!(staging_path.exists());
+
+        vfs.release(fh).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(
+            vfs.inode_table.read().unwrap().get(ino).is_some_and(|e| !e.is_dirty()),
+            "inode should be clean after flush"
+        );
+
+        // Wire a no-op invalidator so lru_evict_sweep can run.
+        vfs.set_entry_invalidator(Box::new(|_, _| true));
+
+        // Force the sweep to consider every file as overflow.
+        let evicted = vfs.lru_evict_sweep(0);
+        assert!(evicted >= 1, "sweep should evict the clean file");
+        assert!(vfs.inode_table.read().unwrap().get(ino).is_none());
+        assert!(!staging_path.exists(), "sweep must drop the staging file");
+    });
+}
+
 /// Truncating a hashed remote file produces an empty staging file, which does
 /// not match the remote. `staging_is_current` must stay false — otherwise the
 /// next open would reuse empty staging as if it held the remote content.

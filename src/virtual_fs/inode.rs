@@ -2039,6 +2039,36 @@ mod tests {
         }
     }
 
+    /// Mirrors the sweep race: candidate selection sees `open_handles == 0`,
+    /// then a concurrent `open()` bumps the counter before the batch runs
+    /// under the write lock. The batch must refuse to evict.
+    #[test]
+    fn test_evict_batch_if_safe_refuses_when_open_handles_bumped_after_scan() {
+        let mut table = InodeTable::new(0);
+        let ino = table.insert(
+            ROOT_INODE,
+            "racer.txt".to_string(),
+            "racer.txt".to_string(),
+            InodeKind::File,
+            1,
+            UNIX_EPOCH,
+            None,
+            0o644,
+            0,
+            0,
+        );
+        table
+            .get(ino)
+            .unwrap()
+            .eviction
+            .open_handles
+            .fetch_add(1, Ordering::Relaxed);
+
+        let evicted = table.evict_batch_if_safe(&[ino]);
+        assert!(evicted.is_empty(), "batch must skip an inode with live handles");
+        assert!(table.get(ino).is_some(), "inode must remain in the table");
+    }
+
     #[test]
     fn test_evict_batch_if_safe_filters_unsafe() {
         let mut table = InodeTable::new(0);
