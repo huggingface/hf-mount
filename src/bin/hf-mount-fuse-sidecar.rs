@@ -229,8 +229,8 @@ fn discover_pending(tmp_dir: &Path) -> io::Result<Vec<PendingMount>> {
 /// Wire format (set by the CSI driver's Go SendMsg):
 ///   - iov[0]: optional data payload (unused, we just need the fds)
 ///   - cmsg:   single SCM_RIGHTS carrying N i32 fds (1 primary + N-1 cloned).
-///             The CSI driver decides the count; here we accept any non-zero N
-///             up to `MAX_FUSE_FDS`.
+///     The CSI driver decides the count; here we accept any non-zero N up
+///     to `MAX_FUSE_FDS`.
 const MAX_FUSE_FDS: usize = 32;
 
 fn connect_and_receive_fds(socket_path: &Path, timeout_secs: u64) -> io::Result<Vec<OwnedFd>> {
