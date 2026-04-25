@@ -416,17 +416,19 @@ impl InodeTable {
         true
     }
 
-    /// Batched counterpart to `evict_if_safe`. Filters the input through the
-    /// same safety predicate, removes the eligible inodes, then issues a
-    /// single `parent.children.retain()` per parent — collapsing the
-    /// quadratic per-eviction `retain()` into one O(children) pass per
-    /// touched dir. Returns the number of inodes actually evicted.
-    pub(crate) fn evict_batch_if_safe(&mut self, inos: &[u64]) -> usize {
+    /// Batched counterpart to `evict_if_safe`. Re-checks the safety
+    /// predicate (including `open_handles == 0` — a concurrent `open()`
+    /// may have bumped it after the candidate scan), removes the eligible
+    /// inodes, then issues a single `parent.children.retain()` per touched
+    /// parent. Returns the inos actually evicted so the caller can clean
+    /// up per-inode external state (e.g. staging files).
+    pub(crate) fn evict_batch_if_safe(&mut self, inos: &[u64]) -> Vec<u64> {
         let mut by_parent: HashMap<u64, HashSet<u64>> = HashMap::new();
         for &ino in inos {
             let eligible = self.inodes.get(&ino).is_some_and(|e| {
                 e.kind == InodeKind::File
                     && e.eviction.nlookup.load(Ordering::Relaxed) == 0
+                    && e.eviction.open_handles.load(Ordering::Relaxed) == 0
                     && !e.is_dirty()
                     && e.pending_deletes.is_empty()
                     && e.nlink > 0
@@ -436,12 +438,12 @@ impl InodeTable {
             }
         }
 
-        let mut evicted = 0;
+        let mut evicted = Vec::new();
         for set in by_parent.values() {
             for &ino in set {
                 if let Some(entry) = self.inodes.remove(&ino) {
                     self.path_to_inode.remove(&*entry.full_path);
-                    evicted += 1;
+                    evicted.push(ino);
                 }
             }
         }
@@ -2023,7 +2025,11 @@ mod tests {
         }
 
         let inos: Vec<u64> = all.iter().map(|(_, ino)| *ino).collect();
-        assert_eq!(table.evict_batch_if_safe(&inos), 10, "all 10 files should be evicted");
+        assert_eq!(
+            table.evict_batch_if_safe(&inos).len(),
+            10,
+            "all 10 files should be evicted"
+        );
 
         for (parent_ino, ino) in all {
             assert!(table.get(ino).is_none(), "evicted ino must be gone");
@@ -2077,7 +2083,7 @@ mod tests {
         );
         table.bump_nlookup(pinned);
 
-        assert_eq!(table.evict_batch_if_safe(&[safe, dirty, pinned]), 1);
+        assert_eq!(table.evict_batch_if_safe(&[safe, dirty, pinned]), vec![safe]);
         assert!(table.get(safe).is_none());
         assert!(table.get(dirty).is_some(), "dirty file must stay");
         assert!(table.get(pinned).is_some(), "pinned (nlookup>0) must stay");

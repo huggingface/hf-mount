@@ -327,12 +327,19 @@ impl VirtualFs {
         // one pass per touched parent, which matters when many evicted
         // siblings share the same dir.
         const EVICT_CHUNK: usize = 4096;
-        let mut evicted = 0;
+        let mut total_evicted = 0;
         for chunk in to_evict.chunks(EVICT_CHUNK) {
-            let mut inodes = self.inode_table.write().expect("inodes poisoned");
-            evicted += inodes.evict_batch_if_safe(chunk);
+            let evicted_inos = {
+                let mut inodes = self.inode_table.write().expect("inodes poisoned");
+                inodes.evict_batch_if_safe(chunk)
+            };
+            // Reclaim per-inode staging files, mirroring forget()/release().
+            for ino in &evicted_inos {
+                self.drop_staging(*ino);
+            }
+            total_evicted += evicted_inos.len();
         }
-        evicted
+        total_evicted
     }
 
     /// Graceful shutdown: abort polling, drain flush queue, wait for completion.
