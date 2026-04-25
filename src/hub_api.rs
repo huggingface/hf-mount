@@ -419,12 +419,8 @@ impl HubApiClient {
             SourceKind::Bucket { bucket_id } => {
                 let url = format!("{}/api/buckets/{}", endpoint, bucket_id);
                 let context = format!("resolve bucket {bucket_id}");
-                let resp = match send_with_retry(
-                    || init_auth_get(&client, &url, token, &token_file),
-                    &context,
-                    false,
-                )
-                .await
+                let resp = match send_with_retry(|| init_auth_get(&client, &url, token, &token_file), &context, false)
+                    .await
                 {
                     Ok(r) => r,
                     Err(err) => {
