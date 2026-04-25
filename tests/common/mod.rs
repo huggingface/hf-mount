@@ -150,10 +150,7 @@ pub async fn seed_big_dir_with_target(
 
 /// Seed a bucket with a single deep file `a/b/c/d/payload.txt`.
 /// Returns the relative path + payload for cold-read integration tests.
-pub async fn seed_deep_tree(
-    hub: &Arc<hf_mount::hub_api::HubApiClient>,
-    tmp_dir_tag: &str,
-) -> (String, &'static [u8]) {
+pub async fn seed_deep_tree(hub: &Arc<hf_mount::hub_api::HubApiClient>, tmp_dir_tag: &str) -> (String, &'static [u8]) {
     const PAYLOAD: &[u8] = b"deep payload";
     let write_config = build_write_config(hub).await;
     let tmp_dir = std::env::temp_dir().join(format!("hf-mount-{}-{}", tmp_dir_tag, std::process::id()));
