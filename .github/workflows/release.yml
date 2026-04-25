@@ -3,7 +3,6 @@ name: Release
 on:
   push:
     tags: ["v*"]
-    branches-ignore: [main]
   workflow_dispatch:
     inputs:
       bump:
@@ -23,8 +22,6 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  REGISTRY: ghcr.io
-  IMAGE: ghcr.io/huggingface/hf-mount-fuse
 
 jobs:
   # Manual dispatch path: bump Cargo.toml, commit, tag, push.
@@ -227,10 +224,9 @@ jobs:
           name: macos-${{ matrix.arch }}
           path: dist/
 
-  # Shared tag computation for all docker jobs: a bumped release wins,
-  # then a manually pushed tag, else fall back to sha-<sha> for branch
-  # pushes. Also decides whether the `latest` manifest should be updated
-  # (never on pre-releases, i.e. tags containing a `-`).
+  # Compute the docker tag base + whether to push :latest. A bumped
+  # release wins, then a manually-pushed tag, else fall back to sha-<sha>.
+  # `latest` only on stable releases (tag matches `v\d` and has no `-`).
   docker-tag:
     needs: [bump]
     if: always() && needs.bump.result != 'failure'
@@ -256,81 +252,14 @@ jobs:
           echo "base=$BASE" >> "$GITHUB_OUTPUT"
           echo "push_latest=$PUSH_LATEST" >> "$GITHUB_OUTPUT"
 
-  docker-amd64:
-    name: Build & Push Docker (amd64)
+  docker:
     needs: [bump, docker-tag]
     if: always() && needs.docker-tag.result == 'success'
-    runs-on: ubuntu-22.04
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.bump.outputs.new_tag || github.ref }}
-      - uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/build-push-action@v6
-        with:
-          context: .
-          platforms: linux/amd64
-          push: true
-          tags: ${{ env.IMAGE }}:${{ needs.docker-tag.outputs.base }}-amd64
-          provenance: false
-          cache-to: type=registry,ref=${{ env.IMAGE }}-cache:amd64,mode=max
-          cache-from: type=registry,ref=${{ env.IMAGE }}-cache:amd64
-
-  docker-arm64:
-    name: Build & Push Docker (arm64)
-    needs: [bump, docker-tag]
-    if: always() && needs.docker-tag.result == 'success'
-    runs-on: ubuntu-22.04-arm
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.bump.outputs.new_tag || github.ref }}
-      - uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/build-push-action@v6
-        with:
-          context: .
-          platforms: linux/arm64
-          push: true
-          tags: ${{ env.IMAGE }}:${{ needs.docker-tag.outputs.base }}-arm64
-          provenance: false
-          cache-to: type=registry,ref=${{ env.IMAGE }}-cache:arm64,mode=max
-          cache-from: type=registry,ref=${{ env.IMAGE }}-cache:arm64
-
-  docker-manifest:
-    name: Publish Docker manifest
-    needs: [docker-tag, docker-amd64, docker-arm64]
-    if: |
-      always() &&
-      needs.docker-amd64.result == 'success' &&
-      needs.docker-arm64.result == 'success'
-    runs-on: ubuntu-22.04
-    steps:
-      - uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/setup-buildx-action@v3
-      - name: Create and push manifest
-        run: |
-          BASE="${{ needs.docker-tag.outputs.base }}"
-          TAGS="-t ${{ env.IMAGE }}:${BASE}"
-          if [[ "${{ needs.docker-tag.outputs.push_latest }}" == "true" ]]; then
-            TAGS="${TAGS} -t ${{ env.IMAGE }}:latest"
-          fi
-          docker buildx imagetools create $TAGS \
-            "${{ env.IMAGE }}:${BASE}-amd64" \
-            "${{ env.IMAGE }}:${BASE}-arm64"
+    uses: ./.github/workflows/_docker-build.yml
+    with:
+      ref: ${{ needs.bump.outputs.new_tag || github.ref }}
+      tag_base: ${{ needs.docker-tag.outputs.base }}
+      push_latest: ${{ needs.docker-tag.outputs.push_latest == 'true' }}
 
   release:
     name: Create Release

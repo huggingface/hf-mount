@@ -1,0 +1,19 @@
+name: Docker (ad-hoc)
+
+# Build & push a multi-arch docker image off any branch, tagged with the
+# commit sha (no release, no version bump, no GitHub release artifacts).
+# Useful for testing image-level changes (Dockerfile, k8s manifests, etc.)
+# without cutting a real release.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    uses: ./.github/workflows/_docker-build.yml
+    with:
+      tag_base: sha-${{ github.sha }}
+      push_latest: false
