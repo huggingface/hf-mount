@@ -873,6 +873,37 @@ fn lookup_uses_head_not_list_tree() {
     });
 }
 
+/// Missing name under an unloaded parent: HEAD returns 404, list_tree
+/// confirms the name isn't there, negative cache is populated, and the
+/// follow-up lookup short-circuits without re-hitting the Hub.
+#[test]
+fn lookup_missing_under_unloaded_parent_populates_negative_cache() {
+    let hub = MockHub::new();
+    hub.add_file("subdir/exists.txt", 1, Some("h"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let subdir = vfs.lookup(ROOT_INODE, "subdir").await.unwrap();
+
+        let pre_head = hub.head_file_call_count();
+        let pre_list = hub.list_tree_call_count();
+
+        let err = vfs.lookup(subdir.ino, "ghost.txt").await.unwrap_err();
+        assert_eq!(err, libc::ENOENT);
+        // Slow path: HEAD probe + list_tree fallback.
+        assert_eq!(hub.head_file_call_count(), pre_head + 1);
+        assert_eq!(hub.list_tree_call_count(), pre_list + 1);
+        assert!(vfs.negative_cache_check("subdir/ghost.txt"));
+
+        // Second lookup should hit the negative cache: no extra Hub calls.
+        let err2 = vfs.lookup(subdir.ino, "ghost.txt").await.unwrap_err();
+        assert_eq!(err2, libc::ENOENT);
+        assert_eq!(hub.head_file_call_count(), pre_head + 1, "neg-cache should skip HEAD");
+        assert_eq!(hub.list_tree_call_count(), pre_list + 1, "neg-cache should skip list_tree");
+    });
+}
+
 /// Sequence: point-lookup (HEAD slow path) → readdir on the same parent
 /// (list_tree populates `children_loaded`) → re-lookup the file. The HEAD-
 /// inserted inode must survive the listing reconciliation and the re-lookup
