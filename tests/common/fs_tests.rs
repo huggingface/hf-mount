@@ -3,6 +3,43 @@ use std::sync::Arc;
 
 type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
+/// Read a single file through the mount and assert its content matches.
+/// No `readdir` first — exercises the point-lookup HEAD path.
+pub fn assert_point_read(mount_point: &str, rel_path: &str, expected: &[u8]) -> TestResult {
+    let full = format!("{}/{}", mount_point, rel_path);
+    let content = std::fs::read(&full).map_err(|e| format!("read {full}: {e}"))?;
+    if content != expected {
+        return Err(format!("content mismatch on {full}: {} bytes", content.len()).into());
+    }
+    Ok(())
+}
+
+/// Cold-read a deep path and then `readdir` an intermediate directory to
+/// make sure the HEAD → list_tree fallback populates directory listings
+/// on demand.
+pub fn assert_deep_read_and_intermediate_readdir(mount_point: &str, rel_path: &str, expected: &[u8]) -> TestResult {
+    assert_point_read(mount_point, rel_path, expected)?;
+
+    // Pick the parent of the file's grandparent as the "intermediate" to list.
+    let intermediate = rel_path.rsplitn(3, '/').nth(2).ok_or("rel_path too shallow")?;
+    let expected_child = rel_path
+        .strip_prefix(intermediate)
+        .and_then(|s| s.strip_prefix('/'))
+        .and_then(|s| s.split('/').next())
+        .ok_or("couldn't derive expected child")?
+        .to_string();
+
+    let dir = format!("{}/{}", mount_point, intermediate);
+    let entries: Vec<_> = std::fs::read_dir(&dir)
+        .map_err(|e| format!("readdir {dir}: {e}"))?
+        .filter_map(|e| e.ok().and_then(|e| e.file_name().into_string().ok()))
+        .collect();
+    if !entries.contains(&expected_child) {
+        return Err(format!("readdir {dir} should list '{expected_child}', got {entries:?}").into());
+    }
+    Ok(())
+}
+
 /// List all files on the Hub, descending into subdirectories.
 /// Needed because list_tree is non-recursive (single directory level).
 async fn list_tree_all(hub: &hf_mount::hub_api::HubApiClient) -> Result<Vec<hf_mount::hub_api::TreeEntry>, String> {

@@ -599,12 +599,13 @@ impl InodeTable {
         self.inodes.get(&ino).is_some_and(|e| e.children_loaded)
     }
 
-    /// Check whether an inode or any of its descendants is dirty.
-    pub fn has_dirty_descendants(&self, ino: u64) -> bool {
+    /// True if the inode or any descendant is either dirty or has an open
+    /// FUSE file handle — i.e. evicting the subtree would drop local state.
+    pub fn has_dirty_or_open_descendants(&self, ino: u64) -> bool {
         let mut stack = vec![ino];
         while let Some(current) = stack.pop() {
             if let Some(entry) = self.inodes.get(&current) {
-                if entry.is_dirty() {
+                if entry.is_dirty() || entry.eviction.open_handles.load(Ordering::Relaxed) > 0 {
                     return true;
                 }
                 for child in &entry.children {

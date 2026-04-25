@@ -830,6 +830,290 @@ fn lookup_ttl_skips_head_within_window() {
     });
 }
 
+/// A `lookup(parent, name)` under an unloaded directory resolves the single
+/// file via HEAD without listing its siblings — the doc-site workload never
+/// calls `readdir`, so paying for a list_tree on every cold lookup would
+/// bloat the table with sibling inodes the caller never asked for.
+#[test]
+fn lookup_uses_head_not_list_tree() {
+    let hub = MockHub::new();
+    for i in 0..50 {
+        hub.add_file(&format!("subdir/file_{i:02}.txt"), 10, Some(&format!("h{i}")), None);
+    }
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        // Root is materialized at startup; `subdir` is a lazy directory child.
+        let subdir = vfs.lookup(ROOT_INODE, "subdir").await.unwrap();
+        assert_eq!(subdir.kind, InodeKind::Directory);
+
+        let pre_list = hub.list_tree_call_count();
+        let pre_head = hub.head_file_call_count();
+        let pre_len = vfs.inode_table.read().unwrap().len();
+
+        let attr = vfs.lookup(subdir.ino, "file_07.txt").await.unwrap();
+        assert_eq!(attr.size, 10);
+
+        assert_eq!(
+            hub.list_tree_call_count(),
+            pre_list,
+            "lookup under an unloaded dir must not trigger list_tree"
+        );
+        assert_eq!(
+            hub.head_file_call_count(),
+            pre_head + 1,
+            "one HEAD for the point lookup"
+        );
+        assert_eq!(
+            vfs.inode_table.read().unwrap().len(),
+            pre_len + 1,
+            "only the requested file should be materialized"
+        );
+    });
+}
+
+/// Missing name under an unloaded parent: HEAD returns 404, list_tree
+/// confirms the name isn't there, negative cache is populated, and the
+/// follow-up lookup short-circuits without re-hitting the Hub.
+#[test]
+fn lookup_missing_under_unloaded_parent_populates_negative_cache() {
+    let hub = MockHub::new();
+    hub.add_file("subdir/exists.txt", 1, Some("h"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let subdir = vfs.lookup(ROOT_INODE, "subdir").await.unwrap();
+
+        let pre_head = hub.head_file_call_count();
+        let pre_list = hub.list_tree_call_count();
+
+        let err = vfs.lookup(subdir.ino, "ghost.txt").await.unwrap_err();
+        assert_eq!(err, libc::ENOENT);
+        // Slow path: HEAD probe + list_tree fallback.
+        assert_eq!(hub.head_file_call_count(), pre_head + 1);
+        assert_eq!(hub.list_tree_call_count(), pre_list + 1);
+        assert!(vfs.negative_cache_check("subdir/ghost.txt"));
+
+        // Second lookup should hit the negative cache: no extra Hub calls.
+        let err2 = vfs.lookup(subdir.ino, "ghost.txt").await.unwrap_err();
+        assert_eq!(err2, libc::ENOENT);
+        assert_eq!(hub.head_file_call_count(), pre_head + 1, "neg-cache should skip HEAD");
+        assert_eq!(
+            hub.list_tree_call_count(),
+            pre_list + 1,
+            "neg-cache should skip list_tree"
+        );
+    });
+}
+
+/// Sequence: point-lookup (HEAD slow path) → readdir on the same parent
+/// (list_tree populates `children_loaded`) → re-lookup the file. The HEAD-
+/// inserted inode must survive the listing reconciliation and the re-lookup
+/// must return the same ino without re-fetching.
+#[test]
+fn lookup_then_readdir_then_lookup_preserves_inode() {
+    let hub = MockHub::new();
+    hub.add_file("subdir/keep.txt", 7, Some("h_keep"), None);
+    hub.add_file("subdir/sib.txt", 3, Some("h_sib"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let subdir = vfs.lookup(ROOT_INODE, "subdir").await.unwrap();
+
+        // 1. HEAD-based point lookup of one file (parent not listed yet).
+        let first = vfs.lookup(subdir.ino, "keep.txt").await.unwrap();
+        let inserted_ino = first.ino;
+        assert_eq!(first.size, 7);
+        assert!(
+            !vfs.inode_table.read().unwrap().is_children_loaded(subdir.ino),
+            "HEAD path must not flip children_loaded"
+        );
+
+        // 2. readdir runs list_tree → reconciles the full listing.
+        let entries = vfs.readdir(subdir.ino).await.unwrap();
+        let names: std::collections::HashSet<_> = entries.into_iter().map(|e| e.name).collect();
+        assert!(names.contains("keep.txt"));
+        assert!(names.contains("sib.txt"));
+        assert!(vfs.inode_table.read().unwrap().is_children_loaded(subdir.ino));
+
+        // 3. Re-lookup the original file → fast path, same ino, no extra HEAD.
+        let pre_head = hub.head_file_call_count();
+        let again = vfs.lookup(subdir.ino, "keep.txt").await.unwrap();
+        assert_eq!(again.ino, inserted_ino, "inode must be stable across readdir");
+        assert_eq!(again.size, 7);
+        // Fast path may revalidate via HEAD (TTL-gated); at most one extra call.
+        assert!(hub.head_file_call_count() <= pre_head + 1);
+    });
+}
+
+/// HEAD responses without size can't be trusted for the inode (open_readonly
+/// would take the empty-file shortcut), so fall back to list_tree which has
+/// the authoritative size from the tree index.
+#[test]
+fn lookup_falls_back_to_list_when_head_has_no_size() {
+    let hub = MockHub::new();
+    hub.add_file("sub/sized.txt", 42, Some("h"), None);
+    hub.set_head(
+        "sub/sized.txt",
+        Some(HeadFileInfo {
+            xet_hash: Some("h".to_string()),
+            etag: None,
+            size: None,
+            last_modified: None,
+        }),
+    );
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let sub = vfs.lookup(ROOT_INODE, "sub").await.unwrap();
+        let pre_list = hub.list_tree_call_count();
+        let attr = vfs.lookup(sub.ino, "sized.txt").await.unwrap();
+        assert_eq!(attr.size, 42, "size must come from the listing, not the HEAD");
+        assert_eq!(
+            hub.list_tree_call_count(),
+            pre_list + 1,
+            "HEAD without size should trigger a list_tree"
+        );
+    });
+}
+
+/// A cached directory entry under an unloaded parent must be re-resolved
+/// rather than served from memory — without a fresh listing we can't tell
+/// whether the dir was removed or replaced remotely.
+#[test]
+fn lookup_rechecks_cached_directory_when_parent_unloaded() {
+    let hub = MockHub::new();
+    hub.add_file("area/nested/file.txt", 10, Some("h"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let area = vfs.lookup(ROOT_INODE, "area").await.unwrap();
+        // Prime `area`'s children so `nested` is in the table.
+        let _ = vfs.readdir(area.ino).await.unwrap();
+        assert!(vfs.inode_table.read().unwrap().is_children_loaded(area.ino));
+
+        // Invalidate the parent's listing (mirrors what LRU eviction does).
+        if let Some(e) = vfs.inode_table.write().unwrap().get_mut(area.ino) {
+            e.children_loaded = false;
+        }
+
+        let pre_list = hub.list_tree_call_count();
+        let pre_head = hub.head_file_call_count();
+
+        let nested = vfs.lookup(area.ino, "nested").await.unwrap();
+        assert_eq!(nested.kind, InodeKind::Directory);
+
+        // Must re-resolve via the slow path: one HEAD probe (404, it's a dir)
+        // and one list_tree to confirm.
+        assert_eq!(hub.head_file_call_count(), pre_head + 1);
+        assert_eq!(hub.list_tree_call_count(), pre_list + 1);
+    });
+}
+
+/// If a previously-cached directory has been replaced by a file on the
+/// remote, the HEAD slow path must evict the stale dir and expose the new
+/// file instead of returning the old cached entry.
+#[test]
+fn lookup_replaces_stale_directory_with_file_via_head() {
+    let hub = MockHub::new();
+    hub.add_file("swap/child.txt", 1, Some("h_inner"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        // Cache `swap` as a directory + one child.
+        let swap_dir = vfs.lookup(ROOT_INODE, "swap").await.unwrap();
+        assert_eq!(swap_dir.kind, InodeKind::Directory);
+        let _ = vfs.readdir(swap_dir.ino).await.unwrap();
+
+        // Remote replaces the directory with a file at the same path.
+        hub.remove_file("swap/child.txt");
+        hub.add_file("swap", 99, Some("h_file"), None);
+
+        // Invalidate root's listing so lookup takes the slow path.
+        if let Some(e) = vfs.inode_table.write().unwrap().get_mut(ROOT_INODE) {
+            e.children_loaded = false;
+        }
+
+        let attr = vfs.lookup(ROOT_INODE, "swap").await.unwrap();
+        assert_eq!(
+            attr.kind,
+            InodeKind::File,
+            "stale directory must be replaced by the file"
+        );
+        assert_eq!(attr.size, 99);
+    });
+}
+
+/// If the stale cached directory has an open file handle on one of its
+/// descendants, the HEAD path must NOT evict it — doing so would drop
+/// local state still referenced by FUSE. The lookup returns the stale
+/// directory entry in place; correctness yields to data safety in this
+/// narrow race.
+#[test]
+fn lookup_preserves_stale_directory_with_open_descendant() {
+    let hub = MockHub::new();
+    hub.add_file("swap/child.txt", 5, Some("h_inner"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let swap_dir = vfs.lookup(ROOT_INODE, "swap").await.unwrap();
+        let _ = vfs.readdir(swap_dir.ino).await.unwrap();
+
+        // Keep a file handle on a descendant of the cached dir.
+        let child = vfs.lookup(swap_dir.ino, "child.txt").await.unwrap();
+        let fh = vfs.open(child.ino, false, false, None).await.unwrap();
+
+        // Remote swap: dir → file.
+        hub.remove_file("swap/child.txt");
+        hub.add_file("swap", 99, Some("h_file"), None);
+
+        // Invalidate root's listing so lookup hits the slow path.
+        if let Some(e) = vfs.inode_table.write().unwrap().get_mut(ROOT_INODE) {
+            e.children_loaded = false;
+        }
+
+        let attr = vfs.lookup(ROOT_INODE, "swap").await.unwrap();
+        // Fallback to list_tree, which keeps the stale dir alive because
+        // descendants are still open — safer than losing the open handle.
+        assert_eq!(attr.kind, InodeKind::Directory);
+
+        vfs.release(fh).await.unwrap();
+    });
+}
+
+/// When the HEAD probe returns 404 the name could be a directory — fall
+/// back to a full listing so dir traversal still works.
+#[test]
+fn lookup_falls_back_to_list_for_directory() {
+    let hub = MockHub::new();
+    hub.add_file("outer/inner/file.txt", 10, Some("h"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let outer = vfs.lookup(ROOT_INODE, "outer").await.unwrap();
+        let pre_list = hub.list_tree_call_count();
+        let pre_head = hub.head_file_call_count();
+
+        let inner = vfs.lookup(outer.ino, "inner").await.unwrap();
+        assert_eq!(inner.kind, InodeKind::Directory);
+
+        assert_eq!(hub.head_file_call_count(), pre_head + 1, "HEAD probed first");
+        assert_eq!(
+            hub.list_tree_call_count(),
+            pre_list + 1,
+            "404 on HEAD falls back to a single list_tree"
+        );
+    });
+}
+
 /// Lookup of nonexistent path returns ENOENT and populates the negative cache.
 #[test]
 fn negative_cache_insert() {
@@ -2314,10 +2598,13 @@ fn poll_multiple_loaded_dirs() {
     let (rt, vfs) = vfs_repo(&hub, &xet);
 
     rt.block_on(async {
-        // Load both root and sub directory.
-        let _ = vfs.lookup(ROOT_INODE, "root.txt").await.unwrap();
+        // Load both root and sub directory via readdir — lookup alone no
+        // longer populates the full children listing (it uses HEAD for point
+        // resolution), but the poll loop only watches dirs that have been
+        // readdir'd.
+        let _ = vfs.readdir(ROOT_INODE).await.unwrap();
         let sub = vfs.lookup(ROOT_INODE, "sub").await.unwrap();
-        let _ = vfs.lookup(sub.ino, "nested.txt").await.unwrap();
+        let _ = vfs.readdir(sub.ino).await.unwrap();
 
         // Both dirs should be loaded.
         {

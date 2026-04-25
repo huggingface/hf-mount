@@ -25,8 +25,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@nightly
+      # Pin nightly so rustfmt rules don't drift between CI and contributor machines.
+      # Bump together with the nightly used in `make fmt` / contributor setup.
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: nightly-2026-04-22
           components: rustfmt
 
       - uses: dtolnay/rust-toolchain@1.95.0

@@ -109,6 +109,67 @@ pub async fn setup_bucket_with_file(test_name: &str, filename: &str, content: &[
     Some(guard)
 }
 
+/// Seed a bucket with `big_dir/sib_NN.txt` (20 siblings) + `big_dir/target.txt`.
+/// Returns the target's relative path under the mount + its expected content.
+/// Used by the point-lookup integration tests to exercise the HEAD-based
+/// slow path against a populated sibling set.
+pub async fn seed_big_dir_with_target(
+    hub: &Arc<hf_mount::hub_api::HubApiClient>,
+    tmp_dir_tag: &str,
+) -> (String, &'static [u8]) {
+    const TARGET_CONTENT: &[u8] = b"hello from the target";
+    let write_config = build_write_config(hub).await;
+    let tmp_dir = std::env::temp_dir().join(format!("hf-mount-{}-{}", tmp_dir_tag, std::process::id()));
+    std::fs::create_dir_all(&tmp_dir).ok();
+
+    let mut ops = Vec::with_capacity(21);
+    for i in 0..20 {
+        let path = tmp_dir.join(format!("sib_{i:02}.txt"));
+        std::fs::write(&path, format!("sib_{i:02}")).unwrap();
+        let info = upload_file(write_config.clone(), &path).await;
+        ops.push(hf_mount::hub_api::BatchOp::AddFile {
+            path: format!("big_dir/sib_{i:02}.txt"),
+            xet_hash: info.hash().to_string(),
+            mtime: 0,
+            content_type: None,
+        });
+    }
+    let target_path = tmp_dir.join("target.txt");
+    std::fs::write(&target_path, TARGET_CONTENT).unwrap();
+    let info = upload_file(write_config, &target_path).await;
+    ops.push(hf_mount::hub_api::BatchOp::AddFile {
+        path: "big_dir/target.txt".to_string(),
+        xet_hash: info.hash().to_string(),
+        mtime: 0,
+        content_type: None,
+    });
+    hub.batch_operations(&ops).await.expect("batch add failed");
+    std::fs::remove_dir_all(&tmp_dir).ok();
+    ("big_dir/target.txt".to_string(), TARGET_CONTENT)
+}
+
+/// Seed a bucket with a single deep file `a/b/c/d/payload.txt`.
+/// Returns the relative path + payload for cold-read integration tests.
+pub async fn seed_deep_tree(hub: &Arc<hf_mount::hub_api::HubApiClient>, tmp_dir_tag: &str) -> (String, &'static [u8]) {
+    const PAYLOAD: &[u8] = b"deep payload";
+    let write_config = build_write_config(hub).await;
+    let tmp_dir = std::env::temp_dir().join(format!("hf-mount-{}-{}", tmp_dir_tag, std::process::id()));
+    std::fs::create_dir_all(&tmp_dir).ok();
+    let staging = tmp_dir.join("payload.txt");
+    std::fs::write(&staging, PAYLOAD).unwrap();
+    let info = upload_file(write_config, &staging).await;
+    hub.batch_operations(&[hf_mount::hub_api::BatchOp::AddFile {
+        path: "a/b/c/d/payload.txt".to_string(),
+        xet_hash: info.hash().to_string(),
+        mtime: 0,
+        content_type: None,
+    }])
+    .await
+    .expect("batch add failed");
+    std::fs::remove_dir_all(&tmp_dir).ok();
+    ("a/b/c/d/payload.txt".to_string(), PAYLOAD)
+}
+
 /// Create a bucket on the Hub. Ignores 409 (already exists).
 pub async fn create_bucket(endpoint: &str, token: &str, bucket_id: &str) {
     let resp = Client::new()

@@ -35,6 +35,67 @@ async fn test_nfs_read_only() {
     }
 }
 
+/// Read a file under a large subdir without any prior `readdir`. The VFS
+/// slow path should resolve the file via HEAD alone, without materializing
+/// its siblings.
+#[tokio::test]
+async fn test_nfs_point_lookup_in_large_dir() {
+    let guard = match common::setup_bucket("nfs-point-lookup").await {
+        Some(g) => g,
+        None => return,
+    };
+    let (target_rel, target_content) = common::seed_big_dir_with_target(&guard.hub, "nfs-pl").await;
+
+    let mount_point = format!("/tmp/hf-mount-nfs-pl-mnt-{}", std::process::id());
+    let cache_dir = format!("/tmp/hf-mount-nfs-pl-cache-{}", std::process::id());
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let child = common::mount_bucket_nfs(&guard.bucket_id, &mount_point, &cache_dir, &["--read-only"]);
+        let op = common::fs_tests::assert_point_read(&mount_point, &target_rel, target_content);
+        common::unmount_nfs(&mount_point, child, 10);
+        op
+    }));
+
+    std::fs::remove_dir_all(&mount_point).ok();
+    std::fs::remove_dir_all(&cache_dir).ok();
+
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => panic!("NFS point-lookup test failed: {}", e),
+        Err(e) => std::panic::resume_unwind(e),
+    }
+}
+
+/// Read a file via a cold deep path — every intermediate directory must
+/// resolve correctly through the HEAD → list_tree fallback chain.
+#[tokio::test]
+async fn test_nfs_deep_cold_read() {
+    let guard = match common::setup_bucket("nfs-deep-read").await {
+        Some(g) => g,
+        None => return,
+    };
+    let (deep_rel, payload) = common::seed_deep_tree(&guard.hub, "nfs-dr").await;
+
+    let mount_point = format!("/tmp/hf-mount-nfs-dr-mnt-{}", std::process::id());
+    let cache_dir = format!("/tmp/hf-mount-nfs-dr-cache-{}", std::process::id());
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let child = common::mount_bucket_nfs(&guard.bucket_id, &mount_point, &cache_dir, &["--read-only"]);
+        let op = common::fs_tests::assert_deep_read_and_intermediate_readdir(&mount_point, &deep_rel, payload);
+        common::unmount_nfs(&mount_point, child, 10);
+        op
+    }));
+
+    std::fs::remove_dir_all(&mount_point).ok();
+    std::fs::remove_dir_all(&cache_dir).ok();
+
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => panic!("NFS deep cold read failed: {}", e),
+        Err(e) => std::panic::resume_unwind(e),
+    }
+}
+
 /// NFS writable mount — uses advanced_writes (staging files) automatically.
 #[tokio::test]
 async fn test_nfs_writes() {

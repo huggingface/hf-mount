@@ -587,9 +587,7 @@ impl VirtualFs {
                 .map(|c| c.ino)
                 .collect();
             for ino in stale {
-                // Don't remove if the inode or any descendant is dirty or has open handles.
-                let has_dirty_or_open = inodes.has_dirty_descendants(ino) || inodes.has_open_handles(ino);
-                if !has_dirty_or_open {
+                if !inodes.has_dirty_or_open_descendants(ino) {
                     inodes.remove(ino);
                 }
             }
@@ -630,13 +628,13 @@ impl VirtualFs {
 
     /// Bump the per-inode open-handle refcount. Used by the FUSE adapter
     /// on `opendir` so a directory with an active readdir can't be evicted.
-    #[cfg(any(feature = "fuse", test))]
+    #[cfg(feature = "fuse")]
     pub(crate) fn bump_open_handles(&self, ino: u64) {
         self.inode_table.read().expect("inodes poisoned").bump_open_handles(ino);
     }
 
     /// Counterpart to `bump_open_handles`, called from `releasedir`.
-    #[cfg(any(feature = "fuse", test))]
+    #[cfg(feature = "fuse")]
     pub(crate) fn drop_open_handles(&self, ino: u64) {
         self.inode_table.read().expect("inodes poisoned").drop_open_handles(ino);
     }
@@ -838,20 +836,35 @@ impl VirtualFs {
                 return Err(libc::ENOTDIR);
             }
 
-            if parent_entry.children_loaded {
-                if let Some(entry) = inodes.lookup_child(parent, name) {
-                    // Revalidate remote files via HEAD (xet-backed and plain git/LFS).
-                    if entry.kind == InodeKind::File && !entry.is_dirty() {
-                        FastResult::NeedsRevalidation {
-                            ino: entry.inode,
-                            full_path: entry.full_path.to_string(),
-                            current_hash: entry.xet_hash.clone(),
-                            current_etag: entry.etag.clone(),
-                        }
-                    } else {
-                        FastResult::Hit(self.make_vfs_attr(entry))
-                    }
-                } else {
+            // Try in-memory first regardless of `children_loaded`: an inode
+            // inserted via the HEAD point-lookup path or still present after
+            // a partial eviction can be served without a full re-list.
+            //
+            // For directories we still require `children_loaded` to trust the
+            // cached entry: without the parent listing, we can't tell whether
+            // the dir was removed or replaced remotely (files revalidate
+            // individually via HEAD, dirs don't).
+            match inodes.lookup_child(parent, name) {
+                // Clean cached file: HEAD-revalidate (gated by `metadata_ttl`)
+                // so size/hash/mtime stay fresh between poll cycles.
+                Some(entry) if entry.kind == InodeKind::File && !entry.is_dirty() => FastResult::NeedsRevalidation {
+                    ino: entry.inode,
+                    full_path: entry.full_path.to_string(),
+                    current_hash: entry.xet_hash.clone(),
+                    current_etag: entry.etag.clone(),
+                },
+                // Either a dirty file (local writes win until flushed) or any
+                // entry under a fully-listed parent we can trust as-is.
+                Some(entry) if entry.kind == InodeKind::File || parent_entry.children_loaded => {
+                    FastResult::Hit(self.make_vfs_attr(entry))
+                }
+                // Cached non-file under an unloaded parent: we can't HEAD-probe
+                // a directory to check it still exists (resolve endpoint only
+                // serves files), so defer to the slow path which lists.
+                Some(_) => FastResult::NotLoaded,
+                // No cached entry but the parent listing is authoritative →
+                // the name really doesn't exist; populate the negative cache.
+                None if parent_entry.children_loaded => {
                     let parent_path = &parent_entry.full_path;
                     let full_path = if parent_path.is_empty() {
                         name.to_string()
@@ -860,8 +873,8 @@ impl VirtualFs {
                     };
                     FastResult::Miss(full_path)
                 }
-            } else {
-                FastResult::NotLoaded
+                // No entry, no listing → slow path (HEAD then list_tree).
+                None => FastResult::NotLoaded,
             }
         }; // inodes lock dropped here
 
@@ -902,6 +915,22 @@ impl VirtualFs {
             return Err(libc::ENOENT);
         }
 
+        // Resolve the single requested path via HEAD instead of listing the
+        // whole parent — for point-access workloads (no `readdir`) this keeps
+        // the inode table scoped to what the caller actually touches.
+        match self.hub_client.head_file(&full_path).await {
+            // Without size, `open_readonly` would take the empty-file shortcut
+            // and expose a zero-byte file. Fall back to list_tree which has
+            // the authoritative size from the tree index.
+            Ok(Some(head)) if head.size.is_some() => {
+                return self.insert_file_from_head(parent, name, &full_path, head);
+            }
+            // 404 may mean "doesn't exist" or "it's a directory" (the resolve
+            // endpoint only handles files), so the listing has the final word.
+            Ok(_) => {}
+            Err(e) => debug!("HEAD lookup {} failed, falling back to list: {}", full_path, e),
+        }
+
         self.ensure_children_loaded(parent).await?;
 
         let inodes = self.inode_table.read().expect("inodes poisoned");
@@ -912,6 +941,70 @@ impl VirtualFs {
                 self.negative_cache_insert(full_path);
                 Err(libc::ENOENT)
             }
+        }
+    }
+
+    /// Insert a file inode resolved via HEAD, without touching its siblings.
+    /// Used by the lookup slow path to avoid listing the whole parent dir
+    /// when only one file is needed. The parent's `children_loaded` stays
+    /// `false` so a later `readdir` still triggers a full listing.
+    fn insert_file_from_head(
+        &self,
+        parent: u64,
+        name: &str,
+        full_path: &str,
+        head: crate::hub_api::HeadFileInfo,
+    ) -> VirtualFsResult<VirtualFsAttr> {
+        let size = head.size.unwrap_or(0);
+        let mtime = head
+            .last_modified
+            .as_deref()
+            .map(crate::hub_api::mtime_from_http_date)
+            .unwrap_or_else(|| self.hub_client.default_mtime());
+
+        let mut inodes = self.inode_table.write().expect("inodes poisoned");
+        match inodes.get(parent) {
+            None => return Err(libc::ENOENT),
+            Some(e) if e.kind != InodeKind::Directory => return Err(libc::ENOTDIR),
+            Some(_) => {}
+        }
+        if let Some(existing) = inodes.lookup_child(parent, name) {
+            // A concurrent HEAD lookup may have just inserted the same file —
+            // return its attr instead of redoing the work.
+            if existing.kind == InodeKind::File {
+                return Ok(self.make_vfs_attr(existing));
+            }
+            // The cached entry is a directory but HEAD just confirmed the
+            // remote path is a file: the dir was replaced. Evict the stale
+            // subtree, unless dirty/open descendants would be lost — in that
+            // case keep serving the stale dir (the next sweep / explicit
+            // close will eventually clear the way).
+            let stale_ino = existing.inode;
+            if inodes.has_dirty_or_open_descendants(stale_ino) {
+                return Ok(self.make_vfs_attr(existing));
+            }
+            inodes.remove(stale_ino);
+        }
+        let ino = inodes.insert(
+            parent,
+            name.to_string(),
+            full_path.to_string(),
+            InodeKind::File,
+            size,
+            mtime,
+            head.xet_hash,
+            0o644,
+            self.uid,
+            self.gid,
+        );
+        if let Some(etag) = head.etag
+            && let Some(entry) = inodes.get_mut(ino)
+        {
+            entry.etag = Some(etag);
+        }
+        match inodes.get(ino) {
+            Some(entry) => Ok(self.make_vfs_attr(entry)),
+            None => Err(libc::EIO),
         }
     }
 

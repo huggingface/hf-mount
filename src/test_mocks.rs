@@ -25,6 +25,8 @@ pub struct MockHub {
     download_fail: AtomicBool,
     source: SourceKind,
     default_mtime: SystemTime,
+    list_tree_calls: AtomicU32,
+    head_file_calls: AtomicU32,
 }
 
 #[allow(dead_code)]
@@ -42,6 +44,8 @@ impl MockHub {
                 bucket_id: "test-bucket".to_string(),
             },
             default_mtime: UNIX_EPOCH,
+            list_tree_calls: AtomicU32::new(0),
+            head_file_calls: AtomicU32::new(0),
         })
     }
 
@@ -60,6 +64,8 @@ impl MockHub {
                 revision: "main".to_string(),
             },
             default_mtime: UNIX_EPOCH,
+            list_tree_calls: AtomicU32::new(0),
+            head_file_calls: AtomicU32::new(0),
         })
     }
 
@@ -113,6 +119,14 @@ impl MockHub {
         self.head_fail.store(true, Ordering::SeqCst);
     }
 
+    pub fn list_tree_call_count(&self) -> u32 {
+        self.list_tree_calls.load(Ordering::SeqCst)
+    }
+
+    pub fn head_file_call_count(&self) -> u32 {
+        self.head_file_calls.load(Ordering::SeqCst)
+    }
+
     pub fn fail_next_download(&self) {
         self.download_fail.store(true, Ordering::SeqCst);
     }
@@ -129,6 +143,7 @@ impl MockHub {
 #[async_trait::async_trait]
 impl HubOps for MockHub {
     async fn list_tree(&self, prefix: &str) -> Result<Vec<TreeEntry>> {
+        self.list_tree_calls.fetch_add(1, Ordering::SeqCst);
         let tree = self.tree.lock().unwrap();
         let prefix_slash = if prefix.is_empty() {
             String::new()
@@ -173,6 +188,7 @@ impl HubOps for MockHub {
     }
 
     async fn head_file(&self, path: &str) -> Result<Option<HeadFileInfo>> {
+        self.head_file_calls.fetch_add(1, Ordering::SeqCst);
         if self.head_fail.swap(false, Ordering::SeqCst) {
             return Err(Error::hub("mock head_file failure"));
         }

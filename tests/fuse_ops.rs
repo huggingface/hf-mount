@@ -74,6 +74,68 @@ async fn test_fuse_advanced_writes() {
     }
 }
 
+/// Read a file under a large subdir without any prior `readdir`: the VFS
+/// slow path should resolve the file via HEAD alone, without materializing
+/// the sibling inodes. A successful content match proves the HEAD path
+/// wires up correctly end-to-end.
+#[tokio::test]
+async fn test_fuse_point_lookup_skips_list_tree() {
+    let guard = match common::setup_bucket("fuse-point-lookup").await {
+        Some(g) => g,
+        None => return,
+    };
+    let (target_rel, target_content) = common::seed_big_dir_with_target(&guard.hub, "fuse-pl").await;
+
+    let mount_point = format!("/tmp/hf-mount-pl-mnt-{}", std::process::id());
+    let cache_dir = format!("/tmp/hf-mount-pl-cache-{}", std::process::id());
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let child = common::mount_bucket(&guard.bucket_id, &mount_point, &cache_dir, &["--read-only"]);
+        let op = common::fs_tests::assert_point_read(&mount_point, &target_rel, target_content);
+        common::unmount(&mount_point, child, 30);
+        op
+    }));
+
+    std::fs::remove_dir_all(&mount_point).ok();
+    std::fs::remove_dir_all(&cache_dir).ok();
+
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => panic!("point lookup test failed: {}", e),
+        Err(e) => std::panic::resume_unwind(e),
+    }
+}
+
+/// Read a file via a cold deep path — every intermediate directory must
+/// resolve correctly through the HEAD-then-list-tree fallback chain.
+#[tokio::test]
+async fn test_fuse_deep_cold_read() {
+    let guard = match common::setup_bucket("fuse-deep-read").await {
+        Some(g) => g,
+        None => return,
+    };
+    let (deep_rel, payload) = common::seed_deep_tree(&guard.hub, "fuse-dr").await;
+
+    let mount_point = format!("/tmp/hf-mount-dr-mnt-{}", std::process::id());
+    let cache_dir = format!("/tmp/hf-mount-dr-cache-{}", std::process::id());
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let child = common::mount_bucket(&guard.bucket_id, &mount_point, &cache_dir, &["--read-only"]);
+        let op = common::fs_tests::assert_deep_read_and_intermediate_readdir(&mount_point, &deep_rel, payload);
+        common::unmount(&mount_point, child, 30);
+        op
+    }));
+
+    std::fs::remove_dir_all(&mount_point).ok();
+    std::fs::remove_dir_all(&cache_dir).ok();
+
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => panic!("deep cold read test failed: {}", e),
+        Err(e) => std::panic::resume_unwind(e),
+    }
+}
+
 /// Test HEAD revalidation: remote file changes are detected via lookup() HEAD
 /// and the kernel page cache is invalidated so re-reads return fresh content.
 #[tokio::test]
