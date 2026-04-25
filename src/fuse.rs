@@ -569,10 +569,16 @@ impl FuseSession {
 
 /// Start a FUSE session. Returns immediately once the daemon is serving.
 /// The caller can signal readiness, then call `session.wait()` to block.
+///
+/// `fuse_fds` lets the caller bypass our `Session::new` (which opens
+/// `/dev/fuse` and so requires CAP_SYS_ADMIN). The first fd is the primary
+/// (handshake runs on it); subsequent fds must already be bound to the same
+/// FUSE connection (typically cloned via `FUSE_DEV_IOC_CLONE` by a privileged
+/// helper). Each extra fd backs one additional reader thread.
 pub fn mount_fuse(
     setup: &MountSetup,
     daemon_guard: Option<&mut DaemonGuard>,
-    fuse_fd: Option<OwnedFd>,
+    fuse_fds: Vec<OwnedFd>,
 ) -> Result<FuseSession, io::Error> {
     let adapter = FuseAdapter::new(
         setup.runtime.handle().clone(),
@@ -613,17 +619,23 @@ pub fn mount_fuse(
         fuser::SessionACL::All
     };
     // clone_fd and multi-threading are only supported on Linux by fuser.
-    // Disable clone_fd in sidecar mode (from_fd): the sidecar is unprivileged
-    // and cannot open /dev/fuse to create cloned fds. See #94.
+    // In sidecar mode the sidecar is unprivileged and cannot open /dev/fuse,
+    // so the CSI driver pre-clones N fds and sends them via SCM_RIGHTS;
+    // fuser's internal clone_fd path is then skipped. See #94.
+    //
+    // Worker count: fuser's from_fds path forces `1 + extras.len()` and
+    // ignores `n_threads`. We still set it for parity in the empty-Vec
+    // path (Session::new) where it does drive thread count.
     if cfg!(target_os = "linux") {
-        config.clone_fd = fuse_fd.is_none();
-        config.n_threads = Some(setup.max_threads);
+        config.clone_fd = fuse_fds.is_empty();
+        config.n_threads = if fuse_fds.is_empty() {
+            Some(setup.max_threads)
+        } else {
+            Some(fuse_fds.len())
+        };
     }
 
-    let session = if let Some(owned_fd) = fuse_fd {
-        info!("Using pre-opened FUSE fd={:?}", owned_fd);
-        fuser::Session::from_fd(adapter, owned_fd, config.acl, config)?
-    } else {
+    let session = if fuse_fds.is_empty() {
         fuser::Session::new(adapter, mount_point, &config).inspect_err(|e| {
             if e.kind() == io::ErrorKind::PermissionDenied {
                 error!(
@@ -633,6 +645,16 @@ pub fn mount_fuse(
                 );
             }
         })?
+    } else {
+        let mut fds = fuse_fds.into_iter();
+        let primary = fds.next().expect("non-empty checked above");
+        let extras: Vec<OwnedFd> = fds.collect();
+        info!(
+            "Using pre-opened FUSE fds: primary={:?}, extras={}",
+            primary,
+            extras.len()
+        );
+        fuser::Session::from_fds(adapter, primary, extras, config.acl, config)?
     };
     let notifier = session.notifier();
     let notifier_for_inode = notifier.clone();

@@ -97,19 +97,23 @@ fn main() {
         let _ = std::fs::remove_file(&error_path);
         let _ = std::fs::remove_file(error_path.with_file_name("ready"));
 
-        let fuse_fd = match connect_and_receive_fd(&mount.socket_path, 60) {
-            Ok(fd) => fd,
+        let fuse_fds = match connect_and_receive_fds(&mount.socket_path, 60) {
+            Ok(fds) if fds.is_empty() => {
+                write_error(&error_path, &format!("Received zero fds for {}", label));
+                continue;
+            }
+            Ok(fds) => fds,
             Err(err) => {
-                write_error(&error_path, &format!("Failed to receive fd for {}: {}", label, err));
+                write_error(&error_path, &format!("Failed to receive fds for {}: {}", label, err));
                 continue;
             }
         };
 
-        info!("Received fd={:?} for {}", fuse_fd, label);
+        info!("Received {} fd(s) for {}", fuse_fds.len(), label);
 
         error_paths.push(error_path.clone());
         handles.push(std::thread::spawn(move || {
-            run_mount(fuse_fd, mount.mount_args, error_path);
+            run_mount(fuse_fds, mount.mount_args, error_path);
         }));
     }
 
@@ -219,13 +223,17 @@ fn discover_pending(tmp_dir: &Path) -> io::Result<Vec<PendingMount>> {
     Ok(mounts)
 }
 
-/// Connect to the CSI driver's Unix socket and receive the FUSE fd via SCM_RIGHTS.
+/// Connect to the CSI driver's Unix socket and receive the FUSE fds via SCM_RIGHTS.
 /// Retries on ENOENT/ECONNREFUSED until the socket appears or timeout expires.
 ///
 /// Wire format (set by the CSI driver's Go SendMsg):
-///   - iov[0]: optional data payload (unused, we just need the fd)
-///   - cmsg:   single SCM_RIGHTS carrying one i32 fd
-fn connect_and_receive_fd(socket_path: &Path, timeout_secs: u64) -> io::Result<OwnedFd> {
+///   - iov[0]: optional data payload (unused, we just need the fds)
+///   - cmsg:   single SCM_RIGHTS carrying N i32 fds (1 primary + N-1 cloned).
+///     The CSI driver decides the count; here we accept any non-zero N up
+///     to `MAX_FUSE_FDS`.
+const MAX_FUSE_FDS: usize = 32;
+
+fn connect_and_receive_fds(socket_path: &Path, timeout_secs: u64) -> io::Result<Vec<OwnedFd>> {
     info!("Connecting to CSI driver socket at {}", socket_path.display());
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
     let stream = loop {
@@ -249,8 +257,9 @@ fn connect_and_receive_fd(socket_path: &Path, timeout_secs: u64) -> io::Result<O
 
     // Data buffer (iov) for the regular message payload.
     let mut buf = [0u8; 4096];
-    // Control message buffer, sized for exactly one fd (one i32).
-    let mut cmsg_buf = vec![0u8; unsafe { libc::CMSG_SPACE(size_of::<i32>() as u32) as usize }];
+    // Control message buffer, sized for up to MAX_FUSE_FDS fds.
+    let cmsg_capacity = unsafe { libc::CMSG_SPACE((size_of::<i32>() * MAX_FUSE_FDS) as u32) as usize };
+    let mut cmsg_buf = vec![0u8; cmsg_capacity];
 
     let mut iov = libc::iovec {
         iov_base: buf.as_mut_ptr() as *mut libc::c_void,
@@ -290,20 +299,32 @@ fn connect_and_receive_fd(socket_path: &Path, timeout_secs: u64) -> io::Result<O
         ));
     }
 
-    let raw_fd = unsafe {
-        let cmsg_ref = &*cmsg;
-        if cmsg_ref.cmsg_level != libc::SOL_SOCKET || cmsg_ref.cmsg_type != libc::SCM_RIGHTS {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "unexpected control message type",
-            ));
-        }
-        // The fd is stored right after the cmsg header.
-        *(libc::CMSG_DATA(cmsg) as *const i32)
-    };
+    let cmsg_ref = unsafe { &*cmsg };
+    if cmsg_ref.cmsg_level != libc::SOL_SOCKET || cmsg_ref.cmsg_type != libc::SCM_RIGHTS {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unexpected control message type",
+        ));
+    }
+    // cmsg_len includes the cmsghdr; the fds occupy the rest.
+    let header_len = unsafe { libc::CMSG_LEN(0) as usize };
+    let payload_len = (cmsg_ref.cmsg_len as usize).saturating_sub(header_len);
+    if payload_len == 0 || payload_len % size_of::<i32>() != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("malformed SCM_RIGHTS payload ({payload_len} bytes)"),
+        ));
+    }
+    let fd_count = payload_len / size_of::<i32>();
+    let data_ptr = unsafe { libc::CMSG_DATA(cmsg) as *const i32 };
 
-    // SAFETY: raw_fd was just received via SCM_RIGHTS and is a valid open fd.
-    Ok(unsafe { OwnedFd::from_raw_fd(raw_fd) })
+    let mut fds = Vec::with_capacity(fd_count);
+    for i in 0..fd_count {
+        let raw_fd = unsafe { *data_ptr.add(i) };
+        // SAFETY: raw_fd was just received via SCM_RIGHTS and is a valid open fd.
+        fds.push(unsafe { OwnedFd::from_raw_fd(raw_fd) });
+    }
+    Ok(fds)
 }
 
 /// Log an error and write it to the error file for the CSI driver to read.
@@ -312,7 +333,7 @@ fn write_error(path: &Path, msg: &str) {
     let _ = std::fs::write(path, msg);
 }
 
-fn run_mount(fuse_fd: OwnedFd, mount_args: MountArgs, error_path: PathBuf) {
+fn run_mount(fuse_fds: Vec<OwnedFd>, mount_args: MountArgs, error_path: PathBuf) {
     let label = mount_args.source.label();
 
     // build() panics on auth/config errors (e.g. invalid token, CAS 401).
@@ -335,9 +356,9 @@ fn run_mount(fuse_fd: OwnedFd, mount_args: MountArgs, error_path: PathBuf) {
         }
     };
 
-    info!("Starting FUSE mount for {} (fd={:?})", label, fuse_fd);
+    info!("Starting FUSE mount for {} ({} fd(s))", label, fuse_fds.len());
 
-    let session = match mount_fuse(&setup, None, Some(fuse_fd)) {
+    let session = match mount_fuse(&setup, None, fuse_fds) {
         Ok(s) => s,
         Err(err) => {
             write_error(&error_path, &format!("FUSE mount failed for {}: {}", label, err));
@@ -350,4 +371,92 @@ fn run_mount(fuse_fd: OwnedFd, mount_args: MountArgs, error_path: PathBuf) {
 
     session.wait();
     info!("FUSE session ended for {}", label);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::net::UnixListener;
+    use std::thread;
+
+    /// Open `n` file descriptors, send them all in one SCM_RIGHTS over a Unix
+    /// socket, and verify the receiver reconstructs the same count of valid
+    /// fds backed by the same files.
+    fn send_fds_and_receive(n: usize) -> Vec<OwnedFd> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = dir.path().join("s");
+
+        // Each fd points to a file we can identify by content after recv.
+        let payloads: Vec<String> = (0..n).map(|i| format!("fd_{i}_marker")).collect();
+        let mut tmp_files = Vec::with_capacity(n);
+        let mut raw_fds = Vec::with_capacity(n);
+        for payload in &payloads {
+            let mut tmp = tempfile::tempfile().unwrap();
+            tmp.write_all(payload.as_bytes()).unwrap();
+            raw_fds.push(tmp.as_raw_fd());
+            tmp_files.push(tmp);
+        }
+
+        let listener = UnixListener::bind(&socket_path).expect("bind socket");
+        let socket_path_clone = socket_path.clone();
+
+        let recv = thread::spawn(move || connect_and_receive_fds(&socket_path_clone, 5).expect("recv"));
+
+        let (server, _) = listener.accept().expect("accept");
+        let server_fd = server.as_raw_fd();
+
+        let mut data: u8 = 1;
+        let mut iov = libc::iovec {
+            iov_base: &mut data as *mut u8 as *mut libc::c_void,
+            iov_len: 1,
+        };
+        let cmsg_space = unsafe { libc::CMSG_SPACE((size_of::<i32>() * n) as u32) as usize };
+        let mut cmsg_buf = vec![0u8; cmsg_space];
+        let msg = libc::msghdr {
+            msg_name: std::ptr::null_mut(),
+            msg_namelen: 0,
+            msg_iov: &mut iov,
+            msg_iovlen: 1,
+            msg_control: cmsg_buf.as_mut_ptr() as *mut libc::c_void,
+            msg_controllen: cmsg_buf.len() as _,
+            msg_flags: 0,
+        };
+        unsafe {
+            let cmsg = libc::CMSG_FIRSTHDR(&msg);
+            (*cmsg).cmsg_level = libc::SOL_SOCKET;
+            (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+            (*cmsg).cmsg_len = libc::CMSG_LEN((size_of::<i32>() * n) as u32) as _;
+            let data_ptr = libc::CMSG_DATA(cmsg) as *mut i32;
+            for (i, raw) in raw_fds.iter().enumerate() {
+                *data_ptr.add(i) = *raw;
+            }
+            let sent = libc::sendmsg(server_fd, &msg, 0);
+            assert!(sent > 0, "sendmsg failed: {}", io::Error::last_os_error());
+        }
+        // Close server side so receiver can return.
+        drop(server);
+        drop(tmp_files); // we kept them alive only until sendmsg ran.
+
+        recv.join().unwrap()
+    }
+
+    #[test]
+    fn receives_one_fd() {
+        let fds = send_fds_and_receive(1);
+        assert_eq!(fds.len(), 1);
+    }
+
+    #[test]
+    fn receives_multiple_fds() {
+        let fds = send_fds_and_receive(4);
+        assert_eq!(fds.len(), 4);
+    }
+
+    #[test]
+    fn receives_max_fds() {
+        let fds = send_fds_and_receive(MAX_FUSE_FDS);
+        assert_eq!(fds.len(), MAX_FUSE_FDS);
+    }
 }
