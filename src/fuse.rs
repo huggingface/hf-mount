@@ -581,7 +581,7 @@ pub fn mount_fuse(
     fuse_fds: Vec<OwnedFd>,
 ) -> Result<FuseSession, io::Error> {
     let adapter = FuseAdapter::new(
-        setup.runtime.handle().clone(),
+        setup.runtime.clone(),
         setup.virtual_fs.clone(),
         setup.metadata_ttl,
         setup.read_only,
@@ -694,7 +694,7 @@ pub fn mount_fuse(
         bg,
         virtual_fs: setup.virtual_fs.clone(),
         mount_point: mount_point.to_path_buf(),
-        runtime: setup.runtime.handle().clone(),
+        runtime: setup.runtime.clone(),
     })
 }
 
