@@ -1561,7 +1561,7 @@ impl VirtualFs {
                 return None;
             }
         }
-        let layout = prefetch::parse_safetensors_layout(header_len, &buf[8..needed])?;
+        let layout = prefetch::parse_safetensors_layout(header_len, &buf[8..needed], file_size)?;
         Some((layout, buf.freeze()))
     }
 
@@ -1746,13 +1746,13 @@ impl VirtualFs {
                     let mut response = BytesMut::with_capacity(to_read);
                     let mut cursor = offset;
 
-                    // Forward → seek → speculative buffer (last resort fast path).
-                    // The speculative buffer is promoted to forward on hit, so a
-                    // partial hit can be completed by the regular slow path.
-                    if state.try_serve_forward(offset, size).is_none()
-                        && state.try_serve_seek(offset, size).is_none()
-                        && state.try_promote_speculative(offset)
-                    {
+                    // Promote a speculative buffer match into the forward
+                    // buffer BEFORE attempting to serve, so the (mutating)
+                    // try_serve_forward isn't called twice in direct-io
+                    // mode where it drains consumed bytes. This guarantees
+                    // each fast-path probe is invoked at most once.
+                    if state.would_serve_speculative(offset) {
+                        state.try_promote_speculative(offset);
                         debug!("prefetch hit (speculative): offset={}", offset);
                     }
 
@@ -1830,17 +1830,16 @@ impl VirtualFs {
                 // Phase 3: speculative prefetch of tensor i+1 if we just
                 // crossed the halfway mark of tensor i. Background, never
                 // blocks the read response.
+                // Atomic claim: choose AND mark inflight under one lock to
+                // close the TOCTOU between concurrent readers (would
+                // otherwise double-spawn the same prefetch).
                 let speculation = {
-                    let state = prefetch.lock().await;
+                    let mut state = prefetch.lock().await;
                     state
-                        .next_tensor_to_prefetch(offset, size)
+                        .claim_speculative_prefetch(offset, size)
                         .map(|(start, end)| (state.xet_hash.clone(), state.file_size, start, end))
                 };
                 if let Some((xet_hash, xet_file_size, spec_start, spec_end)) = speculation {
-                    {
-                        let mut state = prefetch.lock().await;
-                        state.mark_speculative_inflight(spec_start);
-                    }
                     let prefetch_clone = prefetch.clone();
                     let xet_sessions = self.xet_sessions.clone();
                     self.runtime.spawn(async move {

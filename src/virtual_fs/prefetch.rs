@@ -12,29 +12,51 @@ use crate::xet::DownloadStreamOps;
 /// Returns `None` on any parse failure (the file may not actually be
 /// safetensors, even if the extension says so) — callers fall back to the
 /// generic `MIN_RANGE_FETCH_MMAP` path.
-pub(crate) fn parse_safetensors_layout(header_len: u64, header_json: &[u8]) -> Option<Vec<(u64, u64)>> {
+pub(crate) fn parse_safetensors_layout(
+    header_len: u64,
+    header_json: &[u8],
+    file_size: u64,
+) -> Option<Vec<(u64, u64)>> {
     let value: serde_json::Value = serde_json::from_slice(header_json).ok()?;
     let obj = value.as_object()?;
     // `data_offsets` in the header are relative to the start of the data
     // section, which lives at byte `8 + header_len` in the file.
-    let data_origin = 8 + header_len;
-    let mut layout: Vec<(u64, u64)> = obj
-        .iter()
-        .filter(|(k, _)| *k != "__metadata__")
-        .filter_map(|(_, v)| {
-            let offsets = v.get("data_offsets")?.as_array()?;
-            if offsets.len() != 2 {
-                return None;
-            }
-            let start = offsets[0].as_u64()?;
-            let end = offsets[1].as_u64()?;
-            if end < start {
-                return None;
-            }
-            Some((data_origin + start, data_origin + end))
-        })
-        .collect();
+    let data_origin = 8u64.checked_add(header_len)?;
+    let mut layout: Vec<(u64, u64)> = Vec::with_capacity(obj.len());
+    for (key, v) in obj {
+        if key == "__metadata__" {
+            continue;
+        }
+        let offsets = v.get("data_offsets").and_then(|x| x.as_array())?;
+        if offsets.len() != 2 {
+            warn!("safetensors header: tensor {} has malformed data_offsets", key);
+            return None;
+        }
+        let start_rel = offsets[0].as_u64()?;
+        let end_rel = offsets[1].as_u64()?;
+        if end_rel < start_rel {
+            warn!("safetensors header: tensor {} has reversed data_offsets", key);
+            return None;
+        }
+        let start = data_origin.checked_add(start_rel)?;
+        let end = data_origin.checked_add(end_rel)?;
+        if end > file_size {
+            warn!(
+                "safetensors header: tensor {} extends past file_size ({} > {})",
+                key, end, file_size
+            );
+            return None;
+        }
+        layout.push((start, end));
+    }
     layout.sort();
+    // Detect overlaps: each tensor must end before (or at) the next one starts.
+    for w in layout.windows(2) {
+        if w[0].1 > w[1].0 {
+            warn!("safetensors header: tensors overlap at offset {}", w[1].0);
+            return None;
+        }
+    }
     if layout.is_empty() {
         warn!("safetensors header parsed but contained no tensors");
         return None;
@@ -224,15 +246,15 @@ impl PrefetchState {
         if offset >= start && offset < end { Some((start, end)) } else { None }
     }
 
-    /// Speculate the next tensor only when (a) the read is past 75 % of the
-    /// current tensor — high confidence the user is scanning, not just
-    /// poking — and (b) the current tensor is itself big enough that a full
-    /// scan amortises a speculative fetch (≥ 4 MiB). Below 4 MiB the user
-    /// usually just reads a config-like tensor and seeks elsewhere.
-    pub(crate) fn next_tensor_to_prefetch(&self, offset: u64, size: u32) -> Option<(u64, u64)> {
+    /// Atomic claim of the next-tensor speculative fetch. Returns
+    /// `(next_start, next_end_capped)` if speculation should run AND records
+    /// the claim by setting `speculative_inflight`. Concurrent callers will
+    /// get `None` from the second invocation, so at most one task is spawned
+    /// per tensor (closes the TOCTOU between "decide" and "mark inflight").
+    pub(crate) fn claim_speculative_prefetch(&mut self, offset: u64, size: u32) -> Option<(u64, u64)> {
         const SPECULATION_TRIGGER_RATIO: u64 = 4; // 3/4 of the way through
         const MIN_CUR_TENSOR_FOR_SPEC: u64 = 4 * 1_048_576;
-        const MIN_NEXT_TENSOR_FOR_SPEC: u64 = 1 * 1_048_576;
+        const MIN_NEXT_TENSOR_FOR_SPEC: u64 = 1_048_576;
 
         let layout = self.tensor_layout.as_ref()?;
         let (cur_start, cur_end) = self.tensor_for(offset)?;
@@ -244,13 +266,11 @@ impl PrefetchState {
         if offset + size as u64 <= trigger {
             return None;
         }
-        // Find next tensor by index.
         let idx = layout.partition_point(|(s, _)| *s <= cur_start);
         let (next_start, next_end) = *layout.get(idx)?;
         if next_end - next_start < MIN_NEXT_TENSOR_FOR_SPEC {
             return None;
         }
-        let capped_end = (next_start + MAX_TENSOR_FETCH).min(next_end);
         if let Some(spec) = &self.speculative
             && spec.start == next_start
         {
@@ -259,27 +279,31 @@ impl PrefetchState {
         if self.speculative_inflight == Some(next_start) {
             return None;
         }
+        let capped_end = (next_start + MAX_TENSOR_FETCH).min(next_end);
+        // Atomic claim: mark inflight here so a concurrent caller in another
+        // task observes it and skips the duplicate spawn.
+        self.speculative_inflight = Some(next_start);
         Some((next_start, capped_end))
     }
 
-    /// If `offset` lies in the speculative buffer, take ownership of it,
-    /// promote to the forward buffer, and return its bytes range. Caller
-    /// then re-attempts `try_serve_forward`.
-    pub(crate) fn try_promote_speculative(&mut self, offset: u64) -> bool {
+    /// Pure check: would `try_promote_speculative(offset)` succeed? Used to
+    /// decide whether to invoke the (mutating) promote without first
+    /// touching the forward-buffer probe.
+    pub(crate) fn would_serve_speculative(&self, offset: u64) -> bool {
         let Some(spec) = &self.speculative else { return false };
         let spec_end = spec.start + spec.data.len() as u64;
-        if offset < spec.start || offset >= spec_end {
+        offset >= spec.start && offset < spec_end
+    }
+
+    /// If `offset` lies in the speculative buffer, take ownership of it and
+    /// promote to the forward buffer.
+    pub(crate) fn try_promote_speculative(&mut self, offset: u64) -> bool {
+        if !self.would_serve_speculative(offset) {
             return false;
         }
         let spec = self.speculative.take().unwrap();
         self.seed_forward_buffer(spec.start, spec.data);
         true
-    }
-
-    /// Mark a tensor as "prefetch in flight" so concurrent readers don't
-    /// double-spawn. Cleared by the spawned task on completion.
-    pub(crate) fn mark_speculative_inflight(&mut self, tensor_start: u64) {
-        self.speculative_inflight = Some(tensor_start);
     }
 
     /// Store the result of a background prefetch task.
@@ -381,6 +405,21 @@ impl PrefetchState {
 
     /// Store freshly downloaded chunks in the forward buffer.
     pub(crate) fn store_fetched(&mut self, offset: u64, chunks: VecDeque<Bytes>, total: usize) {
+        // If the new buffer is non-contiguous with the old one, any persistent
+        // stream owned by the state is now positioned at a stale offset
+        // (it advances with the buffer it was opened for). Drop it so a future
+        // ContinueStream read can't return the wrong bytes. With the
+        // lock-released-during-fetch pattern, a concurrent RangeDownload can
+        // clobber the buffer while another reader's stream is still alive —
+        // this is the safety net that catches it.
+        let old_buf_end = self.buf_start + self.chunks_len as u64;
+        if offset != old_buf_end && self.stream.is_some() {
+            debug!(
+                "prefetch: invalidating stale stream (new buf_start={} != old_buf_end={})",
+                offset, old_buf_end
+            );
+            self.stream = None;
+        }
         self.chunks = chunks;
         self.chunks_len = total;
         self.chunks_front_offset = 0;
@@ -765,5 +804,128 @@ mod tests {
         // Re-read at same offset hits (data retained)
         let result = ps.try_serve_forward(0, 3).unwrap();
         assert_eq!(&result[..], &[1, 2, 3]);
+    }
+
+    // ── Safetensors header parser ───────────────────────────────────
+
+    fn make_header(json: &str) -> (u64, Vec<u8>) {
+        let bytes = json.as_bytes().to_vec();
+        (bytes.len() as u64, bytes)
+    }
+
+    #[test]
+    fn safetensors_layout_rejects_offset_past_eof() {
+        // file_size = 100, but a tensor's data_offsets end at 200 (relative).
+        // With data_origin = 8 + header_len, the absolute end exceeds file_size → reject.
+        let json = r#"{"a":{"data_offsets":[0,200]}}"#;
+        let (header_len, bytes) = make_header(json);
+        let layout = parse_safetensors_layout(header_len, &bytes, 100);
+        assert!(layout.is_none(), "should reject tensor extending past file_size");
+    }
+
+    #[test]
+    fn safetensors_layout_rejects_overlapping_tensors() {
+        // a: 0..50, b: 30..80 → overlap at 30..50
+        let json = r#"{"a":{"data_offsets":[0,50]}, "b":{"data_offsets":[30,80]}}"#;
+        let (header_len, bytes) = make_header(json);
+        let big_file = 1_000_000;
+        let layout = parse_safetensors_layout(header_len, &bytes, big_file);
+        assert!(layout.is_none(), "should reject overlapping tensors");
+    }
+
+    #[test]
+    fn safetensors_layout_rejects_overflow_arithmetic() {
+        // header_len = u64::MAX would overflow data_origin = 8 + header_len.
+        let json = r#"{"a":{"data_offsets":[0,1]}}"#;
+        let (_, bytes) = make_header(json);
+        let layout = parse_safetensors_layout(u64::MAX, &bytes, u64::MAX);
+        assert!(layout.is_none(), "should reject when 8 + header_len overflows");
+    }
+
+    #[test]
+    fn safetensors_layout_accepts_valid() {
+        let json = r#"{"a":{"data_offsets":[0,10]}, "b":{"data_offsets":[10,20]}}"#;
+        let (header_len, bytes) = make_header(json);
+        let file_size = 8 + header_len + 20;
+        let layout = parse_safetensors_layout(header_len, &bytes, file_size).unwrap();
+        assert_eq!(layout.len(), 2);
+        let origin = 8 + header_len;
+        assert_eq!(layout[0], (origin, origin + 10));
+        assert_eq!(layout[1], (origin + 10, origin + 20));
+    }
+
+    // ── store_fetched stream invalidation ──────────────────────────
+
+    #[test]
+    fn store_fetched_invalidates_stream_on_non_contiguous_overwrite() {
+        // Simulate a fake stream: we just need *some* Box<dyn DownloadStreamOps>.
+        // Reuse a simple stub that returns no chunks.
+        struct EmptyStream;
+        #[async_trait::async_trait]
+        impl crate::xet::DownloadStreamOps for EmptyStream {
+            async fn next(&mut self) -> crate::error::Result<Option<Bytes>> {
+                Ok(None)
+            }
+        }
+        let mut ps = PrefetchState::new("h".into(), 1024, false, false);
+        // Old buffer at [0..10), so stream should be at offset 10.
+        ps.buf_start = 0;
+        ps.chunks_len = 10;
+        ps.chunks.push_back(Bytes::from(vec![0u8; 10]));
+        ps.stream = Some(Box::new(EmptyStream));
+        // Non-contiguous store at offset 100 → stream should be dropped.
+        ps.store_fetched(100, VecDeque::from(vec![Bytes::from(vec![1u8; 5])]), 5);
+        assert!(ps.stream.is_none(), "non-contiguous store must drop stale stream");
+        assert_eq!(ps.buf_start, 100);
+        assert_eq!(ps.chunks_len, 5);
+    }
+
+    #[test]
+    fn store_fetched_keeps_stream_on_contiguous_overwrite() {
+        struct EmptyStream;
+        #[async_trait::async_trait]
+        impl crate::xet::DownloadStreamOps for EmptyStream {
+            async fn next(&mut self) -> crate::error::Result<Option<Bytes>> {
+                Ok(None)
+            }
+        }
+        let mut ps = PrefetchState::new("h".into(), 1024, false, false);
+        ps.buf_start = 0;
+        ps.chunks_len = 10;
+        ps.chunks.push_back(Bytes::from(vec![0u8; 10]));
+        ps.stream = Some(Box::new(EmptyStream));
+        // Contiguous store at offset 10 → keep stream.
+        ps.store_fetched(10, VecDeque::from(vec![Bytes::from(vec![1u8; 5])]), 5);
+        assert!(ps.stream.is_some(), "contiguous store must preserve stream");
+    }
+
+    // ── claim_speculative_prefetch atomicity ───────────────────────
+
+    #[test]
+    fn claim_speculative_prefetch_marks_inflight() {
+        let mut ps = PrefetchState::new("h".into(), u64::MAX, false, true);
+        // Layout: tensor 0 at [100, 100+8MiB), tensor 1 at [100+8MiB, 100+10MiB)
+        let t0_start = 100u64;
+        let t0_end = t0_start + 8 * 1_048_576;
+        let t1_start = t0_end;
+        let t1_end = t1_start + 2 * 1_048_576;
+        ps.tensor_layout = Some(vec![(t0_start, t0_end), (t1_start, t1_end)]);
+        // Read past 75% of tensor 0 → should claim.
+        let trigger = t0_start + (t0_end - t0_start) * 3 / 4 + 1;
+        let claim = ps.claim_speculative_prefetch(trigger, 1024);
+        assert_eq!(claim, Some((t1_start, t1_end)));
+        assert_eq!(ps.speculative_inflight, Some(t1_start));
+        // Second call must not double-claim.
+        let claim2 = ps.claim_speculative_prefetch(trigger, 1024);
+        assert!(claim2.is_none(), "second claim must yield None when inflight");
+    }
+
+    #[test]
+    fn claim_speculative_skips_small_tensors() {
+        let mut ps = PrefetchState::new("h".into(), u64::MAX, false, true);
+        // Small current tensor (1 MiB) → speculation off.
+        ps.tensor_layout = Some(vec![(0, 1_048_576), (1_048_576, 100_000_000)]);
+        let claim = ps.claim_speculative_prefetch(1_000_000, 1024);
+        assert!(claim.is_none(), "small current tensor must not trigger spec");
     }
 }
