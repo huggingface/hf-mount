@@ -174,6 +174,20 @@ impl PrefetchState {
         self.tensor_layout = Some(layout);
     }
 
+    /// Pre-populate the forward buffer with bytes we already pulled (e.g. the
+    /// safetensors header probe). The first reads at this offset hit the
+    /// buffer with zero added latency, hiding the open-time CAS round-trip.
+    pub(crate) fn seed_forward_buffer(&mut self, offset: u64, data: Bytes) {
+        if data.is_empty() {
+            return;
+        }
+        self.buf_start = offset;
+        self.chunks_len = data.len();
+        self.chunks_front_offset = 0;
+        self.chunks.clear();
+        self.chunks.push_back(data);
+    }
+
     /// If `offset` falls inside a known tensor, return that tensor's end
     /// (absolute file offset). Returns `None` for the safetensors header
     /// region (offset < 8 + header_len, before the first tensor) or when no

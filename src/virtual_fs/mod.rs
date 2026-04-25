@@ -1440,11 +1440,24 @@ impl VirtualFs {
         let mut state = PrefetchState::new(xet_hash.clone(), size, self.direct_io, mmap_hint);
 
         if is_safetensors && size > 8 && !xet_hash.is_empty() {
-            if let Some(layout) = self.fetch_safetensors_layout(&xet_hash, size).await {
-                debug!("open_lazy: parsed safetensors layout for {}: {} tensors", full_path, layout.len());
-                state.set_tensor_layout(layout);
-            } else {
-                debug!("open_lazy: safetensors header parse failed for {}, using mmap_hint floor", full_path);
+            match self.fetch_safetensors_layout(&xet_hash, size).await {
+                Some((layout, warm_buf)) => {
+                    debug!(
+                        "open_lazy: parsed safetensors layout for {}: {} tensors, warm_buf={}KB",
+                        full_path,
+                        layout.len(),
+                        warm_buf.len() / 1024,
+                    );
+                    state.set_tensor_layout(layout);
+                    // Speculatively seed the forward buffer with the bytes we
+                    // already pulled to parse the header. The first reads
+                    // (header introspection + start of tensor 0) hit the
+                    // buffer with zero added latency.
+                    state.seed_forward_buffer(0, warm_buf);
+                }
+                None => {
+                    debug!("open_lazy: safetensors header parse failed for {}, using mmap_hint floor", full_path);
+                }
             }
         }
 
@@ -1458,12 +1471,14 @@ impl VirtualFs {
         Ok(file_handle)
     }
 
-    /// Fetch and parse the safetensors header (8-byte length + JSON body) via
-    /// a single bounded CAS request, then return the per-tensor offset table.
-    /// Returns `None` on any I/O or parse error; caller falls back gracefully.
-    async fn fetch_safetensors_layout(&self, xet_hash: &str, file_size: u64) -> Option<Vec<(u64, u64)>> {
+    /// Fetch and parse the safetensors header. Returns the per-tensor offset
+    /// table AND the bytes that were pulled to read the header (typically a
+    /// 1 MiB probe), so the caller can seed the prefetch buffer with them
+    /// rather than throw them away. None on any I/O or parse error.
+    async fn fetch_safetensors_layout(&self, xet_hash: &str, file_size: u64) -> Option<(Vec<(u64, u64)>, Bytes)> {
         // Most safetensors headers are < 1 MiB. Pull a generous initial slice
-        // so we get the length prefix and the full JSON in one round-trip.
+        // so we get the length prefix and the full JSON in one round-trip,
+        // and the leading bytes of tensor 0 as a free side effect.
         const HEADER_PROBE: u64 = 1_048_576;
         let probe_end = HEADER_PROBE.min(file_size);
         let file_info = XetFileInfo::new(xet_hash.to_string(), file_size);
@@ -1493,12 +1508,10 @@ impl VirtualFs {
         }
         let header_len = u64::from_le_bytes(buf[..8].try_into().ok()?);
         if header_len == 0 || header_len > 64 * 1_048_576 {
-            // sanity: refuse implausibly small/large headers
             return None;
         }
         let needed = (8 + header_len) as usize;
         if buf.len() < needed {
-            // Header is bigger than our probe — fetch the rest.
             let mut more = match self.xet_sessions.download_stream_boxed(
                 &file_info,
                 buf.len() as u64,
@@ -1521,7 +1534,8 @@ impl VirtualFs {
                 return None;
             }
         }
-        prefetch::parse_safetensors_layout(header_len, &buf[8..needed])
+        let layout = prefetch::parse_safetensors_layout(header_len, &buf[8..needed])?;
+        Some((layout, buf.freeze()))
     }
 
     /// Fetch data for the prefetch buffer. Uses the persistent stream for sequential
