@@ -622,9 +622,17 @@ pub fn mount_fuse(
     // In sidecar mode the sidecar is unprivileged and cannot open /dev/fuse,
     // so the CSI driver pre-clones N fds and sends them via SCM_RIGHTS;
     // fuser's internal clone_fd path is then skipped. See #94.
+    //
+    // Worker count: fuser's from_fds path forces `1 + extras.len()` and
+    // ignores `n_threads`. We still set it for parity in the empty-Vec
+    // path (Session::new) where it does drive thread count.
     if cfg!(target_os = "linux") {
         config.clone_fd = fuse_fds.is_empty();
-        config.n_threads = Some(setup.max_threads);
+        config.n_threads = if fuse_fds.is_empty() {
+            Some(setup.max_threads)
+        } else {
+            Some(fuse_fds.len())
+        };
     }
 
     let session = if fuse_fds.is_empty() {
