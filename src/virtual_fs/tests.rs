@@ -873,6 +873,47 @@ fn lookup_uses_head_not_list_tree() {
     });
 }
 
+/// Sequence: point-lookup (HEAD slow path) → readdir on the same parent
+/// (list_tree populates `children_loaded`) → re-lookup the file. The HEAD-
+/// inserted inode must survive the listing reconciliation and the re-lookup
+/// must return the same ino without re-fetching.
+#[test]
+fn lookup_then_readdir_then_lookup_preserves_inode() {
+    let hub = MockHub::new();
+    hub.add_file("subdir/keep.txt", 7, Some("h_keep"), None);
+    hub.add_file("subdir/sib.txt", 3, Some("h_sib"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let subdir = vfs.lookup(ROOT_INODE, "subdir").await.unwrap();
+
+        // 1. HEAD-based point lookup of one file (parent not listed yet).
+        let first = vfs.lookup(subdir.ino, "keep.txt").await.unwrap();
+        let inserted_ino = first.ino;
+        assert_eq!(first.size, 7);
+        assert!(
+            !vfs.inode_table.read().unwrap().is_children_loaded(subdir.ino),
+            "HEAD path must not flip children_loaded"
+        );
+
+        // 2. readdir runs list_tree → reconciles the full listing.
+        let entries = vfs.readdir(subdir.ino).await.unwrap();
+        let names: std::collections::HashSet<_> = entries.into_iter().map(|e| e.name).collect();
+        assert!(names.contains("keep.txt"));
+        assert!(names.contains("sib.txt"));
+        assert!(vfs.inode_table.read().unwrap().is_children_loaded(subdir.ino));
+
+        // 3. Re-lookup the original file → fast path, same ino, no extra HEAD.
+        let pre_head = hub.head_file_call_count();
+        let again = vfs.lookup(subdir.ino, "keep.txt").await.unwrap();
+        assert_eq!(again.ino, inserted_ino, "inode must be stable across readdir");
+        assert_eq!(again.size, 7);
+        // Fast path may revalidate via HEAD (TTL-gated); at most one extra call.
+        assert!(hub.head_file_call_count() <= pre_head + 1);
+    });
+}
+
 /// HEAD responses without size can't be trusted for the inode (open_readonly
 /// would take the empty-file shortcut), so fall back to list_tree which has
 /// the authoritative size from the tree index.
