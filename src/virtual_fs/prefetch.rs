@@ -404,26 +404,27 @@ impl PrefetchState {
     }
 
     /// Store freshly downloaded chunks in the forward buffer.
-    pub(crate) fn store_fetched(&mut self, offset: u64, chunks: VecDeque<Bytes>, total: usize) {
-        // If the new buffer is non-contiguous with the old one, any persistent
-        // stream owned by the state is now positioned at a stale offset
-        // (it advances with the buffer it was opened for). Drop it so a future
-        // ContinueStream read can't return the wrong bytes. With the
-        // lock-released-during-fetch pattern, a concurrent RangeDownload can
-        // clobber the buffer while another reader's stream is still alive —
-        // this is the safety net that catches it.
-        let old_buf_end = self.buf_start + self.chunks_len as u64;
-        if offset != old_buf_end && self.stream.is_some() {
-            debug!(
-                "prefetch: invalidating stale stream (new buf_start={} != old_buf_end={})",
-                offset, old_buf_end
-            );
-            self.stream = None;
-        }
+    /// Atomically install a freshly fetched buffer AND the stream that
+    /// produced it. The stream's read cursor must be at `offset + total`.
+    /// Concurrent writers may interleave under the lock-released-during-fetch
+    /// pattern, but each `store_fetched` is itself atomic: the stream slot
+    /// always reflects the LAST writer's buffer, so a future `ContinueStream`
+    /// read uses a stream whose cursor matches `buf_start + chunks_len`.
+    /// Pass `stream_to_return = None` when the fetch was range-based (no
+    /// persistent stream produced); any older stream is dropped because its
+    /// cursor is now unrelated to the new buffer offset.
+    pub(crate) fn store_fetched(
+        &mut self,
+        offset: u64,
+        chunks: VecDeque<Bytes>,
+        total: usize,
+        stream_to_return: Option<Box<dyn DownloadStreamOps>>,
+    ) {
         self.chunks = chunks;
         self.chunks_len = total;
         self.chunks_front_offset = 0;
         self.buf_start = offset;
+        self.stream = stream_to_return;
     }
 
     /// Effective length of the front chunk, accounting for partially consumed bytes.
@@ -562,6 +563,9 @@ fn read_chunk_range(chunks: &VecDeque<Bytes>, front_offset: usize, skip: usize, 
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+
     use super::*;
 
     /// Helper: create a PrefetchState pre-loaded with chunks at a given offset.
@@ -857,9 +861,10 @@ mod tests {
     // ── store_fetched stream invalidation ──────────────────────────
 
     #[test]
-    fn store_fetched_invalidates_stream_on_non_contiguous_overwrite() {
-        // Simulate a fake stream: we just need *some* Box<dyn DownloadStreamOps>.
-        // Reuse a simple stub that returns no chunks.
+    fn store_fetched_atomically_pairs_buffer_and_stream() {
+        // Buffer + stream are paired: store_fetched always replaces the
+        // stream slot with the one passed in. A None drops any stale stream
+        // (range-style fetches that don't produce a persistent stream).
         struct EmptyStream;
         #[async_trait::async_trait]
         impl crate::xet::DownloadStreamOps for EmptyStream {
@@ -868,35 +873,53 @@ mod tests {
             }
         }
         let mut ps = PrefetchState::new("h".into(), 1024, false, false);
-        // Old buffer at [0..10), so stream should be at offset 10.
         ps.buf_start = 0;
         ps.chunks_len = 10;
         ps.chunks.push_back(Bytes::from(vec![0u8; 10]));
         ps.stream = Some(Box::new(EmptyStream));
-        // Non-contiguous store at offset 100 → stream should be dropped.
-        ps.store_fetched(100, VecDeque::from(vec![Bytes::from(vec![1u8; 5])]), 5);
-        assert!(ps.stream.is_none(), "non-contiguous store must drop stale stream");
+        // Range-style store: stream_to_return = None → stream slot cleared.
+        ps.store_fetched(100, VecDeque::from(vec![Bytes::from(vec![1u8; 5])]), 5, None);
+        assert!(ps.stream.is_none(), "range-style store must clear stale stream");
         assert_eq!(ps.buf_start, 100);
         assert_eq!(ps.chunks_len, 5);
     }
 
     #[test]
-    fn store_fetched_keeps_stream_on_contiguous_overwrite() {
-        struct EmptyStream;
+    fn store_fetched_replaces_stream_on_contiguous_overwrite() {
+        // Even when the new buffer is contiguous with the old, the freshly
+        // provided stream replaces whatever was there. Closes the
+        // concurrent-contiguous race where a slower writer would otherwise
+        // leave its earlier-positioned stream installed under a buffer
+        // produced by a faster writer.
+        struct ProbeStream {
+            calls: Arc<AtomicUsize>,
+        }
         #[async_trait::async_trait]
-        impl crate::xet::DownloadStreamOps for EmptyStream {
+        impl crate::xet::DownloadStreamOps for ProbeStream {
             async fn next(&mut self) -> crate::error::Result<Option<Bytes>> {
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Ok(None)
             }
         }
+        let old_calls = Arc::new(AtomicUsize::new(0));
+        let new_calls = Arc::new(AtomicUsize::new(0));
+
         let mut ps = PrefetchState::new("h".into(), 1024, false, false);
         ps.buf_start = 0;
         ps.chunks_len = 10;
         ps.chunks.push_back(Bytes::from(vec![0u8; 10]));
-        ps.stream = Some(Box::new(EmptyStream));
-        // Contiguous store at offset 10 → keep stream.
-        ps.store_fetched(10, VecDeque::from(vec![Bytes::from(vec![1u8; 5])]), 5);
-        assert!(ps.stream.is_some(), "contiguous store must preserve stream");
+        ps.stream = Some(Box::new(ProbeStream { calls: old_calls.clone() }));
+        ps.store_fetched(
+            10,
+            VecDeque::from(vec![Bytes::from(vec![1u8; 5])]),
+            5,
+            Some(Box::new(ProbeStream { calls: new_calls.clone() })),
+        );
+        // Drive the installed stream once and verify it was the *new* one.
+        let mut s = ps.stream.take().expect("contiguous store must keep a stream slot");
+        let _ = futures::executor::block_on(s.next());
+        assert_eq!(new_calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(old_calls.load(std::sync::atomic::Ordering::Relaxed), 0);
     }
 
     // ── claim_speculative_prefetch atomicity ───────────────────────

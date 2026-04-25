@@ -1811,12 +1811,11 @@ impl VirtualFs {
                     // Quick lock: store + restore stream + drain.
                     {
                         let mut state = prefetch.lock().await;
-                        state.store_fetched(cursor, chunks, total);
-                        if let Some(s) = stream_to_return
-                            && state.stream.is_none()
-                        {
-                            state.stream = Some(s);
-                        }
+                        // store_fetched now takes ownership of the stream
+                        // atomically — buffer and stream are paired, so a
+                        // future ContinueStream cannot use a stream whose
+                        // cursor doesn't match `buf_start + chunks_len`.
+                        state.store_fetched(cursor, chunks, total, stream_to_return);
                         let remaining = (to_read - response.len()) as u32;
                         if let Some(data) = state.try_serve_forward(cursor, remaining) {
                             cursor += data.len() as u64;
