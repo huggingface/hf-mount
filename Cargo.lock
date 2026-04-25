@@ -832,6 +832,7 @@ checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
 [[package]]
 name = "fuser"
 version = "0.17.0"
+source = "git+https://github.com/huggingface/fuser.git?branch=sidecar-multi-fd#bb211d807228d4808c02faa963786baf250c62c2"
 dependencies = [
  "bitflags",
  "libc",
