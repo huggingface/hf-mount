@@ -1,9 +1,46 @@
 use std::collections::VecDeque;
 
 use bytes::{Bytes, BytesMut};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::xet::DownloadStreamOps;
+
+/// Parse a safetensors JSON header into a sorted list of `(start, end)`
+/// absolute file offsets, one per tensor. `header_len` is the value of the
+/// first u64 LE in the file; `header_json` is the next `header_len` bytes.
+///
+/// Returns `None` on any parse failure (the file may not actually be
+/// safetensors, even if the extension says so) — callers fall back to the
+/// generic `MIN_RANGE_FETCH_MMAP` path.
+pub(crate) fn parse_safetensors_layout(header_len: u64, header_json: &[u8]) -> Option<Vec<(u64, u64)>> {
+    let value: serde_json::Value = serde_json::from_slice(header_json).ok()?;
+    let obj = value.as_object()?;
+    // `data_offsets` in the header are relative to the start of the data
+    // section, which lives at byte `8 + header_len` in the file.
+    let data_origin = 8 + header_len;
+    let mut layout: Vec<(u64, u64)> = obj
+        .iter()
+        .filter(|(k, _)| *k != "__metadata__")
+        .filter_map(|(_, v)| {
+            let offsets = v.get("data_offsets")?.as_array()?;
+            if offsets.len() != 2 {
+                return None;
+            }
+            let start = offsets[0].as_u64()?;
+            let end = offsets[1].as_u64()?;
+            if end < start {
+                return None;
+            }
+            Some((data_origin + start, data_origin + end))
+        })
+        .collect();
+    layout.sort();
+    if layout.is_empty() {
+        warn!("safetensors header parsed but contained no tensors");
+        return None;
+    }
+    Some(layout)
+}
 
 // ── Constants ──────────────────────────────────────────────────────────
 // TODO: expose these as CLI args / config to allow runtime tuning without recompilation.
@@ -30,8 +67,15 @@ pub(crate) const MIN_RANGE_FETCH: u64 = 4 * 1_048_576; // 4 MiB
 /// `.bin`, `.gguf`). transformers/torch loaders mmap these files and access
 /// them via many small page-sized reads, which appear random to FUSE but are
 /// actually a scan within a tensor. Pulling 32 MiB on the first miss covers
-/// most of a tensor in one CAS round-trip.
+/// most of a tensor in one CAS round-trip. Used as fallback when the
+/// tensor-aligned path (`tensor_end_for`) doesn't apply.
 pub(crate) const MIN_RANGE_FETCH_MMAP: u64 = 32 * 1_048_576; // 32 MiB
+/// Cap on a tensor-aligned RangeDownload. Some safetensors tensors are
+/// hundreds of MiB (a single big embedding); fetching the whole thing at the
+/// first FUSE chunk would block other readers and waste CAS bandwidth if
+/// only the first few MiB are actually consumed. 64 MiB is roughly one CAS
+/// xorb, which is the natural batching granularity downstream.
+pub(crate) const MAX_TENSOR_FETCH: u64 = 64 * 1_048_576; // 64 MiB
 
 // ── FetchPlan ────────────────────────────────────────────────────────
 
@@ -98,6 +142,13 @@ pub(crate) struct PrefetchState {
     /// pytorch bin, gguf). Bumps the floor on RangeDownload fetches so a
     /// pages-faulted scan within a tensor doesn't hammer CAS once per FUSE chunk.
     pub(crate) mmap_hint: bool,
+    /// Sorted list of `(start, end)` absolute file offsets, one per tensor.
+    /// Populated only for `.safetensors` files whose header parsed at open
+    /// time. Used in `prepare_fetch` to align `fetch_size` on tensor
+    /// boundaries — fetch exactly the remainder of the tensor that contains
+    /// `offset`, no more, no less. Avoids both over-fetch into the next
+    /// tensor and the per-FUSE-chunk CAS round-trip pattern.
+    pub(crate) tensor_layout: Option<Vec<(u64, u64)>>,
 }
 
 impl PrefetchState {
@@ -115,7 +166,26 @@ impl PrefetchState {
             stream: None,
             forward_only,
             mmap_hint,
+            tensor_layout: None,
         }
+    }
+
+    pub(crate) fn set_tensor_layout(&mut self, layout: Vec<(u64, u64)>) {
+        self.tensor_layout = Some(layout);
+    }
+
+    /// If `offset` falls inside a known tensor, return that tensor's end
+    /// (absolute file offset). Returns `None` for the safetensors header
+    /// region (offset < 8 + header_len, before the first tensor) or when no
+    /// layout is available.
+    fn tensor_end_for(&self, offset: u64) -> Option<u64> {
+        let layout = self.tensor_layout.as_ref()?;
+        let idx = layout.partition_point(|(start, _end)| *start <= offset);
+        if idx == 0 {
+            return None;
+        }
+        let (start, end) = layout[idx - 1];
+        if offset >= start && offset < end { Some(end) } else { None }
     }
 
     /// Cache miss: drain consumed data, classify access pattern, adjust window,
@@ -184,12 +254,15 @@ impl PrefetchState {
             MIN_RANGE_FETCH
         };
         // For sequential reads, prefetch ahead (window_size) to amortise latency.
-        // For random/seek reads (RangeDownload), fetch at least `range_floor`
-        // so a userspace read kernel-split into 128 KiB FUSE chunks doesn't
-        // hammer CAS once per chunk — only the first chunk pays the round-trip,
-        // the rest hit the forward buffer.
+        // For random/seek reads (RangeDownload), prefer a tensor-aligned fetch
+        // when we have a parsed safetensors layout: pull up to the end of the
+        // current tensor (capped at MAX_TENSOR_FETCH), but never below
+        // `range_floor` so a read near the end of a small tensor still pays
+        // off the round-trip with a meaningful fetch.
+        let to_tensor_end = self.tensor_end_for(offset).map(|e| e - offset).unwrap_or(0);
+        let range_fetch = to_tensor_end.max(range_floor).min(MAX_TENSOR_FETCH);
         let fetch_size = match strategy {
-            FetchStrategy::RangeDownload => needed.max(range_floor),
+            FetchStrategy::RangeDownload => needed.max(range_fetch),
             _ => needed.max(self.window_size),
         }
         .min(self.file_size - offset);
