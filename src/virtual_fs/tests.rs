@@ -900,7 +900,11 @@ fn lookup_missing_under_unloaded_parent_populates_negative_cache() {
         let err2 = vfs.lookup(subdir.ino, "ghost.txt").await.unwrap_err();
         assert_eq!(err2, libc::ENOENT);
         assert_eq!(hub.head_file_call_count(), pre_head + 1, "neg-cache should skip HEAD");
-        assert_eq!(hub.list_tree_call_count(), pre_list + 1, "neg-cache should skip list_tree");
+        assert_eq!(
+            hub.list_tree_call_count(),
+            pre_list + 1,
+            "neg-cache should skip list_tree"
+        );
     });
 }
 
