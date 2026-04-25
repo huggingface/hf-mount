@@ -16,7 +16,7 @@ mod flush;
 pub mod inode;
 mod poll;
 mod prefetch;
-use crate::xet::{StagingCoordinator, StagingDir, StreamingWriterOps, XetOps};
+use crate::xet::{DownloadStreamOps, StagingCoordinator, StagingDir, StreamingWriterOps, XetOps};
 use inode::{InodeEntry, InodeKind, InodeTable};
 use prefetch::{FetchPlan, PrefetchState};
 
@@ -92,6 +92,17 @@ pub struct VfsConfig {
 /// Exception: setattr(truncate) holds inode_table.write() across File::create
 /// / set_len syscalls (microseconds) to prevent write() from updating
 /// inode.size between the file truncation and the metadata update.
+/// Heuristic: does this file look like a tensor checkpoint that ML loaders
+/// will mmap? When true, we widen RangeDownload fetches so a kernel-split
+/// pread doesn't become 32 CAS round-trips.
+fn is_mmap_friendly(full_path: &str) -> bool {
+    let lower = full_path.to_ascii_lowercase();
+    lower.ends_with(".safetensors")
+        || lower.ends_with(".bin")
+        || lower.ends_with(".pt")
+        || lower.ends_with(".gguf")
+}
+
 pub struct VirtualFs {
     runtime: tokio::runtime::Handle,
     hub_client: Arc<dyn HubOps>,
@@ -1377,11 +1388,11 @@ impl VirtualFs {
             (true, None) if fe.xet_hash.is_empty() && fe.size > 0 => {
                 self.await_pending_commit(ino).await?;
                 let fe = self.get_file_entry(ino)?;
-                self.open_lazy(ino, fe.xet_hash, fe.size)
+                self.open_lazy(ino, fe.xet_hash, fe.size, &fe.full_path)
             }
 
             // Remote xet-backed file — lazy CAS range reads.
-            _ if !fe.xet_hash.is_empty() => self.open_lazy(ino, fe.xet_hash, fe.size),
+            _ if !fe.xet_hash.is_empty() => self.open_lazy(ino, fe.xet_hash, fe.size, &fe.full_path),
 
             // Plain LFS/git file without xet hash — HTTP download to staging cache.
             _ if fe.size > 0 => {
@@ -1414,16 +1425,21 @@ impl VirtualFs {
             }
 
             // Empty file (size=0, no hash).
-            _ => self.open_lazy(ino, String::new(), 0),
+            _ => self.open_lazy(ino, String::new(), 0, &fe.full_path),
         }
     }
 
     /// Allocate a lazy file handle backed by a prefetch buffer.
-    fn open_lazy(&self, ino: u64, xet_hash: String, size: u64) -> VirtualFsResult<u64> {
+    fn open_lazy(&self, ino: u64, xet_hash: String, size: u64, full_path: &str) -> VirtualFsResult<u64> {
+        let mmap_hint = is_mmap_friendly(full_path);
+        if mmap_hint {
+            debug!("open_lazy: mmap_hint enabled for {}", full_path);
+        }
         let prefetch = Arc::new(tokio::sync::Mutex::new(PrefetchState::new(
             xet_hash,
             size,
             self.direct_io,
+            mmap_hint,
         )));
         let file_handle = self.alloc_file_handle();
         self.inode_table.read().expect("inodes poisoned").bump_open_handles(ino);
@@ -1437,23 +1453,23 @@ impl VirtualFs {
     /// Fetch data for the prefetch buffer. Uses the persistent stream for sequential
     /// reads (with automatic (re)start), or opens a temporary stream with retries
     /// for range/seek access. Returns EIO if all attempts fail.
-    async fn fetch_data(
+    /// Unlocked variant: caller is responsible for taking the stream out of the
+    /// PrefetchState mutex before calling, and putting it back after (if returned).
+    /// This lets the network I/O run without holding the mutex, allowing parallel
+    /// RangeDownloads from multiple readers (and parallel reads on the buffer fast
+    /// path while a fetch is in flight).
+    #[allow(clippy::too_many_arguments)]
+    async fn fetch_data_unlocked(
         &self,
-        prefetch_state: &mut PrefetchState,
+        xet_hash: &str,
+        xet_file_size: u64,
+        mut first_stream: Option<Box<dyn DownloadStreamOps>>,
         cursor: u64,
         plan: &FetchPlan,
         file_size: u64,
-    ) -> std::result::Result<(VecDeque<Bytes>, usize), i32> {
+    ) -> std::result::Result<(VecDeque<Bytes>, usize, Option<Box<dyn DownloadStreamOps>>), i32> {
         const MAX_ATTEMPTS: u32 = 3;
-        let file_info = XetFileInfo::new(prefetch_state.xet_hash.clone(), prefetch_state.file_size);
-
-        // Take the persistent stream before the loop (sequential reads).
-        // first_stream.take() only returns Some on the first iteration.
-        let mut first_stream = if plan.strategy.is_stream() {
-            prefetch_state.stream.take()
-        } else {
-            None
-        };
+        let file_info = XetFileInfo::new(xet_hash.to_string(), xet_file_size);
 
         for attempt in 0..MAX_ATTEMPTS {
             let stream = match first_stream.take() {
@@ -1518,6 +1534,7 @@ impl VirtualFs {
 
                 // Early EOF sanity check: only meaningful when we got some data
                 // (zero-data EOF is just a failed attempt, handled by retry below)
+                let mut stream_to_return: Option<Box<dyn DownloadStreamOps>> = None;
                 if stream_eof && total > 0 {
                     let stream_total = cursor + total as u64;
                     if stream_total < file_size {
@@ -1528,7 +1545,7 @@ impl VirtualFs {
                             total,
                             file_size,
                             file_size - stream_total,
-                            prefetch_state.xet_hash,
+                            xet_hash,
                         );
                         debug_assert!(
                             false,
@@ -1536,16 +1553,13 @@ impl VirtualFs {
                         );
                     }
                 } else if plan.strategy.is_stream() && !failed {
-                    // Keep stream alive for future sequential reads
-                    prefetch_state.stream = Some(stream);
+                    // Keep stream alive for future sequential reads (caller restores into state).
+                    stream_to_return = Some(stream);
                 }
 
                 if total > 0 {
-                    debug!(
-                        "prefetch fetch: cursor={}, got={}, window={}",
-                        cursor, total, prefetch_state.window_size,
-                    );
-                    return Ok((chunks, total));
+                    debug!("prefetch fetch: cursor={}, got={}", cursor, total,);
+                    return Ok((chunks, total, stream_to_return));
                 }
             }
 
@@ -1556,7 +1570,7 @@ impl VirtualFs {
 
         error!(
             "prefetch: all {} fetch attempts failed: cursor={}, hash={}",
-            MAX_ATTEMPTS, cursor, prefetch_state.xet_hash,
+            MAX_ATTEMPTS, cursor, xet_hash,
         );
         Err(libc::EIO)
     }
@@ -1603,73 +1617,88 @@ impl VirtualFs {
                 }
             }
             ReadTarget::Remote { prefetch } => {
-                let mut prefetch_state = prefetch.lock().await;
+                // Phase 1: try the buffer fast path under a quick lock, then drop.
+                let (file_size, mut response, mut cursor, to_read) = {
+                    let mut state = prefetch.lock().await;
+                    let file_size = state.file_size;
 
-                let file_size = prefetch_state.file_size;
-
-                // Past EOF
-                if offset >= file_size {
-                    return Ok((Bytes::new(), true));
-                }
-
-                // Maximum bytes we should return (capped at file boundary).
-                let to_read = ((size as u64).min(file_size - offset)) as usize;
-
-                // IMPORTANT: Never return a short read unless at real EOF.
-                // The Linux FUSE kernel module shrinks i_size on short reads
-                // (fuse_read_update_size), which makes subsequent reads return
-                // 0 bytes and truncates the file from the application's view.
-
-                let mut response = BytesMut::with_capacity(to_read);
-                let mut cursor = offset;
-
-                // Fast path: forward buffer has enough data (common case, zero-copy).
-                if let Some(data) = prefetch_state.try_serve_forward(offset, size) {
-                    if data.len() == to_read {
-                        debug!("prefetch hit (forward): offset={}, len={}", offset, data.len());
-                        let eof = offset + data.len() as u64 >= file_size;
-                        return Ok((data, eof));
+                    // Past EOF
+                    if offset >= file_size {
+                        return Ok((Bytes::new(), true));
                     }
-                    cursor += data.len() as u64;
-                    response.extend_from_slice(&data);
-                } else if let Some(data) = prefetch_state.try_serve_seek(offset, size) {
-                    // Seek window: only reachable when forward buffer has no data
-                    // at this offset (backward seek). Zero-copy on full hit.
-                    if data.len() == to_read {
-                        debug!("prefetch hit (seek): offset={}, len={}", offset, data.len());
-                        let eof = offset + data.len() as u64 >= file_size;
-                        return Ok((data, eof));
-                    }
-                    cursor += data.len() as u64;
-                    response.extend_from_slice(&data);
-                }
 
-                // Assembly loop: fetch more data until we have to_read bytes.
-                // Only reached at prefetch window boundaries or cache misses.
-                while response.len() < to_read {
-                    let remaining = (to_read - response.len()) as u32;
-                    let plan = prefetch_state.prepare_fetch(cursor, remaining);
-                    debug!(
-                        "prefetch miss: cursor={}, remaining={}, strategy={:?}, fetch_size={}, \
-                         buf_start={}, file_size={}, has_stream={}",
-                        cursor,
-                        remaining,
-                        plan.strategy,
-                        plan.fetch_size,
-                        prefetch_state.buf_start,
-                        file_size,
-                        prefetch_state.stream.is_some(),
-                    );
+                    let to_read = ((size as u64).min(file_size - offset)) as usize;
+                    let mut response = BytesMut::with_capacity(to_read);
+                    let mut cursor = offset;
 
-                    let (chunks, total) = self.fetch_data(&mut prefetch_state, cursor, &plan, file_size).await?;
-
-                    prefetch_state.store_fetched(cursor, chunks, total);
-
-                    // Drain freshly filled buffer into response
-                    let remaining = (to_read - response.len()) as u32;
-                    if let Some(data) = prefetch_state.try_serve_forward(cursor, remaining) {
+                    if let Some(data) = state.try_serve_forward(offset, size) {
+                        if data.len() == to_read {
+                            debug!("prefetch hit (forward): offset={}, len={}", offset, data.len());
+                            let eof = offset + data.len() as u64 >= file_size;
+                            return Ok((data, eof));
+                        }
                         cursor += data.len() as u64;
                         response.extend_from_slice(&data);
+                    } else if let Some(data) = state.try_serve_seek(offset, size) {
+                        if data.len() == to_read {
+                            debug!("prefetch hit (seek): offset={}, len={}", offset, data.len());
+                            let eof = offset + data.len() as u64 >= file_size;
+                            return Ok((data, eof));
+                        }
+                        cursor += data.len() as u64;
+                        response.extend_from_slice(&data);
+                    }
+                    (file_size, response, cursor, to_read)
+                };
+
+                // Phase 2: assembly loop. Plan + take stream under lock, fetch
+                // OUTSIDE the lock (so other readers can do their own RangeDownloads
+                // in parallel and the fast path stays hot), then re-lock to store.
+                while response.len() < to_read {
+                    let remaining = (to_read - response.len()) as u32;
+
+                    // Quick lock: prepare fetch, take stream out (if stream-strategy).
+                    // Stream is owned by the fetcher for the duration of this fetch;
+                    // other readers that miss while we're fetching will start their
+                    // own bounded RangeDownload (one extra round-trip, no contention).
+                    let (xet_hash, xet_file_size, plan, stream_taken) = {
+                        let mut state = prefetch.lock().await;
+                        let plan = state.prepare_fetch(cursor, remaining);
+                        let stream_taken = if plan.strategy.is_stream() { state.stream.take() } else { None };
+                        debug!(
+                            "prefetch miss: cursor={}, remaining={}, strategy={:?}, fetch_size={}, \
+                             buf_start={}, file_size={}",
+                            cursor, remaining, plan.strategy, plan.fetch_size, state.buf_start, file_size,
+                        );
+                        (state.xet_hash.clone(), state.file_size, plan, stream_taken)
+                    };
+
+                    // Network I/O — no lock held.
+                    let (chunks, total, stream_to_return) = self
+                        .fetch_data_unlocked(
+                            &xet_hash,
+                            xet_file_size,
+                            stream_taken,
+                            cursor,
+                            &plan,
+                            file_size,
+                        )
+                        .await?;
+
+                    // Quick lock: store + restore stream + drain.
+                    {
+                        let mut state = prefetch.lock().await;
+                        state.store_fetched(cursor, chunks, total);
+                        if let Some(s) = stream_to_return
+                            && state.stream.is_none()
+                        {
+                            state.stream = Some(s);
+                        }
+                        let remaining = (to_read - response.len()) as u32;
+                        if let Some(data) = state.try_serve_forward(cursor, remaining) {
+                            cursor += data.len() as u64;
+                            response.extend_from_slice(&data);
+                        }
                     }
                 }
 
