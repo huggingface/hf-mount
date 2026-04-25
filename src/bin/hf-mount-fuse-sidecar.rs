@@ -12,8 +12,7 @@ use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use clap::Parser;
@@ -21,6 +20,11 @@ use tracing::{error, info, warn};
 
 use hf_mount::fuse::mount_fuse;
 use hf_mount::setup::{Args as MountArgs, build, init_tracing, raise_fd_limit};
+use hf_mount::virtual_fs::VirtualFs;
+
+/// Set of running mounts, exposed to the SIGTERM handler so it can drain
+/// dirty data before the process exits.
+type VfsRegistry = Arc<Mutex<Vec<Arc<VirtualFs>>>>;
 
 #[derive(Parser)]
 #[command(about = "CSI sidecar mounter for HF volumes")]
@@ -53,12 +57,40 @@ fn main() {
     raise_fd_limit();
     init_tracing(false);
 
-    let shutdown = Arc::new(AtomicBool::new(false));
+    // SIGTERM handler: drain every running VFS (flushes dirty inodes to the
+    // Hub via the flush manager) in parallel, then exit. The empty-registry
+    // case (signal arrives during config discovery) is just a fast no-op exit.
+    //
+    // We can't unmount from here — the CSI driver did the kernel mount()
+    // against the host kubelet path, which the sidecar can't see (the args
+    // file uses the "/tmp" placeholder). fuser's tokio signal handler would
+    // try `umount2(/tmp, MNT_DETACH)`, fail, and `bg.join()` would block
+    // forever; kubelet would then SIGKILL at the full grace period and any
+    // dirty data would be lost.
+    //
+    // Driving `VirtualFs::shutdown()` ourselves uses the grace window to
+    // flush, then we exit; the kernel ends the FUSE connection on fd close
+    // and CSI's NodeUnpublishVolume does the host-side umount.
+    let vfs_registry: VfsRegistry = Arc::new(Mutex::new(Vec::new()));
     {
-        let shutdown = Arc::clone(&shutdown);
+        let vfs_registry = Arc::clone(&vfs_registry);
         ctrlc::set_handler(move || {
-            info!("Received shutdown signal");
-            shutdown.store(true, Ordering::Relaxed);
+            let vfs_list: Vec<Arc<VirtualFs>> = vfs_registry.lock().expect("vfs_registry poisoned").clone();
+            if vfs_list.is_empty() {
+                info!("Received shutdown signal, exiting");
+                std::process::exit(0);
+            }
+            info!("Received shutdown signal, flushing {} mount(s)", vfs_list.len());
+            // Drain in parallel — total wall time is max(flush), not sum(flush).
+            let drain_handles: Vec<_> = vfs_list
+                .into_iter()
+                .map(|vfs| std::thread::spawn(move || vfs.shutdown()))
+                .collect();
+            for h in drain_handles {
+                let _ = h.join();
+            }
+            info!("Flush complete, exiting");
+            std::process::exit(0);
         })
         .expect("failed to install signal handler");
     }
@@ -69,18 +101,8 @@ fn main() {
 
     info!("HF mount sidecar starting, watching {}", args.tmp_dir.display());
 
-    let pending = wait_for_configs(
-        &args.tmp_dir,
-        args.poll_secs,
-        args.timeout_secs,
-        args.expected_mounts,
-        &shutdown,
-    );
+    let pending = wait_for_configs(&args.tmp_dir, args.poll_secs, args.timeout_secs, args.expected_mounts);
     if pending.is_empty() {
-        if shutdown.load(Ordering::Relaxed) {
-            info!("Shutting down before any mounts started");
-            return;
-        }
         error!("No mount configs found after {}s, exiting", args.timeout_secs);
         std::process::exit(1);
     }
@@ -112,8 +134,9 @@ fn main() {
         info!("Received {} fd(s) for {}", fuse_fds.len(), label);
 
         error_paths.push(error_path.clone());
+        let vfs_registry = Arc::clone(&vfs_registry);
         handles.push(std::thread::spawn(move || {
-            run_mount(fuse_fds, mount.mount_args, error_path);
+            run_mount(fuse_fds, mount.mount_args, error_path, vfs_registry);
         }));
     }
 
@@ -156,21 +179,10 @@ fn main() {
     info!("All mounts exited");
 }
 
-fn wait_for_configs(
-    tmp_dir: &Path,
-    poll_secs: u64,
-    timeout_secs: u64,
-    expected: usize,
-    shutdown: &AtomicBool,
-) -> Vec<PendingMount> {
+fn wait_for_configs(tmp_dir: &Path, poll_secs: u64, timeout_secs: u64, expected: usize) -> Vec<PendingMount> {
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
 
     loop {
-        if shutdown.load(Ordering::Relaxed) {
-            info!("Shutdown requested during config discovery");
-            return Vec::new();
-        }
-
         match discover_pending(tmp_dir) {
             Ok(mounts) if !mounts.is_empty() => {
                 if mounts.len() >= expected {
@@ -333,7 +345,7 @@ fn write_error(path: &Path, msg: &str) {
     let _ = std::fs::write(path, msg);
 }
 
-fn run_mount(fuse_fds: Vec<OwnedFd>, mount_args: MountArgs, error_path: PathBuf) {
+fn run_mount(fuse_fds: Vec<OwnedFd>, mount_args: MountArgs, error_path: PathBuf, vfs_registry: VfsRegistry) {
     let label = mount_args.source.label();
 
     // build() panics on auth/config errors (e.g. invalid token, CAS 401).
@@ -355,6 +367,12 @@ fn run_mount(fuse_fds: Vec<OwnedFd>, mount_args: MountArgs, error_path: PathBuf)
             return;
         }
     };
+
+    // Register the VFS so the SIGTERM handler can drain it on shutdown.
+    vfs_registry
+        .lock()
+        .expect("vfs_registry poisoned")
+        .push(setup.virtual_fs.clone());
 
     info!("Starting FUSE mount for {} ({} fd(s))", label, fuse_fds.len());
 
