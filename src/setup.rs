@@ -178,7 +178,11 @@ pub struct Args {
 
 /// Everything needed to run a mount backend (FUSE or NFS).
 pub struct MountSetup {
-    pub runtime: tokio::runtime::Runtime,
+    pub runtime: tokio::runtime::Handle,
+    /// Owned runtime, kept alive for the lifetime of this MountSetup. `None`
+    /// when the runtime is owned externally (sidecar mode shares one runtime
+    /// across all volumes — see `build_with_runtime`).
+    _owned_runtime: Option<tokio::runtime::Runtime>,
     pub virtual_fs: Arc<VirtualFs>,
     pub mount_point: PathBuf,
     pub read_only: bool,
@@ -234,12 +238,28 @@ pub fn init_tracing(daemon: bool) {
 
 /// Build tokio runtime, storage client, Hub client, and VFS.
 /// `is_nfs` controls whether advanced writes are forced (NFS has no open/close).
+///
+/// Owns the runtime it creates. Use `build_with_runtime` to share one runtime
+/// across multiple volumes (sidecar mode).
 pub fn build(source: Source, options: MountOptions, is_nfs: bool) -> MountSetup {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .expect("Failed to create tokio runtime");
+    let mut setup = build_with_runtime(source, options, is_nfs, runtime.handle().clone());
+    setup._owned_runtime = Some(runtime);
+    setup
+}
 
+/// Like `build`, but reuses an externally-owned runtime. The caller must keep
+/// the corresponding `Runtime` alive for at least as long as the returned
+/// `MountSetup`.
+pub fn build_with_runtime(
+    source: Source,
+    options: MountOptions,
+    is_nfs: bool,
+    runtime: tokio::runtime::Handle,
+) -> MountSetup {
     let (mount_point, source_kind, path_prefix) = match source {
         Source::Bucket { bucket_id, mount_point } => {
             let (id, prefix) = split_path_prefix(&bucket_id).unwrap_or_else(|e| panic!("invalid bucket path: {e}"));
@@ -390,7 +410,7 @@ pub fn build(source: Source, options: MountOptions, is_nfs: bool) -> MountSetup 
     let metadata_ttl = std::time::Duration::from_millis(options.metadata_ttl_ms);
 
     let virtual_fs = VirtualFs::new(
-        runtime.handle().clone(),
+        runtime.clone(),
         hub_client,
         xet_sessions,
         staging_dir,
@@ -417,6 +437,7 @@ pub fn build(source: Source, options: MountOptions, is_nfs: bool) -> MountSetup 
 
     MountSetup {
         runtime,
+        _owned_runtime: None,
         virtual_fs,
         mount_point,
         read_only,
@@ -458,7 +479,7 @@ pub fn raise_fd_limit() {
     }
 }
 
-fn build_cas_config(runtime: &tokio::runtime::Runtime, refresher: &Arc<HubTokenRefresher>) -> Arc<TranslatorConfig> {
+fn build_cas_config(runtime: &tokio::runtime::Handle, refresher: &Arc<HubTokenRefresher>) -> Arc<TranslatorConfig> {
     let jwt = runtime
         .block_on(refresher.fetch_initial())
         .unwrap_or_else(|e| panic!("Failed to get storage token: {e}"));

@@ -19,7 +19,7 @@ use clap::Parser;
 use tracing::{error, info, warn};
 
 use hf_mount::fuse::mount_fuse;
-use hf_mount::setup::{Args as MountArgs, build, init_tracing, raise_fd_limit};
+use hf_mount::setup::{Args as MountArgs, build_with_runtime, init_tracing, raise_fd_limit};
 use hf_mount::virtual_fs::VirtualFs;
 
 /// Set of running mounts, exposed to the SIGTERM handler so it can drain
@@ -101,6 +101,14 @@ fn main() {
 
     info!("HF mount sidecar starting, watching {}", args.tmp_dir.display());
 
+    // One tokio runtime shared across all volumes. Each `build_with_runtime`
+    // call below borrows its handle, avoiding N full multi-threaded runtimes
+    // (~4 worker threads each) for N volumes. See #96.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("Failed to create tokio runtime");
+
     let pending = wait_for_configs(&args.tmp_dir, args.poll_secs, args.timeout_secs, args.expected_mounts);
     if pending.is_empty() {
         error!("No mount configs found after {}s, exiting", args.timeout_secs);
@@ -135,8 +143,9 @@ fn main() {
 
         error_paths.push(error_path.clone());
         let vfs_registry = Arc::clone(&vfs_registry);
+        let rt_handle = runtime.handle().clone();
         handles.push(std::thread::spawn(move || {
-            run_mount(fuse_fds, mount.mount_args, error_path, vfs_registry);
+            run_mount(fuse_fds, mount.mount_args, error_path, vfs_registry, rt_handle);
         }));
     }
 
@@ -345,14 +354,20 @@ fn write_error(path: &Path, msg: &str) {
     let _ = std::fs::write(path, msg);
 }
 
-fn run_mount(fuse_fds: Vec<OwnedFd>, mount_args: MountArgs, error_path: PathBuf, vfs_registry: VfsRegistry) {
+fn run_mount(
+    fuse_fds: Vec<OwnedFd>,
+    mount_args: MountArgs,
+    error_path: PathBuf,
+    vfs_registry: VfsRegistry,
+    runtime: tokio::runtime::Handle,
+) {
     let label = mount_args.source.label();
 
-    // build() panics on auth/config errors (e.g. invalid token, CAS 401).
-    // Catch the panic so we can write the error to the error file for the
-    // CSI driver to report as FailedMount.
+    // build_with_runtime() panics on auth/config errors (e.g. invalid token,
+    // CAS 401). Catch the panic so we can write the error to the error file
+    // for the CSI driver to report as FailedMount.
     let setup = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        build(mount_args.source, mount_args.options, false)
+        build_with_runtime(mount_args.source, mount_args.options, false, runtime)
     })) {
         Ok(s) => s,
         Err(panic) => {
