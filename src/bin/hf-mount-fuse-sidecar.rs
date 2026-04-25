@@ -19,7 +19,7 @@ use clap::Parser;
 use tracing::{error, info, warn};
 
 use hf_mount::fuse::mount_fuse;
-use hf_mount::setup::{Args as MountArgs, build_with_runtime, init_tracing, raise_fd_limit};
+use hf_mount::setup::{Args as MountArgs, build_runtime, build_with_runtime, init_tracing, raise_fd_limit};
 use hf_mount::virtual_fs::VirtualFs;
 
 /// Set of running mounts, exposed to the SIGTERM handler so it can drain
@@ -104,10 +104,7 @@ fn main() {
     // One tokio runtime shared across all volumes. Each `build_with_runtime`
     // call below borrows its handle, avoiding N full multi-threaded runtimes
     // (~4 worker threads each) for N volumes. See #96.
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .expect("Failed to create tokio runtime");
+    let runtime = build_runtime();
 
     let pending = wait_for_configs(&args.tmp_dir, args.poll_secs, args.timeout_secs, args.expected_mounts);
     if pending.is_empty() {

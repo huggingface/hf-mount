@@ -236,16 +236,21 @@ pub fn init_tracing(daemon: bool) {
 
 // ── Build runtime + VFS (spawns threads) ─────────────────────────────
 
+/// Build a multi-threaded tokio runtime suitable for hf-mount.
+pub fn build_runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("Failed to create tokio runtime")
+}
+
 /// Build tokio runtime, storage client, Hub client, and VFS.
 /// `is_nfs` controls whether advanced writes are forced (NFS has no open/close).
 ///
 /// Owns the runtime it creates. Use `build_with_runtime` to share one runtime
 /// across multiple volumes (sidecar mode).
 pub fn build(source: Source, options: MountOptions, is_nfs: bool) -> MountSetup {
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .expect("Failed to create tokio runtime");
+    let runtime = build_runtime();
     let mut setup = build_with_runtime(source, options, is_nfs, runtime.handle().clone());
     setup._owned_runtime = Some(runtime);
     setup
