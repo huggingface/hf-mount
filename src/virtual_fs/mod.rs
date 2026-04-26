@@ -329,7 +329,7 @@ impl VirtualFs {
         let mut to_evict = Vec::with_capacity(candidates.len());
         let mut iter = candidates.into_iter();
         loop {
-            let chunk: Vec<(u64, u64, String)> = iter.by_ref().take(INVAL_BATCH_SIZE).collect();
+            let chunk: Vec<(u64, u64, Arc<str>)> = iter.by_ref().take(INVAL_BATCH_SIZE).collect();
             if chunk.is_empty() {
                 break;
             }
@@ -667,7 +667,7 @@ impl VirtualFs {
                 .children
                 .iter()
                 .filter(|c| {
-                    let in_listing = seen_names.contains(&c.name) || seen_dirs.contains(&c.name);
+                    let in_listing = seen_names.contains(&*c.name) || seen_dirs.contains(&*c.name);
                     if in_listing {
                         return false;
                     }
@@ -1239,7 +1239,7 @@ impl VirtualFs {
                 entries.push(VirtualFsDirEntry {
                     ino: child.inode,
                     kind: child.kind,
-                    name: child_ref.name.clone(),
+                    name: child_ref.name.to_string(),
                 });
             }
         }
