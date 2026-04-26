@@ -324,12 +324,10 @@ impl VirtualFs {
         }
 
         let mut to_evict = Vec::with_capacity(candidates.len());
-        let mut iter = candidates.into_iter();
-        loop {
-            let chunk: Vec<(u64, u64, String)> = iter.by_ref().take(INVAL_BATCH_SIZE).collect();
-            if chunk.is_empty() {
-                break;
-            }
+        let mut candidates = candidates;
+        while !candidates.is_empty() {
+            let take_n = candidates.len().min(INVAL_BATCH_SIZE);
+            let chunk: Vec<(u64, u64, String)> = candidates.drain(..take_n).collect();
             let invalidator = self.entry_invalidator.clone();
             let result = tokio::task::spawn_blocking(move || {
                 let Some(invalidate_entry) = invalidator.get() else {
@@ -348,21 +346,24 @@ impl VirtualFs {
                 (evicted, false)
             })
             .await;
-            match result {
+            let stop = match result {
                 Ok((mut chunk_inos, stop)) => {
                     to_evict.append(&mut chunk_inos);
-                    if stop {
-                        break;
-                    }
+                    stop
                 }
                 Err(e) => {
                     warn!("lru_sweep: invalidation batch joined with error: {e}");
-                    break;
+                    true
                 }
+            };
+            if stop {
+                break;
             }
-            // Pause so the kernel can drain reverse-notify and concurrent
-            // FUSE ops can make progress.
-            tokio::time::sleep(INVAL_BATCH_PAUSE).await;
+            if !candidates.is_empty() {
+                // Pause so the kernel can drain reverse-notify and concurrent
+                // FUSE ops can make progress. Skip on the final batch.
+                tokio::time::sleep(INVAL_BATCH_PAUSE).await;
+            }
         }
 
         if to_evict.is_empty() {
