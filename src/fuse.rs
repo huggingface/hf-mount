@@ -54,11 +54,20 @@ impl FuseAdapter {
     }
 
     fn open_flags(&self) -> FopenFlags {
+        let mut flags = FopenFlags::empty();
         if self.direct_io {
-            FopenFlags::FOPEN_DIRECT_IO
-        } else {
-            FopenFlags::empty()
+            flags |= FopenFlags::FOPEN_DIRECT_IO;
+        } else if self.read_only {
+            // Read-only mounts: hold the page cache across opens. Without
+            // this, the kernel invalidates the page cache on every open(),
+            // forcing a full FUSE READ traversal even when the file's data
+            // is already resident from a previous read. With it, warm
+            // reloads of e.g. transformers `from_pretrained` go from ~4 s
+            // to ~0.7 s on a 5 GiB safetensors. Safe here because nothing
+            // mutates the file from below in read-only mode.
+            flags |= FopenFlags::FOPEN_KEEP_CACHE;
         }
+        flags
     }
 
     /// Return a `VirtualFsAttr` to the kernel while bumping the inode's
