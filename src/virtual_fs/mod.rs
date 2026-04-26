@@ -16,7 +16,7 @@ mod flush;
 pub mod inode;
 mod poll;
 mod prefetch;
-use crate::xet::{StagingCoordinator, StagingDir, StreamingWriterOps, XetOps};
+use crate::xet::{DownloadStreamOps, StagingCoordinator, StagingDir, StreamingWriterOps, XetOps};
 use inode::{InodeEntry, InodeKind, InodeTable};
 use prefetch::{FetchPlan, PrefetchState};
 
@@ -92,6 +92,44 @@ pub struct VfsConfig {
 /// Exception: setattr(truncate) holds inode_table.write() across File::create
 /// / set_len syscalls (microseconds) to prevent write() from updating
 /// inode.size between the file truncation and the metadata update.
+/// Heuristic: does this file look like a tensor checkpoint that ML loaders
+/// will mmap? When true, we widen RangeDownload fetches so a kernel-split
+/// pread doesn't become 32 CAS round-trips.
+fn is_mmap_friendly(full_path: &str) -> bool {
+    let lower = full_path.to_ascii_lowercase();
+    lower.ends_with(".safetensors")
+        || lower.ends_with(".bin")
+        || lower.ends_with(".pt")
+        || lower.ends_with(".gguf")
+}
+
+/// Background-prefetch helper: stream the byte range `[start, end)` from CAS
+/// into a single `Bytes`. Returns `None` on any error (caller falls back to
+/// the slow path on the next read).
+async fn fetch_tensor_speculative(
+    xet_sessions: &Arc<dyn XetOps>,
+    file_info: &XetFileInfo,
+    start: u64,
+    end: u64,
+) -> Option<Bytes> {
+    let mut stream = xet_sessions.download_stream_boxed(file_info, start, Some(end)).ok()?;
+    let mut buf = BytesMut::with_capacity((end - start) as usize);
+    loop {
+        match stream.next().await {
+            Ok(Some(chunk)) => buf.extend_from_slice(&chunk),
+            Ok(None) => break,
+            Err(e) => {
+                debug!("speculative: stream error at offset {}: {}", start, e);
+                return None;
+            }
+        }
+        if (buf.len() as u64) + start >= end {
+            break;
+        }
+    }
+    Some(buf.freeze())
+}
+
 pub struct VirtualFs {
     runtime: tokio::runtime::Handle,
     hub_client: Arc<dyn HubOps>,
@@ -1377,11 +1415,11 @@ impl VirtualFs {
             (true, None) if fe.xet_hash.is_empty() && fe.size > 0 => {
                 self.await_pending_commit(ino).await?;
                 let fe = self.get_file_entry(ino)?;
-                self.open_lazy(ino, fe.xet_hash, fe.size)
+                self.open_lazy(ino, fe.xet_hash, fe.size, &fe.full_path).await
             }
 
             // Remote xet-backed file — lazy CAS range reads.
-            _ if !fe.xet_hash.is_empty() => self.open_lazy(ino, fe.xet_hash, fe.size),
+            _ if !fe.xet_hash.is_empty() => self.open_lazy(ino, fe.xet_hash, fe.size, &fe.full_path).await,
 
             // Plain LFS/git file without xet hash — HTTP download to staging cache.
             _ if fe.size > 0 => {
@@ -1414,17 +1452,43 @@ impl VirtualFs {
             }
 
             // Empty file (size=0, no hash).
-            _ => self.open_lazy(ino, String::new(), 0),
+            _ => self.open_lazy(ino, String::new(), 0, &fe.full_path).await,
         }
     }
 
-    /// Allocate a lazy file handle backed by a prefetch buffer.
-    fn open_lazy(&self, ino: u64, xet_hash: String, size: u64) -> VirtualFsResult<u64> {
-        let prefetch = Arc::new(tokio::sync::Mutex::new(PrefetchState::new(
-            xet_hash,
-            size,
-            self.direct_io,
-        )));
+    /// Allocate a lazy file handle backed by a prefetch buffer. For
+    /// `.safetensors` files we also try to parse the JSON header at open
+    /// time so the prefetch logic can align fetches on tensor boundaries.
+    /// Header parse failure (or any non-safetensors content) silently falls
+    /// back to the generic mmap-friendly path.
+    async fn open_lazy(&self, ino: u64, xet_hash: String, size: u64, full_path: &str) -> VirtualFsResult<u64> {
+        let mmap_hint = is_mmap_friendly(full_path);
+        let is_safetensors = full_path.to_ascii_lowercase().ends_with(".safetensors");
+        let mut state = PrefetchState::new(xet_hash.clone(), size, self.direct_io, mmap_hint);
+
+        if is_safetensors && size > 8 && !xet_hash.is_empty() {
+            match self.fetch_safetensors_layout(&xet_hash, size).await {
+                Some((layout, warm_buf)) => {
+                    debug!(
+                        "open_lazy: parsed safetensors layout for {}: {} tensors, warm_buf={}KB",
+                        full_path,
+                        layout.len(),
+                        warm_buf.len() / 1024,
+                    );
+                    state.set_tensor_layout(layout);
+                    // Speculatively seed the forward buffer with the bytes we
+                    // already pulled to parse the header. The first reads
+                    // (header introspection + start of tensor 0) hit the
+                    // buffer with zero added latency.
+                    state.seed_forward_buffer(0, warm_buf);
+                }
+                None => {
+                    debug!("open_lazy: safetensors header parse failed for {}, using mmap_hint floor", full_path);
+                }
+            }
+        }
+
+        let prefetch = Arc::new(tokio::sync::Mutex::new(state));
         let file_handle = self.alloc_file_handle();
         self.inode_table.read().expect("inodes poisoned").bump_open_handles(ino);
         self.open_files
@@ -1434,26 +1498,93 @@ impl VirtualFs {
         Ok(file_handle)
     }
 
+    /// Fetch and parse the safetensors header. Returns the per-tensor offset
+    /// table AND the bytes that were pulled to read the header (typically a
+    /// 1 MiB probe), so the caller can seed the prefetch buffer with them
+    /// rather than throw them away. None on any I/O or parse error.
+    async fn fetch_safetensors_layout(&self, xet_hash: &str, file_size: u64) -> Option<(Vec<(u64, u64)>, Bytes)> {
+        // Most safetensors headers are < 1 MiB. Pull a generous initial slice
+        // so we get the length prefix and the full JSON in one round-trip,
+        // and the leading bytes of tensor 0 as a free side effect.
+        const HEADER_PROBE: u64 = 1_048_576;
+        let probe_end = HEADER_PROBE.min(file_size);
+        let file_info = XetFileInfo::new(xet_hash.to_string(), file_size);
+        let mut stream = match self.xet_sessions.download_stream_boxed(&file_info, 0, Some(probe_end)) {
+            Ok(s) => s,
+            Err(e) => {
+                debug!("safetensors header fetch: stream open failed: {}", e);
+                return None;
+            }
+        };
+        let mut buf = BytesMut::with_capacity(probe_end as usize);
+        loop {
+            match stream.next().await {
+                Ok(Some(chunk)) => buf.extend_from_slice(&chunk),
+                Ok(None) => break,
+                Err(e) => {
+                    debug!("safetensors header fetch: stream error: {}", e);
+                    return None;
+                }
+            }
+            if (buf.len() as u64) >= probe_end {
+                break;
+            }
+        }
+        if buf.len() < 8 {
+            return None;
+        }
+        let header_len = u64::from_le_bytes(buf[..8].try_into().ok()?);
+        if header_len == 0 || header_len > 64 * 1_048_576 {
+            return None;
+        }
+        let needed = (8 + header_len) as usize;
+        if buf.len() < needed {
+            let mut more = match self.xet_sessions.download_stream_boxed(
+                &file_info,
+                buf.len() as u64,
+                Some((8 + header_len).min(file_size)),
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    debug!("safetensors header fetch (extension): stream open failed: {}", e);
+                    return None;
+                }
+            };
+            while buf.len() < needed {
+                match more.next().await {
+                    Ok(Some(chunk)) => buf.extend_from_slice(&chunk),
+                    Ok(None) => break,
+                    Err(_) => return None,
+                }
+            }
+            if buf.len() < needed {
+                return None;
+            }
+        }
+        let layout = prefetch::parse_safetensors_layout(header_len, &buf[8..needed], file_size)?;
+        Some((layout, buf.freeze()))
+    }
+
     /// Fetch data for the prefetch buffer. Uses the persistent stream for sequential
     /// reads (with automatic (re)start), or opens a temporary stream with retries
     /// for range/seek access. Returns EIO if all attempts fail.
-    async fn fetch_data(
+    /// Unlocked variant: caller is responsible for taking the stream out of the
+    /// PrefetchState mutex before calling, and putting it back after (if returned).
+    /// This lets the network I/O run without holding the mutex, allowing parallel
+    /// RangeDownloads from multiple readers (and parallel reads on the buffer fast
+    /// path while a fetch is in flight).
+    #[allow(clippy::too_many_arguments)]
+    async fn fetch_data_unlocked(
         &self,
-        prefetch_state: &mut PrefetchState,
+        xet_hash: &str,
+        xet_file_size: u64,
+        mut first_stream: Option<Box<dyn DownloadStreamOps>>,
         cursor: u64,
         plan: &FetchPlan,
         file_size: u64,
-    ) -> std::result::Result<(VecDeque<Bytes>, usize), i32> {
+    ) -> std::result::Result<(VecDeque<Bytes>, usize, Option<Box<dyn DownloadStreamOps>>), i32> {
         const MAX_ATTEMPTS: u32 = 3;
-        let file_info = XetFileInfo::new(prefetch_state.xet_hash.clone(), prefetch_state.file_size);
-
-        // Take the persistent stream before the loop (sequential reads).
-        // first_stream.take() only returns Some on the first iteration.
-        let mut first_stream = if plan.strategy.is_stream() {
-            prefetch_state.stream.take()
-        } else {
-            None
-        };
+        let file_info = XetFileInfo::new(xet_hash.to_string(), xet_file_size);
 
         for attempt in 0..MAX_ATTEMPTS {
             let stream = match first_stream.take() {
@@ -1518,6 +1649,7 @@ impl VirtualFs {
 
                 // Early EOF sanity check: only meaningful when we got some data
                 // (zero-data EOF is just a failed attempt, handled by retry below)
+                let mut stream_to_return: Option<Box<dyn DownloadStreamOps>> = None;
                 if stream_eof && total > 0 {
                     let stream_total = cursor + total as u64;
                     if stream_total < file_size {
@@ -1528,7 +1660,7 @@ impl VirtualFs {
                             total,
                             file_size,
                             file_size - stream_total,
-                            prefetch_state.xet_hash,
+                            xet_hash,
                         );
                         debug_assert!(
                             false,
@@ -1536,16 +1668,13 @@ impl VirtualFs {
                         );
                     }
                 } else if plan.strategy.is_stream() && !failed {
-                    // Keep stream alive for future sequential reads
-                    prefetch_state.stream = Some(stream);
+                    // Keep stream alive for future sequential reads (caller restores into state).
+                    stream_to_return = Some(stream);
                 }
 
                 if total > 0 {
-                    debug!(
-                        "prefetch fetch: cursor={}, got={}, window={}",
-                        cursor, total, prefetch_state.window_size,
-                    );
-                    return Ok((chunks, total));
+                    debug!("prefetch fetch: cursor={}, got={}", cursor, total,);
+                    return Ok((chunks, total, stream_to_return));
                 }
             }
 
@@ -1556,7 +1685,7 @@ impl VirtualFs {
 
         error!(
             "prefetch: all {} fetch attempts failed: cursor={}, hash={}",
-            MAX_ATTEMPTS, cursor, prefetch_state.xet_hash,
+            MAX_ATTEMPTS, cursor, xet_hash,
         );
         Err(libc::EIO)
     }
@@ -1603,77 +1732,134 @@ impl VirtualFs {
                 }
             }
             ReadTarget::Remote { prefetch } => {
-                let mut prefetch_state = prefetch.lock().await;
+                // Phase 1: try the buffer fast path under a quick lock, then drop.
+                let (file_size, mut response, mut cursor, to_read) = {
+                    let mut state = prefetch.lock().await;
+                    let file_size = state.file_size;
 
-                let file_size = prefetch_state.file_size;
-
-                // Past EOF
-                if offset >= file_size {
-                    return Ok((Bytes::new(), true));
-                }
-
-                // Maximum bytes we should return (capped at file boundary).
-                let to_read = ((size as u64).min(file_size - offset)) as usize;
-
-                // IMPORTANT: Never return a short read unless at real EOF.
-                // The Linux FUSE kernel module shrinks i_size on short reads
-                // (fuse_read_update_size), which makes subsequent reads return
-                // 0 bytes and truncates the file from the application's view.
-
-                let mut response = BytesMut::with_capacity(to_read);
-                let mut cursor = offset;
-
-                // Fast path: forward buffer has enough data (common case, zero-copy).
-                if let Some(data) = prefetch_state.try_serve_forward(offset, size) {
-                    if data.len() == to_read {
-                        debug!("prefetch hit (forward): offset={}, len={}", offset, data.len());
-                        let eof = offset + data.len() as u64 >= file_size;
-                        return Ok((data, eof));
+                    // Past EOF
+                    if offset >= file_size {
+                        return Ok((Bytes::new(), true));
                     }
-                    cursor += data.len() as u64;
-                    response.extend_from_slice(&data);
-                } else if let Some(data) = prefetch_state.try_serve_seek(offset, size) {
-                    // Seek window: only reachable when forward buffer has no data
-                    // at this offset (backward seek). Zero-copy on full hit.
-                    if data.len() == to_read {
-                        debug!("prefetch hit (seek): offset={}, len={}", offset, data.len());
-                        let eof = offset + data.len() as u64 >= file_size;
-                        return Ok((data, eof));
+
+                    let to_read = ((size as u64).min(file_size - offset)) as usize;
+                    let mut response = BytesMut::with_capacity(to_read);
+                    let mut cursor = offset;
+
+                    // Promote a speculative buffer match into the forward
+                    // buffer BEFORE attempting to serve, so the (mutating)
+                    // try_serve_forward isn't called twice in direct-io
+                    // mode where it drains consumed bytes. This guarantees
+                    // each fast-path probe is invoked at most once.
+                    if state.would_serve_speculative(offset) {
+                        state.try_promote_speculative(offset);
+                        debug!("prefetch hit (speculative): offset={}", offset);
                     }
-                    cursor += data.len() as u64;
-                    response.extend_from_slice(&data);
-                }
 
-                // Assembly loop: fetch more data until we have to_read bytes.
-                // Only reached at prefetch window boundaries or cache misses.
-                while response.len() < to_read {
-                    let remaining = (to_read - response.len()) as u32;
-                    let plan = prefetch_state.prepare_fetch(cursor, remaining);
-                    debug!(
-                        "prefetch miss: cursor={}, remaining={}, strategy={:?}, fetch_size={}, \
-                         buf_start={}, file_size={}, has_stream={}",
-                        cursor,
-                        remaining,
-                        plan.strategy,
-                        plan.fetch_size,
-                        prefetch_state.buf_start,
-                        file_size,
-                        prefetch_state.stream.is_some(),
-                    );
-
-                    let (chunks, total) = self.fetch_data(&mut prefetch_state, cursor, &plan, file_size).await?;
-
-                    prefetch_state.store_fetched(cursor, chunks, total);
-
-                    // Drain freshly filled buffer into response
-                    let remaining = (to_read - response.len()) as u32;
-                    if let Some(data) = prefetch_state.try_serve_forward(cursor, remaining) {
+                    if let Some(data) = state.try_serve_forward(offset, size) {
+                        if data.len() == to_read {
+                            let eof = offset + data.len() as u64 >= file_size;
+                            return Ok((data, eof));
+                        }
                         cursor += data.len() as u64;
                         response.extend_from_slice(&data);
+                    } else if let Some(data) = state.try_serve_seek(offset, size) {
+                        if data.len() == to_read {
+                            let eof = offset + data.len() as u64 >= file_size;
+                            return Ok((data, eof));
+                        }
+                        cursor += data.len() as u64;
+                        response.extend_from_slice(&data);
+                    }
+                    (file_size, response, cursor, to_read)
+                };
+
+                // Phase 2: assembly loop. Plan + take stream under lock, fetch
+                // OUTSIDE the lock (so other readers can do their own RangeDownloads
+                // in parallel and the fast path stays hot), then re-lock to store.
+                while response.len() < to_read {
+                    let remaining = (to_read - response.len()) as u32;
+
+                    // Quick lock: prepare fetch, take stream out (if stream-strategy).
+                    // Stream is owned by the fetcher for the duration of this fetch;
+                    // other readers that miss while we're fetching will start their
+                    // own bounded RangeDownload (one extra round-trip, no contention).
+                    let (xet_hash, xet_file_size, plan, stream_taken) = {
+                        let mut state = prefetch.lock().await;
+                        let plan = state.prepare_fetch(cursor, remaining);
+                        let stream_taken = if plan.strategy.is_stream() { state.stream.take() } else { None };
+                        debug!(
+                            "prefetch miss: cursor={}, remaining={}, strategy={:?}, fetch_size={}, \
+                             buf_start={}, file_size={}",
+                            cursor, remaining, plan.strategy, plan.fetch_size, state.buf_start, file_size,
+                        );
+                        (state.xet_hash.clone(), state.file_size, plan, stream_taken)
+                    };
+
+                    // Network I/O — no lock held.
+                    let (chunks, total, stream_to_return) = self
+                        .fetch_data_unlocked(
+                            &xet_hash,
+                            xet_file_size,
+                            stream_taken,
+                            cursor,
+                            &plan,
+                            file_size,
+                        )
+                        .await?;
+
+                    // Quick lock: store + restore stream + drain.
+                    {
+                        let mut state = prefetch.lock().await;
+                        // store_fetched now takes ownership of the stream
+                        // atomically — buffer and stream are paired, so a
+                        // future ContinueStream cannot use a stream whose
+                        // cursor doesn't match `buf_start + chunks_len`.
+                        state.store_fetched(cursor, chunks, total, stream_to_return);
+                        let remaining = (to_read - response.len()) as u32;
+                        if let Some(data) = state.try_serve_forward(cursor, remaining) {
+                            cursor += data.len() as u64;
+                            response.extend_from_slice(&data);
+                        }
                     }
                 }
 
                 let eof = cursor == file_size;
+
+                // Phase 3: speculative prefetch of tensor i+1 if we just
+                // crossed the halfway mark of tensor i. Background, never
+                // blocks the read response.
+                // Atomic claim: choose AND mark inflight under one lock to
+                // close the TOCTOU between concurrent readers (would
+                // otherwise double-spawn the same prefetch).
+                let speculation = {
+                    let mut state = prefetch.lock().await;
+                    state
+                        .claim_speculative_prefetch(offset, size)
+                        .map(|(start, end)| (state.xet_hash.clone(), state.file_size, start, end))
+                };
+                if let Some((xet_hash, xet_file_size, spec_start, spec_end)) = speculation {
+                    let prefetch_clone = prefetch.clone();
+                    let xet_sessions = self.xet_sessions.clone();
+                    self.runtime.spawn(async move {
+                        let file_info = XetFileInfo::new(xet_hash, xet_file_size);
+                        let result =
+                            fetch_tensor_speculative(&xet_sessions, &file_info, spec_start, spec_end).await;
+                        let mut state = prefetch_clone.lock().await;
+                        match result {
+                            Some(bytes) => {
+                                debug!(
+                                    "speculative: stored tensor at offset {} ({} KiB)",
+                                    spec_start,
+                                    bytes.len() / 1024
+                                );
+                                state.store_speculative(spec_start, bytes);
+                            }
+                            None => state.clear_speculative_inflight(spec_start),
+                        }
+                    });
+                }
+
                 Ok((response.freeze(), eof))
             }
         }

@@ -1,9 +1,68 @@
 use std::collections::VecDeque;
 
 use bytes::{Bytes, BytesMut};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::xet::DownloadStreamOps;
+
+/// Parse a safetensors JSON header into a sorted list of `(start, end)`
+/// absolute file offsets, one per tensor. `header_len` is the value of the
+/// first u64 LE in the file; `header_json` is the next `header_len` bytes.
+///
+/// Returns `None` on any parse failure (the file may not actually be
+/// safetensors, even if the extension says so) — callers fall back to the
+/// generic `MIN_RANGE_FETCH_MMAP` path.
+pub(crate) fn parse_safetensors_layout(
+    header_len: u64,
+    header_json: &[u8],
+    file_size: u64,
+) -> Option<Vec<(u64, u64)>> {
+    let value: serde_json::Value = serde_json::from_slice(header_json).ok()?;
+    let obj = value.as_object()?;
+    // `data_offsets` in the header are relative to the start of the data
+    // section, which lives at byte `8 + header_len` in the file.
+    let data_origin = 8u64.checked_add(header_len)?;
+    let mut layout: Vec<(u64, u64)> = Vec::with_capacity(obj.len());
+    for (key, v) in obj {
+        if key == "__metadata__" {
+            continue;
+        }
+        let offsets = v.get("data_offsets").and_then(|x| x.as_array())?;
+        if offsets.len() != 2 {
+            warn!("safetensors header: tensor {} has malformed data_offsets", key);
+            return None;
+        }
+        let start_rel = offsets[0].as_u64()?;
+        let end_rel = offsets[1].as_u64()?;
+        if end_rel < start_rel {
+            warn!("safetensors header: tensor {} has reversed data_offsets", key);
+            return None;
+        }
+        let start = data_origin.checked_add(start_rel)?;
+        let end = data_origin.checked_add(end_rel)?;
+        if end > file_size {
+            warn!(
+                "safetensors header: tensor {} extends past file_size ({} > {})",
+                key, end, file_size
+            );
+            return None;
+        }
+        layout.push((start, end));
+    }
+    layout.sort();
+    // Detect overlaps: each tensor must end before (or at) the next one starts.
+    for w in layout.windows(2) {
+        if w[0].1 > w[1].0 {
+            warn!("safetensors header: tensors overlap at offset {}", w[1].0);
+            return None;
+        }
+    }
+    if layout.is_empty() {
+        warn!("safetensors header parsed but contained no tensors");
+        return None;
+    }
+    Some(layout)
+}
 
 // ── Constants ──────────────────────────────────────────────────────────
 // TODO: expose these as CLI args / config to allow runtime tuning without recompilation.
@@ -20,6 +79,25 @@ pub(crate) const SEEK_WINDOW: usize = 1_048_576; // 1 MiB
 /// stream. Reads within this range are served by draining/discarding the
 /// gap from the current stream (cheaper than a new CAS request).
 pub(crate) const FORWARD_SKIP: u64 = 16 * 1_048_576; // 16 MiB
+/// Minimum bytes to fetch on a RangeDownload (random/seek). Prevents the
+/// pathological "32×128 KiB CAS round-trips per 4 MiB pread" pattern when the
+/// kernel splits a userspace read into FUSE chunks: with this floor, the first
+/// chunk pulls a fat block, subsequent chunks of the same pread hit the
+/// forward buffer.
+pub(crate) const MIN_RANGE_FETCH: u64 = 4 * 1_048_576; // 4 MiB
+/// Larger floor used when the file looks mmap-friendly (e.g. `.safetensors`,
+/// `.bin`, `.gguf`). transformers/torch loaders mmap these files and access
+/// them via many small page-sized reads, which appear random to FUSE but are
+/// actually a scan within a tensor. Pulling 32 MiB on the first miss covers
+/// most of a tensor in one CAS round-trip. Used as fallback when the
+/// tensor-aligned path (`tensor_end_for`) doesn't apply.
+pub(crate) const MIN_RANGE_FETCH_MMAP: u64 = 32 * 1_048_576; // 32 MiB
+/// Cap on a tensor-aligned RangeDownload. Some safetensors tensors are
+/// hundreds of MiB (a single big embedding); fetching the whole thing at the
+/// first FUSE chunk would block other readers and waste CAS bandwidth if
+/// only the first few MiB are actually consumed. 64 MiB is roughly one CAS
+/// xorb, which is the natural batching granularity downstream.
+pub(crate) const MAX_TENSOR_FETCH: u64 = 64 * 1_048_576; // 64 MiB
 
 // ── FetchPlan ────────────────────────────────────────────────────────
 
@@ -82,10 +160,35 @@ pub(crate) struct PrefetchState {
     pub(crate) stream: Option<Box<dyn DownloadStreamOps>>,
     /// When true, drain consumed bytes after serving (no re-read from buffer).
     forward_only: bool,
+    /// File looks like a tensor checkpoint that's typically mmap'd (safetensors,
+    /// pytorch bin, gguf). Bumps the floor on RangeDownload fetches so a
+    /// pages-faulted scan within a tensor doesn't hammer CAS once per FUSE chunk.
+    pub(crate) mmap_hint: bool,
+    /// Sorted list of `(start, end)` absolute file offsets, one per tensor.
+    /// Populated only for `.safetensors` files whose header parsed at open
+    /// time. Used in `prepare_fetch` to align `fetch_size` on tensor
+    /// boundaries — fetch exactly the remainder of the tensor that contains
+    /// `offset`, no more, no less. Avoids both over-fetch into the next
+    /// tensor and the per-FUSE-chunk CAS round-trip pattern.
+    pub(crate) tensor_layout: Option<Vec<(u64, u64)>>,
+    /// Speculative buffer for tensor i+1, fetched in the background while
+    /// tensor i is being scanned. Matched by absolute offset; promoted to
+    /// the forward buffer on a hit.
+    pub(crate) speculative: Option<SpeculativeBuf>,
+    /// Tensor start currently being prefetched in the background (to avoid
+    /// double-spawn). Cleared when the task stores its result.
+    pub(crate) speculative_inflight: Option<u64>,
+}
+
+/// Background-prefetched bytes for the tensor following the one currently
+/// being scanned.
+pub(crate) struct SpeculativeBuf {
+    pub(crate) start: u64,
+    pub(crate) data: Bytes,
 }
 
 impl PrefetchState {
-    pub(crate) fn new(xet_hash: String, file_size: u64, forward_only: bool) -> Self {
+    pub(crate) fn new(xet_hash: String, file_size: u64, forward_only: bool, mmap_hint: bool) -> Self {
         Self {
             xet_hash,
             file_size,
@@ -98,6 +201,123 @@ impl PrefetchState {
             window_size: INITIAL_WINDOW,
             stream: None,
             forward_only,
+            mmap_hint,
+            tensor_layout: None,
+            speculative: None,
+            speculative_inflight: None,
+        }
+    }
+
+    pub(crate) fn set_tensor_layout(&mut self, layout: Vec<(u64, u64)>) {
+        self.tensor_layout = Some(layout);
+    }
+
+    /// Pre-populate the forward buffer with bytes we already pulled (e.g. the
+    /// safetensors header probe). The first reads at this offset hit the
+    /// buffer with zero added latency, hiding the open-time CAS round-trip.
+    pub(crate) fn seed_forward_buffer(&mut self, offset: u64, data: Bytes) {
+        if data.is_empty() {
+            return;
+        }
+        self.buf_start = offset;
+        self.chunks_len = data.len();
+        self.chunks_front_offset = 0;
+        self.chunks.clear();
+        self.chunks.push_back(data);
+    }
+
+    /// If `offset` falls inside a known tensor, return that tensor's end
+    /// (absolute file offset). Returns `None` for the safetensors header
+    /// region (offset < 8 + header_len, before the first tensor) or when no
+    /// layout is available.
+    fn tensor_end_for(&self, offset: u64) -> Option<u64> {
+        let (_, end) = self.tensor_for(offset)?;
+        Some(end)
+    }
+
+    /// `(start, end)` of the tensor containing `offset`, or `None`.
+    fn tensor_for(&self, offset: u64) -> Option<(u64, u64)> {
+        let layout = self.tensor_layout.as_ref()?;
+        let idx = layout.partition_point(|(start, _end)| *start <= offset);
+        if idx == 0 {
+            return None;
+        }
+        let (start, end) = layout[idx - 1];
+        if offset >= start && offset < end { Some((start, end)) } else { None }
+    }
+
+    /// Atomic claim of the next-tensor speculative fetch. Returns
+    /// `(next_start, next_end_capped)` if speculation should run AND records
+    /// the claim by setting `speculative_inflight`. Concurrent callers will
+    /// get `None` from the second invocation, so at most one task is spawned
+    /// per tensor (closes the TOCTOU between "decide" and "mark inflight").
+    pub(crate) fn claim_speculative_prefetch(&mut self, offset: u64, size: u32) -> Option<(u64, u64)> {
+        const SPECULATION_TRIGGER_RATIO: u64 = 4; // 3/4 of the way through
+        const MIN_CUR_TENSOR_FOR_SPEC: u64 = 4 * 1_048_576;
+        const MIN_NEXT_TENSOR_FOR_SPEC: u64 = 1_048_576;
+
+        let layout = self.tensor_layout.as_ref()?;
+        let (cur_start, cur_end) = self.tensor_for(offset)?;
+        let cur_len = cur_end - cur_start;
+        if cur_len < MIN_CUR_TENSOR_FOR_SPEC {
+            return None;
+        }
+        let trigger = cur_start + cur_len * (SPECULATION_TRIGGER_RATIO - 1) / SPECULATION_TRIGGER_RATIO;
+        if offset + size as u64 <= trigger {
+            return None;
+        }
+        let idx = layout.partition_point(|(s, _)| *s <= cur_start);
+        let (next_start, next_end) = *layout.get(idx)?;
+        if next_end - next_start < MIN_NEXT_TENSOR_FOR_SPEC {
+            return None;
+        }
+        if let Some(spec) = &self.speculative
+            && spec.start == next_start
+        {
+            return None;
+        }
+        if self.speculative_inflight == Some(next_start) {
+            return None;
+        }
+        let capped_end = (next_start + MAX_TENSOR_FETCH).min(next_end);
+        // Atomic claim: mark inflight here so a concurrent caller in another
+        // task observes it and skips the duplicate spawn.
+        self.speculative_inflight = Some(next_start);
+        Some((next_start, capped_end))
+    }
+
+    /// Pure check: would `try_promote_speculative(offset)` succeed? Used to
+    /// decide whether to invoke the (mutating) promote without first
+    /// touching the forward-buffer probe.
+    pub(crate) fn would_serve_speculative(&self, offset: u64) -> bool {
+        let Some(spec) = &self.speculative else { return false };
+        let spec_end = spec.start + spec.data.len() as u64;
+        offset >= spec.start && offset < spec_end
+    }
+
+    /// If `offset` lies in the speculative buffer, take ownership of it and
+    /// promote to the forward buffer.
+    pub(crate) fn try_promote_speculative(&mut self, offset: u64) -> bool {
+        if !self.would_serve_speculative(offset) {
+            return false;
+        }
+        let spec = self.speculative.take().unwrap();
+        self.seed_forward_buffer(spec.start, spec.data);
+        true
+    }
+
+    /// Store the result of a background prefetch task.
+    pub(crate) fn store_speculative(&mut self, start: u64, data: Bytes) {
+        self.speculative = Some(SpeculativeBuf { start, data });
+        if self.speculative_inflight == Some(start) {
+            self.speculative_inflight = None;
+        }
+    }
+
+    /// Clear the inflight marker if a prefetch failed without storing.
+    pub(crate) fn clear_speculative_inflight(&mut self, tensor_start: u64) {
+        if self.speculative_inflight == Some(tensor_start) {
+            self.speculative_inflight = None;
         }
     }
 
@@ -161,11 +381,21 @@ impl PrefetchState {
         };
 
         let needed = (size as u64).min(self.file_size - offset);
+        let range_floor = if self.mmap_hint {
+            MIN_RANGE_FETCH_MMAP
+        } else {
+            MIN_RANGE_FETCH
+        };
         // For sequential reads, prefetch ahead (window_size) to amortise latency.
-        // For random/seek reads (RangeDownload), fetch only what's needed — any
-        // extra bytes are likely wasted on the next random seek.
+        // For random/seek reads (RangeDownload), prefer a tensor-aligned fetch
+        // when we have a parsed safetensors layout: pull up to the end of the
+        // current tensor (capped at MAX_TENSOR_FETCH), but never below
+        // `range_floor` so a read near the end of a small tensor still pays
+        // off the round-trip with a meaningful fetch.
+        let to_tensor_end = self.tensor_end_for(offset).map(|e| e - offset).unwrap_or(0);
+        let range_fetch = to_tensor_end.max(range_floor).min(MAX_TENSOR_FETCH);
         let fetch_size = match strategy {
-            FetchStrategy::RangeDownload => needed,
+            FetchStrategy::RangeDownload => needed.max(range_fetch),
             _ => needed.max(self.window_size),
         }
         .min(self.file_size - offset);
@@ -174,11 +404,27 @@ impl PrefetchState {
     }
 
     /// Store freshly downloaded chunks in the forward buffer.
-    pub(crate) fn store_fetched(&mut self, offset: u64, chunks: VecDeque<Bytes>, total: usize) {
+    /// Atomically install a freshly fetched buffer AND the stream that
+    /// produced it. The stream's read cursor must be at `offset + total`.
+    /// Concurrent writers may interleave under the lock-released-during-fetch
+    /// pattern, but each `store_fetched` is itself atomic: the stream slot
+    /// always reflects the LAST writer's buffer, so a future `ContinueStream`
+    /// read uses a stream whose cursor matches `buf_start + chunks_len`.
+    /// Pass `stream_to_return = None` when the fetch was range-based (no
+    /// persistent stream produced); any older stream is dropped because its
+    /// cursor is now unrelated to the new buffer offset.
+    pub(crate) fn store_fetched(
+        &mut self,
+        offset: u64,
+        chunks: VecDeque<Bytes>,
+        total: usize,
+        stream_to_return: Option<Box<dyn DownloadStreamOps>>,
+    ) {
         self.chunks = chunks;
         self.chunks_len = total;
         self.chunks_front_offset = 0;
         self.buf_start = offset;
+        self.stream = stream_to_return;
     }
 
     /// Effective length of the front chunk, accounting for partially consumed bytes.
@@ -317,11 +563,14 @@ fn read_chunk_range(chunks: &VecDeque<Bytes>, front_offset: usize, skip: usize, 
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+
     use super::*;
 
     /// Helper: create a PrefetchState pre-loaded with chunks at a given offset.
     fn ps_with_chunks(buf_start: u64, chunks: &[&[u8]]) -> PrefetchState {
-        let mut ps = PrefetchState::new("hash".into(), u64::MAX, false);
+        let mut ps = PrefetchState::new("hash".into(), u64::MAX, false, false);
         ps.buf_start = buf_start;
         for chunk in chunks {
             let b = Bytes::copy_from_slice(chunk);
@@ -382,7 +631,7 @@ mod tests {
     #[test]
     fn seek_window_basic() {
         // Backward seek window serves previously consumed bytes.
-        let mut ps = PrefetchState::new("hash".into(), u64::MAX, false);
+        let mut ps = PrefetchState::new("hash".into(), u64::MAX, false, false);
         ps.seek_data.extend(&[10, 20, 30, 40, 50]);
         ps.seek_start = 100;
         let result = ps.try_serve_seek(102, 2).unwrap();
@@ -391,7 +640,7 @@ mod tests {
 
     #[test]
     fn seek_window_out_of_range() {
-        let mut ps = PrefetchState::new("hash".into(), u64::MAX, false);
+        let mut ps = PrefetchState::new("hash".into(), u64::MAX, false, false);
         ps.seek_data.extend(&[1, 2, 3]);
         ps.seek_start = 100;
         assert!(ps.try_serve_seek(99, 1).is_none());
@@ -451,7 +700,7 @@ mod tests {
 
     #[test]
     fn empty_buffer() {
-        let mut ps = PrefetchState::new("hash".into(), 100, false);
+        let mut ps = PrefetchState::new("hash".into(), 100, false, false);
         assert!(ps.try_serve_forward(0, 10).is_none());
     }
 
@@ -468,7 +717,7 @@ mod tests {
     #[test]
     fn seek_zero_size() {
         // A zero-size seek read at a valid offset should return Some(empty).
-        let mut ps = PrefetchState::new("hash".into(), u64::MAX, false);
+        let mut ps = PrefetchState::new("hash".into(), u64::MAX, false, false);
         ps.seek_data.extend(&[1, 2, 3]);
         ps.seek_start = 0;
         let result = ps.try_serve_seek(0, 0).unwrap();
@@ -529,7 +778,7 @@ mod tests {
     // ── Forward-only mode tests ─────────────────────────────────────
 
     fn ps_forward_only(buf_start: u64, chunks: &[&[u8]]) -> PrefetchState {
-        let mut ps = PrefetchState::new("hash".into(), u64::MAX, true);
+        let mut ps = PrefetchState::new("hash".into(), u64::MAX, true, false);
         ps.buf_start = buf_start;
         for chunk in chunks {
             let b = Bytes::copy_from_slice(chunk);
@@ -559,5 +808,147 @@ mod tests {
         // Re-read at same offset hits (data retained)
         let result = ps.try_serve_forward(0, 3).unwrap();
         assert_eq!(&result[..], &[1, 2, 3]);
+    }
+
+    // ── Safetensors header parser ───────────────────────────────────
+
+    fn make_header(json: &str) -> (u64, Vec<u8>) {
+        let bytes = json.as_bytes().to_vec();
+        (bytes.len() as u64, bytes)
+    }
+
+    #[test]
+    fn safetensors_layout_rejects_offset_past_eof() {
+        // file_size = 100, but a tensor's data_offsets end at 200 (relative).
+        // With data_origin = 8 + header_len, the absolute end exceeds file_size → reject.
+        let json = r#"{"a":{"data_offsets":[0,200]}}"#;
+        let (header_len, bytes) = make_header(json);
+        let layout = parse_safetensors_layout(header_len, &bytes, 100);
+        assert!(layout.is_none(), "should reject tensor extending past file_size");
+    }
+
+    #[test]
+    fn safetensors_layout_rejects_overlapping_tensors() {
+        // a: 0..50, b: 30..80 → overlap at 30..50
+        let json = r#"{"a":{"data_offsets":[0,50]}, "b":{"data_offsets":[30,80]}}"#;
+        let (header_len, bytes) = make_header(json);
+        let big_file = 1_000_000;
+        let layout = parse_safetensors_layout(header_len, &bytes, big_file);
+        assert!(layout.is_none(), "should reject overlapping tensors");
+    }
+
+    #[test]
+    fn safetensors_layout_rejects_overflow_arithmetic() {
+        // header_len = u64::MAX would overflow data_origin = 8 + header_len.
+        let json = r#"{"a":{"data_offsets":[0,1]}}"#;
+        let (_, bytes) = make_header(json);
+        let layout = parse_safetensors_layout(u64::MAX, &bytes, u64::MAX);
+        assert!(layout.is_none(), "should reject when 8 + header_len overflows");
+    }
+
+    #[test]
+    fn safetensors_layout_accepts_valid() {
+        let json = r#"{"a":{"data_offsets":[0,10]}, "b":{"data_offsets":[10,20]}}"#;
+        let (header_len, bytes) = make_header(json);
+        let file_size = 8 + header_len + 20;
+        let layout = parse_safetensors_layout(header_len, &bytes, file_size).unwrap();
+        assert_eq!(layout.len(), 2);
+        let origin = 8 + header_len;
+        assert_eq!(layout[0], (origin, origin + 10));
+        assert_eq!(layout[1], (origin + 10, origin + 20));
+    }
+
+    // ── store_fetched stream invalidation ──────────────────────────
+
+    #[test]
+    fn store_fetched_atomically_pairs_buffer_and_stream() {
+        // Buffer + stream are paired: store_fetched always replaces the
+        // stream slot with the one passed in. A None drops any stale stream
+        // (range-style fetches that don't produce a persistent stream).
+        struct EmptyStream;
+        #[async_trait::async_trait]
+        impl crate::xet::DownloadStreamOps for EmptyStream {
+            async fn next(&mut self) -> crate::error::Result<Option<Bytes>> {
+                Ok(None)
+            }
+        }
+        let mut ps = PrefetchState::new("h".into(), 1024, false, false);
+        ps.buf_start = 0;
+        ps.chunks_len = 10;
+        ps.chunks.push_back(Bytes::from(vec![0u8; 10]));
+        ps.stream = Some(Box::new(EmptyStream));
+        // Range-style store: stream_to_return = None → stream slot cleared.
+        ps.store_fetched(100, VecDeque::from(vec![Bytes::from(vec![1u8; 5])]), 5, None);
+        assert!(ps.stream.is_none(), "range-style store must clear stale stream");
+        assert_eq!(ps.buf_start, 100);
+        assert_eq!(ps.chunks_len, 5);
+    }
+
+    #[test]
+    fn store_fetched_replaces_stream_on_contiguous_overwrite() {
+        // Even when the new buffer is contiguous with the old, the freshly
+        // provided stream replaces whatever was there. Closes the
+        // concurrent-contiguous race where a slower writer would otherwise
+        // leave its earlier-positioned stream installed under a buffer
+        // produced by a faster writer.
+        struct ProbeStream {
+            calls: Arc<AtomicUsize>,
+        }
+        #[async_trait::async_trait]
+        impl crate::xet::DownloadStreamOps for ProbeStream {
+            async fn next(&mut self) -> crate::error::Result<Option<Bytes>> {
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(None)
+            }
+        }
+        let old_calls = Arc::new(AtomicUsize::new(0));
+        let new_calls = Arc::new(AtomicUsize::new(0));
+
+        let mut ps = PrefetchState::new("h".into(), 1024, false, false);
+        ps.buf_start = 0;
+        ps.chunks_len = 10;
+        ps.chunks.push_back(Bytes::from(vec![0u8; 10]));
+        ps.stream = Some(Box::new(ProbeStream { calls: old_calls.clone() }));
+        ps.store_fetched(
+            10,
+            VecDeque::from(vec![Bytes::from(vec![1u8; 5])]),
+            5,
+            Some(Box::new(ProbeStream { calls: new_calls.clone() })),
+        );
+        // Drive the installed stream once and verify it was the *new* one.
+        let mut s = ps.stream.take().expect("contiguous store must keep a stream slot");
+        let _ = futures::executor::block_on(s.next());
+        assert_eq!(new_calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(old_calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    // ── claim_speculative_prefetch atomicity ───────────────────────
+
+    #[test]
+    fn claim_speculative_prefetch_marks_inflight() {
+        let mut ps = PrefetchState::new("h".into(), u64::MAX, false, true);
+        // Layout: tensor 0 at [100, 100+8MiB), tensor 1 at [100+8MiB, 100+10MiB)
+        let t0_start = 100u64;
+        let t0_end = t0_start + 8 * 1_048_576;
+        let t1_start = t0_end;
+        let t1_end = t1_start + 2 * 1_048_576;
+        ps.tensor_layout = Some(vec![(t0_start, t0_end), (t1_start, t1_end)]);
+        // Read past 75% of tensor 0 → should claim.
+        let trigger = t0_start + (t0_end - t0_start) * 3 / 4 + 1;
+        let claim = ps.claim_speculative_prefetch(trigger, 1024);
+        assert_eq!(claim, Some((t1_start, t1_end)));
+        assert_eq!(ps.speculative_inflight, Some(t1_start));
+        // Second call must not double-claim.
+        let claim2 = ps.claim_speculative_prefetch(trigger, 1024);
+        assert!(claim2.is_none(), "second claim must yield None when inflight");
+    }
+
+    #[test]
+    fn claim_speculative_skips_small_tensors() {
+        let mut ps = PrefetchState::new("h".into(), u64::MAX, false, true);
+        // Small current tensor (1 MiB) → speculation off.
+        ps.tensor_layout = Some(vec![(0, 1_048_576), (1_048_576, 100_000_000)]);
+        let claim = ps.claim_speculative_prefetch(1_000_000, 1024);
+        assert!(claim.is_none(), "small current tensor must not trigger spec");
     }
 }
