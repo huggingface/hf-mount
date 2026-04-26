@@ -22,10 +22,12 @@ pub enum InodeKind {
 }
 
 /// A directory child entry: stores the name on the parent→child edge.
+/// `name` is an `Arc<str>` so it can be shared with the corresponding
+/// `InodeEntry.name` — only one heap allocation per inode/parent edge.
 #[derive(Debug, Clone)]
 pub struct DirChild {
     pub ino: u64,
-    pub name: String,
+    pub name: Arc<str>,
 }
 
 /// Eviction-control bookkeeping. All atomics so the FUSE hot path can
@@ -91,7 +93,9 @@ impl EvictionState {
 pub struct InodeEntry {
     pub inode: u64,
     pub parent: u64,
-    pub name: String,
+    /// Shared with the parent's `DirChild.name` (same `Arc`) — one
+    /// allocation per parent→child edge.
+    pub name: Arc<str>,
     /// Full path from the mount root.
     pub full_path: Arc<str>,
     pub kind: InodeKind,
@@ -213,7 +217,7 @@ impl InodeTable {
         let root = InodeEntry {
             inode: ROOT_INODE,
             parent: ROOT_INODE,
-            name: String::new(),
+            name: Arc::from(""),
             full_path: root_path.clone(),
             kind: InodeKind::Directory,
             size: 0,
@@ -344,7 +348,7 @@ impl InodeTable {
     /// we actually return — O(N log max) with max cloned Strings, vs the
     /// naive sort-and-truncate that allocates for every filter-passing
     /// entry before discarding most of them.
-    pub(crate) fn lru_candidates(&self, max: usize) -> Vec<(u64, u64, String)> {
+    pub(crate) fn lru_candidates(&self, max: usize) -> Vec<(u64, u64, Arc<str>)> {
         if max == 0 {
             return Vec::new();
         }
@@ -450,6 +454,7 @@ impl InodeTable {
         for (parent_ino, evicted_set) in &by_parent {
             if let Some(parent) = self.inodes.get_mut(parent_ino) {
                 parent.children.retain(|c| !evicted_set.contains(&c.ino));
+                parent.children.shrink_to_fit();
                 // Force readdir to re-fetch the listing so evicted inodes can
                 // be re-materialized on next access.
                 parent.children_loaded = false;
@@ -467,7 +472,7 @@ impl InodeTable {
     pub fn lookup_child(&self, parent: u64, name: &str) -> Option<&InodeEntry> {
         let parent_entry = self.inodes.get(&parent)?;
         for child in &parent_entry.children {
-            if child.name == name
+            if &*child.name == name
                 && let Some(entry) = self.inodes.get(&child.ino)
             {
                 return Some(entry);
@@ -520,12 +525,14 @@ impl InodeTable {
 
         let inode = self.next_inode.fetch_add(1, Ordering::Relaxed);
         let touch_seq = self.touch_counter.fetch_add(1, Ordering::Relaxed);
-        let child_name = name.clone();
+        // One Arc allocation per name, shared by InodeEntry.name and the
+        // parent's DirChild.name — clones below are refcount bumps.
+        let name_arc: Arc<str> = Arc::from(name);
         let full_path_arc: Arc<str> = Arc::from(full_path);
         let entry = InodeEntry {
             inode,
             parent,
-            name,
+            name: name_arc.clone(),
             full_path: full_path_arc.clone(),
             kind,
             size,
@@ -558,7 +565,7 @@ impl InodeTable {
         if let Some(parent_entry) = self.inodes.get_mut(&parent) {
             parent_entry.children.push(DirChild {
                 ino: inode,
-                name: child_name,
+                name: name_arc,
             });
             // POSIX: new subdirectory's ".." links to parent
             if kind == InodeKind::Directory {
@@ -759,14 +766,14 @@ impl InodeTable {
         // Find child ino and build full_path in a single parent lookup
         let (child_ino, full_path) = {
             let parent_entry = self.inodes.get(&parent)?;
-            let ino = parent_entry.children.iter().find(|c| c.name == name).map(|c| c.ino)?;
+            let ino = parent_entry.children.iter().find(|c| &*c.name == name).map(|c| c.ino)?;
             let path = child_path(&parent_entry.full_path, name);
             (ino, path)
         };
 
         // Remove the DirChild from parent
         if let Some(parent_entry) = self.inodes.get_mut(&parent)
-            && let Some(pos) = parent_entry.children.iter().position(|c| c.name == name)
+            && let Some(pos) = parent_entry.children.iter().position(|c| &*c.name == name)
         {
             parent_entry.children.remove(pos);
         }
@@ -793,16 +800,19 @@ impl InodeTable {
 
         // Detach from old parent
         if let Some(old_p) = self.inodes.get_mut(&old_parent)
-            && let Some(pos) = old_p.children.iter().position(|c| c.ino == ino && c.name == old_name)
+            && let Some(pos) = old_p.children.iter().position(|c| c.ino == ino && &*c.name == old_name)
         {
             old_p.children.remove(pos);
         }
+
+        // Allocate the new name once, share with the InodeEntry below.
+        let new_name_arc: Arc<str> = Arc::from(new_name);
 
         // Attach to new parent
         if let Some(new_p) = self.inodes.get_mut(&new_parent) {
             new_p.children.push(DirChild {
                 ino,
-                name: new_name.to_string(),
+                name: new_name_arc.clone(),
             });
         }
 
@@ -819,7 +829,7 @@ impl InodeTable {
         // Update child's parent/name
         if let Some(entry) = self.inodes.get_mut(&ino) {
             entry.parent = new_parent;
-            entry.name = new_name.to_string();
+            entry.name = new_name_arc;
         }
     }
 
@@ -873,7 +883,7 @@ mod tests {
         assert!(found.is_some(), "should find child by name");
         let found = found.unwrap();
         assert_eq!(found.inode, ino);
-        assert_eq!(found.name, "hello.txt");
+        assert_eq!(&*found.name, "hello.txt");
         assert_eq!(found.full_path.as_ref(), "hello.txt");
         assert_eq!(found.kind, InodeKind::File);
         assert_eq!(found.size, 42);
@@ -1040,7 +1050,7 @@ mod tests {
         assert!(removed.is_some());
         let removed = removed.unwrap();
         assert_eq!(removed.inode, ino);
-        assert_eq!(removed.name, "remove_me.txt");
+        assert_eq!(&*removed.name, "remove_me.txt");
 
         // Parent's children no longer contains the inode
         let root = table.get(ROOT_INODE).unwrap();
@@ -1687,7 +1697,7 @@ mod tests {
 
         // name/parent updated on the inode
         let entry = table.get(file_ino).unwrap();
-        assert_eq!(entry.name, "new.txt");
+        assert_eq!(&*entry.name, "new.txt");
         assert_eq!(entry.parent, ROOT_INODE);
 
         // nlink unchanged (same parent, file not directory)
@@ -1746,7 +1756,7 @@ mod tests {
 
         // name/parent updated
         let entry = table.get(file_ino).unwrap();
-        assert_eq!(entry.name, "g.txt");
+        assert_eq!(&*entry.name, "g.txt");
         assert_eq!(entry.parent, dir_b);
 
         // nlink unchanged on both parents (file move, not directory)

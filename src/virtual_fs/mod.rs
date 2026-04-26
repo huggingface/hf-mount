@@ -25,8 +25,11 @@ use prefetch::{FetchPlan, PrefetchState};
 /// Block size reported in stat(2) for `st_blocks` calculation.
 const BLOCK_SIZE: u32 = 512;
 /// Maximum entries in the negative-lookup cache (parent_path/name → Instant).
-/// Prevents repeated Hub API calls for paths known to not exist.
-const NEG_CACHE_CAPACITY: usize = 10_000;
+/// Prevents repeated Hub API calls for paths known to not exist. Each entry
+/// holds an owned `String` key, so this cache is the dominant cost of the
+/// negative-cache pool. 1k is enough to absorb bursts; older entries roll
+/// over and a real lookup absorbs the cost on miss.
+const NEG_CACHE_CAPACITY: usize = 1_000;
 /// How long a negative-cache entry stays valid before being re-checked.
 const NEG_CACHE_TTL: Duration = Duration::from_secs(30);
 /// `notify_inval_entry` is a blocking syscall that takes the parent dir's
@@ -326,7 +329,7 @@ impl VirtualFs {
         let mut to_evict = Vec::with_capacity(candidates.len());
         let mut iter = candidates.into_iter();
         loop {
-            let chunk: Vec<(u64, u64, String)> = iter.by_ref().take(INVAL_BATCH_SIZE).collect();
+            let chunk: Vec<(u64, u64, Arc<str>)> = iter.by_ref().take(INVAL_BATCH_SIZE).collect();
             if chunk.is_empty() {
                 break;
             }
@@ -664,7 +667,7 @@ impl VirtualFs {
                 .children
                 .iter()
                 .filter(|c| {
-                    let in_listing = seen_names.contains(&c.name) || seen_dirs.contains(&c.name);
+                    let in_listing = seen_names.contains(&*c.name) || seen_dirs.contains(&*c.name);
                     if in_listing {
                         return false;
                     }
@@ -680,6 +683,10 @@ impl VirtualFs {
         }
 
         if let Some(parent) = inodes.get_mut(parent_ino) {
+            // Vec growth doubles capacity; for a one-shot readdir of a stable
+            // directory we'd otherwise keep ~50% slack forever. Trim now,
+            // since regrowth on rare child mutations is cheap.
+            parent.children.shrink_to_fit();
             parent.children_loaded = true;
         }
         Ok(())
@@ -1232,7 +1239,7 @@ impl VirtualFs {
                 entries.push(VirtualFsDirEntry {
                     ino: child.inode,
                     kind: child.kind,
-                    name: child_ref.name.clone(),
+                    name: child_ref.name.to_string(),
                 });
             }
         }

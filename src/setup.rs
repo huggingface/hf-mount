@@ -237,8 +237,13 @@ pub fn init_tracing(daemon: bool) {
 // ── Build runtime + VFS (spawns threads) ─────────────────────────────
 
 /// Build a multi-threaded tokio runtime suitable for hf-mount.
+///
+/// Async tasks live on the heap, so the per-thread stack only needs to fit
+/// the deepest sync call. 512 KB is ample and shrinks the per-worker virtual
+/// reservation from the 2 MB default.
 pub fn build_runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_multi_thread()
+        .thread_stack_size(512 * 1024)
         .enable_all()
         .build()
         .expect("Failed to create tokio runtime")

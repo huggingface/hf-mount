@@ -529,7 +529,7 @@ fn rename_clean_file() {
         let inodes = vfs.inode_table.read().unwrap();
         let entry = inodes.get(ino).unwrap();
         assert_eq!(entry.full_path.as_ref(), "dst.txt");
-        assert_eq!(entry.name, "dst.txt");
+        assert_eq!(&*entry.name, "dst.txt");
     });
 }
 
