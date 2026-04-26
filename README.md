@@ -34,13 +34,13 @@ Agentic storage: Agents don't require complex APIs or SDKs, they thrive on the f
 
 ## Install
 
-### Quick install
+### Homebrew (macOS, Linux)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/huggingface/hf-mount/main/install.sh | sh
+brew install hf-mount
 ```
 
-Installs `hf-mount` to `~/.local/bin/`. Set `INSTALL_DIR` to change the location. Supports Linux (x86_64, aarch64) and macOS (Apple Silicon).
+On macOS, this installs the NFS backend only (`hf-mount`, `hf-mount-nfs`). For the FUSE backend on macOS, download the binary manually or build from source — macFUSE is closed-source and not distributable through homebrew-core.
 
 ### Manual download
 
@@ -62,7 +62,7 @@ The NFS backend has no system dependencies. For FUSE:
 
 ### Build from source
 
-Requires Rust 1.85+.
+Requires Rust 1.89+.
 
 ```bash
 # NFS only (no system deps, works everywhere)
