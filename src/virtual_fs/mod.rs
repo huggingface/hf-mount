@@ -324,10 +324,15 @@ impl VirtualFs {
         }
 
         let mut to_evict = Vec::with_capacity(candidates.len());
-        let mut candidates = candidates;
-        while !candidates.is_empty() {
-            let take_n = candidates.len().min(INVAL_BATCH_SIZE);
-            let chunk: Vec<(u64, u64, String)> = candidates.drain(..take_n).collect();
+        let mut iter = candidates.into_iter();
+        loop {
+            let chunk: Vec<(u64, u64, String)> = iter.by_ref().take(INVAL_BATCH_SIZE).collect();
+            if chunk.is_empty() {
+                break;
+            }
+            // A short chunk means the iterator was exhausted while filling
+            // it — no need to pause after, there is nothing more to process.
+            let is_last = chunk.len() < INVAL_BATCH_SIZE;
             let invalidator = self.entry_invalidator.clone();
             let result = tokio::task::spawn_blocking(move || {
                 let Some(invalidate_entry) = invalidator.get() else {
@@ -356,14 +361,12 @@ impl VirtualFs {
                     true
                 }
             };
-            if stop {
+            if stop || is_last {
                 break;
             }
-            if !candidates.is_empty() {
-                // Pause so the kernel can drain reverse-notify and concurrent
-                // FUSE ops can make progress. Skip on the final batch.
-                tokio::time::sleep(INVAL_BATCH_PAUSE).await;
-            }
+            // Pause so the kernel can drain reverse-notify and concurrent
+            // FUSE ops can make progress.
+            tokio::time::sleep(INVAL_BATCH_PAUSE).await;
         }
 
         if to_evict.is_empty() {
