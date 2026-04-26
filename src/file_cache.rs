@@ -40,6 +40,9 @@ struct State {
 
 pub struct FileCache {
     root: PathBuf,
+    /// Per-process subdirectory under `<root>/.tmp/<pid>` for in-flight downloads.
+    /// Isolated so concurrent mounts sharing `cache_dir` don't trample each other.
+    tmp_dir: PathBuf,
     capacity: u64,
     state: RwLock<State>,
     inflight: Mutex<HashMap<String, broadcast::Sender<()>>>,
@@ -52,10 +55,13 @@ impl FileCache {
     pub fn new(cache_dir: &Path, capacity: u64) -> Result<Arc<Self>> {
         let root = cache_dir.join(FILES_DIR);
         fs::create_dir_all(&root).map_err(|e| io_err(format!("mkdir {root:?}: {e}")))?;
-        let tmp = root.join(TMP_DIR);
-        fs::create_dir_all(&tmp).map_err(|e| io_err(format!("mkdir {tmp:?}: {e}")))?;
-        // Sweep leftover .tmp files from a prior crashed run.
-        if let Ok(rd) = fs::read_dir(&tmp) {
+        // Per-process tmp dir so concurrent mounts sharing the same cache_dir
+        // don't clobber each other's in-flight downloads when one (re)starts.
+        let tmp_dir = root.join(TMP_DIR).join(std::process::id().to_string());
+        fs::create_dir_all(&tmp_dir).map_err(|e| io_err(format!("mkdir {tmp_dir:?}: {e}")))?;
+        // Reap our own leftovers from a prior crashed run with the same pid (rare
+        // but harmless). Other pids' tmp dirs are left alone.
+        if let Ok(rd) = fs::read_dir(&tmp_dir) {
             for entry in rd.flatten() {
                 let _ = fs::remove_file(entry.path());
             }
@@ -70,6 +76,7 @@ impl FileCache {
         );
         Ok(Arc::new(Self {
             root,
+            tmp_dir,
             capacity,
             state: RwLock::new(state),
             inflight: Mutex::new(HashMap::new()),
@@ -183,6 +190,13 @@ impl FileCache {
         if hash.is_empty() {
             return Ok(());
         }
+        // Files that don't fit in the cache would be downloaded only to be
+        // immediately evicted (taking warm entries down with them), so skip
+        // them entirely. The post-download size check below is the safety net
+        // when `expected_size` was unknown.
+        if expected_size.is_some_and(|s| s > self.capacity) {
+            return Ok(());
+        }
 
         let (is_leader, mut rx) = {
             let mut inflight = self.inflight.lock().expect("file_cache.inflight poisoned");
@@ -230,10 +244,7 @@ impl FileCache {
             fs::create_dir_all(parent).map_err(|e| io_err(format!("mkdir {parent:?}: {e}")))?;
         }
 
-        let tmp_path = self
-            .root
-            .join(TMP_DIR)
-            .join(format!("{hash}.{}.{}", std::process::id(), ulid::Ulid::new()));
+        let tmp_path = self.tmp_dir.join(format!("{hash}.{}", ulid::Ulid::new()));
 
         if let Err(e) = fetch(tmp_path.clone()).await {
             let _ = fs::remove_file(&tmp_path);
@@ -250,6 +261,16 @@ impl FileCache {
             return Err(Error::Xet(format!(
                 "file_cache: size mismatch for {hash}: got {actual_size}, expected {expected}",
             )));
+        }
+        // Defense in depth: if the size wasn't known up front, drop oversized
+        // files now rather than letting eviction nuke the warm cache.
+        if actual_size > self.capacity {
+            let _ = fs::remove_file(&tmp_path);
+            warn!(
+                "file_cache: skipping {hash}: size {actual_size} exceeds capacity {}",
+                self.capacity
+            );
+            return Ok(());
         }
 
         fs::rename(&tmp_path, &final_path).map_err(|e| io_err(format!("rename {tmp_path:?} → {final_path:?}: {e}")))?;
@@ -421,6 +442,24 @@ mod tests {
         cache.forget("fade123456").await;
         assert!(!cache.contains("fade123456").await);
         assert!(cache.try_open("fade123456").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn oversized_file_does_not_evict_warm_cache() {
+        // Capacity 30: warm A (20 bytes) fits. B with size 100 must be rejected
+        // without touching A.
+        let dir = tempfile::tempdir().unwrap();
+        let cache = FileCache::new(dir.path(), 30).unwrap();
+        populate_with(&cache, "aa00", vec![b'a'; 20]).await;
+        cache
+            .populate("bb00", Some(100), |dest| async move {
+                write_file(&dest, &[b'b'; 100]);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(cache.contains("aa00").await, "A must survive oversized B");
+        assert!(!cache.contains("bb00").await, "B is too large to cache");
     }
 
     #[tokio::test]
