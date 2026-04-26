@@ -2145,7 +2145,7 @@ impl VirtualFs {
         if let Some(entry) = inodes.get_mut(ino) {
             entry.apply_commit(
                 file_info.hash(),
-                file_info.file_size(),
+                file_info.file_size().unwrap_or(0),
                 channel.dirty_generation_at_open.load(Ordering::Relaxed),
             );
         }
@@ -2154,7 +2154,7 @@ impl VirtualFs {
             "Committed file: {} (hash={}, size={})",
             full_path,
             file_info.hash(),
-            file_info.file_size(),
+            file_info.file_size().unwrap_or(0),
         );
 
         Ok(())

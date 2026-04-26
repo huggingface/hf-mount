@@ -881,7 +881,7 @@ pub async fn run_revalidation_test(
     eprintln!(
         "  [revalidation] new xet_hash={}, size={}",
         xet_hash,
-        file_info.file_size()
+        file_info.file_size().unwrap_or(0)
     );
 
     let mtime_ms = std::time::SystemTime::now()

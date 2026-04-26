@@ -7,6 +7,7 @@ use tracing::info;
 use xet_data::processing::configurations::TranslatorConfig;
 use xet_data::processing::data_client::default_config;
 use xet_data::processing::{CacheConfig, FileDownloadSession, create_remote_client, get_cache};
+use xet_runtime::core::XetContext;
 
 use crate::cached_xet_client::CachedXetClient;
 use crate::hub_api::{HubApiClient, HubTokenRefresher, SourceKind, parse_repo_id, split_path_prefix};
@@ -329,7 +330,8 @@ pub fn build_with_runtime(
     }
 
     let refresher = hub_client.token_refresher(read_only);
-    let cas_config = build_cas_config(&runtime, &refresher);
+    let xet_ctx = XetContext::default().expect("Failed to create XetContext");
+    let cas_config = build_cas_config(&xet_ctx, &runtime, &refresher);
 
     // Ensure cache directory exists and is writable (needed for staging even without chunk cache).
     std::fs::create_dir_all(&options.cache_dir)
@@ -345,7 +347,7 @@ pub fn build_with_runtime(
             cache_directory: xorbs_dir,
             cache_size: options.cache_size,
         };
-        Some(get_cache(&config).expect("Failed to create chunk cache"))
+        Some(get_cache(&xet_ctx.config, &config).expect("Failed to create chunk cache"))
     };
 
     let raw_client = runtime
@@ -356,9 +358,9 @@ pub fn build_with_runtime(
         ))
         .expect("Failed to create storage client");
     let cached_client = CachedXetClient::new(raw_client);
-    let download_session = FileDownloadSession::from_client(cached_client.clone(), None, xorb_cache);
+    let download_session = FileDownloadSession::from_client(&xet_ctx, cached_client.clone(), xorb_cache.clone());
     let upload_config = if read_only { None } else { Some(cas_config) };
-    let xet_sessions = XetSessions::new(download_session, upload_config, cached_client);
+    let xet_sessions = XetSessions::new(xet_ctx, download_session, upload_config, cached_client, xorb_cache);
 
     let advanced_writes = options.advanced_writes || (is_nfs && !read_only);
     // Repos need a staging dir for HTTP download cache (open_readonly),
@@ -489,15 +491,19 @@ pub fn raise_fd_limit() {
     }
 }
 
-fn build_cas_config(runtime: &tokio::runtime::Handle, refresher: &Arc<HubTokenRefresher>) -> Arc<TranslatorConfig> {
+fn build_cas_config(
+    ctx: &XetContext,
+    runtime: &tokio::runtime::Handle,
+    refresher: &Arc<HubTokenRefresher>,
+) -> Arc<TranslatorConfig> {
     let jwt = runtime
         .block_on(refresher.fetch_initial())
         .unwrap_or_else(|e| panic!("Failed to get storage token: {e}"));
     info!("Got storage token for endpoint: {}", jwt.cas_url);
     Arc::new(
         default_config(
+            ctx,
             jwt.cas_url,
-            None,
             Some((jwt.access_token, jwt.exp)),
             Some(refresher.clone()),
             None,
