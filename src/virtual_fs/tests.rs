@@ -3475,7 +3475,7 @@ fn lru_sweep_drops_clean_staging_file() {
         vfs.set_entry_invalidator(Box::new(|_, _| true));
 
         // Force the sweep to consider every file as overflow.
-        let evicted = vfs.lru_evict_sweep(0);
+        let evicted = vfs.lru_evict_sweep(0).await;
         assert!(evicted >= 1, "sweep should evict the clean file");
         assert!(vfs.inode_table.read().unwrap().get(ino).is_none());
         assert!(!staging_path.exists(), "sweep must drop the staging file");
@@ -3719,7 +3719,7 @@ fn lru_keeps_inode_table_bounded_under_lookup_churn() {
 
             // Drive one sweep per completed directory, matching the prod
             // cadence (sweep runs on an interval, not per insert).
-            vfs.lru_evict_sweep(SOFT_LIMIT);
+            vfs.lru_evict_sweep(SOFT_LIMIT).await;
 
             let len = vfs.inode_table.read().unwrap().len();
             peak = peak.max(len);
