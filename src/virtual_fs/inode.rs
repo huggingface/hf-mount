@@ -1,6 +1,6 @@
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 pub const ROOT_INODE: u64 = 1;
@@ -188,12 +188,10 @@ pub struct InodeTable {
     /// by the LRU evictor to order entries by recency without a wall-clock
     /// syscall on the hot path.
     touch_counter: AtomicU64,
-    /// Target size for the LRU evictor. 0 = disabled. When non-zero, the
-    /// async sweep in `VirtualFs::lru_sweep_loop` picks the oldest-touched
-    /// entries and asks the kernel (via FUSE `inval_entry`) to drop their
-    /// dentries; the kernel's subsequent `forget()` then shrinks the table.
-    /// The table may temporarily overshoot the cap between sweeps.
-    soft_limit: AtomicUsize,
+    /// Whether `touch()` should record recency. Armed when the inode evictor
+    /// is on (`soft_limit > 0`) or via `enable_touch_tracking()` (staging GC
+    /// needs an LRU order over staging files even with the evictor disabled).
+    touch_enabled: AtomicBool,
 }
 
 impl Default for InodeTable {
@@ -209,7 +207,7 @@ impl InodeTable {
             path_to_inode: HashMap::new(),
             next_inode: AtomicU64::new(2),
             touch_counter: AtomicU64::new(0),
-            soft_limit: AtomicUsize::new(soft_limit),
+            touch_enabled: AtomicBool::new(soft_limit > 0),
         };
 
         // Create root inode
@@ -308,16 +306,22 @@ impl InodeTable {
     }
 
     /// Snapshot a fresh counter value onto `inode.last_touched`. Atomic so
-    /// the FUSE reader pool never contends a writer. Early-out when LRU is
-    /// disabled so the common prod config pays nothing.
+    /// the FUSE reader pool never contends a writer. Early-out when no
+    /// consumer needs LRU recency so the common prod config pays nothing.
     pub(crate) fn touch(&self, inode: u64) {
-        if self.soft_limit.load(Ordering::Relaxed) == 0 {
+        if !self.touch_enabled.load(Ordering::Relaxed) {
             return;
         }
         if let Some(entry) = self.inodes.get(&inode) {
             let seq = self.touch_counter.fetch_add(1, Ordering::Relaxed);
             entry.eviction.last_touched.store(seq, Ordering::Relaxed);
         }
+    }
+
+    /// Arm `touch()` for the staging GC so its LRU order is meaningful even
+    /// when the inode evictor is off (`--inode-soft-limit 0`).
+    pub(crate) fn enable_touch_tracking(&self) {
+        self.touch_enabled.store(true, Ordering::Relaxed);
     }
 
     /// Mark an inode as "wanted to evict but blocked" so `release()` can

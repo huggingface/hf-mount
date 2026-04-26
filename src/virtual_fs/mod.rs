@@ -170,6 +170,14 @@ impl VirtualFs {
 
         let staging = Arc::new(StagingCoordinator::new(staging_dir));
 
+        // Staging GC orders eviction by `last_touched`. When the inode evictor
+        // is off (`soft_limit==0`) the touch hook is a no-op, so arm it
+        // explicitly when a staging budget is configured — otherwise the GC
+        // would fall back to arbitrary HashMap order.
+        if staging.dir().is_some_and(|sd| sd.has_budget()) {
+            inodes.read().expect("inodes poisoned").enable_touch_tracking();
+        }
+
         let flush_manager = if !config.read_only && config.advanced_writes {
             staging.dir().expect("--advanced-writes requires a staging directory");
             Some(flush::FlushManager::new(
@@ -845,7 +853,11 @@ impl VirtualFs {
         match File::open(path) {
             Ok(file) => {
                 let file_handle = self.alloc_file_handle();
-                self.inode_table.read().expect("inodes poisoned").bump_open_handles(ino);
+                {
+                    let inodes = self.inode_table.read().expect("inodes poisoned");
+                    inodes.bump_open_handles(ino);
+                    inodes.touch(ino);
+                }
                 self.open_files.write().expect("open_files poisoned").insert(
                     file_handle,
                     OpenFile::Local {
@@ -1370,7 +1382,11 @@ impl VirtualFs {
         }
 
         let file_handle = self.alloc_file_handle();
-        self.inode_table.read().expect("inodes poisoned").bump_open_handles(ino);
+        {
+            let inodes = self.inode_table.read().expect("inodes poisoned");
+            inodes.bump_open_handles(ino);
+            inodes.touch(ino);
+        }
         self.open_files.write().expect("open_files poisoned").insert(
             file_handle,
             OpenFile::Local {
@@ -1819,6 +1835,7 @@ impl VirtualFs {
                         }
                         entry.set_dirty();
                     }
+                    inodes.touch(handle_ino);
                     Ok(written)
                 }
             }
@@ -2234,6 +2251,7 @@ impl VirtualFs {
                 0
             };
             inodes.touch_parent(parent, now);
+            inodes.touch(ino);
             (ino, full_path, dirty_gen)
         };
 
