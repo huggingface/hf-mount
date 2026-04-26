@@ -7,7 +7,7 @@ use xet_client::ClientError;
 use xet_client::cas_client::adaptive_concurrency::ConnectionPermit;
 use xet_client::cas_client::{Client, ProgressCallback, URLProvider};
 use xet_client::cas_types::{
-    BatchQueryReconstructionResponse, FileRange, HexMerkleHash, QueryReconstructionResponse, XorbReconstructionTerm,
+    BatchQueryReconstructionResponse, FileRange, HexMerkleHash, QueryReconstructionResponseV2, XorbReconstructionTerm,
 };
 use xet_core_structures::merklehash::MerkleHash;
 use xet_core_structures::metadata_shard::file_structs::MDBFileInfo;
@@ -24,12 +24,12 @@ const MAX_CACHE_ENTRIES: usize = 4096;
 const CACHE_TTL: Duration = Duration::from_secs(59 * 60);
 
 struct CacheEntry {
-    response: QueryReconstructionResponse,
+    response: QueryReconstructionResponseV2,
     inserted_at: Instant,
 }
 
 impl CacheEntry {
-    fn new(response: QueryReconstructionResponse) -> Self {
+    fn new(response: QueryReconstructionResponseV2) -> Self {
         Self {
             response,
             inserted_at: Instant::now(),
@@ -94,7 +94,7 @@ impl CachedXetClient {
 /// TODO: fix P2 — add `chunk_uncompressed_sizes: Vec<u32>` (and `chunk_compressed_sizes`)
 /// to `XorbReconstructionTerm` in xet-core/xetcas so that chunk-level trimming can be
 /// replicated client-side, reducing over-fetch to zero.
-fn derive_range_response(full: &QueryReconstructionResponse, range: FileRange) -> QueryReconstructionResponse {
+fn derive_range_response(full: &QueryReconstructionResponseV2, range: FileRange) -> QueryReconstructionResponseV2 {
     let mut cur_offset: u64 = 0;
     let mut result_terms: Vec<XorbReconstructionTerm> = Vec::new();
     let mut offset_into_first: u64 = 0;
@@ -120,17 +120,17 @@ fn derive_range_response(full: &QueryReconstructionResponse, range: FileRange) -
         cur_offset = term_end;
     }
 
-    let fetch_info = full
-        .fetch_info
+    let xorbs = full
+        .xorbs
         .iter()
         .filter(|(k, _)| needed_hashes.contains(*k))
         .map(|(k, v)| (*k, v.clone()))
         .collect();
 
-    QueryReconstructionResponse {
+    QueryReconstructionResponseV2 {
         offset_into_first_range: offset_into_first,
         terms: result_terms,
-        fetch_info,
+        xorbs,
     }
 }
 
@@ -140,7 +140,7 @@ impl Client for CachedXetClient {
         &self,
         file_id: &MerkleHash,
         bytes_range: Option<FileRange>,
-    ) -> Result<Option<QueryReconstructionResponse>> {
+    ) -> Result<Option<QueryReconstructionResponseV2>> {
         let key: ReconCacheKey = (*file_id, bytes_range);
 
         // Single-flight action: either wait for an in-flight request or lead the fetch.
@@ -156,8 +156,8 @@ impl Client for CachedXetClient {
             // at chunk granularity) than what derive_range_response produces from the
             // full plan, so prefer it when available.
             enum CacheResult {
-                ExactHit(QueryReconstructionResponse),
-                FullPlan(QueryReconstructionResponse, FileRange),
+                ExactHit(QueryReconstructionResponseV2),
+                FullPlan(QueryReconstructionResponseV2, FileRange),
                 Miss,
             }
 
@@ -391,7 +391,7 @@ mod tests {
             &self,
             file_id: &MerkleHash,
             bytes_range: Option<FileRange>,
-        ) -> Result<Option<QueryReconstructionResponse>> {
+        ) -> Result<Option<QueryReconstructionResponseV2>> {
             let key = (*file_id, bytes_range);
             {
                 let mut calls = self.calls.lock().expect("calls lock poisoned");
@@ -404,10 +404,10 @@ mod tests {
             }
 
             match self.mode {
-                MockMode::ReturnSome => Ok(Some(QueryReconstructionResponse {
+                MockMode::ReturnSome => Ok(Some(QueryReconstructionResponseV2 {
                     offset_into_first_range: bytes_range.map_or(0, |r| r.start),
                     terms: Vec::new(),
-                    fetch_info: HashMap::new(),
+                    xorbs: HashMap::new(),
                 })),
                 MockMode::ReturnNone => Ok(None),
                 MockMode::ReturnErr => Err(ClientError::Other("boom".to_string())),
