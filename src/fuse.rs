@@ -53,11 +53,14 @@ impl FuseAdapter {
         }
     }
 
+    /// Per-open flags: DIRECT_IO bypasses the page cache; otherwise we ask
+    /// the kernel to retain it across opens (safe because init() negotiates
+    /// AUTO_INVAL_DATA, so the kernel invalidates on attr changes).
     fn open_flags(&self) -> FopenFlags {
         if self.direct_io {
             FopenFlags::FOPEN_DIRECT_IO
         } else {
-            FopenFlags::empty()
+            FopenFlags::FOPEN_KEEP_CACHE
         }
     }
 
@@ -140,6 +143,16 @@ impl Filesystem for FuseAdapter {
                  mmap-based readers (e.g. safetensors) may fail with EINVAL"
             );
         }
+
+        // Kernel auto-invalidates cached pages on mtime/size changes —
+        // required for FOPEN_KEEP_CACHE on writable mounts. Available
+        // since Linux 3.15 (2014); mandatory.
+        config.add_capabilities(InitFlags::FUSE_AUTO_INVAL_DATA).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                "FUSE_AUTO_INVAL_DATA not supported (kernel < 3.15)",
+            )
+        })?;
 
         // Receive O_TRUNC in open() flags instead of a separate setattr(size=0) call.
         if !self.read_only {
