@@ -496,6 +496,7 @@ pub fn make_test_vfs(
         hub,
         xet,
         staging_dir,
+        None,
         crate::virtual_fs::VfsConfig {
             read_only: opts.read_only,
             advanced_writes: opts.advanced_writes,

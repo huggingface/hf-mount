@@ -10,6 +10,7 @@ use bytes::{Bytes, BytesMut};
 use tracing::{debug, error, info, warn};
 use xet_data::processing::XetFileInfo;
 
+use crate::file_cache::FileCache;
 use crate::hub_api::{BatchOp, HubOps};
 
 mod flush;
@@ -142,6 +143,10 @@ pub struct VirtualFs {
     filter_os_files: bool,
     /// When true, prefetch buffers drain after serving (forward-only, no re-read cache).
     direct_io: bool,
+    /// Optional whole-file cache. When `Some`, opens hit the local copy if the
+    /// xet hash is already populated; misses kick a background populate so the
+    /// next open is fast. Mutually exclusive with xet-core's chunk cache.
+    file_cache: Option<Arc<FileCache>>,
 }
 
 /// Where to read file content from when opening read-only.
@@ -151,6 +156,7 @@ impl VirtualFs {
         hub_client: Arc<dyn HubOps>,
         xet_sessions: Arc<dyn XetOps>,
         staging_dir: Option<StagingDir>,
+        file_cache: Option<Arc<FileCache>>,
         config: VfsConfig,
     ) -> Arc<Self> {
         let inodes = Arc::new(RwLock::new(InodeTable::new(config.inode_soft_limit)));
@@ -221,6 +227,7 @@ impl VirtualFs {
             serve_lookup_from_cache: config.serve_lookup_from_cache,
             filter_os_files: config.filter_os_files,
             direct_io: config.direct_io,
+            file_cache,
         });
 
         // Set root inode mtime and ownership (repos use the last commit date).
@@ -784,24 +791,41 @@ impl VirtualFs {
     /// Open a local file as read-only and return the file handle.
     fn open_local_readonly(&self, ino: u64, path: &PathBuf) -> VirtualFsResult<u64> {
         match File::open(path) {
-            Ok(file) => {
-                let file_handle = self.alloc_file_handle();
-                self.inode_table.read().expect("inodes poisoned").bump_open_handles(ino);
-                self.open_files.write().expect("open_files poisoned").insert(
-                    file_handle,
-                    OpenFile::Local {
-                        ino,
-                        file: Arc::new(file),
-                        writable: false,
-                    },
-                );
-                Ok(file_handle)
-            }
+            Ok(file) => self.install_local_handle(ino, Arc::new(file), false),
             Err(e) => {
                 error!("Failed to open file {:?}: {}", path, e);
                 Err(libc::EIO)
             }
         }
+    }
+
+    /// Register an already-opened `File` as a read-only `OpenFile::Local`
+    /// handle. Used by the file_cache fast-path so the read fd stays alive
+    /// even if eviction unlinks the on-disk copy after the open.
+    fn install_local_handle(&self, ino: u64, file: Arc<File>, writable: bool) -> VirtualFsResult<u64> {
+        let file_handle = self.alloc_file_handle();
+        self.inode_table.read().expect("inodes poisoned").bump_open_handles(ino);
+        self.open_files
+            .write()
+            .expect("open_files poisoned")
+            .insert(file_handle, OpenFile::Local { ino, file, writable });
+        Ok(file_handle)
+    }
+
+    /// Fire-and-forget background populate of the whole-file cache. Failures
+    /// are logged inside `FileCache::populate`; the read path still works
+    /// via the lazy CAS handle returned to the caller.
+    fn spawn_populate_file_cache(&self, xet_hash: String, file_size: u64) {
+        let Some(fc) = self.file_cache.clone() else { return };
+        let xet = self.xet_sessions.clone();
+        self.runtime.spawn(async move {
+            let hash_for_dl = xet_hash.clone();
+            let _ = fc
+                .populate(&xet_hash, Some(file_size), move |dest| async move {
+                    xet.download_to_file(&hash_for_dl, file_size, &dest).await
+                })
+                .await;
+        });
     }
 
     /// Check if a path is in the negative cache (and not expired).
@@ -1380,8 +1404,17 @@ impl VirtualFs {
                 self.open_lazy(ino, fe.xet_hash, fe.size)
             }
 
-            // Remote xet-backed file — lazy CAS range reads.
-            _ if !fe.xet_hash.is_empty() => self.open_lazy(ino, fe.xet_hash, fe.size),
+            // Remote xet-backed file — try the whole-file cache first, then
+            // fall back to lazy CAS range reads.
+            _ if !fe.xet_hash.is_empty() => {
+                if let Some(fc) = &self.file_cache {
+                    if let Some(file) = fc.try_open(&fe.xet_hash).await {
+                        return self.install_local_handle(ino, file, false);
+                    }
+                    self.spawn_populate_file_cache(fe.xet_hash.clone(), fe.size);
+                }
+                self.open_lazy(ino, fe.xet_hash, fe.size)
+            }
 
             // Plain LFS/git file without xet hash — HTTP download to staging cache.
             _ if fe.size > 0 => {
