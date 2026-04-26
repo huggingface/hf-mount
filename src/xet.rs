@@ -1,6 +1,6 @@
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use xet_client::cas_client::Client;
@@ -172,70 +172,110 @@ impl DownloadStreamOps for DownloadStreamWrapper {
 
 /// On-disk staging area for advanced writes (random seek, read-modify-write).
 /// Not used in simple (append-only) mode.
+///
+/// Each mount gets its own random subdirectory under `cache_dir` so mounts
+/// never observe each other's staging files — no session key suffix on file
+/// names, no seeding of `bytes_used` from foreign entries, and a clean rm
+/// when the last clone is dropped.
+///
+/// Tracks disk usage via `bytes_used`. When `max_bytes > 0` and usage exceeds
+/// the limit, the flush loop garbage-collects flushed staging files. When
+/// under the limit (or unlimited), staging files persist as a read-after-write
+/// cache within the mount lifetime.
 #[derive(Clone)]
 pub struct StagingDir {
+    /// Shared root so the directory is only deleted when the last clone drops.
+    root: Arc<StagingRoot>,
+    /// Approximate bytes used by staging files on disk.
+    bytes_used: Arc<AtomicU64>,
+    /// Maximum staging bytes before GC kicks in. 0 = unlimited.
+    max_bytes: u64,
+}
+
+/// Owns the on-disk staging directory and removes it when dropped.
+struct StagingRoot {
     dir: PathBuf,
-    /// Per-session random key to make staging paths unpredictable.
-    session_key: u64,
+}
+
+impl Drop for StagingRoot {
+    fn drop(&mut self) {
+        if let Err(e) = std::fs::remove_dir_all(&self.dir) {
+            tracing::warn!("staging: failed to remove {}: {}", self.dir.display(), e);
+        }
+    }
 }
 
 impl StagingDir {
-    pub fn new(cache_dir: &Path) -> Self {
-        let dir = cache_dir.join("staging");
+    pub fn new(cache_dir: &Path, max_bytes: u64) -> Self {
+        // Random per-mount subdir so two mounts sharing cache_dir, or a mount
+        // started after a crashed previous one, never see each other's files.
+        let dir = cache_dir.join(format!("staging-{:016x}", rand_u64()));
         std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("Failed to create staging dir {:?}: {e}", dir));
+
         Self {
-            dir,
-            session_key: rand_u64(),
+            root: Arc::new(StagingRoot { dir }),
+            bytes_used: Arc::new(AtomicU64::new(0)),
+            max_bytes,
         }
     }
 
     /// Root directory of the staging area.
     pub fn root(&self) -> &Path {
-        &self.dir
+        &self.root.dir
     }
 
     /// Get the staging path for a given inode.
-    /// Deterministic within a session but unpredictable from outside.
     pub fn path(&self, inode: u64) -> PathBuf {
-        self.dir.join(format!("ino_{:x}_{:016x}", inode, self.session_key))
+        self.root.dir.join(format!("ino_{:x}", inode))
     }
-}
 
-// ── StagingCoordinator ────────────────────────────────────────────────
+    /// Size of the on-disk staging file for `inode`, or 0 if it doesn't exist.
+    pub fn file_size(&self, inode: u64) -> u64 {
+        std::fs::metadata(self.path(inode)).map(|m| m.len()).unwrap_or(0)
+    }
 
-/// Bundles the on-disk staging area with per-inode async locks so subsystems
-/// outside `VirtualFs` (e.g. flush-path GC) can take the same lock as
-/// `open_advanced_write` / `setattr(truncate)` to serialize staging I/O.
-pub(crate) struct StagingCoordinator {
-    dir: Option<StagingDir>,
-    locks: Mutex<HashMap<u64, Arc<tokio::sync::Mutex<()>>>>,
-}
-
-impl StagingCoordinator {
-    pub(crate) fn new(dir: Option<StagingDir>) -> Self {
-        Self {
-            dir,
-            locks: Mutex::new(HashMap::new()),
+    /// Remove the staging file for `inode`, ignoring NotFound.
+    /// Returns `true` if the file was actually removed.
+    pub fn try_remove(&self, inode: u64) -> bool {
+        let path = self.path(inode);
+        let size = self.file_size(inode);
+        match std::fs::remove_file(&path) {
+            Ok(()) => {
+                self.resize_bytes(size, 0);
+                true
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => {
+                tracing::warn!("staging GC: failed to remove ino={}: {}", inode, e);
+                false
+            }
         }
     }
 
-    pub(crate) fn dir(&self) -> Option<&StagingDir> {
-        self.dir.as_ref()
+    /// Whether staging usage exceeds the configured limit.
+    pub fn is_over_limit(&self) -> bool {
+        self.max_bytes > 0 && self.bytes_used.load(Ordering::Relaxed) > self.max_bytes
     }
 
-    pub(crate) fn path(&self, ino: u64) -> Option<PathBuf> {
-        self.dir.as_ref().map(|sd| sd.path(ino))
+    /// Whether a non-zero disk budget was configured (i.e. GC is armed).
+    pub fn has_budget(&self) -> bool {
+        self.max_bytes > 0
     }
 
-    /// Get or create the per-inode async lock. Held across awaits (download,
-    /// unlink) so concurrent opens and flush-path GC can't interleave.
-    pub(crate) fn lock(&self, ino: u64) -> Arc<tokio::sync::Mutex<()>> {
-        self.locks
-            .lock()
-            .expect("staging locks poisoned")
-            .entry(ino)
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone()
+    #[cfg(test)]
+    pub fn bytes_used(&self) -> u64 {
+        self.bytes_used.load(Ordering::Relaxed)
+    }
+
+    /// Apply the net change when a staging file goes from `old` to `new` bytes.
+    /// Saturates at zero on shrink to tolerate accounting drift. Covers
+    /// plain add (old=0), plain remove (new=0), and in-place resize.
+    pub fn resize_bytes(&self, old: u64, new: u64) {
+        self.bytes_used
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_sub(old).saturating_add(new))
+            })
+            .ok();
     }
 }
 

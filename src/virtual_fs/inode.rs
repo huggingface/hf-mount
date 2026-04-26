@@ -1,6 +1,6 @@
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 pub const ROOT_INODE: u64 = 1;
@@ -114,7 +114,7 @@ pub struct InodeEntry {
     /// `xet_hash` matched (so we didn't race with `poll_remote_changes`).
     /// Cleared whenever poll advances `xet_hash` out of band.
     pub staging_is_current: bool,
-    /// ETag from the last HEAD revalidation (used for non-xet plain git/LFS files).
+    /// ETag from the last HEAD revalidation (used for non-Xet files).
     pub etag: Option<String>,
     /// Dirty generation counter. 0 = clean. Each mutation increments the counter.
     /// `flush_batch` snapshots the generation before upload; after commit it only
@@ -188,12 +188,10 @@ pub struct InodeTable {
     /// by the LRU evictor to order entries by recency without a wall-clock
     /// syscall on the hot path.
     touch_counter: AtomicU64,
-    /// Target size for the LRU evictor. 0 = disabled. When non-zero, the
-    /// async sweep in `VirtualFs::lru_sweep_loop` picks the oldest-touched
-    /// entries and asks the kernel (via FUSE `inval_entry`) to drop their
-    /// dentries; the kernel's subsequent `forget()` then shrinks the table.
-    /// The table may temporarily overshoot the cap between sweeps.
-    soft_limit: AtomicUsize,
+    /// Whether `touch()` should record recency. Armed when the inode evictor
+    /// is on (`soft_limit > 0`) or via `enable_touch_tracking()` (staging GC
+    /// needs an LRU order over staging files even with the evictor disabled).
+    touch_enabled: AtomicBool,
 }
 
 impl Default for InodeTable {
@@ -209,7 +207,7 @@ impl InodeTable {
             path_to_inode: HashMap::new(),
             next_inode: AtomicU64::new(2),
             touch_counter: AtomicU64::new(0),
-            soft_limit: AtomicUsize::new(soft_limit),
+            touch_enabled: AtomicBool::new(soft_limit > 0),
         };
 
         // Create root inode
@@ -308,16 +306,22 @@ impl InodeTable {
     }
 
     /// Snapshot a fresh counter value onto `inode.last_touched`. Atomic so
-    /// the FUSE reader pool never contends a writer. Early-out when LRU is
-    /// disabled so the common prod config pays nothing.
+    /// the FUSE reader pool never contends a writer. Early-out when no
+    /// consumer needs LRU recency so the common prod config pays nothing.
     pub(crate) fn touch(&self, inode: u64) {
-        if self.soft_limit.load(Ordering::Relaxed) == 0 {
+        if !self.touch_enabled.load(Ordering::Relaxed) {
             return;
         }
         if let Some(entry) = self.inodes.get(&inode) {
             let seq = self.touch_counter.fetch_add(1, Ordering::Relaxed);
             entry.eviction.last_touched.store(seq, Ordering::Relaxed);
         }
+    }
+
+    /// Arm `touch()` for the staging GC so its LRU order is meaningful even
+    /// when the inode evictor is off (`--inode-soft-limit 0`).
+    pub(crate) fn enable_touch_tracking(&self) {
+        self.touch_enabled.store(true, Ordering::Relaxed);
     }
 
     /// Mark an inode as "wanted to evict but blocked" so `release()` can
@@ -378,6 +382,26 @@ impl InodeTable {
             .into_iter()
             .filter_map(|(_, ino)| self.inodes.get(&ino).map(|e| (ino, e.parent, e.name.clone())))
             .collect()
+    }
+
+    /// Return file inodes that are clean, have no open handles, and no
+    /// pending renames, sorted by `last_touched` ascending. Used by the
+    /// staging GC to reclaim the oldest-accessed staging files first.
+    pub(crate) fn staging_gc_candidates(&self) -> Vec<u64> {
+        let mut picks: Vec<(u64, u64)> = self
+            .inodes
+            .values()
+            .filter(|e| {
+                e.kind == InodeKind::File
+                    && e.nlink > 0
+                    && !e.is_dirty()
+                    && e.pending_deletes.is_empty()
+                    && e.eviction.open_handles.load(Ordering::Relaxed) == 0
+            })
+            .map(|e| (e.eviction.last_touched.load(Ordering::Relaxed), e.inode))
+            .collect();
+        picks.sort_by_key(|&(ts, _)| ts);
+        picks.into_iter().map(|(_, ino)| ino).collect()
     }
 
     /// Evict a file inode from the table if it's safe to do so. Returns true

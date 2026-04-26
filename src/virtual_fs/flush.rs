@@ -7,9 +7,10 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use crate::hub_api::{BatchOp, HubOps};
-use crate::xet::{StagingDir, XetOps};
+use crate::xet::XetOps;
 
 use super::inode::InodeTable;
+use super::staging::StagingCoordinator;
 
 enum FlushSignal {
     /// Flush a dirty inode.
@@ -32,9 +33,10 @@ pub(crate) struct FlushManager {
 }
 
 impl FlushManager {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         xet_sessions: Arc<dyn XetOps>,
-        staging_dir: StagingDir,
+        staging: Arc<StagingCoordinator>,
         hub_client: Arc<dyn HubOps>,
         inodes: Arc<RwLock<InodeTable>>,
         runtime: &tokio::runtime::Handle,
@@ -51,7 +53,7 @@ impl FlushManager {
         let handle = runtime.spawn(flush_loop(
             rx,
             xet_sessions,
-            staging_dir,
+            staging,
             bg_hub,
             inodes,
             bg_errors,
@@ -166,7 +168,7 @@ fn run_blocking<F: FnOnce()>(f: F) {
 async fn flush_loop(
     mut rx: mpsc::UnboundedReceiver<FlushSignal>,
     xet_sessions: Arc<dyn XetOps>,
-    staging_dir: StagingDir,
+    staging: Arc<StagingCoordinator>,
     hub_client: Arc<dyn HubOps>,
     inodes: Arc<RwLock<InodeTable>>,
     flush_errors: Arc<Mutex<HashMap<u64, String>>>,
@@ -215,7 +217,7 @@ async fn flush_loop(
             flush_batch(
                 dirty_inos,
                 &*xet_sessions,
-                &staging_dir,
+                &staging,
                 &*hub_client,
                 &inodes,
                 &flush_errors,
@@ -270,24 +272,24 @@ struct FlushItem {
     prev_xet_hash: Option<String>,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn flush_batch(
     pending: Vec<u64>,
     xet_sessions: &dyn XetOps,
-    staging_dir: &StagingDir,
+    staging: &StagingCoordinator,
     hub_client: &dyn HubOps,
     inodes: &RwLock<InodeTable>,
     flush_errors: &Mutex<HashMap<u64, String>>,
 ) {
-    // Dedup by inode (keep last request per ino).
-    // Walk backwards so last occurrence wins, then reverse in-place.
+    let staging_dir = staging.dir().expect("flush_batch requires staging directory");
+    // Walk backwards so the last request per ino wins, then reverse in-place.
     let mut seen = HashSet::new();
     let mut deduped: Vec<u64> = pending.into_iter().rev().filter(|ino| seen.insert(*ino)).collect();
     deduped.reverse();
 
     debug!("flush_batch: deduped inos = {:?}", deduped);
 
-    // Resolve paths from inode table, skip deleted/non-dirty/unlinked inodes.
-    // Snapshot the dirty_generation so we only clear dirty if no concurrent writer advanced it.
+    // Snapshot dirty_generation so we only clear dirty if no concurrent writer advanced it.
     let to_flush: Vec<FlushItem> = {
         let inode_table = inodes.read().expect("inodes poisoned");
         deduped
@@ -300,11 +302,12 @@ async fn flush_batch(
                         return None;
                     }
                 };
-                if !entry.is_dirty() || entry.nlink == 0 {
-                    debug!(
-                        "flush: ino={} path={} not dirty or unlinked, skipping",
-                        ino, entry.full_path
-                    );
+                if entry.nlink == 0 {
+                    debug!("flush: ino={} unlinked, skipping", ino);
+                    return None;
+                }
+                if !entry.is_dirty() {
+                    debug!("flush: ino={} path={} not dirty, skipping", ino, entry.full_path);
                     return None;
                 }
                 let staging_path = staging_dir.path(ino);
@@ -327,6 +330,8 @@ async fn flush_batch(
     };
 
     if to_flush.is_empty() {
+        // Still reclaim if other clean staging files pushed us over budget.
+        staging.gc(inodes).await;
         return;
     }
 
@@ -372,8 +377,7 @@ async fn flush_batch(
         .unwrap_or_default()
         .as_millis() as u64;
 
-    // Build batch operations (Hub API requires all adds before all deletes).
-    // Track which files are unchanged so we can clear dirty without a Hub commit.
+    // Hub API requires all adds before all deletes.
     let mut ops = Vec::new();
     let mut delete_ops = Vec::new();
     let mut unchanged = vec![false; to_flush.len()];
@@ -407,7 +411,7 @@ async fn flush_batch(
         }
     }
 
-    // Clear dirty for unchanged files before the Hub commit (they don't need it).
+    // Clear dirty on unchanged files without waiting for the Hub round-trip.
     {
         let mut inode_table = inodes.write().expect("inodes poisoned");
         for (i, (item, file_info)) in to_flush.iter().zip(upload_results.iter()).enumerate() {
@@ -426,9 +430,11 @@ async fn flush_batch(
     ops.append(&mut delete_ops);
 
     if ops.is_empty() {
+        let gc_count = staging.gc(inodes).await;
         info!(
-            "Batch flush: all {} file(s) unchanged, no Hub commit needed",
-            to_flush.len()
+            "Batch flush: all {} file(s) unchanged, no Hub commit needed, {} staging file(s) reclaimed",
+            to_flush.len(),
+            gc_count
         );
         return;
     }
@@ -445,24 +451,27 @@ async fn flush_batch(
         return;
     }
 
-    let mut inode_table = inodes.write().expect("inodes poisoned");
-    for (i, (item, file_info)) in to_flush.iter().zip(upload_results.iter()).enumerate() {
-        if unchanged[i] {
-            continue;
-        }
-        if let Some(entry) = inode_table.get_mut(item.ino) {
-            entry.apply_commit(
-                file_info.hash(),
-                file_info.file_size().expect("upload returned XetFileInfo without size"),
-                item.dirty_generation,
-            );
+    {
+        let mut inode_table = inodes.write().expect("inodes poisoned");
+        for (i, (item, file_info)) in to_flush.iter().zip(upload_results.iter()).enumerate() {
+            if !unchanged[i]
+                && let Some(entry) = inode_table.get_mut(item.ino)
+            {
+                entry.apply_commit(
+                    file_info.hash(),
+                    file_info.file_size().expect("upload returned XetFileInfo without size"),
+                    item.dirty_generation,
+                );
+            }
         }
     }
+
+    let gc_count = staging.gc(inodes).await;
 
     let changed_count = unchanged.iter().filter(|u| !**u).count();
     let unchanged_count = unchanged.len() - changed_count;
     info!(
-        "Batch flush completed: {} file(s) committed, {} unchanged",
-        changed_count, unchanged_count
+        "Batch flush completed: {} file(s) committed, {} unchanged, {} staging file(s) reclaimed",
+        changed_count, unchanged_count, gc_count
     );
 }
