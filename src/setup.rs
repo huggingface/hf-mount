@@ -237,8 +237,16 @@ pub fn init_tracing(daemon: bool) {
 // ── Build runtime + VFS (spawns threads) ─────────────────────────────
 
 /// Build a multi-threaded tokio runtime suitable for hf-mount.
+///
+/// We're I/O-bound (FUSE syscalls + HTTP), so the default `num_cpus` worker
+/// pool is wasteful: on a 16-core node it spawned 16 workers × 2 MB stack
+/// reservations and gave glibc malloc that many arenas to fragment. Cap the
+/// pool and shrink stacks — async tasks live on the heap, the stack only
+/// needs to fit the deepest sync call.
 pub fn build_runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .thread_stack_size(512 * 1024)
         .enable_all()
         .build()
         .expect("Failed to create tokio runtime")
