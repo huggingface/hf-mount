@@ -1443,10 +1443,20 @@ impl VirtualFs {
 
     /// Open a file for reading. Dispatches based on where the content lives.
     async fn open_readonly(&self, ino: u64, fe: FileEntry, staging_path: Option<PathBuf>) -> VirtualFsResult<u64> {
+        // For dirty-staging reads, hold the per-inode staging lock across
+        // both the existence check and the open so the flush-path GC can't
+        // unlink the file in between (it takes the same lock in gc_one).
+        let _staging_guard = if fe.is_dirty && staging_path.is_some() {
+            Some(self.staging.lock(ino).lock_owned().await)
+        } else {
+            None
+        };
+
         // If the dirty snapshot pointed at a now-missing staging file, the
-        // flush-path GC may have raced: the inode was flushed clean and its
-        // staging reclaimed between the snapshot and here. Re-read the entry
-        // so we dispatch on current state instead of returning EIO.
+        // flush-path GC may have raced before we took the lock above: the
+        // inode was flushed clean and its staging reclaimed between the
+        // snapshot and here. Re-read the entry so we dispatch on current
+        // state instead of returning EIO.
         let fe = match (fe.is_dirty, &staging_path) {
             (true, Some(p)) if !p.exists() => self.get_file_entry(ino)?,
             _ => fe,
@@ -2442,7 +2452,7 @@ impl VirtualFs {
         // Remote succeeded (or no remote needed) — now unlink locally.
         // unlink_one decrements nlink; the inode stays in the table with nlink=0
         // so open file handles can still fstat() it.
-        let inode_removed = {
+        let inode_fully_removed = {
             let mut inodes = self.inode_table.write().expect("inodes poisoned");
             let last_link = inodes
                 .unlink_one(parent, name)
@@ -2451,15 +2461,21 @@ impl VirtualFs {
             // Update parent mtime/ctime (POSIX: directory was modified)
             let now = SystemTime::now();
             inodes.touch_parent(parent, now);
-            // If last link gone and no open handles, remove the orphan immediately
-            if last_link && !inodes.has_open_handles(ino) {
+            // If last link gone and no open handles, remove the orphan immediately.
+            // Otherwise leave it for release() so an open fd can keep writing
+            // (POSIX unlink-while-open) without us yanking the staging file +
+            // debiting the budget twice.
+            let no_handles = !inodes.has_open_handles(ino);
+            if last_link && no_handles {
                 inodes.remove_orphan(ino);
             }
-            last_link
+            last_link && no_handles
         };
 
-        // Clean up staging file only if inode was fully removed (no remaining hard links)
-        if inode_removed {
+        // Clean up staging file only when the inode is actually gone. With an
+        // open fd, drop_staging waits until release() so writes through the
+        // surviving fd can still update bytes_used coherently.
+        if inode_fully_removed {
             self.drop_staging(ino);
         }
 
