@@ -811,7 +811,7 @@ impl HubApiClient {
     }
 
     /// Download a file via HTTP GET on the resolve endpoint and write it to `dest`.
-    /// Used for plain LFS / plain git files in repos (no xet hash).
+    /// Used for non-Xet files in repos (no xet hash).
     ///
     /// Supports ETag-based conditional requests: if `dest` already exists and a
     /// sidecar `{dest}.etag` file is present, sends `If-None-Match`. On 304 the
