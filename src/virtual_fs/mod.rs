@@ -1377,11 +1377,11 @@ impl VirtualFs {
             (true, None) if fe.xet_hash.is_empty() && fe.size > 0 => {
                 self.await_pending_commit(ino).await?;
                 let fe = self.get_file_entry(ino)?;
-                self.open_lazy(ino, fe.xet_hash, fe.size)
+                self.open_lazy(ino, fe.xet_hash, fe.size).await
             }
 
             // Remote xet-backed file — lazy CAS range reads.
-            _ if !fe.xet_hash.is_empty() => self.open_lazy(ino, fe.xet_hash, fe.size),
+            _ if !fe.xet_hash.is_empty() => self.open_lazy(ino, fe.xet_hash, fe.size).await,
 
             // Plain LFS/git file without xet hash — HTTP download to staging cache.
             _ if fe.size > 0 => {
@@ -1414,12 +1414,17 @@ impl VirtualFs {
             }
 
             // Empty file (size=0, no hash).
-            _ => self.open_lazy(ino, String::new(), 0),
+            _ => self.open_lazy(ino, String::new(), 0).await,
         }
     }
 
-    /// Allocate a lazy file handle backed by a prefetch buffer.
-    fn open_lazy(&self, ino: u64, xet_hash: String, size: u64) -> VirtualFsResult<u64> {
+    /// Allocate a lazy file handle backed by a prefetch buffer. Pre-warms
+    /// the full reconstruction plan in `CachedXetClient` so later
+    /// bounded-range requests derive locally instead of round-tripping CAS.
+    async fn open_lazy(&self, ino: u64, xet_hash: String, size: u64) -> VirtualFsResult<u64> {
+        if !xet_hash.is_empty() {
+            self.xet_sessions.warm_reconstruction_cache(&xet_hash).await;
+        }
         let prefetch = Arc::new(tokio::sync::Mutex::new(PrefetchState::new(
             xet_hash,
             size,
