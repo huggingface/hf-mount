@@ -289,12 +289,11 @@ impl VirtualFs {
             let Some(vfs) = weak.upgrade() else { return };
             let table_len = vfs.inode_table.read().expect("inodes poisoned").len();
             let evicted = vfs.lru_evict_sweep(soft_limit).await;
-            if evicted > 0 || table_len > soft_limit {
-                info!(
-                    "lru_sweep: table={} soft_limit={} evicted={}",
-                    table_len, soft_limit, evicted
-                );
-            }
+            // Always log so the table size series is observable in prod logs.
+            info!(
+                "lru_sweep: table={} soft_limit={} evicted={}",
+                table_len, soft_limit, evicted
+            );
         }
     }
 
