@@ -257,6 +257,11 @@ impl StagingDir {
         self.max_bytes > 0 && self.bytes_used.load(Ordering::Relaxed) > self.max_bytes
     }
 
+    /// Whether a non-zero disk budget was configured (i.e. GC is armed).
+    pub fn has_budget(&self) -> bool {
+        self.max_bytes > 0
+    }
+
     #[cfg(test)]
     pub fn bytes_used(&self) -> u64 {
         self.bytes_used.load(Ordering::Relaxed)
