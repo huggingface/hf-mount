@@ -1472,6 +1472,13 @@ impl VirtualFs {
             _ if !fe.xet_hash.is_empty() => self.open_lazy(ino, fe.xet_hash, fe.size),
 
             // Plain LFS/git file without xet hash — HTTP download to staging cache.
+            //
+            // TODO(staging-gc): http_<hash> files are not counted in
+            // StagingDir::bytes_used and not picked up by try_remove(ino), so
+            // a repo with large non-Xet LFS files can exceed --max-staging-size
+            // without the GC noticing. Either resize_bytes() after download +
+            // index http_* paths in StagingCoordinator, or document that the
+            // budget covers writes only.
             _ if fe.size > 0 => {
                 let staging = self.staging.dir().ok_or_else(|| {
                     error!("No staging dir for HTTP download of ino={}", ino);
