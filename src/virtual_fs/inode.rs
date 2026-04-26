@@ -450,6 +450,7 @@ impl InodeTable {
         for (parent_ino, evicted_set) in &by_parent {
             if let Some(parent) = self.inodes.get_mut(parent_ino) {
                 parent.children.retain(|c| !evicted_set.contains(&c.ino));
+                parent.children.shrink_to_fit();
                 // Force readdir to re-fetch the listing so evicted inodes can
                 // be re-materialized on next access.
                 parent.children_loaded = false;
