@@ -61,6 +61,18 @@ impl From<reqwest::Error> for Error {
     }
 }
 
+impl From<xet_data::DataError> for Error {
+    fn from(err: xet_data::DataError) -> Self {
+        Self::Xet(err.to_string())
+    }
+}
+
+impl From<xet_data::file_reconstruction::FileReconstructionError> for Error {
+    fn from(err: xet_data::file_reconstruction::FileReconstructionError) -> Self {
+        Self::Xet(err.to_string())
+    }
+}
+
 pub fn is_retryable_status(status: u16) -> bool {
     matches!(status, 408 | 429 | 500 | 502 | 503 | 504)
 }

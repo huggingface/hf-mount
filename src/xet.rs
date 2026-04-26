@@ -109,12 +109,8 @@ impl XetOps for XetSessions {
             .upload_config
             .as_ref()
             .ok_or_else(|| Error::hub("no upload config (read-only mode)"))?;
-        let session = FileUploadSession::new(config.clone())
-            .await
-            .map_err(|e| Error::Xet(e.to_string()))?;
-        let (_id, cleaner) = session
-            .start_clean(None, None, Sha256Policy::Skip)
-            .map_err(|e| Error::Xet(e.to_string()))?;
+        let session = FileUploadSession::new(config.clone()).await?;
+        let (_id, cleaner) = session.start_clean(None, None, Sha256Policy::Skip)?;
         Ok(Box::new(StreamingWriter {
             cleaner,
             session,
@@ -124,10 +120,7 @@ impl XetOps for XetSessions {
 
     async fn download_to_file(&self, xet_hash: &str, file_size: u64, dest: &Path) -> Result<()> {
         let file_info = XetFileInfo::new(xet_hash.to_string(), file_size);
-        self.session
-            .download_file(&file_info, dest)
-            .await
-            .map_err(|e| Error::Xet(e.to_string()))?;
+        self.session.download_file(&file_info, dest).await?;
         Ok(())
     }
 
@@ -137,22 +130,12 @@ impl XetOps for XetSessions {
             .as_ref()
             .ok_or_else(|| Error::hub("no upload config (read-only mode)"))?;
 
-        let upload_session = FileUploadSession::new(config.clone())
-            .await
-            .map_err(|e| Error::Xet(e.to_string()))?;
+        let upload_session = FileUploadSession::new(config.clone()).await?;
 
         let files: Vec<(PathBuf, Sha256Policy)> = paths.iter().map(|p| (p.to_path_buf(), Sha256Policy::Skip)).collect();
 
-        let results = upload_session
-            .upload_files(files)
-            .await
-            .map_err(|e| Error::Xet(e.to_string()))?;
-
-        upload_session
-            .clone()
-            .finalize()
-            .await
-            .map_err(|e| Error::Xet(e.to_string()))?;
+        let results = upload_session.upload_files(files).await?;
+        upload_session.finalize().await?;
 
         Ok(results)
     }
@@ -181,7 +164,7 @@ struct DownloadStreamWrapper(DownloadStream);
 #[async_trait::async_trait]
 impl DownloadStreamOps for DownloadStreamWrapper {
     async fn next(&mut self) -> Result<Option<Bytes>> {
-        self.0.next().await.map_err(|e| Error::Xet(e.to_string()))
+        Ok(self.0.next().await?)
     }
 }
 
@@ -276,17 +259,14 @@ pub struct StreamingWriter {
 #[async_trait::async_trait]
 impl StreamingWriterOps for StreamingWriter {
     async fn write(&mut self, data: &[u8]) -> Result<()> {
-        self.cleaner
-            .add_data(data)
-            .await
-            .map_err(|e| Error::Xet(e.to_string()))?;
+        self.cleaner.add_data(data).await?;
         self.bytes_written += data.len() as u64;
         Ok(())
     }
 
     async fn finish_boxed(self: Box<Self>) -> Result<XetFileInfo> {
-        let (info, _metrics) = self.cleaner.finish().await.map_err(|e| Error::Xet(e.to_string()))?;
-        self.session.finalize().await.map_err(|e| Error::Xet(e.to_string()))?;
+        let (info, _metrics) = self.cleaner.finish().await?;
+        self.session.finalize().await?;
         Ok(info)
     }
 
