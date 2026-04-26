@@ -114,7 +114,7 @@ pub struct InodeEntry {
     /// `xet_hash` matched (so we didn't race with `poll_remote_changes`).
     /// Cleared whenever poll advances `xet_hash` out of band.
     pub staging_is_current: bool,
-    /// ETag from the last HEAD revalidation (used for non-xet plain git/LFS files).
+    /// ETag from the last HEAD revalidation (used for non-Xet files).
     pub etag: Option<String>,
     /// Dirty generation counter. 0 = clean. Each mutation increments the counter.
     /// `flush_batch` snapshots the generation before upload; after commit it only

@@ -1428,7 +1428,7 @@ impl VirtualFs {
             // Flag the cache as current only when the staging actually mirrors
             // the remote. Cases to exclude:
             // - truncated hashed file: empty staging, non-empty xet_hash.
-            // - plain git/LFS with `size > 0` and no xet_hash: File::create
+            // - non-Xet file with `size > 0` and no xet_hash: File::create
             //   leaves empty staging, which does not match the remote.
             // - race with poll: `xet_hash` moved between `open()` reading the
             //   inode and here, so the downloaded hash is now stale — detected
@@ -1564,11 +1564,11 @@ impl VirtualFs {
                 self.open_lazy(ino, fe.xet_hash, fe.size)
             }
 
-            // Plain LFS/git file without xet hash — HTTP download to staging cache.
+            // Non-Xet file — HTTP download to staging cache.
             //
             // TODO(staging-gc): http_<hash> files are not counted in
             // StagingDir::bytes_used and not picked up by try_remove(ino), so
-            // a repo with large non-Xet LFS files can exceed --max-staging-size
+            // a repo with large non-Xet files can exceed --max-staging-size
             // without the GC noticing. Either resize_bytes() after download +
             // index http_* paths in StagingCoordinator, or document that the
             // budget covers writes only.

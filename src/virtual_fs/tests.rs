@@ -2096,7 +2096,7 @@ fn open_readonly_dirty_staging() {
     });
 }
 
-/// Opening a plain file without xet_hash (LFS/git) uses HTTP download.
+/// Opening a non-Xet file (no xet_hash) uses HTTP download.
 #[test]
 fn open_readonly_http_download() {
     let hub = MockHub::new_repo();
