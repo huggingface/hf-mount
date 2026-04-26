@@ -89,7 +89,7 @@ pub async fn setup_bucket_with_file(test_name: &str, filename: &str, content: &[
     eprintln!(
         "Uploaded: xet_hash={}, size={}",
         xet_hash,
-        file_info.file_size().unwrap_or(0)
+        file_info.file_size().expect("upload returned XetFileInfo without size")
     );
 
     let mtime_ms = SystemTime::now()
