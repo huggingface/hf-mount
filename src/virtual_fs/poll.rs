@@ -33,11 +33,11 @@ impl super::VirtualFs {
             let prefixes = inodes.read().expect("inodes poisoned").loaded_dir_prefixes();
             // buffer_unordered yields out of order, so carry the prefix alongside the result.
             let results: Vec<(String, _)> = stream::iter(prefixes.iter().cloned())
-                .map(|p| {
+                .map(|prefix| {
                     let client = hub_client.clone();
                     async move {
-                        let r = client.list_tree(&p).await;
-                        (p, r)
+                        let result = client.list_tree(&prefix).await;
+                        (prefix, result)
                     }
                 })
                 .buffer_unordered(POLL_TREE_LISTING_CONCURRENCY)
