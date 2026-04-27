@@ -21,7 +21,6 @@ bytes = "1"
 chrono = "0.4"
 clap = { version = "4", features = ["derive", "env"] }
 ctrlc = { version = "3", features = ["termination"] }
-fuser = { version = "0.17", optional = true }
 futures = "0.3"
 libc = "0.2"
 nfsserve = { version = "0.11", optional = true }
@@ -39,6 +38,12 @@ default = []
 fuse = ["dep:fuser"]
 nfs = ["dep:nfsserve"]
 vendored-openssl = ["openssl-sys/vendored"]
+
+# fuser is Unix-only (Linux/macOS FUSE bindings). Gating it as a Unix-target
+# dep means the `fuse` feature is effectively unavailable on Windows; the NFS
+# backend (`hf-mount-nfs`) is the supported path on Windows.
+[target.'cfg(unix)'.dependencies]
+fuser = { version = "0.17", optional = true }
 
 [dependencies.openssl-sys]
 version = "0.9"

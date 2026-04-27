@@ -1,8 +1,12 @@
 pub mod cached_xet_client;
+#[cfg(unix)]
+pub mod daemon;
+#[cfg(not(unix))]
+#[path = "daemon_windows.rs"]
 pub mod daemon;
 pub mod error;
 pub mod file_cache;
-#[cfg(feature = "fuse")]
+#[cfg(all(unix, feature = "fuse"))]
 pub mod fuse;
 pub mod hub_api;
 #[cfg(feature = "nfs")]
