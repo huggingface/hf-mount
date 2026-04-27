@@ -175,7 +175,7 @@ impl VirtualFs {
         file_cache: Option<Arc<FileCache>>,
         config: VfsConfig,
     ) -> Arc<Self> {
-        let inodes = Arc::new(RwLock::new(InodeTable::new(config.inode_soft_limit)));
+        let inodes = Arc::new(RwLock::new(InodeTable::new(config.inode_soft_limit > 0)));
         let negative_cache = Arc::new(RwLock::new(HashMap::new()));
 
         let staging = Arc::new(StagingCoordinator::new(staging_dir));

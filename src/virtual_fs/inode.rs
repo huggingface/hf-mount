@@ -196,18 +196,21 @@ pub struct InodeTable {
 
 impl Default for InodeTable {
     fn default() -> Self {
-        Self::new(0)
+        Self::new(false)
     }
 }
 
 impl InodeTable {
-    pub fn new(soft_limit: usize) -> Self {
+    /// `track_touches` arms the `touch()` recency hook. Set to true when the
+    /// LRU evictor (`--inode-soft-limit > 0`) or the staging GC needs an
+    /// LRU order; left false in tests/configs that exercise neither.
+    pub fn new(track_touches: bool) -> Self {
         let mut table = Self {
             inodes: HashMap::new(),
             path_to_inode: HashMap::new(),
             next_inode: AtomicU64::new(2),
             touch_counter: AtomicU64::new(0),
-            touch_enabled: AtomicBool::new(soft_limit > 0),
+            touch_enabled: AtomicBool::new(track_touches),
         };
 
         // Create root inode
@@ -887,7 +890,7 @@ mod tests {
 
     #[test]
     fn test_insert_and_lookup() {
-        let mut table = InodeTable::new(0);
+        let mut table = InodeTable::new(false);
 
         let ino = table.insert(
             ROOT_INODE,
@@ -924,7 +927,7 @@ mod tests {
 
     #[test]
     fn test_dirty_flag() {
-        let mut table = InodeTable::new(0);
+        let mut table = InodeTable::new(false);
 
         let ino = table.insert(
             ROOT_INODE,
@@ -962,7 +965,7 @@ mod tests {
 
     #[test]
     fn apply_commit_clears_dirty_and_updates_metadata() {
-        let mut table = InodeTable::new(0);
+        let mut table = InodeTable::new(false);
         let ino = table.insert(
             ROOT_INODE,
             "test".to_string(),
@@ -991,7 +994,7 @@ mod tests {
 
     #[test]
     fn apply_commit_preserves_state_on_generation_mismatch() {
-        let mut table = InodeTable::new(0);
+        let mut table = InodeTable::new(false);
         let ino = table.insert(
             ROOT_INODE,
             "test".to_string(),
@@ -1025,7 +1028,7 @@ mod tests {
 
     #[test]
     fn set_dirty_saturates() {
-        let mut table = InodeTable::new(0);
+        let mut table = InodeTable::new(false);
         let ino = table.insert(
             ROOT_INODE,
             "test".to_string(),
@@ -1047,7 +1050,7 @@ mod tests {
 
     #[test]
     fn test_remove() {
-        let mut table = InodeTable::new(0);
+        let mut table = InodeTable::new(false);
 
         let ino = table.insert(
             ROOT_INODE,
@@ -1092,7 +1095,7 @@ mod tests {
 
     #[test]
     fn test_remove_path_insert_path() {
-        let mut table = InodeTable::new(0);
+        let mut table = InodeTable::new(false);
 
         let ino = table.insert(
             ROOT_INODE,
@@ -1123,7 +1126,7 @@ mod tests {
 
     #[test]
     fn test_insert_duplicate_path() {
-        let mut table = InodeTable::new(0);
+        let mut table = InodeTable::new(false);
 
         let ino1 = table.insert(
             ROOT_INODE,
@@ -1168,7 +1171,7 @@ mod tests {
 
     #[test]
     fn test_update_subtree_paths() {
-        let mut table = InodeTable::new(0);
+        let mut table = InodeTable::new(false);
 
         // Build: root / old_dir / child.txt
         //                       / subdir / deep.txt
@@ -1248,7 +1251,7 @@ mod tests {
 
     #[test]
     fn test_get_dir_ino() {
-        let mut table = InodeTable::new(0);
+        let mut table = InodeTable::new(false);
 
         // Root is a directory
         assert_eq!(table.get_dir_ino(""), Some(ROOT_INODE));
@@ -1291,7 +1294,7 @@ mod tests {
 
     #[test]
     fn test_file_snapshot() {
-        let mut table = InodeTable::new(0);
+        let mut table = InodeTable::new(false);
 
         let ino1 = table.insert(
             ROOT_INODE,
@@ -1351,7 +1354,7 @@ mod tests {
 
     #[test]
     fn test_update_remote_file() {
-        let mut table = InodeTable::new(0);
+        let mut table = InodeTable::new(false);
 
         let ino = table.insert(
             ROOT_INODE,
@@ -1386,7 +1389,7 @@ mod tests {
 
     #[test]
     fn test_invalidate_children() {
-        let mut table = InodeTable::new(0);
+        let mut table = InodeTable::new(false);
 
         let dir_ino = table.insert(
             ROOT_INODE,
@@ -1415,7 +1418,7 @@ mod tests {
 
     #[test]
     fn test_pending_deletes() {
-        let mut table = InodeTable::new(0);
+        let mut table = InodeTable::new(false);
 
         let ino = table.insert(
             ROOT_INODE,
@@ -1449,7 +1452,7 @@ mod tests {
 
     #[test]
     fn test_remove_non_empty_dir_cleans_descendants() {
-        let mut table = InodeTable::new(0);
+        let mut table = InodeTable::new(false);
 
         // Build: root / dir / child.txt
         //                    / subdir / deep.txt
@@ -1524,7 +1527,7 @@ mod tests {
     #[cfg(debug_assertions)]
     #[should_panic(expected = "parent inode")]
     fn test_insert_with_missing_parent_panics() {
-        let mut table = InodeTable::new(0);
+        let mut table = InodeTable::new(false);
         // Parent inode 999 does not exist — should panic in debug
         table.insert(
             999,
@@ -1544,7 +1547,7 @@ mod tests {
     #[cfg(debug_assertions)]
     #[should_panic(expected = "different kind")]
     fn test_insert_duplicate_path_different_kind_panics() {
-        let mut table = InodeTable::new(0);
+        let mut table = InodeTable::new(false);
         table.insert(
             ROOT_INODE,
             "name".to_string(),
@@ -1574,7 +1577,7 @@ mod tests {
 
     #[test]
     fn test_dirty_inos_excludes_directories() {
-        let mut table = InodeTable::new(0);
+        let mut table = InodeTable::new(false);
         let file_ino = table.insert(
             ROOT_INODE,
             "dirty.txt".to_string(),
@@ -1608,7 +1611,7 @@ mod tests {
 
     #[test]
     fn test_update_subtree_paths_missing_inode_is_noop() {
-        let mut table = InodeTable::new(0);
+        let mut table = InodeTable::new(false);
         table.insert(
             ROOT_INODE,
             "file.txt".to_string(),
@@ -1632,7 +1635,7 @@ mod tests {
 
     #[test]
     fn test_remove_directory_with_already_removed_child() {
-        let mut table = InodeTable::new(0);
+        let mut table = InodeTable::new(false);
         let dir_ino = table.insert(
             ROOT_INODE,
             "dir".to_string(),
@@ -1670,7 +1673,7 @@ mod tests {
 
     #[test]
     fn test_remove_directory_adjusts_parent_nlink() {
-        let mut table = InodeTable::new(0);
+        let mut table = InodeTable::new(false);
         let nlink_before = table.get(ROOT_INODE).unwrap().nlink;
 
         let dir_ino = table.insert(
@@ -1696,7 +1699,7 @@ mod tests {
 
     #[test]
     fn test_move_child_same_parent() {
-        let mut table = InodeTable::new(0);
+        let mut table = InodeTable::new(false);
 
         let file_ino = table.insert(
             ROOT_INODE,
@@ -1730,7 +1733,7 @@ mod tests {
 
     #[test]
     fn test_move_child_cross_parent_file() {
-        let mut table = InodeTable::new(0);
+        let mut table = InodeTable::new(false);
 
         let dir_a = table.insert(
             ROOT_INODE,
@@ -1790,7 +1793,7 @@ mod tests {
 
     #[test]
     fn test_move_child_cross_parent_directory() {
-        let mut table = InodeTable::new(0);
+        let mut table = InodeTable::new(false);
 
         let dir_a = table.insert(
             ROOT_INODE,
@@ -1841,7 +1844,7 @@ mod tests {
 
     #[test]
     fn test_touch_parent() {
-        let mut table = InodeTable::new(0);
+        let mut table = InodeTable::new(false);
         let before = table.get(ROOT_INODE).unwrap().mtime;
 
         let now = UNIX_EPOCH + std::time::Duration::from_secs(12345);
@@ -1855,7 +1858,7 @@ mod tests {
 
     #[test]
     fn test_unlink_one_basic() {
-        let mut table = InodeTable::new(0);
+        let mut table = InodeTable::new(false);
 
         let file_ino = table.insert(
             ROOT_INODE,
@@ -1885,7 +1888,7 @@ mod tests {
 
     #[test]
     fn test_unlink_one_last_link() {
-        let mut table = InodeTable::new(0);
+        let mut table = InodeTable::new(false);
 
         let file_ino = table.insert(
             ROOT_INODE,
@@ -1916,7 +1919,7 @@ mod tests {
 
     #[test]
     fn test_nlookup_starts_at_zero() {
-        let mut table = InodeTable::new(0);
+        let mut table = InodeTable::new(false);
         let ino = table.insert(
             ROOT_INODE,
             "f.txt".to_string(),
@@ -1934,7 +1937,7 @@ mod tests {
 
     #[test]
     fn test_nlookup_bump_drop() {
-        let mut table = InodeTable::new(0);
+        let mut table = InodeTable::new(false);
         let ino = table.insert(
             ROOT_INODE,
             "f.txt".to_string(),
@@ -1968,7 +1971,7 @@ mod tests {
         if cfg!(debug_assertions) {
             return;
         }
-        let mut table = InodeTable::new(0);
+        let mut table = InodeTable::new(false);
         let ino = table.insert(
             ROOT_INODE,
             "f.txt".to_string(),
@@ -1992,13 +1995,13 @@ mod tests {
 
     #[test]
     fn test_nlookup_unknown_inode_drop_returns_false() {
-        let table = InodeTable::new(0);
+        let table = InodeTable::new(false);
         assert!(!table.drop_nlookup(9999, 1));
     }
 
     #[test]
     fn test_evict_if_safe_removes_clean_file() {
-        let mut table = InodeTable::new(0);
+        let mut table = InodeTable::new(false);
         let ino = table.insert(
             ROOT_INODE,
             "f.txt".to_string(),
@@ -2025,7 +2028,7 @@ mod tests {
 
     #[test]
     fn test_evict_batch_if_safe_groups_by_parent() {
-        let mut table = InodeTable::new(0);
+        let mut table = InodeTable::new(false);
         // Two parent dirs each with 5 files.
         let mut all = Vec::new();
         for parent_name in ["a", "b"] {
@@ -2078,7 +2081,7 @@ mod tests {
     /// under the write lock. The batch must refuse to evict.
     #[test]
     fn test_evict_batch_if_safe_refuses_when_open_handles_bumped_after_scan() {
-        let mut table = InodeTable::new(0);
+        let mut table = InodeTable::new(false);
         let ino = table.insert(
             ROOT_INODE,
             "racer.txt".to_string(),
@@ -2105,7 +2108,7 @@ mod tests {
 
     #[test]
     fn test_evict_batch_if_safe_filters_unsafe() {
-        let mut table = InodeTable::new(0);
+        let mut table = InodeTable::new(false);
         let safe = table.insert(
             ROOT_INODE,
             "safe.txt".to_string(),
@@ -2155,7 +2158,7 @@ mod tests {
 
     #[test]
     fn test_evict_if_safe_refuses_when_nlookup_held() {
-        let mut table = InodeTable::new(0);
+        let mut table = InodeTable::new(false);
         let ino = table.insert(
             ROOT_INODE,
             "f.txt".to_string(),
@@ -2179,7 +2182,7 @@ mod tests {
 
     #[test]
     fn test_evict_if_safe_refuses_when_dirty() {
-        let mut table = InodeTable::new(0);
+        let mut table = InodeTable::new(false);
         let ino = table.insert(
             ROOT_INODE,
             "f.txt".to_string(),
@@ -2203,7 +2206,7 @@ mod tests {
 
     #[test]
     fn test_evict_if_safe_refuses_when_pending_deletes() {
-        let mut table = InodeTable::new(0);
+        let mut table = InodeTable::new(false);
         let ino = table.insert(
             ROOT_INODE,
             "f.txt".to_string(),
@@ -2224,7 +2227,7 @@ mod tests {
 
     #[test]
     fn test_evict_if_safe_refuses_directory() {
-        let mut table = InodeTable::new(0);
+        let mut table = InodeTable::new(false);
         let ino = table.insert(
             ROOT_INODE,
             "d".to_string(),
@@ -2247,7 +2250,7 @@ mod tests {
         // An unlinked-but-still-open file (nlink == 0) must stay in the table
         // until release() cleans it up via remove_orphan — evicting it would
         // drop the xet_hash / path a racing read still needs.
-        let mut table = InodeTable::new(0);
+        let mut table = InodeTable::new(false);
         let ino = table.insert(
             ROOT_INODE,
             "doomed.txt".to_string(),
@@ -2269,14 +2272,14 @@ mod tests {
 
     #[test]
     fn test_evict_if_safe_unknown_inode() {
-        let mut table = InodeTable::new(0);
+        let mut table = InodeTable::new(false);
         assert!(!table.evict_if_safe(9999));
     }
 
     // ── insert / touch ──────────────────────────────────────────────
 
     fn mk_table_with_soft_limit(soft: usize) -> InodeTable {
-        InodeTable::new(soft)
+        InodeTable::new(soft > 0)
     }
 
     fn mk_file(table: &mut InodeTable, name: &str) -> u64 {
@@ -2310,7 +2313,7 @@ mod tests {
     fn test_soft_limit_zero_gates_touch() {
         // touch() is a no-op when LRU is disabled (soft_limit==0), so the
         // hot path stays cheap in the common case.
-        let mut table = InodeTable::new(0);
+        let mut table = InodeTable::new(false);
         let f = mk_file(&mut table, "f.txt");
         let before = table.get(f).unwrap().eviction.last_touched.load(Ordering::Relaxed);
         table.touch(f);
@@ -2320,7 +2323,7 @@ mod tests {
 
     #[test]
     fn test_soft_limit_nonzero_enables_touch() {
-        let mut table = InodeTable::new(100);
+        let mut table = InodeTable::new(true);
         let f = mk_file(&mut table, "f.txt");
         let before = table.get(f).unwrap().eviction.last_touched.load(Ordering::Relaxed);
         table.touch(f);
@@ -2332,7 +2335,7 @@ mod tests {
 
     #[test]
     fn test_evict_pending_flag_toggle() {
-        let mut table = InodeTable::new(0);
+        let mut table = InodeTable::new(false);
         let f = mk_file(&mut table, "f.txt");
         assert!(!table.take_evict_pending(f), "flag starts false");
         table.mark_evict_pending(f);
@@ -2342,7 +2345,7 @@ mod tests {
 
     #[test]
     fn test_evict_pending_unknown_inode() {
-        let table = InodeTable::new(0);
+        let table = InodeTable::new(false);
         table.mark_evict_pending(9999); // no-op, must not panic
         assert!(!table.take_evict_pending(9999));
     }
@@ -2351,7 +2354,7 @@ mod tests {
 
     #[test]
     fn test_open_handles_refcount_tracking() {
-        let mut table = InodeTable::new(0);
+        let mut table = InodeTable::new(false);
         let busy = mk_file(&mut table, "busy.txt");
 
         assert!(!table.has_open_handles(busy));
