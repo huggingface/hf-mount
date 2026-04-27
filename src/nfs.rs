@@ -518,16 +518,17 @@ pub async fn mount_nfs(
 
     // Windows NFS client (Services for NFS / Client for NFS feature).
     // The mount point must be a drive letter (e.g. "Z:") or an empty NTFS dir.
-    // Windows mount.exe has no `mountport=` to bypass portmapper, so we start
-    // a tiny RPC portmapper (proc 100000 v2) on 127.0.0.1:111 that maps
-    // NFS/MOUNT v3 to nfsserve's actual TCP port. Requires Administrator
-    // (port 111 is privileged).
+    // Windows mount.exe can't bypass portmapper, so spawn nfsserve's
+    // `portmap_listener` on 127.0.0.1:111 to map NFS/MOUNT v3 to the actual
+    // server port. Requires Administrator (port 111 is privileged).
     #[cfg(windows)]
-    let portmapper_handle = portmapper::start(port).await.map_err(|e| {
-        std::io::Error::other(format!(
-            "failed to bind portmapper on 127.0.0.1:111: {e} (Administrator required, or another portmap is running)"
-        ))
-    })?;
+    let portmapper_handle = nfsserve::portmap_listener::spawn("127.0.0.1:111".parse().unwrap(), port)
+        .await
+        .map_err(|e| {
+            std::io::Error::other(format!(
+                "failed to bind portmapper on 127.0.0.1:111: {e} (Administrator required, or another portmap is running)"
+            ))
+        })?;
     #[cfg(windows)]
     {
         let _ = actimeo; // Windows mount.exe has no actimeo equivalent.
@@ -1071,147 +1072,5 @@ mod tests {
         pool.unpin(1);
         pool.unpin(1);
         assert_eq!(pool.handles[&1].pin_count, 0);
-    }
-}
-
-// ── Windows portmapper (RFC 1833) ────────────────────────────────────────
-//
-// Windows NFS client (Services for NFS) doesn't support a "mountport=" option
-// to bypass portmapper; it queries portmapper at 127.0.0.1:111 to discover
-// MOUNT and NFS service ports. We bind a minimal RPC v2 portmapper that
-// answers GETPORT(MOUNT v3) and GETPORT(NFS v3) with nfsserve's TCP port.
-//
-// Linux/macOS skip this via `mountport=N` mount option.
-
-#[cfg(windows)]
-mod portmapper {
-    use std::sync::atomic::{AtomicU16, Ordering};
-
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::{TcpListener, UdpSocket};
-
-    static SERVICE_PORT: AtomicU16 = AtomicU16::new(0);
-
-    const PMAP_PROG: u32 = 100000;
-    const PMAP_VERS: u32 = 2;
-    const NFS_PROG: u32 = 100003;
-    const MOUNT_PROG: u32 = 100005;
-
-    const PMAP_PROC_NULL: u32 = 0;
-    const PMAP_PROC_GETPORT: u32 = 3;
-
-    const RPC_REPLY: u32 = 1;
-    const RPC_MSG_ACCEPTED: u32 = 0;
-    const RPC_SUCCESS: u32 = 0;
-    const RPC_PROG_UNAVAIL: u32 = 1;
-    const RPC_PROC_UNAVAIL: u32 = 3;
-
-    fn read_u32(buf: &[u8], off: usize) -> Option<u32> {
-        Some(u32::from_be_bytes(buf.get(off..off + 4)?.try_into().ok()?))
-    }
-
-    /// Process one RPC message. Returns the reply payload (no fragment header).
-    fn handle(buf: &[u8]) -> Option<Vec<u8>> {
-        let xid = read_u32(buf, 0)?;
-        if read_u32(buf, 4)? != 0 || read_u32(buf, 8)? != 2 {
-            return None; // not a CALL or wrong rpcvers
-        }
-        let prog = read_u32(buf, 12)?;
-        let vers = read_u32(buf, 16)?;
-        let proc_id = read_u32(buf, 20)?;
-        // Skip cred + verf (each: flavor(4) + len(4) + body).
-        let cred_len = read_u32(buf, 28)? as usize;
-        let verf_off = 32 + cred_len;
-        let verf_len = read_u32(buf, verf_off + 4)? as usize;
-        let args_off = verf_off + 8 + verf_len;
-
-        let mut out = Vec::with_capacity(32);
-        out.extend_from_slice(&xid.to_be_bytes());
-        out.extend_from_slice(&RPC_REPLY.to_be_bytes());
-        out.extend_from_slice(&RPC_MSG_ACCEPTED.to_be_bytes());
-        out.extend_from_slice(&0u32.to_be_bytes()); // verf flavor (AUTH_NONE)
-        out.extend_from_slice(&0u32.to_be_bytes()); // verf length
-
-        if prog != PMAP_PROG || vers != PMAP_VERS {
-            out.extend_from_slice(&RPC_PROG_UNAVAIL.to_be_bytes());
-            return Some(out);
-        }
-
-        match proc_id {
-            PMAP_PROC_NULL => {
-                out.extend_from_slice(&RPC_SUCCESS.to_be_bytes());
-                Some(out)
-            }
-            PMAP_PROC_GETPORT => {
-                let q_prog = read_u32(buf, args_off)?;
-                let port = if q_prog == NFS_PROG || q_prog == MOUNT_PROG {
-                    SERVICE_PORT.load(Ordering::Relaxed) as u32
-                } else {
-                    0
-                };
-                out.extend_from_slice(&RPC_SUCCESS.to_be_bytes());
-                out.extend_from_slice(&port.to_be_bytes());
-                Some(out)
-            }
-            _ => {
-                out.extend_from_slice(&RPC_PROC_UNAVAIL.to_be_bytes());
-                Some(out)
-            }
-        }
-    }
-
-    /// Bind UDP+TCP on 127.0.0.1:111, register the nfsserve port, and spawn the
-    /// accept loops. Returns when the sockets are bound (no readiness race vs
-    /// the subsequent mount.exe call). Drop the returned handle to abort.
-    pub async fn start(service_port: u16) -> std::io::Result<tokio::task::JoinHandle<()>> {
-        let udp = UdpSocket::bind("127.0.0.1:111").await?;
-        let tcp = TcpListener::bind("127.0.0.1:111").await?;
-        SERVICE_PORT.store(service_port, Ordering::Relaxed);
-
-        Ok(tokio::spawn(async move {
-            let udp_task = tokio::spawn(async move {
-                let mut buf = [0u8; 1500];
-                loop {
-                    let Ok((n, peer)) = udp.recv_from(&mut buf).await else {
-                        continue;
-                    };
-                    if let Some(reply) = handle(&buf[..n]) {
-                        let _ = udp.send_to(&reply, peer).await;
-                    }
-                }
-            });
-
-            // Loopback-only; no per-connection cap by design.
-            let tcp_task = tokio::spawn(async move {
-                loop {
-                    let Ok((mut stream, _)) = tcp.accept().await else {
-                        continue;
-                    };
-                    tokio::spawn(async move {
-                        // ONC RPC over TCP: 4-byte fragment header, MSB=last fragment, lower 31=length.
-                        loop {
-                            let mut hdr = [0u8; 4];
-                            if stream.read_exact(&mut hdr).await.is_err() {
-                                return;
-                            }
-                            let len = (u32::from_be_bytes(hdr) & 0x7fff_ffff) as usize;
-                            let mut body = vec![0u8; len];
-                            if stream.read_exact(&mut body).await.is_err() {
-                                return;
-                            }
-                            if let Some(reply) = handle(&body) {
-                                let frag_hdr = ((reply.len() as u32) | 0x8000_0000).to_be_bytes();
-                                if stream.write_all(&frag_hdr).await.is_err() || stream.write_all(&reply).await.is_err()
-                                {
-                                    return;
-                                }
-                            }
-                        }
-                    });
-                }
-            });
-
-            let _ = tokio::join!(udp_task, tcp_task);
-        }))
     }
 }

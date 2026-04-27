@@ -1481,8 +1481,7 @@ dependencies = [
 [[package]]
 name = "nfsserve"
 version = "0.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ef1424b6d88c60a091931392970999ea3ceab132d968e6a5545c770fad5b97d7"
+source = "git+https://github.com/huggingface/nfsserve.git?branch=feat%2Fportmap-listener#bbfcce6322183b4a75b3931c9ab2a5b78b550401"
 dependencies = [
  "anyhow",
  "async-trait",
