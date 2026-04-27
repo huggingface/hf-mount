@@ -518,28 +518,25 @@ pub async fn mount_nfs(
 
     // Windows NFS client (Services for NFS / Client for NFS feature).
     // The mount point must be a drive letter (e.g. "Z:") or an empty NTFS dir.
-    // Windows mount.exe has no `mountport=` to bypass portmapper, so we run a
-    // tiny portmap (proc 100000 v2) on 127.0.0.1:111 that maps NFS/MOUNT v3 to
-    // nfsserve's actual TCP port. Requires Administrator (port 111 is privileged).
+    // Windows mount.exe has no `mountport=` to bypass portmapper, so we start
+    // a tiny RPC portmapper (proc 100000 v2) on 127.0.0.1:111 that maps
+    // NFS/MOUNT v3 to nfsserve's actual TCP port. Requires Administrator
+    // (port 111 is privileged).
+    #[cfg(windows)]
+    let portmapper_handle = portmapper::start(port).await.map_err(|e| {
+        std::io::Error::other(format!(
+            "failed to bind portmapper on 127.0.0.1:111: {e} (Administrator required, or another portmap is running)"
+        ))
+    })?;
     #[cfg(windows)]
     {
         let _ = actimeo; // Windows mount.exe has no actimeo equivalent.
-        portmapper::set_service_port(port);
-        let portmapper_handle = tokio::spawn(async {
-            if let Err(e) = portmapper::serve().await {
-                tracing::error!("portmapper failed: {} (port 111 needs Administrator)", e);
-            }
-        });
-        // Give portmapper a moment to bind before mount.exe queries it.
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-
-        let mut opts = format!("nolock,anon,mtype=hard,rsize=32,wsize=32,timeout=60");
+        let mut opts = String::from("nolock,anon,mtype=hard,rsize=32,wsize=32,timeout=60");
         if read_only {
-            opts = format!("{opts},ro");
+            opts.push_str(",ro");
         }
-        let unc = "\\\\127.0.0.1\\!".to_string();
         let output = std::process::Command::new("mount")
-            .args(["-o", &opts, &unc, mount_point_str])
+            .args(["-o", &opts, "\\\\127.0.0.1\\!", mount_point_str])
             .output()?;
         if !output.status.success() {
             server_handle.abort();
@@ -551,9 +548,6 @@ pub async fn mount_nfs(
                 output.status
             )));
         }
-        // Keep portmapper running for the lifetime of the mount; the runtime
-        // will drop it when mount_nfs returns.
-        std::mem::forget(portmapper_handle);
     }
 
     info!("NFS mount active at {}", mount_point_str);
@@ -568,10 +562,15 @@ pub async fn mount_nfs(
     // handle_forever() is an infinite accept() loop that never returns on its own.
     // On Linux, `umount` doesn't always send the UMNT RPC, so we also poll
     // /proc/mounts as a fallback to detect when the mount disappears.
+    // SIGTERM future: real signal listener on Unix, never-completing on Windows.
     #[cfg(unix)]
     let mut sigterm =
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("Failed to register SIGTERM");
-    tokio::pin!(server_handle);
+    #[cfg(unix)]
+    let sigterm_fut = async move { sigterm.recv().await };
+    #[cfg(not(unix))]
+    let sigterm_fut = std::future::pending::<Option<()>>();
+    tokio::pin!(server_handle, sigterm_fut);
     loop {
         tokio::select! {
             msg = mount_rx.recv() => {
@@ -592,7 +591,7 @@ pub async fn mount_nfs(
                 unmount_nfs(mount_point_str);
                 break;
             }
-            _ = async { #[cfg(unix)] { sigterm.recv().await; } #[cfg(not(unix))] { std::future::pending::<()>().await; } } => {
+            _ = &mut sigterm_fut => {
                 info!("Received SIGTERM, unmounting...");
                 unmount_nfs(mount_point_str);
                 break;
@@ -605,6 +604,9 @@ pub async fn mount_nfs(
             }
         }
     }
+
+    #[cfg(windows)]
+    portmapper_handle.abort();
 
     // Drain handle pool: flush and release all cached handles before VFS shutdown.
     let entries = pool_for_shutdown.lock().expect("handle_pool poisoned").drain();
@@ -792,53 +794,44 @@ fn system_time_to_nfstime(t: SystemTime) -> nfstime3 {
 
 /// Check if a path is still an active mount point.
 fn unmount_nfs(mount_point: &str) {
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     {
         use std::ffi::CString;
-
-        // Try libc unmount first (no external process dependency).
-        if let Ok(c_path) = CString::new(mount_point) {
-            #[cfg(target_os = "linux")]
-            {
-                if unsafe { libc::umount2(c_path.as_ptr(), libc::MNT_DETACH) } == 0 {
-                    return;
-                }
-            }
-            #[cfg(target_os = "macos")]
-            {
-                if unsafe { libc::unmount(c_path.as_ptr(), libc::MNT_FORCE) } == 0 {
-                    return;
-                }
-            }
-        }
-
-        // Fallback: external command.
-        #[cfg(target_os = "macos")]
-        if let Err(e) = std::process::Command::new("umount").arg(mount_point).status() {
-            tracing::warn!("NFS unmount fallback failed for {}: {}", mount_point, e);
-        }
-        #[cfg(target_os = "linux")]
+        if let Ok(c_path) = CString::new(mount_point)
+            && unsafe { libc::umount2(c_path.as_ptr(), libc::MNT_DETACH) } == 0
         {
-            let result = if unsafe { libc::getuid() } == 0 {
-                std::process::Command::new("umount").arg(mount_point).status()
-            } else {
-                std::process::Command::new("sudo")
-                    .args(["-n", "umount", mount_point])
-                    .status()
-            };
-            if let Err(e) = result {
-                tracing::warn!("NFS unmount fallback failed for {}: {}", mount_point, e);
-            }
+            return;
+        }
+        let result = if unsafe { libc::getuid() } == 0 {
+            std::process::Command::new("umount").arg(mount_point).status()
+        } else {
+            std::process::Command::new("sudo")
+                .args(["-n", "umount", mount_point])
+                .status()
+        };
+        if let Err(e) = result {
+            tracing::warn!("NFS unmount fallback failed for {}: {}", mount_point, e);
         }
     }
 
-    #[cfg(windows)]
+    #[cfg(target_os = "macos")]
     {
-        // `umount.exe` ships with the Windows NFS client. `-f` forces unmount
-        // even if handles are still open.
-        if let Err(e) = std::process::Command::new("umount").args(["-f", mount_point]).status() {
+        use std::ffi::CString;
+        if let Ok(c_path) = CString::new(mount_point)
+            && unsafe { libc::unmount(c_path.as_ptr(), libc::MNT_FORCE) } == 0
+        {
+            return;
+        }
+        if let Err(e) = std::process::Command::new("umount").arg(mount_point).status() {
             tracing::warn!("NFS unmount fallback failed for {}: {}", mount_point, e);
         }
+    }
+
+    // `umount.exe` ships with the Windows NFS client. `-f` forces unmount
+    // even if handles are still open.
+    #[cfg(windows)]
+    if let Err(e) = std::process::Command::new("umount").args(["-f", mount_point]).status() {
+        tracing::warn!("NFS unmount fallback failed for {}: {}", mount_point, e);
     }
 }
 
@@ -1113,123 +1106,112 @@ mod portmapper {
     const RPC_PROG_UNAVAIL: u32 = 1;
     const RPC_PROC_UNAVAIL: u32 = 3;
 
-    pub fn set_service_port(port: u16) {
-        SERVICE_PORT.store(port, Ordering::Relaxed);
-    }
-
     fn read_u32(buf: &[u8], off: usize) -> Option<u32> {
-        buf.get(off..off + 4)
-            .map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
-    }
-
-    fn write_u32(out: &mut Vec<u8>, v: u32) {
-        out.extend_from_slice(&v.to_be_bytes());
+        Some(u32::from_be_bytes(buf.get(off..off + 4)?.try_into().ok()?))
     }
 
     /// Process one RPC message. Returns the reply payload (no fragment header).
     fn handle(buf: &[u8]) -> Option<Vec<u8>> {
         let xid = read_u32(buf, 0)?;
-        if read_u32(buf, 4)? != 0 {
-            return None;
-        } // not a CALL
-        if read_u32(buf, 8)? != 2 {
-            return None;
-        } // wrong rpcvers
+        if read_u32(buf, 4)? != 0 || read_u32(buf, 8)? != 2 {
+            return None; // not a CALL or wrong rpcvers
+        }
         let prog = read_u32(buf, 12)?;
         let vers = read_u32(buf, 16)?;
         let proc_id = read_u32(buf, 20)?;
-        // cred: flavor(4) + len(4) + body. Skip both cred and verf.
+        // Skip cred + verf (each: flavor(4) + len(4) + body).
         let cred_len = read_u32(buf, 28)? as usize;
         let verf_off = 32 + cred_len;
         let verf_len = read_u32(buf, verf_off + 4)? as usize;
         let args_off = verf_off + 8 + verf_len;
 
-        let mut out = Vec::with_capacity(64);
-        write_u32(&mut out, xid);
-        write_u32(&mut out, RPC_REPLY);
-        write_u32(&mut out, RPC_MSG_ACCEPTED);
-        write_u32(&mut out, 0); // verf flavor (AUTH_NONE)
-        write_u32(&mut out, 0); // verf length
+        let mut out = Vec::with_capacity(32);
+        out.extend_from_slice(&xid.to_be_bytes());
+        out.extend_from_slice(&RPC_REPLY.to_be_bytes());
+        out.extend_from_slice(&RPC_MSG_ACCEPTED.to_be_bytes());
+        out.extend_from_slice(&0u32.to_be_bytes()); // verf flavor (AUTH_NONE)
+        out.extend_from_slice(&0u32.to_be_bytes()); // verf length
 
         if prog != PMAP_PROG || vers != PMAP_VERS {
-            write_u32(&mut out, RPC_PROG_UNAVAIL);
+            out.extend_from_slice(&RPC_PROG_UNAVAIL.to_be_bytes());
             return Some(out);
         }
 
         match proc_id {
             PMAP_PROC_NULL => {
-                write_u32(&mut out, RPC_SUCCESS);
+                out.extend_from_slice(&RPC_SUCCESS.to_be_bytes());
                 Some(out)
             }
             PMAP_PROC_GETPORT => {
                 let q_prog = read_u32(buf, args_off)?;
-                let _q_vers = read_u32(buf, args_off + 4)?;
-                let _q_prot = read_u32(buf, args_off + 8)?;
                 let port = if q_prog == NFS_PROG || q_prog == MOUNT_PROG {
                     SERVICE_PORT.load(Ordering::Relaxed) as u32
                 } else {
                     0
                 };
-                write_u32(&mut out, RPC_SUCCESS);
-                write_u32(&mut out, port);
+                out.extend_from_slice(&RPC_SUCCESS.to_be_bytes());
+                out.extend_from_slice(&port.to_be_bytes());
                 Some(out)
             }
             _ => {
-                write_u32(&mut out, RPC_PROC_UNAVAIL);
+                out.extend_from_slice(&RPC_PROC_UNAVAIL.to_be_bytes());
                 Some(out)
             }
         }
     }
 
-    pub async fn serve() -> std::io::Result<()> {
+    /// Bind UDP+TCP on 127.0.0.1:111, register the nfsserve port, and spawn the
+    /// accept loops. Returns when the sockets are bound (no readiness race vs
+    /// the subsequent mount.exe call). Drop the returned handle to abort.
+    pub async fn start(service_port: u16) -> std::io::Result<tokio::task::JoinHandle<()>> {
         let udp = UdpSocket::bind("127.0.0.1:111").await?;
         let tcp = TcpListener::bind("127.0.0.1:111").await?;
+        SERVICE_PORT.store(service_port, Ordering::Relaxed);
 
-        let udp_task = tokio::spawn(async move {
-            let mut buf = [0u8; 1500];
-            loop {
-                let Ok((n, peer)) = udp.recv_from(&mut buf).await else {
-                    continue;
-                };
-                if let Some(reply) = handle(&buf[..n]) {
-                    let _ = udp.send_to(&reply, peer).await;
-                }
-            }
-        });
-
-        let tcp_task = tokio::spawn(async move {
-            loop {
-                let Ok((mut stream, _)) = tcp.accept().await else {
-                    continue;
-                };
-                tokio::spawn(async move {
-                    loop {
-                        // ONC RPC over TCP: 4-byte fragment header, MSB=last fragment, lower 31=length.
-                        let mut hdr = [0u8; 4];
-                        if stream.read_exact(&mut hdr).await.is_err() {
-                            return;
-                        }
-                        let frag = u32::from_be_bytes(hdr);
-                        let len = (frag & 0x7fff_ffff) as usize;
-                        let mut body = vec![0u8; len];
-                        if stream.read_exact(&mut body).await.is_err() {
-                            return;
-                        }
-                        if let Some(reply) = handle(&body) {
-                            let frag_hdr = ((reply.len() as u32) | 0x8000_0000).to_be_bytes();
-                            if stream.write_all(&frag_hdr).await.is_err() {
-                                return;
-                            }
-                            if stream.write_all(&reply).await.is_err() {
-                                return;
-                            }
-                        }
+        Ok(tokio::spawn(async move {
+            let udp_task = tokio::spawn(async move {
+                let mut buf = [0u8; 1500];
+                loop {
+                    let Ok((n, peer)) = udp.recv_from(&mut buf).await else {
+                        continue;
+                    };
+                    if let Some(reply) = handle(&buf[..n]) {
+                        let _ = udp.send_to(&reply, peer).await;
                     }
-                });
-            }
-        });
+                }
+            });
 
-        let _ = tokio::join!(udp_task, tcp_task);
-        Ok(())
+            // Loopback-only; no per-connection cap by design.
+            let tcp_task = tokio::spawn(async move {
+                loop {
+                    let Ok((mut stream, _)) = tcp.accept().await else {
+                        continue;
+                    };
+                    tokio::spawn(async move {
+                        // ONC RPC over TCP: 4-byte fragment header, MSB=last fragment, lower 31=length.
+                        loop {
+                            let mut hdr = [0u8; 4];
+                            if stream.read_exact(&mut hdr).await.is_err() {
+                                return;
+                            }
+                            let len = (u32::from_be_bytes(hdr) & 0x7fff_ffff) as usize;
+                            let mut body = vec![0u8; len];
+                            if stream.read_exact(&mut body).await.is_err() {
+                                return;
+                            }
+                            if let Some(reply) = handle(&body) {
+                                let frag_hdr = ((reply.len() as u32) | 0x8000_0000).to_be_bytes();
+                                if stream.write_all(&frag_hdr).await.is_err() || stream.write_all(&reply).await.is_err()
+                                {
+                                    return;
+                                }
+                            }
+                        }
+                    });
+                }
+            });
+
+            let _ = tokio::join!(udp_task, tcp_task);
+        }))
     }
 }

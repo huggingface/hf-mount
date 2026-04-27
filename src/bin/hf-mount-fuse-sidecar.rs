@@ -61,7 +61,7 @@ mod imp {
         socket_path: PathBuf,
     }
 
-    pub fn run() {
+    pub fn main() {
         let args = Args::parse();
         raise_fd_limit();
         init_tracing(false);
@@ -503,5 +503,5 @@ mod imp {
 
 #[cfg(unix)]
 fn main() {
-    imp::run();
+    imp::main();
 }
