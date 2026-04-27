@@ -2,12 +2,18 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
+use futures::stream::{self, StreamExt};
 use tracing::{info, warn};
 
 use crate::hub_api::HubOps;
 
 use super::Invalidator;
 use super::inode::{self, InodeTable};
+
+/// Cap on concurrent tree-listing requests per poll round. Without this, every loaded
+/// directory prefix is fetched in parallel, which produces a thundering-herd burst
+/// against the Hub API and triggers 504s on large mounts (e.g. transformers/docs).
+const POLL_TREE_LISTING_CONCURRENCY: usize = 4;
 
 impl super::VirtualFs {
     /// Background task: polls Hub API tree listing to detect remote changes.
@@ -25,20 +31,30 @@ impl super::VirtualFs {
             // This avoids fetching the entire tree for large repos where most
             // directories have never been accessed.
             let prefixes = inodes.read().expect("inodes poisoned").loaded_dir_prefixes();
-            let futures: Vec<_> = prefixes.iter().map(|p| hub_client.list_tree(p)).collect();
-            let results = futures::future::join_all(futures).await;
+            // buffer_unordered yields out of order, so carry the prefix alongside the result.
+            let results: Vec<(String, _)> = stream::iter(prefixes.iter().cloned())
+                .map(|p| {
+                    let client = hub_client.clone();
+                    async move {
+                        let r = client.list_tree(&p).await;
+                        (p, r)
+                    }
+                })
+                .buffer_unordered(POLL_TREE_LISTING_CONCURRENCY)
+                .collect()
+                .await;
             let mut all_entries = Vec::new();
             let mut polled_prefixes = HashSet::new();
             let mut failed_prefixes = Vec::new();
-            for (prefix, result) in prefixes.iter().zip(results) {
+            for (prefix, result) in results {
                 match result {
                     Ok(entries) => {
-                        polled_prefixes.insert(prefix.clone());
+                        polled_prefixes.insert(prefix);
                         all_entries.extend(entries);
                     }
                     Err(e) => {
                         warn!("Remote poll failed for prefix '{prefix}': {e}");
-                        failed_prefixes.push(prefix.clone());
+                        failed_prefixes.push(prefix);
                     }
                 }
             }
