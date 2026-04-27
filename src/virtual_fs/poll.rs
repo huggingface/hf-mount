@@ -32,7 +32,7 @@ impl super::VirtualFs {
             // directories have never been accessed.
             let prefixes = inodes.read().expect("inodes poisoned").loaded_dir_prefixes();
             // buffer_unordered yields out of order, so carry the prefix alongside the result.
-            let results: Vec<(String, _)> = stream::iter(prefixes.iter().cloned())
+            let results: Vec<(String, _)> = stream::iter(prefixes)
                 .map(|prefix| {
                     let client = hub_client.clone();
                     async move {
