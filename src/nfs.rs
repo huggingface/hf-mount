@@ -141,7 +141,8 @@ impl NFSFileSystem for NFSAdapter {
 
     async fn getattr(&self, id: fileid3) -> Result<fattr3, nfsstat3> {
         self.virtual_fs
-            .getattr(id)
+            .getattr_revalidated(id)
+            .await
             .map(|a| vfs_attr_to_nfs(&a))
             .map_err(errno_to_nfs)
     }

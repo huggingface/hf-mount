@@ -202,7 +202,7 @@ impl Filesystem for FuseAdapter {
 
     /// Get file/directory attributes (stat).
     fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
-        match self.virtual_fs.getattr(ino.0) {
+        match self.runtime.block_on(self.virtual_fs.getattr_revalidated(ino.0)) {
             Ok(attr) => reply.attr(&self.metadata_ttl, &vfs_attr_to_fuse(&attr)),
             Err(e) => reply.error(Errno::from_i32(e)),
         }

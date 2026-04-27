@@ -1149,6 +1149,40 @@ impl VirtualFs {
         }
     }
 
+    /// Like [`Self::getattr`] but HEAD-revalidates a clean file inode when
+    /// its `metadata_ttl` window has elapsed. The kernel typically refreshes
+    /// its attribute cache via GETATTR-by-fileid (no LOOKUP), so without this
+    /// path long-lived clients never observe remote changes when polling is
+    /// disabled. `revalidate_file` is itself TTL-gated so the fast case is
+    /// just a read-lock check.
+    pub async fn getattr_revalidated(&self, ino: u64) -> VirtualFsResult<VirtualFsAttr> {
+        debug!("getattr_revalidated: ino={}", ino);
+
+        let revalidate_args = {
+            let inodes = self.inode_table.read().expect("inodes poisoned");
+            let entry = inodes.get(ino).ok_or(libc::ENOENT)?;
+            if entry.kind == InodeKind::File && !entry.is_dirty() {
+                Some((entry.full_path.to_string(), entry.xet_hash.clone(), entry.etag.clone()))
+            } else {
+                None
+            }
+        };
+
+        if let Some((full_path, current_hash, current_etag)) = revalidate_args {
+            self.revalidate_file(ino, &full_path, current_hash.as_deref(), current_etag.as_deref())
+                .await;
+        }
+
+        let inodes = self.inode_table.read().expect("inodes poisoned");
+        match inodes.get(ino) {
+            Some(entry) => {
+                inodes.touch(ino);
+                Ok(self.make_vfs_attr(entry))
+            }
+            None => Err(libc::ENOENT),
+        }
+    }
+
     /// Must be called after every `reply.entry()` / `reply.created()`, or
     /// the kernel and our `nlookup` will drift and a later `forget()` will
     /// underflow. Also touches for LRU so actively-looked-up inodes aren't
