@@ -695,8 +695,12 @@ impl HubApiClient {
             .get("x-xet-hash")
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
+        // Prefer x-linked-size (LFS pointer's true blob size). For non-LFS files
+        // the resolve endpoint serves the file directly, so content-length is the
+        // real size.
         let size = headers
             .get("x-linked-size")
+            .or_else(|| headers.get("content-length"))
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.parse::<u64>().ok());
         let etag = headers
