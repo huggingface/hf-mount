@@ -606,6 +606,10 @@ pub async fn mount_nfs(
         }
     }
 
+    // Stop the NFS server task explicitly (dropping the JoinHandle does not
+    // cancel a tokio task — the server would keep accept()ing on its socket).
+    server_handle.abort();
+    let _ = server_handle.await;
     #[cfg(windows)]
     portmapper_handle.abort();
 
