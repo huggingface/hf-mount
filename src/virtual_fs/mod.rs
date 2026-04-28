@@ -695,6 +695,7 @@ impl VirtualFs {
                 return Err(libc::EIO);
             }
         };
+        let entries_count = entries.len();
 
         let mut inodes = self.inode_table.write().expect("inodes poisoned");
         match inodes.get(parent_ino) {
@@ -703,6 +704,9 @@ impl VirtualFs {
             None => return Err(libc::ENOENT),
             _ => {}
         }
+        // Capture child count before reload to detect shrinkage (used to diagnose
+        // listings that drop entries during concurrent remote writes).
+        let prev_children_count = inodes.get(parent_ino).map(|p| p.children.len()).unwrap_or(0);
         let mut seen_dirs: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut seen_names: std::collections::HashSet<String> = std::collections::HashSet::new();
 
@@ -781,8 +785,10 @@ impl VirtualFs {
         // Remove stale children: entries that existed locally but are no longer
         // in the Hub listing. Skip dirty files (local writes take precedence) and
         // files with open handles (in-flight reads/writes).
+        let mut stale_sample: Vec<String> = Vec::new();
+        let mut stale_count: usize = 0;
         if let Some(parent) = inodes.get(parent_ino) {
-            let stale: Vec<u64> = parent
+            let stale: Vec<(u64, String)> = parent
                 .children
                 .iter()
                 .filter(|c| {
@@ -792,9 +798,13 @@ impl VirtualFs {
                     }
                     inodes.get(c.ino).is_some_and(|e| !e.is_dirty())
                 })
-                .map(|c| c.ino)
+                .map(|c| (c.ino, c.name.to_string()))
                 .collect();
-            for ino in stale {
+            stale_count = stale.len();
+            for (_, name) in stale.iter().take(8) {
+                stale_sample.push(name.clone());
+            }
+            for (ino, _) in stale {
                 if !inodes.has_dirty_or_open_descendants(ino) {
                     inodes.remove(ino);
                 }
@@ -810,6 +820,20 @@ impl VirtualFs {
             parent.children.shrink_to_fit();
             parent.children_loaded_at = Some(Instant::now());
             parent.children_from_remote = true;
+        }
+        // Diagnostic: every reload of a directory listing. `stale_count > 0` after
+        // a previous load means the remote returned fewer entries than we had cached
+        // — suspicious during writes/sync against the source.
+        if stale_count > 0 && prev_children_count > 0 {
+            warn!(
+                "list_tree reload shrunk: prefix='{}' entries={} prev_children={} stale_removed={} sample={:?}",
+                prefix, entries_count, prev_children_count, stale_count, stale_sample
+            );
+        } else {
+            info!(
+                "list_tree: prefix='{}' entries={} prev_children={} stale_removed={}",
+                prefix, entries_count, prev_children_count, stale_count
+            );
         }
         Ok(())
     }
@@ -1315,6 +1339,9 @@ impl VirtualFs {
             Some(entry) => Ok(self.make_vfs_attr(entry)),
             None => {
                 drop(inodes);
+                // Diagnostic: the path was missed by HEAD and absent from the parent
+                // listing; we serve ENOENT and remember it for NEG_CACHE_TTL.
+                info!("lookup ENOENT (negative cache insert): {}", full_path);
                 self.negative_cache_insert(full_path);
                 Err(libc::ENOENT)
             }
