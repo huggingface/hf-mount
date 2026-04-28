@@ -742,8 +742,6 @@ impl VirtualFs {
     }
 
     /// Get or create a per-directory lock for serializing ensure_children_loaded().
-    /// Entries are stored as `Weak`; on miss we sweep dead entries so the map stays
-    /// bounded by the number of directories currently being loaded.
     fn dir_loading_lock(&self, ino: u64) -> Arc<tokio::sync::Mutex<()>> {
         let mut locks = self.dir_loading_locks.lock().expect("dir_loading_locks poisoned");
         if let Some(weak) = locks.get(&ino)
@@ -751,9 +749,6 @@ impl VirtualFs {
         {
             return arc;
         }
-        // Miss: sweep dead Weaks before inserting. Cheap amortized cost since misses
-        // are rare relative to hits, and each sweep removes any entry whose loader has
-        // already finished.
         locks.retain(|_, w| w.strong_count() > 0);
         let arc = Arc::new(tokio::sync::Mutex::new(()));
         locks.insert(ino, Arc::downgrade(&arc));
