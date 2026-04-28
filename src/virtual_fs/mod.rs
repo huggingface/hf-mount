@@ -3,7 +3,7 @@ use std::fs::{File, OpenOptions};
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::{Bytes, BytesMut};
@@ -125,7 +125,11 @@ pub struct VirtualFs {
     /// Per-directory loading locks: serializes concurrent ensure_children_loaded() calls
     /// for the same directory so only one HTTP request is made (prevents thundering herd
     /// when Finder/Spotlight send many lookups on mount).
-    dir_loading_locks: Mutex<HashMap<u64, Arc<tokio::sync::Mutex<()>>>>,
+    ///
+    /// Stored as `Weak` so entries self-clean once no loader holds the Arc — without this,
+    /// long-lived mounts over churning directory trees (e.g. CI doc buckets with PR dirs)
+    /// would accumulate one entry per inode ever loaded.
+    dir_loading_locks: Mutex<HashMap<u64, Weak<tokio::sync::Mutex<()>>>>,
     /// Per-inode pending commit receivers. release() publishes the commit result here;
     /// open() awaits it instead of blindly blocking on staging_lock.
     pending_commits: Mutex<HashMap<u64, CommitHookRx>>,
@@ -738,13 +742,22 @@ impl VirtualFs {
     }
 
     /// Get or create a per-directory lock for serializing ensure_children_loaded().
+    /// Entries are stored as `Weak`; on miss we sweep dead entries so the map stays
+    /// bounded by the number of directories currently being loaded.
     fn dir_loading_lock(&self, ino: u64) -> Arc<tokio::sync::Mutex<()>> {
-        self.dir_loading_locks
-            .lock()
-            .expect("dir_loading_locks poisoned")
-            .entry(ino)
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone()
+        let mut locks = self.dir_loading_locks.lock().expect("dir_loading_locks poisoned");
+        if let Some(weak) = locks.get(&ino)
+            && let Some(arc) = weak.upgrade()
+        {
+            return arc;
+        }
+        // Miss: sweep dead Weaks before inserting. Cheap amortized cost since misses
+        // are rare relative to hits, and each sweep removes any entry whose loader has
+        // already finished.
+        locks.retain(|_, w| w.strong_count() > 0);
+        let arc = Arc::new(tokio::sync::Mutex::new(()));
+        locks.insert(ino, Arc::downgrade(&arc));
+        arc
     }
 
     /// Install a pending commit watch hook on a streaming channel.
