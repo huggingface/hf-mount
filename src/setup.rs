@@ -98,8 +98,8 @@ pub struct MountOptions {
     #[arg(long, default_value_t = 30)]
     pub poll_interval_secs: u64,
 
-    /// Maximum size in bytes for the on-disk chunk cache.
-    #[arg(long, default_value_t = 10_000_000_000)]
+    /// Maximum size for the on-disk chunk cache. Accepts bytes or suffixes like 512Mi, 10G, or 5Gi.
+    #[arg(long, default_value = "10G", value_parser = parse_cache_size)]
     pub cache_size: u64,
 
     /// Disable the on-disk chunk cache. Every read fetches data from
@@ -491,6 +491,103 @@ pub fn raise_fd_limit() {
     }
 }
 
+fn parse_cache_size(value: &str) -> Result<u64, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(cache_size_error(value, "value cannot be empty"));
+    }
+    if value.starts_with('-') {
+        return Err(cache_size_error(value, "value must be non-negative"));
+    }
+
+    let value = value.strip_prefix('+').unwrap_or(value);
+    let number_end = value
+        .char_indices()
+        .find_map(|(idx, c)| (!c.is_ascii_digit() && c != '.').then_some(idx))
+        .unwrap_or(value.len());
+    let number = &value[..number_end];
+    let suffix = &value[number_end..];
+    let multiplier = cache_size_multiplier(suffix).ok_or_else(|| cache_size_error(value, "unknown unit suffix"))?;
+
+    parse_decimal_byte_count(value, number, multiplier)
+}
+
+fn cache_size_multiplier(suffix: &str) -> Option<u128> {
+    let suffix = suffix
+        .strip_suffix('B')
+        .or_else(|| suffix.strip_suffix('b'))
+        .unwrap_or(suffix)
+        .to_ascii_lowercase();
+
+    match suffix.as_str() {
+        "" => Some(1),
+        "k" => Some(1_000),
+        "m" => Some(1_000_000),
+        "g" => Some(1_000_000_000),
+        "t" => Some(1_000_000_000_000),
+        "p" => Some(1_000_000_000_000_000),
+        "e" => Some(1_000_000_000_000_000_000),
+        "ki" => Some(1_024),
+        "mi" => Some(1_024_u128.pow(2)),
+        "gi" => Some(1_024_u128.pow(3)),
+        "ti" => Some(1_024_u128.pow(4)),
+        "pi" => Some(1_024_u128.pow(5)),
+        "ei" => Some(1_024_u128.pow(6)),
+        _ => None,
+    }
+}
+
+fn parse_decimal_byte_count(original: &str, number: &str, multiplier: u128) -> Result<u64, String> {
+    let mut parts = number.split('.');
+    let whole = parts.next().unwrap_or_default();
+    let fraction = parts.next();
+    if parts.next().is_some()
+        || (whole.is_empty() && fraction.unwrap_or_default().is_empty())
+        || !whole.chars().all(|c| c.is_ascii_digit())
+        || !fraction.unwrap_or_default().chars().all(|c| c.is_ascii_digit())
+    {
+        return Err(cache_size_error(original, "expected a decimal number"));
+    }
+
+    let whole_value = if whole.is_empty() {
+        0
+    } else {
+        whole
+            .parse::<u128>()
+            .map_err(|_| cache_size_error(original, "number is too large"))?
+    };
+    let whole_bytes = whole_value
+        .checked_mul(multiplier)
+        .ok_or_else(|| cache_size_error(original, "number is too large"))?;
+
+    let fraction = fraction.unwrap_or_default().trim_end_matches('0');
+    let fraction_bytes = if fraction.is_empty() {
+        0
+    } else {
+        let fraction_value = fraction
+            .parse::<u128>()
+            .map_err(|_| cache_size_error(original, "number is too precise"))?;
+        let denominator = 10_u128
+            .checked_pow(fraction.len() as u32)
+            .ok_or_else(|| cache_size_error(original, "number is too precise"))?;
+        let numerator = fraction_value
+            .checked_mul(multiplier)
+            .ok_or_else(|| cache_size_error(original, "number is too large"))?;
+        let quotient = numerator / denominator;
+        let remainder = numerator % denominator;
+        quotient + if remainder == 0 { 0 } else { 1 }
+    };
+
+    let bytes = whole_bytes
+        .checked_add(fraction_bytes)
+        .ok_or_else(|| cache_size_error(original, "number is too large"))?;
+    u64::try_from(bytes).map_err(|_| cache_size_error(original, "number is too large"))
+}
+
+fn cache_size_error(value: &str, reason: &str) -> String {
+    format!("invalid cache size {value:?}: {reason}; use bytes or units like 512Mi, 10G, 5Gi, or 1TB")
+}
+
 fn build_cas_config(
     ctx: &XetContext,
     runtime: &tokio::runtime::Handle,
@@ -510,4 +607,38 @@ fn build_cas_config(
         )
         .unwrap_or_else(|e| panic!("Failed to build TranslatorConfig: {e}")),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::*;
+
+    #[test]
+    fn parse_cache_size_accepts_bytes_and_human_units() {
+        assert_eq!(parse_cache_size("0").unwrap(), 0);
+        assert_eq!(parse_cache_size("10000000000").unwrap(), 10_000_000_000);
+        assert_eq!(parse_cache_size("10G").unwrap(), 10_000_000_000);
+        assert_eq!(parse_cache_size("10Gi").unwrap(), 10 * 1_024_u64.pow(3));
+        assert_eq!(parse_cache_size("512MiB").unwrap(), 512 * 1_024_u64.pow(2));
+        assert_eq!(parse_cache_size("1.5G").unwrap(), 1_500_000_000);
+        assert_eq!(parse_cache_size("1.5Gi").unwrap(), 1_610_612_736);
+    }
+
+    #[test]
+    fn parse_cache_size_rejects_invalid_values() {
+        for value in ["", "-1", "abc", "1..2G", "10XB", "18446744073709551616"] {
+            assert!(parse_cache_size(value).is_err(), "{value:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn args_parse_cache_size_with_value_parser() {
+        let args = Args::try_parse_from(["hf-mount-fuse", "--cache-size", "2Gi", "repo", "gpt2", "/tmp/gpt2"]).unwrap();
+        assert_eq!(args.options.cache_size, 2 * 1_024_u64.pow(3));
+
+        let args = Args::try_parse_from(["hf-mount-fuse", "repo", "gpt2", "/tmp/gpt2"]).unwrap();
+        assert_eq!(args.options.cache_size, 10_000_000_000);
+    }
 }
