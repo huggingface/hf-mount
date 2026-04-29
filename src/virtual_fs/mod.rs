@@ -996,6 +996,26 @@ impl VirtualFs {
                 };
             }
             FastResult::Miss(full_path) => {
+                // A cached listing can still hide entries added remotely after
+                // we listed. Re-validate before serving ENOENT, gated by the
+                // negative cache so repeated misses stay free.
+                if self.negative_cache_check(&full_path) {
+                    return Err(libc::ENOENT);
+                }
+                // HEAD probe catches files added remotely.
+                if let Ok(Some(head)) = self.hub_client.head_file(&full_path).await
+                    && head.size.is_some()
+                {
+                    return self.insert_file_from_head(parent, name, &full_path, head);
+                }
+                // The resolve endpoint returns 404 for directories, so a HEAD
+                // miss could still be a remotely-added dir. Targeted listing
+                // catches that; non-empty result means the dir exists.
+                if let Ok(entries) = self.hub_client.list_tree(&full_path).await
+                    && !entries.is_empty()
+                {
+                    return self.insert_dir(parent, name, &full_path);
+                }
                 self.negative_cache_insert(full_path);
                 return Err(libc::ENOENT);
             }
@@ -1103,6 +1123,38 @@ impl VirtualFs {
         {
             entry.etag = Some(etag);
         }
+        match inodes.get(ino) {
+            Some(entry) => Ok(self.make_vfs_attr(entry)),
+            None => Err(libc::EIO),
+        }
+    }
+
+    /// Insert a directory inode discovered via a targeted listing, without
+    /// touching siblings. Mirrors `insert_file_from_head` for the dir case.
+    /// Parent's `children_loaded` stays as-is so a later `readdir` still
+    /// triggers a full listing.
+    fn insert_dir(&self, parent: u64, name: &str, full_path: &str) -> VirtualFsResult<VirtualFsAttr> {
+        let mut inodes = self.inode_table.write().expect("inodes poisoned");
+        match inodes.get(parent) {
+            None => return Err(libc::ENOENT),
+            Some(e) if e.kind != InodeKind::Directory => return Err(libc::ENOTDIR),
+            Some(_) => {}
+        }
+        if let Some(existing) = inodes.lookup_child(parent, name) {
+            return Ok(self.make_vfs_attr(existing));
+        }
+        let ino = inodes.insert(
+            parent,
+            name.to_string(),
+            full_path.to_string(),
+            InodeKind::Directory,
+            0,
+            self.hub_client.default_mtime(),
+            None,
+            0o755,
+            self.uid,
+            self.gid,
+        );
         match inodes.get(ino) {
             Some(entry) => Ok(self.make_vfs_attr(entry)),
             None => Err(libc::EIO),
@@ -2427,6 +2479,9 @@ impl VirtualFs {
             self.drop_staging(ino);
         }
 
+        // Remember locally that this path is gone so the lookup HEAD-on-miss
+        // recovery doesn't resurrect it from a not-yet-flushed remote delete.
+        self.negative_cache_insert(full_path.clone());
         info!("Deleted file: {}", full_path);
         Ok(())
     }
@@ -2514,14 +2569,14 @@ impl VirtualFs {
 
         self.ensure_children_loaded(parent).await?;
 
-        let ino = {
+        let (ino, full_path) = {
             let inodes = self.inode_table.read().expect("inodes poisoned");
             match inodes.lookup_child(parent, name) {
                 Some(entry) if entry.kind == InodeKind::Directory => {
                     if !entry.children.is_empty() {
                         return Err(libc::ENOTEMPTY);
                     }
-                    entry.inode
+                    (entry.inode, entry.full_path.to_string())
                 }
                 Some(_) => return Err(libc::ENOTDIR),
                 None => return Err(libc::ENOENT),
@@ -2533,15 +2588,18 @@ impl VirtualFs {
 
         // Re-check ENOTEMPTY + remove under a single write lock to prevent
         // a concurrent create/mkdir from inserting a child in between.
-        let mut inodes = self.inode_table.write().expect("inodes poisoned");
-        match inodes.get(ino) {
-            Some(entry) if !entry.children.is_empty() => return Err(libc::ENOTEMPTY),
-            None => return Err(libc::ENOENT),
-            _ => {}
+        {
+            let mut inodes = self.inode_table.write().expect("inodes poisoned");
+            match inodes.get(ino) {
+                Some(entry) if !entry.children.is_empty() => return Err(libc::ENOTEMPTY),
+                None => return Err(libc::ENOENT),
+                _ => {}
+            }
+            inodes.remove(ino);
+            // nlink adjusted by remove()
+            inodes.touch_parent(parent, SystemTime::now());
         }
-        inodes.remove(ino);
-        // nlink adjusted by remove()
-        inodes.touch_parent(parent, SystemTime::now());
+        self.negative_cache_insert(full_path);
         Ok(())
     }
 
@@ -2615,6 +2673,7 @@ impl VirtualFs {
 
         // Phase 2: sync to remote (add + delete ops).
         let remote_mutated = self.rename_remote(&info).await?;
+        let old_path = info.old_path.clone();
 
         // Phase 3: apply to local inode table under write lock.
         // If Phase 2 mutated the remote and Phase 3 fails with ENOENT (source
@@ -2622,7 +2681,13 @@ impl VirtualFs {
         // Destination-conflict errors (EEXIST, EISDIR, etc.) are propagated
         // since poll may not fix a dirty local inode at the destination path.
         match self.rename_apply_local(info, parent, name, newparent, newname, no_replace) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                // Remember locally that the source path is gone so the lookup
+                // HEAD-on-miss recovery doesn't resurrect it from a
+                // not-yet-flushed remote delete.
+                self.negative_cache_insert(old_path);
+                Ok(())
+            }
             Err(libc::ENOENT) if remote_mutated => {
                 warn!("rename: source gone after remote rename; poll will reconcile");
                 // Invalidate parents so the next lookup re-fetches from remote
