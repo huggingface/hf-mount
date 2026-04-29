@@ -938,8 +938,6 @@ impl VirtualFs {
     // ── VFS operations ─────────────────────────────────────────────────
 
     pub async fn lookup(&self, parent: u64, name: &str) -> VirtualFsResult<VirtualFsAttr> {
-        debug!("lookup: parent={}, name={}", parent, name);
-
         // Fast path: children already loaded → lookup directly, no allocation needed.
         // Revalidation info extracted from the lock scope so we can await outside it.
         enum FastResult {
@@ -953,9 +951,11 @@ impl VirtualFs {
             Miss(String), // full_path for negative cache
             NotLoaded,
         }
+        let parent_path: String;
         let fast = {
             let inodes = self.inode_table.read().expect("inodes poisoned");
             let parent_entry = inodes.get(parent).ok_or(libc::ENOENT)?;
+            parent_path = parent_entry.full_path.to_string();
 
             if parent_entry.kind != InodeKind::Directory {
                 return Err(libc::ENOTDIR);
@@ -1002,6 +1002,17 @@ impl VirtualFs {
                 None => FastResult::NotLoaded,
             }
         }; // inodes lock dropped here
+
+        // Diagnostic: classify every lookup so we can grep what's hitting cache,
+        // what's served as ENOENT from the cached listing, and what goes slow.
+        match &fast {
+            FastResult::Hit(_) => info!("lookup HIT: parent='{}' name='{}'", parent_path, name),
+            FastResult::NeedsRevalidation { full_path, .. } => {
+                info!("lookup REVALIDATE: {}", full_path)
+            }
+            FastResult::Miss(full_path) => info!("lookup MISS (cached parent listing): {}", full_path),
+            FastResult::NotLoaded => info!("lookup SLOW: parent='{}' name='{}'", parent_path, name),
+        }
 
         match fast {
             FastResult::Hit(attr) => return Ok(attr),
@@ -1068,6 +1079,7 @@ impl VirtualFs {
             // and expose a zero-byte file. Fall back to list_tree which has
             // the authoritative size from the tree index.
             Ok(Some(head)) if head.size.is_some() => {
+                info!("lookup SLOW resolved via HEAD: {}", full_path);
                 return self.insert_file_from_head(parent, name, &full_path, head);
             }
             // 404 may mean "doesn't exist" or "it's a directory" (the resolve
@@ -1080,7 +1092,10 @@ impl VirtualFs {
 
         let inodes = self.inode_table.read().expect("inodes poisoned");
         match inodes.lookup_child(parent, name) {
-            Some(entry) => Ok(self.make_vfs_attr(entry)),
+            Some(entry) => {
+                info!("lookup SLOW resolved via list_tree: {}", full_path);
+                Ok(self.make_vfs_attr(entry))
+            }
             None => {
                 drop(inodes);
                 // Diagnostic: the path was missed by HEAD and absent from the parent
@@ -1302,12 +1317,11 @@ impl VirtualFs {
     }
 
     pub async fn readdir(&self, ino: u64) -> VirtualFsResult<Vec<VirtualFsDirEntry>> {
-        debug!("readdir: ino={}", ino);
-
         self.ensure_children_loaded(ino).await?;
 
         let inodes = self.inode_table.read().expect("inodes poisoned");
         let entry = inodes.get(ino).ok_or(libc::ENOENT)?;
+        info!("readdir: path='{}' children={}", entry.full_path, entry.children.len());
 
         let mut entries = Vec::with_capacity(2 + entry.children.len());
         entries.push(VirtualFsDirEntry {
