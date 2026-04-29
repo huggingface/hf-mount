@@ -137,6 +137,81 @@ async fn test_fuse_deep_cold_read() {
 }
 
 /// Test HEAD revalidation: remote file changes are detected via lookup() HEAD
+/// A directory uploaded remotely after the parent's listing was cached
+/// (poll disabled, so no background refresh) must still be discoverable
+/// via a path lookup. Exercises the FastResult::Miss → list_tree probe
+/// path against a real bucket.
+#[tokio::test]
+async fn test_fuse_remote_dir_appears_after_listing() {
+    let guard = match common::setup_bucket_with_file("fuse-new-dir", "initial.txt", b"initial content").await {
+        Some(g) => g,
+        None => return,
+    };
+
+    let mount_point = format!("/tmp/hf-mount-fuse-new-dir-{}", std::process::id());
+    let cache_dir = format!("/tmp/hf-mount-fuse-new-dir-cache-{}", std::process::id());
+
+    let child = common::mount_bucket(&guard.bucket_id, &mount_point, &cache_dir, &["--read-only"]);
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // Cache the root listing (and prove the initial file is visible).
+        let entries: Vec<String> = std::fs::read_dir(&mount_point)?
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert!(entries.contains(&"initial.txt".to_string()));
+        assert!(!entries.contains(&"newdir".to_string()));
+        Ok::<_, std::io::Error>(())
+    }));
+
+    if let Ok(Err(e)) = &result {
+        common::unmount(&mount_point, child, 30);
+        panic!("initial readdir failed: {}", e);
+    }
+
+    // Add a directory remotely (a file under a previously-absent prefix).
+    let write_config = common::build_write_config(&guard.hub).await;
+    let tmp_dir = std::env::temp_dir().join(format!("hf-mount-newdir-stage-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp_dir).ok();
+    let staging = tmp_dir.join("payload.txt");
+    std::fs::write(&staging, b"new content").unwrap();
+    let info = common::upload_file(write_config, &staging).await;
+    guard
+        .hub
+        .batch_operations(&[hf_mount::hub_api::BatchOp::AddFile {
+            path: "newdir/payload.txt".to_string(),
+            xet_hash: info.hash().to_string(),
+            mtime: 0,
+            content_type: None,
+        }])
+        .await
+        .expect("batch add failed");
+    std::fs::remove_dir_all(&tmp_dir).ok();
+
+    let probe = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // `ls newdir/` triggers lookup(parent=root, name="newdir"). The Miss
+        // arm probes via list_tree, finds entries, and inserts the dir.
+        let listed: Vec<String> = std::fs::read_dir(format!("{}/newdir", mount_point))?
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(listed, vec!["payload.txt".to_string()]);
+        let content = std::fs::read_to_string(format!("{}/newdir/payload.txt", mount_point))?;
+        assert_eq!(content, "new content");
+        Ok::<_, std::io::Error>(())
+    }));
+
+    common::unmount(&mount_point, child, 30);
+    std::fs::remove_dir_all(&mount_point).ok();
+    std::fs::remove_dir_all(&cache_dir).ok();
+
+    match probe {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => panic!("post-add probe failed: {}", e),
+        Err(e) => std::panic::resume_unwind(e),
+    }
+}
+
 /// and the kernel page cache is invalidated so re-reads return fresh content.
 #[tokio::test]
 async fn test_fuse_revalidation() {
