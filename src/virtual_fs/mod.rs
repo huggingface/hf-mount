@@ -1031,8 +1031,47 @@ impl VirtualFs {
                 };
             }
             FastResult::Miss(full_path) => {
-                self.negative_cache_insert(full_path);
-                return Err(libc::ENOENT);
+                // The parent listing was loaded earlier and the name isn't in
+                // it — but a stale cached listing can hide entries that were
+                // added remotely after we listed. Re-validate before serving
+                // ENOENT, gated by the negative cache so repeated misses for
+                // the same path stay cheap.
+                if self.negative_cache_check(&full_path) {
+                    return Err(libc::ENOENT);
+                }
+                // HEAD the file: if it exists remotely, the cached parent
+                // listing is stale → insert the inode + invalidate so a
+                // subsequent readdir re-fetches the full picture.
+                if let Ok(Some(head)) = self.hub_client.head_file(&full_path).await
+                    && head.size.is_some()
+                {
+                    info!("lookup MISS but HEAD found: {} (parent listing was stale)", full_path);
+                    {
+                        let mut inodes = self.inode_table.write().expect("inodes poisoned");
+                        inodes.invalidate_children(parent);
+                    }
+                    return self.insert_file_from_head(parent, name, &full_path, head);
+                }
+                // HEAD didn't resolve (404 or error). The name might still be
+                // a directory the resolve endpoint can't serve, so force a
+                // parent relist as a final check before declaring ENOENT.
+                {
+                    let mut inodes = self.inode_table.write().expect("inodes poisoned");
+                    inodes.invalidate_children(parent);
+                }
+                self.ensure_children_loaded(parent).await?;
+                let inodes = self.inode_table.read().expect("inodes poisoned");
+                return match inodes.lookup_child(parent, name) {
+                    Some(entry) => {
+                        info!("lookup MISS resolved via parent relist: {}", full_path);
+                        Ok(self.make_vfs_attr(entry))
+                    }
+                    None => {
+                        drop(inodes);
+                        self.negative_cache_insert(full_path);
+                        Err(libc::ENOENT)
+                    }
+                };
             }
             FastResult::NotLoaded => {} // fall through to slow path
         }

@@ -551,6 +551,8 @@ fn rename_replaces_destination() {
         vfs.rename(ROOT_INODE, "src.txt", ROOT_INODE, "dst.txt", false)
             .await
             .unwrap();
+        // Simulate the remote rename (production hub would have moved it).
+        hub.remove_file("src.txt");
 
         // Inode-level check
         {
@@ -2295,6 +2297,8 @@ fn unlink_cleans_staging() {
 
         // Unlink — should also clean up staging
         vfs.unlink(ROOT_INODE, "file.txt").await.unwrap();
+        // Simulate the remote deletion (production hub would no longer return it).
+        hub.remove_file("file.txt");
 
         // Verify inode is gone
         let result = vfs.lookup(ROOT_INODE, "file.txt").await;
