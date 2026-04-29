@@ -908,6 +908,196 @@ fn lookup_missing_under_unloaded_parent_populates_negative_cache() {
     });
 }
 
+/// A file appears remotely after the parent's listing was cached. A lookup
+/// hitting `FastResult::Miss` must re-validate via HEAD and surface the new
+/// entry instead of trusting the stale cache.
+#[test]
+fn lookup_miss_finds_remotely_added_file() {
+    let hub = MockHub::new();
+    hub.add_file("subdir/known.txt", 5, Some("h_k"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let subdir = vfs.lookup(ROOT_INODE, "subdir").await.unwrap();
+        // Warm parent.children_loaded by listing it.
+        let _ = vfs.readdir(subdir.ino).await.unwrap();
+        assert!(vfs.inode_table.read().unwrap().is_children_loaded(subdir.ino));
+
+        // Simulate a remote concurrent upload after we listed.
+        hub.add_file("subdir/freshly_added.txt", 9, Some("h_fresh"), None);
+        hub.set_head(
+            "subdir/freshly_added.txt",
+            Some(HeadFileInfo {
+                xet_hash: Some("h_fresh".to_string()),
+                etag: None,
+                size: Some(9),
+                last_modified: None,
+            }),
+        );
+
+        // Miss arm should HEAD-probe and discover the entry.
+        let attr = vfs.lookup(subdir.ino, "freshly_added.txt").await.unwrap();
+        assert_eq!(attr.size, 9);
+        assert_eq!(attr.kind, InodeKind::File);
+    });
+}
+
+/// A directory appears remotely after the parent's listing was cached. A
+/// lookup hitting `FastResult::Miss` must fall back to the targeted list_tree
+/// probe (resolve endpoint returns 404 for dirs) and surface the new entry.
+#[test]
+fn lookup_miss_finds_remotely_added_dir() {
+    let hub = MockHub::new();
+    hub.add_file("repo/v1.0.0/file.txt", 3, Some("h_v1"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let repo = vfs.lookup(ROOT_INODE, "repo").await.unwrap();
+        // Warm parent.children_loaded; the only known sub-dir is v1.0.0.
+        let _ = vfs.readdir(repo.ino).await.unwrap();
+
+        // Simulate a remote upload of a new version directory.
+        hub.add_file("repo/v2.0.0/file.txt", 4, Some("h_v2"), None);
+
+        // Miss arm: HEAD on `repo/v2.0.0` returns 404 (it's a dir), list_tree
+        // probe finds entries under it, and we insert the dir non-destructively.
+        let attr = vfs.lookup(repo.ino, "v2.0.0").await.unwrap();
+        assert_eq!(attr.kind, InodeKind::Directory);
+
+        // Sibling listing must still be intact: v1.0.0 should not have been evicted.
+        let inodes = vfs.inode_table.read().unwrap();
+        assert!(inodes.lookup_child(repo.ino, "v1.0.0").is_some());
+    });
+}
+
+/// A name absent from a cached parent listing AND from the remote: ENOENT
+/// is served and the negative cache short-circuits subsequent lookups.
+#[test]
+fn lookup_miss_truly_absent_populates_neg_cache() {
+    let hub = MockHub::new();
+    hub.add_file("subdir/known.txt", 1, Some("h"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let subdir = vfs.lookup(ROOT_INODE, "subdir").await.unwrap();
+        let _ = vfs.readdir(subdir.ino).await.unwrap();
+
+        let pre_head = hub.head_file_call_count();
+        let pre_list = hub.list_tree_call_count();
+
+        let err = vfs.lookup(subdir.ino, "ghost.txt").await.unwrap_err();
+        assert_eq!(err, libc::ENOENT);
+        assert_eq!(hub.head_file_call_count(), pre_head + 1, "HEAD probed once");
+        assert_eq!(hub.list_tree_call_count(), pre_list + 1, "list_tree probed once");
+        assert!(vfs.negative_cache_check("subdir/ghost.txt"));
+
+        // Second lookup should hit neg cache, no extra Hub calls.
+        let err2 = vfs.lookup(subdir.ino, "ghost.txt").await.unwrap_err();
+        assert_eq!(err2, libc::ENOENT);
+        assert_eq!(hub.head_file_call_count(), pre_head + 1);
+        assert_eq!(hub.list_tree_call_count(), pre_list + 1);
+    });
+}
+
+/// unlink seeds the negative cache so a lookup right after — before the
+/// remote delete is flushed — doesn't resurrect the file via the new
+/// HEAD-on-miss probe.
+#[test]
+fn unlink_populates_neg_cache() {
+    let hub = MockHub::new();
+    hub.add_file("doomed.txt", 5, Some("h"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let _ = vfs.lookup(ROOT_INODE, "doomed.txt").await.unwrap();
+
+        vfs.unlink(ROOT_INODE, "doomed.txt").await.unwrap();
+        assert!(vfs.negative_cache_check("doomed.txt"));
+
+        // Even though MockHub still has the file (remote delete is async),
+        // the lookup must return ENOENT via the negative cache.
+        let pre_head = hub.head_file_call_count();
+        let err = vfs.lookup(ROOT_INODE, "doomed.txt").await.unwrap_err();
+        assert_eq!(err, libc::ENOENT);
+        assert_eq!(hub.head_file_call_count(), pre_head, "neg cache should skip HEAD");
+    });
+}
+
+/// rmdir seeds the negative cache for the removed directory path.
+#[test]
+fn rmdir_populates_neg_cache() {
+    let hub = MockHub::new();
+    hub.add_dir("emptydir");
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let _ = vfs.lookup(ROOT_INODE, "emptydir").await.unwrap();
+        vfs.rmdir(ROOT_INODE, "emptydir").await.unwrap();
+        assert!(vfs.negative_cache_check("emptydir"));
+    });
+}
+
+/// On a writable mount the children list also holds locally-created entries
+/// that have not yet propagated to the remote tree listing. A Miss-arm
+/// lookup of a different name must NOT evict those local entries — it should
+/// probe the new name in isolation.
+#[test]
+fn lookup_miss_does_not_evict_local_uploads_on_writable_mount() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_advanced(&hub, &xet);
+
+    rt.block_on(async {
+        // Locally create + flush a file. After flush it is "clean" but not
+        // yet visible in the remote tree listing (Xet propagation gap).
+        let (attr, fh) = vfs
+            .create(ROOT_INODE, "local_upload.txt", 0o644, 1000, 1000, None)
+            .await
+            .unwrap();
+        write_blocking(&vfs, attr.ino, fh, 0, b"data").await.unwrap();
+        vfs.flush(attr.ino, fh, None).await.unwrap();
+        vfs.release(fh).await.unwrap();
+
+        // Trigger a Miss-arm lookup for an unrelated name. Old behavior
+        // (invalidate + relist) would have dropped local_upload.txt because
+        // the mock tree doesn't know about it yet.
+        let _ = vfs.lookup(ROOT_INODE, "ghost.txt").await.unwrap_err();
+
+        // The local upload must still resolve.
+        let still_there = vfs.lookup(ROOT_INODE, "local_upload.txt").await.unwrap();
+        assert_eq!(still_there.ino, attr.ino);
+    });
+}
+
+/// rename seeds the negative cache for the source path so the HEAD-on-miss
+/// probe doesn't resurrect it from a not-yet-flushed remote delete.
+#[test]
+fn rename_populates_neg_cache_for_old_path() {
+    let hub = MockHub::new();
+    hub.add_file("src.txt", 3, Some("h"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let _ = vfs.lookup(ROOT_INODE, "src.txt").await.unwrap();
+        vfs.rename(ROOT_INODE, "src.txt", ROOT_INODE, "dst.txt", false)
+            .await
+            .unwrap();
+        assert!(vfs.negative_cache_check("src.txt"));
+
+        // Lookup of old path must not resurrect via HEAD.
+        let pre_head = hub.head_file_call_count();
+        let err = vfs.lookup(ROOT_INODE, "src.txt").await.unwrap_err();
+        assert_eq!(err, libc::ENOENT);
+        assert_eq!(hub.head_file_call_count(), pre_head, "neg cache should skip HEAD");
+    });
+}
+
 /// Sequence: point-lookup (HEAD slow path) → readdir on the same parent
 /// (list_tree populates `children_loaded`) → re-lookup the file. The HEAD-
 /// inserted inode must survive the listing reconciliation and the re-lookup
