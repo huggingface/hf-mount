@@ -1042,6 +1042,38 @@ fn rmdir_populates_neg_cache() {
     });
 }
 
+/// On a writable mount the children list also holds locally-created entries
+/// that have not yet propagated to the remote tree listing. A Miss-arm
+/// lookup of a different name must NOT evict those local entries — it should
+/// probe the new name in isolation.
+#[test]
+fn lookup_miss_does_not_evict_local_uploads_on_writable_mount() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_advanced(&hub, &xet);
+
+    rt.block_on(async {
+        // Locally create + flush a file. After flush it is "clean" but not
+        // yet visible in the remote tree listing (Xet propagation gap).
+        let (attr, fh) = vfs
+            .create(ROOT_INODE, "local_upload.txt", 0o644, 1000, 1000, None)
+            .await
+            .unwrap();
+        write_blocking(&vfs, attr.ino, fh, 0, b"data").await.unwrap();
+        vfs.flush(attr.ino, fh, None).await.unwrap();
+        vfs.release(fh).await.unwrap();
+
+        // Trigger a Miss-arm lookup for an unrelated name. Old behavior
+        // (invalidate + relist) would have dropped local_upload.txt because
+        // the mock tree doesn't know about it yet.
+        let _ = vfs.lookup(ROOT_INODE, "ghost.txt").await.unwrap_err();
+
+        // The local upload must still resolve.
+        let still_there = vfs.lookup(ROOT_INODE, "local_upload.txt").await.unwrap();
+        assert_eq!(still_there.ino, attr.ino);
+    });
+}
+
 /// rename seeds the negative cache for the source path so the HEAD-on-miss
 /// probe doesn't resurrect it from a not-yet-flushed remote delete.
 #[test]
