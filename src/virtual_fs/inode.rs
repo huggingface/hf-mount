@@ -326,6 +326,42 @@ impl InodeTable {
         self.inodes.is_empty()
     }
 
+    /// Reclaim HashMap capacity left over from a past burst.
+    ///
+    /// `HashMap::remove` keeps the bucket array sized for the high-water mark,
+    /// so a large directory listing that inserts thousands of entries and is
+    /// later evicted leaves the bucket array sized for the burst. With one
+    /// entry on the order of a hundred bytes plus the hash slot, a burst of
+    /// ~1.5 M entries pins ~140 MB until the process exits — visible in prod
+    /// as a stair-step on the heap that never comes down between bursts.
+    ///
+    /// Shrink only when we have >=4x headroom and keep 2x going forward, so
+    /// steady-state churn around the soft limit doesn't trigger repeated
+    /// rehashes. Caller must hold the write lock.
+    pub(crate) fn shrink_if_oversized(&mut self) -> (usize, usize) {
+        const MIN_CAP: usize = 1024;
+        const SHRINK_FACTOR: usize = 4;
+        const HEADROOM_FACTOR: usize = 2;
+
+        let mut inodes_freed = 0usize;
+        let cap = self.inodes.capacity();
+        let len = self.inodes.len();
+        if cap > MIN_CAP && cap >= len.saturating_mul(SHRINK_FACTOR) {
+            self.inodes.shrink_to(len.saturating_mul(HEADROOM_FACTOR));
+            inodes_freed = cap.saturating_sub(self.inodes.capacity());
+        }
+
+        let mut paths_freed = 0usize;
+        let cap = self.path_to_inode.capacity();
+        let len = self.path_to_inode.len();
+        if cap > MIN_CAP && cap >= len.saturating_mul(SHRINK_FACTOR) {
+            self.path_to_inode.shrink_to(len.saturating_mul(HEADROOM_FACTOR));
+            paths_freed = cap.saturating_sub(self.path_to_inode.capacity());
+        }
+
+        (inodes_freed, paths_freed)
+    }
+
     /// Snapshot a fresh counter value onto `inode.last_touched`. Atomic so
     /// the FUSE reader pool never contends a writer. Early-out when no
     /// consumer needs LRU recency so the common prod config pays nothing.
@@ -2408,5 +2444,76 @@ mod tests {
         assert!(table.has_open_handles(busy));
         table.drop_open_handles(busy);
         assert!(!table.has_open_handles(busy));
+    }
+
+    // ── HashMap capacity reclaim after burst eviction ──────────────
+
+    #[test]
+    fn test_shrink_if_oversized_reclaims_after_burst() {
+        let mut table = InodeTable::new(0);
+
+        // Burst: insert many files under root, then delete almost all of them
+        // through `remove`, which leaves the bucket array sized for the peak.
+        let inos: Vec<u64> = (0..16_000)
+            .map(|i| {
+                let name = format!("f{i}");
+                table.insert(
+                    ROOT_INODE,
+                    name.clone(),
+                    name,
+                    InodeKind::File,
+                    0,
+                    UNIX_EPOCH,
+                    None,
+                    0o644,
+                    0,
+                    0,
+                )
+            })
+            .collect();
+        for ino in &inos[..15_500] {
+            table.remove(*ino);
+        }
+
+        let cap_before = table.inodes.capacity();
+        assert!(cap_before >= 16_000, "expected burst-sized capacity, got {cap_before}");
+
+        let (inodes_freed, paths_freed) = table.shrink_if_oversized();
+        assert!(inodes_freed > 0, "expected inodes capacity to shrink, got 0");
+        assert!(paths_freed > 0, "expected path_to_inode capacity to shrink, got 0");
+        assert!(
+            table.inodes.capacity() < cap_before,
+            "capacity should drop: before={cap_before} after={}",
+            table.inodes.capacity()
+        );
+        // Live entries are still reachable.
+        assert_eq!(
+            table.inodes.len(),
+            inos.len() - 15_500 + 1, // +1 for root
+        );
+        assert!(table.lookup_child(ROOT_INODE, "f15999").is_some());
+    }
+
+    #[test]
+    fn test_shrink_if_oversized_no_op_when_steady() {
+        let mut table = InodeTable::new(0);
+        for i in 0..100 {
+            let name = format!("k{i}");
+            table.insert(
+                ROOT_INODE,
+                name.clone(),
+                name,
+                InodeKind::File,
+                0,
+                UNIX_EPOCH,
+                None,
+                0o644,
+                0,
+                0,
+            );
+        }
+        // Population matches capacity ratio: shrink should not fire.
+        let (i, p) = table.shrink_if_oversized();
+        assert_eq!((i, p), (0, 0));
     }
 }
