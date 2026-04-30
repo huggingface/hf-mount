@@ -335,19 +335,20 @@ impl InodeTable {
     /// ~1.5 M entries pins ~140 MB until the process exits — visible in prod
     /// as a stair-step on the heap that never comes down between bursts.
     ///
-    /// Shrink only when we have >=4x headroom and keep 2x going forward, so
-    /// steady-state churn around the soft limit doesn't trigger repeated
-    /// rehashes. Caller must hold the write lock.
+    /// Shrink when capacity is at least 2x the live population. Hashbrown
+    /// rounds the requested minimum up to the next power of two divided by
+    /// the load factor, so passing `len` as the floor still leaves ~30-50%
+    /// headroom for new inserts before another rehash is needed. Caller
+    /// must hold the write lock.
     pub(crate) fn shrink_if_oversized(&mut self) -> (usize, usize) {
         const MIN_CAP: usize = 1024;
-        const SHRINK_FACTOR: usize = 4;
-        const HEADROOM_FACTOR: usize = 2;
+        const SHRINK_FACTOR: usize = 2;
 
         let mut inodes_freed = 0usize;
         let cap = self.inodes.capacity();
         let len = self.inodes.len();
         if cap > MIN_CAP && cap >= len.saturating_mul(SHRINK_FACTOR) {
-            self.inodes.shrink_to(len.saturating_mul(HEADROOM_FACTOR));
+            self.inodes.shrink_to(len);
             inodes_freed = cap.saturating_sub(self.inodes.capacity());
         }
 
@@ -355,11 +356,20 @@ impl InodeTable {
         let cap = self.path_to_inode.capacity();
         let len = self.path_to_inode.len();
         if cap > MIN_CAP && cap >= len.saturating_mul(SHRINK_FACTOR) {
-            self.path_to_inode.shrink_to(len.saturating_mul(HEADROOM_FACTOR));
+            self.path_to_inode.shrink_to(len);
             paths_freed = cap.saturating_sub(self.path_to_inode.capacity());
         }
 
         (inodes_freed, paths_freed)
+    }
+
+    /// Cheap inspection helper for diagnostic logging — returns the current
+    /// (capacity, len) of both global maps without taking a write lock.
+    pub(crate) fn map_stats(&self) -> ((usize, usize), (usize, usize)) {
+        (
+            (self.inodes.capacity(), self.inodes.len()),
+            (self.path_to_inode.capacity(), self.path_to_inode.len()),
+        )
     }
 
     /// Snapshot a fresh counter value onto `inode.last_touched`. Atomic so
