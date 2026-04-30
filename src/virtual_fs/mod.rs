@@ -513,6 +513,23 @@ impl VirtualFs {
             }
             total_evicted += evicted_inos.len();
         }
+
+        // After a successful sweep, hand the global maps back any capacity
+        // left over from past bursts. The HashMap allocator keeps slots sized
+        // for the high-water mark, which pins ~hundreds of MB when a single
+        // large directory listing inflated the table well above soft_limit.
+        if total_evicted > 0 {
+            let (inodes_freed, paths_freed) = {
+                let mut inodes = self.inode_table.write().expect("inodes poisoned");
+                inodes.shrink_if_oversized()
+            };
+            if inodes_freed > 0 || paths_freed > 0 {
+                info!(
+                    "lru_sweep: shrunk hashmap slots: inodes -{} path_to_inode -{}",
+                    inodes_freed, paths_freed
+                );
+            }
+        }
         total_evicted
     }
 
