@@ -22,6 +22,10 @@ use hf_mount::fuse::mount_fuse;
 use hf_mount::setup::{Args as MountArgs, build_runtime, build_with_runtime, init_tracing, raise_fd_limit};
 use hf_mount::virtual_fs::VirtualFs;
 
+#[cfg(all(feature = "heap-profiling", target_os = "linux"))]
+#[global_allocator]
+static GLOBAL: hf_mount::heap_profiling::Jemalloc = hf_mount::heap_profiling::Jemalloc;
+
 /// Set of running mounts, exposed to the SIGTERM handler so it can drain
 /// dirty data before the process exits.
 type VfsRegistry = Arc<Mutex<Vec<Arc<VirtualFs>>>>;
@@ -56,6 +60,7 @@ fn main() {
     let args = Args::parse();
     raise_fd_limit();
     init_tracing(false);
+    hf_mount::heap_profiling::maybe_spawn_periodic_dumps();
 
     // SIGTERM handler: drain every running VFS (flushes dirty inodes to the
     // Hub via the flush manager) in parallel, then exit. The empty-registry
