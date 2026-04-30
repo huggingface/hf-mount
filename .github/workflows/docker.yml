@@ -6,6 +6,12 @@ name: Docker (ad-hoc)
 # without cutting a real release.
 on:
   workflow_dispatch:
+    inputs:
+      heap_profiling:
+        description: "Enable jemalloc heap profiling (canary build)"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -15,5 +21,6 @@ jobs:
   build:
     uses: ./.github/workflows/_docker-build.yml
     with:
-      tag_base: sha-${{ github.sha }}
+      tag_base: ${{ inputs.heap_profiling && format('sha-{0}-heap-prof', github.sha) || format('sha-{0}', github.sha) }}
       push_latest: false
+      cargo_features: ${{ inputs.heap_profiling && 'fuse,vendored-openssl,heap-profiling' || 'fuse,vendored-openssl' }}
