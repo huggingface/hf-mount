@@ -3,6 +3,7 @@ pub mod daemon;
 pub mod error;
 #[cfg(feature = "fuse")]
 pub mod fuse;
+pub mod heap_profiling;
 pub mod hub_api;
 #[cfg(feature = "nfs")]
 pub mod nfs;

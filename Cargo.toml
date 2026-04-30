@@ -34,11 +34,17 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ulid = "1"
 uuid = { version = "1", features = ["v4"] }
 
+# Heap profiling (Linux only, opt-in via `heap-profiling` feature).
+[target.'cfg(target_os = "linux")'.dependencies]
+tikv-jemallocator = { version = "0.6", features = ["profiling", "unprefixed_malloc_on_supported_platforms"], optional = true }
+tikv-jemalloc-ctl = { version = "0.6", features = ["use_std"], optional = true }
+
 [features]
 default = []
 fuse = ["dep:fuser"]
 nfs = ["dep:nfsserve"]
 vendored-openssl = ["openssl-sys/vendored"]
+heap-profiling = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl"]
 
 [dependencies.openssl-sys]
 version = "0.9"
