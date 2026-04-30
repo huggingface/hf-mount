@@ -408,26 +408,33 @@ impl VirtualFs {
             let Some(vfs) = weak.upgrade() else { return };
             let table_len = vfs.inode_table.read().expect("inodes poisoned").len();
             let evicted = vfs.lru_evict_sweep(soft_limit).await;
-            if evicted > 0 || table_len > soft_limit {
-                info!(
-                    "lru_sweep: table={} soft_limit={} evicted={}",
-                    table_len, soft_limit, evicted
-                );
-            }
 
             // Reclaim HashMap capacity left over from past bursts. Runs every
             // tick regardless of whether evictions fired this round, so we
             // recover from a burst that has since drained naturally (lookups
             // releasing through forget()) without needing a fresh sweep over
             // the soft limit.
+            let ((inodes_cap_before, _), (paths_cap_before, _)) =
+                vfs.inode_table.read().expect("inodes poisoned").map_stats();
             let (inodes_freed, paths_freed) = {
                 let mut inodes = vfs.inode_table.write().expect("inodes poisoned");
                 inodes.shrink_if_oversized()
             };
-            if inodes_freed > 0 || paths_freed > 0 {
+
+            if evicted > 0 || table_len > soft_limit || inodes_freed > 0 || paths_freed > 0 {
+                let ((inodes_cap, inodes_len), (paths_cap, paths_len)) =
+                    vfs.inode_table.read().expect("inodes poisoned").map_stats();
                 info!(
-                    "lru_sweep: shrunk hashmap slots: inodes -{} path_to_inode -{}",
-                    inodes_freed, paths_freed
+                    "lru_sweep: table={} soft_limit={} evicted={} inodes(cap={}→{}, len={}) paths(cap={}→{}, len={})",
+                    table_len,
+                    soft_limit,
+                    evicted,
+                    inodes_cap_before,
+                    inodes_cap,
+                    inodes_len,
+                    paths_cap_before,
+                    paths_cap,
+                    paths_len
                 );
             }
         }
