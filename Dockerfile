@@ -15,14 +15,19 @@ RUN cargo chef prepare --recipe-path recipe.json
 # Stage 3 — cook: build *only* the dependency graph using the recipe.
 # This layer is reused as long as the recipe hash is unchanged.
 FROM chef AS cook
+# Cargo features baked into the image. Override at build time, e.g.
+# `--build-arg CARGO_FEATURES=fuse,vendored-openssl,heap-profiling` for a
+# profiling-enabled canary.
+ARG CARGO_FEATURES=fuse,vendored-openssl
 COPY --from=planner /build/recipe.json recipe.json
 RUN cargo chef cook --release --no-default-features \
-    --features fuse,vendored-openssl --recipe-path recipe.json
+    --features "${CARGO_FEATURES}" --recipe-path recipe.json
 
 # Stage 4 — build the actual binaries; deps come from the cooked cache.
 FROM cook AS builder
+ARG CARGO_FEATURES
 COPY . .
-RUN cargo build --release --no-default-features --features fuse,vendored-openssl \
+RUN cargo build --release --no-default-features --features "${CARGO_FEATURES}" \
     --bin hf-mount-fuse --bin hf-mount-fuse-sidecar
 
 # Runtime

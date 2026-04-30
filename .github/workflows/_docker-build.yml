@@ -20,6 +20,11 @@ on:
         required: false
         type: boolean
         default: false
+      cargo_features:
+        description: "Cargo feature set baked into the image"
+        required: false
+        type: string
+        default: "fuse,vendored-openssl"
 
 env:
   REGISTRY: ghcr.io
@@ -46,6 +51,8 @@ jobs:
           push: true
           tags: ${{ env.IMAGE }}:${{ inputs.tag_base }}-amd64
           provenance: false
+          build-args: |
+            CARGO_FEATURES=${{ inputs.cargo_features }}
           cache-to: type=registry,ref=${{ env.IMAGE }}-cache:amd64,mode=max
           cache-from: type=registry,ref=${{ env.IMAGE }}-cache:amd64
 
@@ -69,6 +76,8 @@ jobs:
           push: true
           tags: ${{ env.IMAGE }}:${{ inputs.tag_base }}-arm64
           provenance: false
+          build-args: |
+            CARGO_FEATURES=${{ inputs.cargo_features }}
           cache-to: type=registry,ref=${{ env.IMAGE }}-cache:arm64,mode=max
           cache-from: type=registry,ref=${{ env.IMAGE }}-cache:arm64
 
