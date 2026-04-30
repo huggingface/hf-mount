@@ -28,7 +28,8 @@ pub use tikv_jemallocator::Jemalloc;
 // - lg_prof_sample:19     ~512 KiB sampling rate (jemalloc default)
 // - prof_final:true       dump at process exit
 #[cfg(all(feature = "heap-profiling", target_os = "linux"))]
-const MALLOC_CONF_BYTES: &[u8] = b"prof:true,prof_active:true,prof_prefix:/tmp/jeprof,lg_prof_sample:19,prof_final:true\0";
+const MALLOC_CONF_BYTES: &[u8] =
+    b"prof:true,prof_active:true,prof_prefix:/tmp/jeprof,lg_prof_sample:19,prof_final:true\0";
 
 #[cfg(all(feature = "heap-profiling", target_os = "linux"))]
 #[repr(transparent)]
@@ -65,8 +66,7 @@ pub fn maybe_spawn_periodic_dumps() {
                 std::thread::sleep(Duration::from_secs(interval_secs));
                 // Null filename -> jemalloc uses the configured prof_prefix
                 // and an auto-incrementing sequence number.
-                let res: Result<(), _> =
-                    unsafe { raw::write(b"prof.dump\0", std::ptr::null::<*const i8>()) };
+                let res: Result<(), _> = unsafe { raw::write(b"prof.dump\0", std::ptr::null::<*const i8>()) };
                 match res {
                     Ok(_) => info!("heap-profiling: dumped profile"),
                     Err(e) => warn!("heap-profiling: prof.dump failed: {e:?}"),
