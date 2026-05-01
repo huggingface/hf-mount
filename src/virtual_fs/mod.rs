@@ -720,117 +720,139 @@ impl VirtualFs {
         };
         let entries_count = entries.len();
 
-        let mut inodes = self.inode_table.write().expect("inodes poisoned");
-        match inodes.get(parent_ino) {
-            Some(e) if e.children_loaded() => return Ok(()),
-            Some(e) if e.kind != InodeKind::Directory => return Err(libc::ENOTDIR),
-            None => return Err(libc::ENOENT),
-            _ => {}
-        }
-        // Capture child count before reload to detect shrinkage (used to diagnose
-        // listings that drop entries during concurrent remote writes).
-        let prev_children_count = inodes.get(parent_ino).map(|p| p.children.len()).unwrap_or(0);
-        let mut seen_dirs: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut seen_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // Block scope keeps the write lock from being seen as held across the
+        // later `await` (clippy::await_holding_lock). All inserts + stale
+        // detection happen here; the lock is released at the end of the block.
+        let (prev_children_count, stale_candidates) = {
+            let mut inodes = self.inode_table.write().expect("inodes poisoned");
+            match inodes.get(parent_ino) {
+                Some(e) if e.children_loaded() => return Ok(()),
+                Some(e) if e.kind != InodeKind::Directory => return Err(libc::ENOTDIR),
+                None => return Err(libc::ENOENT),
+                _ => {}
+            }
+            // Capture child count before reload to detect shrinkage (used to diagnose
+            // listings that drop entries during concurrent remote writes).
+            let prev_children_count = inodes.get(parent_ino).map(|p| p.children.len()).unwrap_or(0);
+            let mut seen_dirs: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut seen_names: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-        for entry in entries {
-            // Convert absolute bucket path to path relative to current directory.
-            // e.g. prefix="models" → "models/bert/config.json" → "bert/config.json"
-            let rel_path = if prefix.is_empty() {
-                entry.path.clone()
-            } else {
-                entry
-                    .path
-                    .strip_prefix(&prefix)
-                    .and_then(|p| p.strip_prefix('/'))
-                    .unwrap_or(&entry.path)
-                    .to_string()
-            };
+            for entry in entries {
+                // Convert absolute bucket path to path relative to current directory.
+                // e.g. prefix="models" → "models/bert/config.json" → "bert/config.json"
+                let rel_path = if prefix.is_empty() {
+                    entry.path.clone()
+                } else {
+                    entry
+                        .path
+                        .strip_prefix(&prefix)
+                        .and_then(|p| p.strip_prefix('/'))
+                        .unwrap_or(&entry.path)
+                        .to_string()
+                };
 
-            if let Some(slash_pos) = rel_path.find('/') {
-                // Nested path → create the immediate subdirectory only (lazy-loaded later)
-                let dir_name = &rel_path[..slash_pos];
-                if seen_dirs.insert(dir_name.to_string()) {
-                    let dir_full_path = if prefix.is_empty() {
-                        dir_name.to_string()
+                if let Some(slash_pos) = rel_path.find('/') {
+                    // Nested path → create the immediate subdirectory only (lazy-loaded later)
+                    let dir_name = &rel_path[..slash_pos];
+                    if seen_dirs.insert(dir_name.to_string()) {
+                        let dir_full_path = if prefix.is_empty() {
+                            dir_name.to_string()
+                        } else {
+                            format!("{}/{}", prefix, dir_name)
+                        };
+                        inodes.insert(
+                            parent_ino,
+                            dir_name.to_string(),
+                            dir_full_path,
+                            InodeKind::Directory,
+                            0,
+                            self.hub_client.default_mtime(),
+                            None,
+                            0o755,
+                            self.uid,
+                            self.gid,
+                        );
+                    }
+                } else {
+                    let kind = if entry.entry_type == "directory" {
+                        InodeKind::Directory
                     } else {
-                        format!("{}/{}", prefix, dir_name)
+                        InodeKind::File
                     };
-                    inodes.insert(
+                    let size = entry.size.unwrap_or(0);
+                    let mtime = entry
+                        .mtime
+                        .as_deref()
+                        .map(crate::hub_api::mtime_from_str)
+                        .unwrap_or_else(|| self.hub_client.default_mtime());
+                    let default_mode = if kind == InodeKind::Directory { 0o755 } else { 0o644 };
+
+                    let ino = inodes.insert(
                         parent_ino,
-                        dir_name.to_string(),
-                        dir_full_path,
-                        InodeKind::Directory,
-                        0,
-                        self.hub_client.default_mtime(),
-                        None,
-                        0o755,
+                        rel_path.to_string(),
+                        entry.path,
+                        kind,
+                        size,
+                        mtime,
+                        entry.xet_hash,
+                        default_mode,
                         self.uid,
                         self.gid,
                     );
-                }
-            } else {
-                let kind = if entry.entry_type == "directory" {
-                    InodeKind::Directory
-                } else {
-                    InodeKind::File
-                };
-                let size = entry.size.unwrap_or(0);
-                let mtime = entry
-                    .mtime
-                    .as_deref()
-                    .map(crate::hub_api::mtime_from_str)
-                    .unwrap_or_else(|| self.hub_client.default_mtime());
-                let default_mode = if kind == InodeKind::Directory { 0o755 } else { 0o644 };
-
-                let ino = inodes.insert(
-                    parent_ino,
-                    rel_path.to_string(),
-                    entry.path,
-                    kind,
-                    size,
-                    mtime,
-                    entry.xet_hash,
-                    default_mode,
-                    self.uid,
-                    self.gid,
-                );
-                let rel_name = rel_path.to_string();
-                seen_names.insert(rel_name);
-                if let Some(oid) = entry.oid
-                    && let Some(e) = inodes.get_mut(ino)
-                {
-                    e.etag = Some(oid);
-                }
-            }
-        }
-
-        // Remove stale children: entries that existed locally but are no longer
-        // in the Hub listing. Skip dirty files (local writes take precedence) and
-        // files with open handles (in-flight reads/writes).
-        let mut stale_sample: Vec<String> = Vec::new();
-        let mut stale_count: usize = 0;
-        if let Some(parent) = inodes.get(parent_ino) {
-            let stale: Vec<(u64, String)> = parent
-                .children
-                .iter()
-                .filter(|c| {
-                    let in_listing = seen_names.contains(&*c.name) || seen_dirs.contains(&*c.name);
-                    if in_listing {
-                        return false;
+                    let rel_name = rel_path.to_string();
+                    seen_names.insert(rel_name);
+                    if let Some(oid) = entry.oid
+                        && let Some(e) = inodes.get_mut(ino)
+                    {
+                        e.etag = Some(oid);
                     }
-                    inodes.get(c.ino).is_some_and(|e| !e.is_dirty())
-                })
-                .map(|c| (c.ino, c.name.to_string()))
-                .collect();
-            stale_count = stale.len();
-            for (_, name) in stale.iter().take(8) {
-                stale_sample.push(name.clone());
-            }
-            for (ino, _) in stale {
-                if !inodes.has_dirty_or_open_descendants(ino) {
-                    inodes.remove(ino);
                 }
+            }
+
+            // Identify stale candidates: cached children that are not in the new
+            // listing. Skip dirty files (local writes take precedence).
+            let mut stale_candidates: Vec<(u64, String, String)> = Vec::new();
+            if let Some(parent) = inodes.get(parent_ino) {
+                for c in &parent.children {
+                    if seen_names.contains(&*c.name) || seen_dirs.contains(&*c.name) {
+                        continue;
+                    }
+                    let Some(e) = inodes.get(c.ino) else { continue };
+                    if e.is_dirty() {
+                        continue;
+                    }
+                    stale_candidates.push((c.ino, c.name.to_string(), e.full_path.to_string()));
+                }
+            }
+
+            (prev_children_count, stale_candidates)
+        };
+
+        let stale_count = stale_candidates.len();
+        let stale_sample: Vec<String> = stale_candidates.iter().take(8).map(|(_, n, _)| n.clone()).collect();
+
+        // hf sync (huggingface_hub) uploads in chunks then deletes; mid-sync the
+        // bucket listing can transiently return fewer entries than what we had
+        // cached. We saw this in prod as user-facing 404s on /docs/* immediately
+        // after a doc-build republished. A plain "shrunk listing" is therefore
+        // not authoritative for deletion — HEAD-verify each candidate before
+        // evicting it from the cache.
+        let suspicious_shrink = stale_count > 0 && entries_count < prev_children_count;
+
+        let confirmed_stale: Vec<u64> = if suspicious_shrink {
+            // Per-directory lock (acquired earlier) still serializes
+            // ensure_children_loaded() for this dir during the HEADs.
+            self.head_verify_stale(&stale_candidates).await
+        } else {
+            stale_candidates.iter().map(|(ino, _, _)| *ino).collect()
+        };
+
+        let mut inodes = self.inode_table.write().expect("inodes poisoned");
+        let mut removed = 0usize;
+        for ino in confirmed_stale {
+            if !inodes.has_dirty_or_open_descendants(ino) {
+                inodes.remove(ino);
+                removed += 1;
             }
         }
 
@@ -849,16 +871,43 @@ impl VirtualFs {
         // — suspicious during writes/sync against the source.
         if stale_count > 0 && prev_children_count > 0 {
             warn!(
-                "list_tree reload shrunk: prefix='{}' entries={} prev_children={} stale_removed={} sample={:?}",
-                prefix, entries_count, prev_children_count, stale_count, stale_sample
+                "list_tree reload shrunk: prefix='{}' entries={} prev_children={} stale_candidates={} \
+                 removed={} head_verified={} sample={:?}",
+                prefix, entries_count, prev_children_count, stale_count, removed, suspicious_shrink, stale_sample
             );
         } else {
             info!(
                 "list_tree: prefix='{}' entries={} prev_children={} stale_removed={}",
-                prefix, entries_count, prev_children_count, stale_count
+                prefix, entries_count, prev_children_count, removed
             );
         }
         Ok(())
+    }
+
+    /// HEAD-confirm each stale candidate. Returns inodes whose remote HEAD
+    /// returned 404 (safe to evict). Anything that returns 200 or errors is
+    /// kept — the bucket listing was lying or transient, and the entry will
+    /// be reconciled on the next refresh / lookup-driven HEAD.
+    async fn head_verify_stale(&self, candidates: &[(u64, String, String)]) -> Vec<u64> {
+        use futures::stream::{self, StreamExt};
+
+        const VERIFY_CONCURRENCY: usize = 16;
+
+        stream::iter(candidates.iter().cloned())
+            .map(|(ino, _name, full_path)| {
+                let client = self.hub_client.clone();
+                async move {
+                    match client.head_file(&full_path).await {
+                        Ok(None) => Some(ino),
+                        Ok(Some(_)) => None,
+                        Err(_) => None,
+                    }
+                }
+            })
+            .buffer_unordered(VERIFY_CONCURRENCY)
+            .filter_map(|x| async move { x })
+            .collect()
+            .await
     }
 
     /// Recursively load all descendants of a directory so in-memory state
@@ -1254,7 +1303,7 @@ impl VirtualFs {
             FastResult::NeedsRevalidation { full_path, .. } => {
                 info!("lookup REVALIDATE: {}", full_path)
             }
-            FastResult::Miss(full_path) => info!("lookup MISS (cached parent listing): {}", full_path),
+            FastResult::Miss { full_path, .. } => info!("lookup MISS (cached parent listing): {}", full_path),
             FastResult::NotLoaded => info!("lookup SLOW: parent='{}' name='{}'", parent_path, name),
         }
 

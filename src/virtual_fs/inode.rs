@@ -2460,7 +2460,7 @@ mod tests {
 
     #[test]
     fn test_shrink_if_oversized_reclaims_after_burst() {
-        let mut table = InodeTable::new(0);
+        let mut table = InodeTable::new(false);
 
         // Burst: insert many files under root, then delete almost all of them
         // through `remove`, which leaves the bucket array sized for the peak.
@@ -2506,7 +2506,7 @@ mod tests {
 
     #[test]
     fn test_shrink_if_oversized_no_op_when_steady() {
-        let mut table = InodeTable::new(0);
+        let mut table = InodeTable::new(false);
         for i in 0..100 {
             let name = format!("k{i}");
             table.insert(
