@@ -19,13 +19,17 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use tokio::sync::{RwLock, broadcast};
+use tokio::sync::{RwLock, Semaphore, broadcast};
 use tracing::{debug, info, warn};
 
 use crate::error::{Error, Result};
 
 const FILES_DIR: &str = "files";
 const TMP_DIR: &str = ".tmp";
+/// Cap on simultaneous downloads so a workload that opens many distinct files
+/// at once doesn't fan out unbounded `download_file` calls. Single-flight
+/// already collapses same-hash opens; this caps cross-hash parallelism.
+const MAX_CONCURRENT_POPULATES: usize = 8;
 
 struct CacheItem {
     size: u64,
@@ -46,6 +50,8 @@ pub struct FileCache {
     capacity: u64,
     state: RwLock<State>,
     inflight: Mutex<HashMap<String, broadcast::Sender<()>>>,
+    /// Bounds parallel populate downloads (per `MAX_CONCURRENT_POPULATES`).
+    populate_sem: Arc<Semaphore>,
     /// Monotonic counter issued on every `try_open` / insert to order LRU
     /// without taking a write lock on the hot path.
     clock: AtomicU64,
@@ -66,7 +72,7 @@ impl FileCache {
                 let _ = fs::remove_file(entry.path());
             }
         }
-        let state = Self::scan_existing(&root);
+        let (state, max_seen_tick) = Self::scan_existing(&root);
         info!(
             "file_cache: dir={:?} capacity={} discovered_items={} discovered_bytes={}",
             root,
@@ -80,15 +86,22 @@ impl FileCache {
             capacity,
             state: RwLock::new(state),
             inflight: Mutex::new(HashMap::new()),
-            clock: AtomicU64::new(0),
+            populate_sem: Arc::new(Semaphore::new(MAX_CONCURRENT_POPULATES)),
+            // Seed the clock past the largest mtime-derived tick so newly
+            // assigned ticks remain monotonically newer than rediscovered ones.
+            clock: AtomicU64::new(max_seen_tick.saturating_add(1)),
         }))
     }
 
-    fn scan_existing(root: &Path) -> State {
+    /// Returns `(state, max_tick)` where `max_tick` is the largest mtime-derived
+    /// LRU rank seen during the scan. Callers seed `clock` past it so that new
+    /// inserts remain strictly newer than rediscovered entries.
+    fn scan_existing(root: &Path) -> (State, u64) {
         let mut items = HashMap::new();
         let mut total_bytes = 0u64;
+        let mut max_tick = 0u64;
         let Ok(rd1) = fs::read_dir(root) else {
-            return State { items, total_bytes };
+            return (State { items, total_bytes }, max_tick);
         };
         for shard in rd1.flatten() {
             if shard.file_name() == TMP_DIR {
@@ -109,20 +122,33 @@ impl FileCache {
                     continue;
                 }
                 let size = meta.len();
+                let tick = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                if tick > max_tick {
+                    max_tick = tick;
+                }
                 items.insert(
                     hash.to_string(),
                     CacheItem {
                         size,
-                        last_access: AtomicU64::new(0),
+                        last_access: AtomicU64::new(tick),
                     },
                 );
                 total_bytes += size;
             }
         }
-        State { items, total_bytes }
+        (State { items, total_bytes }, max_tick)
     }
 
     fn item_path(&self, hash: &str) -> PathBuf {
+        // Real xet hashes are 64 hex chars. The `_` fallback exists only as
+        // defense for malformed callers; any caller passing a sub-2-char
+        // hash is a bug and would silently collide all such items in one shard.
+        debug_assert!(hash.len() >= 2, "file_cache hash too short: {hash:?}");
         let prefix = if hash.len() >= 2 { &hash[..2] } else { "_" };
         self.root.join(prefix).join(hash)
     }
@@ -198,10 +224,19 @@ impl FileCache {
             return Ok(());
         }
 
+        // Fast-path: already cached. Cheap async read lock, no inflight churn.
+        if self.contains(hash).await {
+            return Ok(());
+        }
+
         let (is_leader, mut rx) = {
             let mut inflight = self.inflight.lock().expect("file_cache.inflight poisoned");
             // Re-check under the inflight lock so a concurrent populate that
-            // just finished doesn't get retried.
+            // just finished doesn't get retried. try_read is best-effort: if a
+            // writer is briefly holding `state` we fall through and become a
+            // follower (correct, just slightly wasteful). We intentionally
+            // don't `await` here because that would hold the sync inflight
+            // mutex across a yield point.
             if self.state.try_read().is_ok_and(|s| s.items.contains_key(hash)) {
                 return Ok(());
             }
@@ -223,13 +258,16 @@ impl FileCache {
             };
         }
 
+        // RAII: guarantees inflight cleanup + broadcast even on panic or
+        // future cancellation. Without this, followers would deadlock waiting
+        // on a `Sender` that's still alive in the inflight HashMap.
+        let _guard = InflightGuard {
+            fc: self.clone(),
+            hash: hash.to_string(),
+        };
         let result = self.populate_inner(hash, expected_size, fetch).await;
         if let Err(ref e) = result {
             warn!("file_cache: populate {hash} failed: {e}");
-        }
-        let mut inflight = self.inflight.lock().expect("file_cache.inflight poisoned");
-        if let Some(tx) = inflight.remove(hash) {
-            let _ = tx.send(());
         }
         result
     }
@@ -239,6 +277,16 @@ impl FileCache {
         F: FnOnce(PathBuf) -> Fut + Send,
         Fut: std::future::Future<Output = Result<()>> + Send,
     {
+        // Bound cross-hash parallelism so a workload opening many distinct
+        // files at once doesn't fan out unbounded `download_file` calls.
+        // Held until populate_inner returns (covers download + publish).
+        let _permit = self
+            .populate_sem
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|e| io_err(format!("semaphore closed: {e}")))?;
+
         let final_path = self.item_path(hash);
         if let Some(parent) = final_path.parent() {
             fs::create_dir_all(parent).map_err(|e| io_err(format!("mkdir {parent:?}: {e}")))?;
@@ -273,18 +321,26 @@ impl FileCache {
             return Ok(());
         }
 
-        fs::rename(&tmp_path, &final_path).map_err(|e| io_err(format!("rename {tmp_path:?} → {final_path:?}: {e}")))?;
+        fs::rename(&tmp_path, &final_path)
+            .map_err(|e| io_err(format!("rename {tmp_path:?} -> {final_path:?}: {e}")))?;
 
         let to_remove = {
             let mut state = self.state.write().await;
             let tick = self.next_tick();
-            state.items.insert(
+            // Subtract any prior entry's size before adding the new one.
+            // Belt-and-suspenders: single-flight should already prevent
+            // re-inserts, but this keeps total_bytes consistent under any
+            // race the inflight guard doesn't cover.
+            let prev = state.items.insert(
                 hash.to_string(),
                 CacheItem {
                     size: actual_size,
                     last_access: AtomicU64::new(tick),
                 },
             );
+            if let Some(prev) = prev {
+                state.total_bytes = state.total_bytes.saturating_sub(prev.size);
+            }
             state.total_bytes += actual_size;
             self.evict_locked(&mut state)
         };
@@ -328,6 +384,25 @@ impl FileCache {
 
 fn io_err(msg: String) -> Error {
     Error::Io(std::io::Error::other(format!("file_cache: {msg}")))
+}
+
+/// Drops the leader's inflight entry and notifies followers, regardless of
+/// whether `populate_inner` returned, panicked, or was cancelled.
+struct InflightGuard {
+    fc: Arc<FileCache>,
+    hash: String,
+}
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        let mut inflight = match self.fc.inflight.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        if let Some(tx) = inflight.remove(&self.hash) {
+            let _ = tx.send(());
+        }
+    }
 }
 
 #[cfg(test)]
@@ -460,6 +535,59 @@ mod tests {
             .unwrap();
         assert!(cache.contains("aa00").await, "A must survive oversized B");
         assert!(!cache.contains("bb00").await, "B is too large to cache");
+    }
+
+    #[tokio::test]
+    async fn forget_then_repopulate_works() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = FileCache::new(dir.path(), 1 << 30).unwrap();
+        let hash = "feedface00";
+        populate_with(&cache, hash, b"v1".to_vec()).await;
+        cache.forget(hash).await;
+        assert!(!cache.contains(hash).await);
+        // Re-populate must succeed (no stale inflight entry, no leftover state).
+        populate_with(&cache, hash, b"v2".to_vec()).await;
+        let f = cache.try_open(hash).await.unwrap();
+        let mut buf = Vec::new();
+        std::io::Read::read_to_end(&mut (&*f), &mut buf).unwrap();
+        assert_eq!(buf, b"v2");
+    }
+
+    #[tokio::test]
+    async fn leader_failure_releases_followers() {
+        // If the leader's fetch fails, followers must wake up and observe the
+        // miss instead of deadlocking on a stale inflight Sender.
+        let dir = tempfile::tempdir().unwrap();
+        let cache = FileCache::new(dir.path(), 1 << 30).unwrap();
+        let hash = "abadcafe00";
+        let leader = {
+            let cache = cache.clone();
+            tokio::spawn(async move {
+                cache
+                    .populate(hash, Some(10), |_dest| async move {
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                        Err(Error::Xet("forced".into()))
+                    })
+                    .await
+            })
+        };
+        // Give the leader a head-start so the follower subscribes.
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let follower = {
+            let cache = cache.clone();
+            tokio::spawn(async move { cache.populate(hash, Some(10), |_| async { Ok(()) }).await })
+        };
+        let leader_res = tokio::time::timeout(std::time::Duration::from_secs(2), leader)
+            .await
+            .expect("leader should not hang")
+            .unwrap();
+        let follower_res = tokio::time::timeout(std::time::Duration::from_secs(2), follower)
+            .await
+            .expect("follower should not deadlock")
+            .unwrap();
+        assert!(leader_res.is_err(), "leader fetch returned an error");
+        assert!(follower_res.is_err(), "follower must surface the populate failure");
+        assert!(!cache.contains(hash).await);
     }
 
     #[tokio::test]

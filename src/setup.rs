@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use clap::Parser;
-use tracing::info;
+use tracing::{info, warn};
 use xet_data::processing::configurations::TranslatorConfig;
 use xet_data::processing::data_client::default_config;
 use xet_data::processing::{CacheConfig, FileDownloadSession, create_remote_client, get_cache};
@@ -349,6 +349,12 @@ pub fn build_with_runtime(
     // The chunk cache and the whole-file cache are mutually exclusive: when
     // `cache_mode=file` we explicitly disable xet-core's chunk_cache so we
     // don't pay disk for both layers.
+    if options.cache_mode == CacheMode::File && options.no_disk_cache {
+        warn!(
+            "--no-disk-cache overrides --cache-mode=file: both disk caches are disabled, every read \
+             will go through CAS"
+        );
+    }
     let file_cache = if options.cache_mode == CacheMode::File && !options.no_disk_cache {
         Some(FileCache::new(&options.cache_dir, options.cache_size).expect("Failed to create file cache"))
     } else {
