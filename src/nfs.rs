@@ -42,19 +42,17 @@ impl NFSAdapter {
         }
     }
 
-    /// Get or open a pooled read handle, returning it with a shared pin. If
-    /// two cold reads race on the same inode, the loser shares the winner's
-    /// pooled handle: the per-handle prefetch buffer absorbs concurrent NFS
-    /// readahead RPCs more efficiently than a second Xet stream would.
+    /// Get or open a pooled read handle with a shared pin. Cold-read races
+    /// converge on a single pooled handle so the per-handle prefetch buffer
+    /// absorbs concurrent NFS readahead RPCs instead of spawning duplicate
+    /// Xet streams.
     async fn get_or_open_handle(&self, ino: u64) -> Result<u64, nfsstat3> {
-        if let Some(handle) = self.share_pooled_handle(ino) {
+        if let Some(handle) = self.acquire_shared(ino) {
             return Ok(handle);
         }
         let file_handle = match self.virtual_fs.open(ino, false, false, None).await {
             Ok(handle) => handle,
-            // Open failed mid-race — another reader may have populated the
-            // pool in the meantime; share that handle rather than failing.
-            Err(err) => return self.share_pooled_handle(ino).ok_or_else(|| errno_to_nfs(err)),
+            Err(err) => return self.acquire_shared(ino).ok_or_else(|| errno_to_nfs(err)),
         };
 
         enum Outcome {
@@ -63,46 +61,39 @@ impl NFSAdapter {
         }
         let outcome = {
             let mut pool = self.handle_pool.lock().expect("handle_pool poisoned");
-            match pool.try_acquire(ino) {
-                AcquireResult::Acquired(existing) => Outcome::ShareExisting(existing),
-                AcquireResult::Pinned => {
-                    let existing = pool.get_unpinned(ino).expect("Pinned implies entry exists");
-                    pool.pin(ino);
-                    Outcome::ShareExisting(existing)
-                }
-                AcquireResult::Missing => {
-                    let result = pool.insert(ino, file_handle);
-                    pool.pin(ino);
-                    Outcome::Inserted(result)
-                }
+            if let Some(existing) = pool.acquire_shared(ino) {
+                Outcome::ShareExisting(existing)
+            } else {
+                let result = pool.insert(ino, file_handle);
+                pool.acquire_shared(ino);
+                Outcome::Inserted(result)
             }
         };
-
         match outcome {
             Outcome::ShareExisting(existing) => {
                 let _ = self.virtual_fs.release(file_handle).await;
                 Ok(existing)
             }
             Outcome::Inserted(result) => {
-                for (evicted_ino, evicted_handle) in result.evicted {
-                    self.evict_handle(evicted_ino, evicted_handle).await;
-                }
-                if let Some(replaced_handle) = result.replaced {
-                    let _ = self.virtual_fs.release(replaced_handle).await;
-                }
+                self.process_insert_result(result).await;
                 Ok(file_handle)
             }
         }
     }
 
-    /// Acquire a shared pin on an existing pooled handle, or `None` if the
-    /// pool has no entry for this inode.
-    fn share_pooled_handle(&self, ino: u64) -> Option<u64> {
-        let mut pool = self.handle_pool.lock().expect("handle_pool poisoned");
-        match pool.try_acquire(ino) {
-            AcquireResult::Acquired(handle) => Some(handle),
-            AcquireResult::Pinned => pool.get_unpinned(ino).inspect(|_| pool.pin(ino)),
-            AcquireResult::Missing => None,
+    fn acquire_shared(&self, ino: u64) -> Option<u64> {
+        self.handle_pool
+            .lock()
+            .expect("handle_pool poisoned")
+            .acquire_shared(ino)
+    }
+
+    async fn process_insert_result(&self, result: InsertResult) {
+        for (evicted_ino, evicted_handle) in result.evicted {
+            self.evict_handle(evicted_ino, evicted_handle).await;
+        }
+        if let Some(replaced_handle) = result.replaced {
+            let _ = self.virtual_fs.release(replaced_handle).await;
         }
     }
 
@@ -173,13 +164,11 @@ impl NFSFileSystem for NFSAdapter {
     }
 
     async fn read(&self, id: fileid3, offset: u64, count: u32) -> Result<(Vec<u8>, bool), nfsstat3> {
-        // Share the pooled handle across concurrent readers. NFS readahead
-        // dispatches multiple READ RPCs for the same inode at adjacent
-        // offsets, and the prefetch buffer attached to the handle absorbs
-        // them efficiently — opening an extra VFS handle per concurrent RPC
-        // would start a fresh Xet stream and saturate the CAS client.
-        // pin_count just protects the entry from LRU eviction here.
-        let file_handle = match self.share_pooled_handle(id) {
+        // Share the pooled handle across concurrent readers — its prefetch
+        // buffer absorbs NFS readahead RPCs efficiently. The shared pin only
+        // blocks LRU eviction; concurrent reads still serialize on the
+        // per-handle prefetch mutex inside virtual_fs.
+        let file_handle = match self.acquire_shared(id) {
             Some(handle) => handle,
             None => self.get_or_open_handle(id).await?,
         };
@@ -190,13 +179,12 @@ impl NFSFileSystem for NFSAdapter {
         match result {
             Ok((bytes, eof)) => Ok((bytes.to_vec(), eof)),
             Err(libc::EBADF) => {
-                // Pinning prevents LRU eviction, but remove() (called by
-                // unlink/rename) can still drop the handle while a read is in
-                // flight. Purge the stale entry and retry once with a fresh
-                // ephemeral handle (avoids racing the pool again).
+                // unlink/rename can remove() a pinned entry while a read is
+                // in flight. Drop the stale entry and retry once with a
+                // freshly-opened handle outside the pool.
                 {
                     let mut pool = self.handle_pool.lock().expect("handle_pool poisoned");
-                    if pool.get_unpinned(id) == Some(file_handle) {
+                    if pool.peek(id) == Some(file_handle) {
                         pool.remove(id);
                     }
                 }
@@ -286,14 +274,13 @@ impl NFSFileSystem for NFSAdapter {
     }
 
     async fn write(&self, id: fileid3, offset: u64, data: &[u8]) -> Result<fattr3, nfsstat3> {
-        // Write requires a handle already in the pool (from create).
-        // Use get_unpinned: the VFS write call is synchronous (pwrite),
-        // so there is no await gap where eviction could race.
+        // virtual_fs.write is synchronous pwrite — no yield point where the
+        // pool could evict, so peek without pinning.
         let file_handle = self
             .handle_pool
             .lock()
             .expect("handle_pool poisoned")
-            .get_unpinned(id)
+            .peek(id)
             .ok_or(nfsstat3::NFS3ERR_STALE)?;
         // NFS always uses advanced_writes (staging files), so write() is a
         // synchronous pwrite() — safe to call from async context.
@@ -613,15 +600,6 @@ struct InsertResult {
     replaced: Option<u64>,
 }
 
-enum AcquireResult {
-    /// Got the pooled handle, pinned (refcount 1).
-    Acquired(u64),
-    /// Pool has an entry but it is pinned by another reader.
-    Pinned,
-    /// No pool entry for this ino.
-    Missing,
-}
-
 struct HandleEntry {
     file_handle: u64,
     /// Number of in-flight operations using this handle. Pinned entries
@@ -643,47 +621,34 @@ impl HandlePool {
         }
     }
 
-    /// Acquire a pooled handle only if it is free. On `Pinned` the caller
-    /// opens an ephemeral VFS handle so two readers do not serialize behind
-    /// the per-handle prefetch mutex.
-    fn try_acquire(&mut self, ino: u64) -> AcquireResult {
-        let entry = match self.handles.get_mut(&ino) {
-            Some(entry) => entry,
-            None => return AcquireResult::Missing,
-        };
-        if entry.pin_count != 0 {
-            return AcquireResult::Pinned;
-        }
-        let file_handle = entry.file_handle;
-        entry.pin_count = 1;
-        self.order_remove(ino);
-        self.order.push_back(ino);
-        AcquireResult::Acquired(file_handle)
+    /// Increment pin_count and return the handle. Does not touch LRU order.
+    fn pin(&mut self, ino: u64) -> Option<u64> {
+        let entry = self.handles.get_mut(&ino)?;
+        entry.pin_count += 1;
+        Some(entry.file_handle)
     }
 
-    /// Look up a handle and promote it to MRU without pinning.
-    fn get_unpinned(&mut self, ino: u64) -> Option<u64> {
-        self.get_inner(ino)
-    }
-
-    fn get_inner(&mut self, ino: u64) -> Option<u64> {
-        let file_handle = self.handles.get(&ino)?.file_handle;
-        self.order_remove(ino);
-        self.order.push_back(ino);
-        Some(file_handle)
-    }
-
-    fn pin(&mut self, ino: u64) {
-        if let Some(entry) = self.handles.get_mut(&ino) {
-            entry.pin_count += 1;
-        }
-    }
-
-    /// Release a pin acquired by `get()` or `pin()`.
     fn unpin(&mut self, ino: u64) {
         if let Some(entry) = self.handles.get_mut(&ino) {
             entry.pin_count = entry.pin_count.saturating_sub(1);
         }
+    }
+
+    /// Pin and promote to MRU. Concurrent readers stack pins on the same
+    /// entry — eviction is blocked until every pin is released.
+    fn acquire_shared(&mut self, ino: u64) -> Option<u64> {
+        let handle = self.pin(ino)?;
+        if self.order.back() != Some(&ino) {
+            self.order_remove(ino);
+            self.order.push_back(ino);
+        }
+        Some(handle)
+    }
+
+    /// Look up a handle without pinning. Safe only when the caller does not
+    /// yield before using the handle.
+    fn peek(&self, ino: u64) -> Option<u64> {
+        self.handles.get(&ino).map(|e| e.file_handle)
     }
 
     /// Remove an entry from the pool, returning the file handle if present.
@@ -891,41 +856,31 @@ mod tests {
     #[test]
     fn handle_pool_basic() {
         let mut pool = HandlePool::new();
-        assert!(pool.get_unpinned(1).is_none());
+        assert!(pool.peek(1).is_none());
 
         let result = pool.insert(1, 100);
         assert!(result.evicted.is_empty());
         assert!(result.replaced.is_none());
-        assert_eq!(pool.get_unpinned(1), Some(100));
+        assert_eq!(pool.peek(1), Some(100));
     }
 
     #[test]
     fn handle_pool_lru_eviction() {
         let mut pool = HandlePool::new();
-        // Fill pool to capacity
         for i in 0..HANDLE_POOL_CAPACITY as u64 {
             pool.insert(i, i + 1000);
         }
-        // All entries present (use get_unpinned to avoid pinning)
-        assert_eq!(pool.get_unpinned(0), Some(1000));
-        assert_eq!(
-            pool.get_unpinned(HANDLE_POOL_CAPACITY as u64 - 1),
-            Some(1000 + HANDLE_POOL_CAPACITY as u64 - 1)
-        );
+        // Promote ino=0 to MRU so the LRU is now ino=1.
+        pool.acquire_shared(0);
+        pool.unpin(0);
 
-        // Insert one more -> evicts LRU. ino=0 was accessed last (by get above),
-        // so ino=1 (oldest untouched) should be evicted.
         let result = pool.insert(999, 9999);
         assert_eq!(result.evicted.len(), 1);
-        let (evicted_ino, evicted_fh) = result.evicted[0];
-        assert_eq!(evicted_ino, 1);
-        assert_eq!(evicted_fh, 1001);
+        assert_eq!(result.evicted[0], (1, 1001));
         assert!(result.replaced.is_none());
 
-        // ino=1 is gone
-        assert!(pool.get_unpinned(1).is_none());
-        // ino=999 is present
-        assert_eq!(pool.get_unpinned(999), Some(9999));
+        assert!(pool.peek(1).is_none());
+        assert_eq!(pool.peek(999), Some(9999));
     }
 
     #[test]
@@ -938,7 +893,7 @@ mod tests {
         assert_eq!(result.replaced, Some(100), "old handle should be returned for release");
         assert!(result.evicted.is_empty());
 
-        assert_eq!(pool.get_unpinned(1), Some(101));
+        assert_eq!(pool.peek(1), Some(101));
         // order should have exactly 2 entries, not 3
         assert_eq!(pool.order.len(), 2);
     }
@@ -951,12 +906,12 @@ mod tests {
         pool.insert(3, 300);
 
         assert_eq!(pool.remove(2), Some(200));
-        assert!(pool.get_unpinned(2).is_none());
+        assert!(pool.peek(2).is_none());
         assert_eq!(pool.order.len(), 2);
         assert_eq!(pool.handles.len(), 2);
         // Remaining entries still work
-        assert_eq!(pool.get_unpinned(1), Some(100));
-        assert_eq!(pool.get_unpinned(3), Some(300));
+        assert_eq!(pool.peek(1), Some(100));
+        assert_eq!(pool.peek(3), Some(300));
     }
 
     #[test]
@@ -981,7 +936,7 @@ mod tests {
         let mut pool = HandlePool::new();
         pool.insert(1, 100);
         assert_eq!(pool.remove(999), None); // no-op
-        assert_eq!(pool.get_unpinned(1), Some(100));
+        assert_eq!(pool.peek(1), Some(100));
         assert_eq!(pool.order.len(), 1);
     }
 
@@ -1052,25 +1007,17 @@ mod tests {
     }
 
     #[test]
-    fn handle_pool_try_acquire() {
+    fn handle_pool_acquire_shared_stacks_pins() {
         let mut pool = HandlePool::new();
+        assert!(pool.acquire_shared(1).is_none());
 
-        // Missing: no entry
-        assert!(matches!(pool.try_acquire(1), AcquireResult::Missing));
-
-        // Acquired: free entry
         pool.insert(1, 100);
-        match pool.try_acquire(1) {
-            AcquireResult::Acquired(h) => assert_eq!(h, 100),
-            _ => panic!("expected Acquired"),
-        }
-        assert_eq!(pool.handles.get(&1).unwrap().pin_count, 1);
+        assert_eq!(pool.acquire_shared(1), Some(100));
+        assert_eq!(pool.acquire_shared(1), Some(100));
+        assert_eq!(pool.handles[&1].pin_count, 2);
 
-        // Pinned: already in use
-        assert!(matches!(pool.try_acquire(1), AcquireResult::Pinned));
-
-        // Unpin -> Acquired again
         pool.unpin(1);
-        assert!(matches!(pool.try_acquire(1), AcquireResult::Acquired(100)));
+        pool.unpin(1);
+        assert_eq!(pool.handles[&1].pin_count, 0);
     }
 }
