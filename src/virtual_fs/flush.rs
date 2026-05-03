@@ -289,6 +289,16 @@ async fn flush_batch(
 
     debug!("flush_batch: deduped inos = {:?}", deduped);
 
+    // Hold per-inode staging locks across snapshot + upload + commit so concurrent
+    // O_TRUNC (open_advanced_write, setattr) and unlink/rename → drop_staging
+    // can't truncate or remove the file xet-core is reading. Acquired before the
+    // snapshot to also catch unlink that races between snapshot and upload.
+    // Acquired in deduped order, which is consistent across concurrent callers.
+    let mut _staging_guards: Vec<tokio::sync::OwnedMutexGuard<()>> = Vec::with_capacity(deduped.len());
+    for ino in &deduped {
+        _staging_guards.push(staging.lock(*ino).lock_owned().await);
+    }
+
     // Snapshot dirty_generation so we only clear dirty if no concurrent writer advanced it.
     let to_flush: Vec<FlushItem> = {
         let inode_table = inodes.read().expect("inodes poisoned");
@@ -330,6 +340,8 @@ async fn flush_batch(
     };
 
     if to_flush.is_empty() {
+        // Drop guards before gc — gc_one acquires the same per-inode locks.
+        drop(_staging_guards);
         // Still reclaim if other clean staging files pushed us over budget.
         staging.gc(inodes).await;
         return;
@@ -367,6 +379,10 @@ async fn flush_batch(
             }
         }
     }
+
+    // Uploads are done — drop the staging locks so unlink/truncate and the
+    // gc() calls below (which acquire the same per-inode locks) can proceed.
+    drop(_staging_guards);
 
     if upload_results.is_empty() {
         return;

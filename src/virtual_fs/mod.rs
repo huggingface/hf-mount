@@ -2569,6 +2569,11 @@ impl VirtualFs {
         // open fd, drop_staging waits until release() so writes through the
         // surviving fd can still update bytes_used coherently.
         if inode_fully_removed {
+            // Take the per-inode staging lock so an in-flight flush upload
+            // (which holds the same lock) finishes reading the file before
+            // we unlink it. Without this, xet-core sees ENOENT mid-upload.
+            let staging_lock = self.staging.lock(ino);
+            let _staging_guard = staging_lock.lock().await;
             self.drop_staging(ino);
         }
 
@@ -2774,7 +2779,13 @@ impl VirtualFs {
         // Destination-conflict errors (EEXIST, EISDIR, etc.) are propagated
         // since poll may not fix a dirty local inode at the destination path.
         match self.rename_apply_local(info, parent, name, newparent, newname, no_replace) {
-            Ok(()) => {
+            Ok(replaced_staging_ino) => {
+                if let Some(ino) = replaced_staging_ino {
+                    // Serialize with in-flight flush upload for this inode.
+                    let staging_lock = self.staging.lock(ino);
+                    let _staging_guard = staging_lock.lock().await;
+                    self.drop_staging(ino);
+                }
                 // Remember locally that the source path is gone so the lookup
                 // HEAD-on-miss recovery doesn't resurrect it from a
                 // not-yet-flushed remote delete.
@@ -2955,6 +2966,9 @@ impl VirtualFs {
     }
 
     /// Phase 3: apply rename to local inode table under write lock.
+    /// Returns `Ok(Some(ino))` when a staging file for a replaced target needs
+    /// to be dropped; the caller must do that asynchronously under the
+    /// per-inode staging lock to serialize with in-flight flush uploads.
     fn rename_apply_local(
         &self,
         info: RenameInfo,
@@ -2963,7 +2977,7 @@ impl VirtualFs {
         newparent: u64,
         newname: &str,
         no_replace: bool,
-    ) -> VirtualFsResult<()> {
+    ) -> VirtualFsResult<Option<u64>> {
         self.negative_cache_remove(&info.new_full_path);
         // Cancel any queued remote delete for the destination path (e.g. rm a && mv b a).
         // For directories, also cancel descendant deletes (e.g. rm -rf dir && mv newdir dir).
@@ -2986,7 +3000,7 @@ impl VirtualFs {
         let replace_target = if let Some(existing) = inodes.lookup_child(newparent, newname) {
             // POSIX: rename(a, b) where a and b are hard links to the same inode is a no-op
             if existing.inode == info.ino {
-                return Ok(());
+                return Ok(None);
             }
             if no_replace {
                 return Err(libc::EEXIST);
@@ -3070,11 +3084,7 @@ impl VirtualFs {
         }
         drop(inodes);
 
-        if let Some(ino) = replaced_staging_ino {
-            self.drop_staging(ino);
-        }
-
-        Ok(())
+        Ok(replaced_staging_ino)
     }
 
     #[allow(clippy::too_many_arguments)]
