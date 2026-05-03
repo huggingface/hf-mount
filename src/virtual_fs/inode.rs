@@ -122,6 +122,11 @@ pub struct InodeEntry {
     /// concurrent writers from silently losing their data.
     pub dirty_generation: u64,
     pub children_loaded: bool,
+    /// When `children_loaded` was last set to true (via remote listing or local
+    /// mkdir). Lookup uses this to skip HEAD-on-miss probes when the listing is
+    /// fresh — a hot path for workloads that lookup many unique names under a
+    /// recently-listed directory (e.g. tarball extraction, build dirs).
+    pub children_loaded_at: Option<Instant>,
     pub children: Vec<DirChild>,
     /// Old remote paths that should be deleted on next flush (set by rename of dirty files).
     pub pending_deletes: Vec<String>,
@@ -235,6 +240,7 @@ impl InodeTable {
             etag: None,
             dirty_generation: 0,
             children_loaded: false,
+            children_loaded_at: None,
             children: Vec::new(),
             pending_deletes: Vec::new(),
             last_revalidated: None,
@@ -576,6 +582,7 @@ impl InodeTable {
             etag: None,
             dirty_generation: 0,
             children_loaded: kind != InodeKind::Directory, // only dirs have children to load
+            children_loaded_at: None,
             children: Vec::new(),
             pending_deletes: Vec::new(),
             last_revalidated: Some(Instant::now()),

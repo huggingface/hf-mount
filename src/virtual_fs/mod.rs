@@ -709,6 +709,7 @@ impl VirtualFs {
             // since regrowth on rare child mutations is cheap.
             parent.children.shrink_to_fit();
             parent.children_loaded = true;
+            parent.children_loaded_at = Some(Instant::now());
         }
         Ok(())
     }
@@ -964,7 +965,12 @@ impl VirtualFs {
                 current_hash: Option<String>,
                 current_etag: Option<String>,
             },
-            Miss(String), // full_path for negative cache
+            Miss {
+                full_path: String,
+                /// True when the parent's listing is fresh enough to trust
+                /// without a HEAD-on-miss revalidation probe.
+                listing_fresh: bool,
+            },
             NotLoaded,
         }
         let fast = {
@@ -1010,7 +1016,18 @@ impl VirtualFs {
                     } else {
                         format!("{}/{}", parent_path, name)
                     };
-                    FastResult::Miss(full_path)
+                    // Skip the HEAD-on-miss revalidation when the listing was
+                    // just refreshed: workloads that rapidly look up unique
+                    // names (tarball extract, build systems, xfstests) would
+                    // otherwise pay one HEAD + list_tree per name despite the
+                    // cache being authoritative.
+                    let listing_fresh = parent_entry
+                        .children_loaded_at
+                        .is_some_and(|t| t.elapsed() < self.metadata_ttl);
+                    FastResult::Miss {
+                        full_path,
+                        listing_fresh,
+                    }
                 }
                 // No entry, no listing → slow path (HEAD then list_tree).
                 None => FastResult::NotLoaded,
@@ -1033,11 +1050,22 @@ impl VirtualFs {
                     None => Err(libc::ENOENT),
                 };
             }
-            FastResult::Miss(full_path) => {
+            FastResult::Miss {
+                full_path,
+                listing_fresh,
+            } => {
                 // A cached listing can still hide entries added remotely after
                 // we listed. Re-validate before serving ENOENT, gated by the
                 // negative cache so repeated misses stay free.
                 if self.negative_cache_check(&full_path) {
+                    return Err(libc::ENOENT);
+                }
+                // Skip the HEAD/list probes if the parent's listing is fresh:
+                // anything added remotely within metadata_ttl will be picked up
+                // by the next listing or poll cycle, and we save 2 round-trips
+                // per unique miss in tight-loop workloads.
+                if listing_fresh {
+                    self.negative_cache_insert(full_path);
                     return Err(libc::ENOENT);
                 }
                 // HEAD probe catches files added remotely.
@@ -2483,6 +2511,7 @@ impl VirtualFs {
             );
             if let Some(entry) = inodes.get_mut(ino) {
                 entry.children_loaded = true;
+                entry.children_loaded_at = Some(Instant::now());
             }
             // nlink already incremented by insert()
             inodes.touch_parent(parent, now);

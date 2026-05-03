@@ -924,6 +924,16 @@ fn lookup_miss_finds_remotely_added_file() {
         let _ = vfs.readdir(subdir.ino).await.unwrap();
         assert!(vfs.inode_table.read().unwrap().is_children_loaded(subdir.ino));
 
+        // Age the listing past metadata_ttl so the lookup-miss path takes the
+        // HEAD-on-miss revalidation branch (otherwise a fresh listing would
+        // be trusted and ENOENT served without probing).
+        vfs.inode_table
+            .write()
+            .unwrap()
+            .get_mut(subdir.ino)
+            .unwrap()
+            .children_loaded_at = None;
+
         // Simulate a remote concurrent upload after we listed.
         hub.add_file("subdir/freshly_added.txt", 9, Some("h_fresh"), None);
         hub.set_head(
@@ -958,6 +968,14 @@ fn lookup_miss_finds_remotely_added_dir() {
         // Warm parent.children_loaded; the only known sub-dir is v1.0.0.
         let _ = vfs.readdir(repo.ino).await.unwrap();
 
+        // Age the listing past metadata_ttl so HEAD/list_tree probes fire.
+        vfs.inode_table
+            .write()
+            .unwrap()
+            .get_mut(repo.ino)
+            .unwrap()
+            .children_loaded_at = None;
+
         // Simulate a remote upload of a new version directory.
         hub.add_file("repo/v2.0.0/file.txt", 4, Some("h_v2"), None);
 
@@ -984,6 +1002,15 @@ fn lookup_miss_truly_absent_populates_neg_cache() {
     rt.block_on(async {
         let subdir = vfs.lookup(ROOT_INODE, "subdir").await.unwrap();
         let _ = vfs.readdir(subdir.ino).await.unwrap();
+
+        // Age the listing past metadata_ttl to exercise the HEAD-on-miss
+        // probe (a fresh listing would short-circuit to ENOENT).
+        vfs.inode_table
+            .write()
+            .unwrap()
+            .get_mut(subdir.ino)
+            .unwrap()
+            .children_loaded_at = None;
 
         let pre_head = hub.head_file_call_count();
         let pre_list = hub.list_tree_call_count();
