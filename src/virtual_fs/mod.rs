@@ -569,7 +569,7 @@ impl VirtualFs {
             let inodes = self.inode_table.read().expect("inodes poisoned");
             match inodes.get(parent_ino) {
                 Some(e) if e.kind != InodeKind::Directory => return Err(libc::ENOTDIR),
-                Some(e) if e.children_loaded => return Ok(()),
+                Some(e) if e.children_loaded() => return Ok(()),
                 None => return Err(libc::ENOENT),
                 _ => {}
             }
@@ -584,7 +584,7 @@ impl VirtualFs {
             let inodes = self.inode_table.read().expect("inodes poisoned");
             match inodes.get(parent_ino) {
                 Some(e) if e.kind != InodeKind::Directory => return Err(libc::ENOTDIR),
-                Some(e) if e.children_loaded => return Ok(()),
+                Some(e) if e.children_loaded() => return Ok(()),
                 Some(e) => e.full_path.to_string(),
                 None => return Err(libc::ENOENT),
             }
@@ -600,7 +600,7 @@ impl VirtualFs {
 
         let mut inodes = self.inode_table.write().expect("inodes poisoned");
         match inodes.get(parent_ino) {
-            Some(e) if e.children_loaded => return Ok(()),
+            Some(e) if e.children_loaded() => return Ok(()),
             Some(e) if e.kind != InodeKind::Directory => return Err(libc::ENOTDIR),
             None => return Err(libc::ENOENT),
             _ => {}
@@ -708,7 +708,8 @@ impl VirtualFs {
             // directory we'd otherwise keep ~50% slack forever. Trim now,
             // since regrowth on rare child mutations is cheap.
             parent.children.shrink_to_fit();
-            parent.children_loaded = true;
+            parent.children_loaded_at = Some(Instant::now());
+            parent.children_from_remote = true;
         }
         Ok(())
     }
@@ -964,7 +965,13 @@ impl VirtualFs {
                 current_hash: Option<String>,
                 current_etag: Option<String>,
             },
-            Miss(String), // full_path for negative cache
+            Miss {
+                full_path: String,
+                /// True when the parent has no remote presence (locally
+                /// created in this session); HEAD/list_tree probes are
+                /// pointless and can be skipped.
+                local_only: bool,
+            },
             NotLoaded,
         }
         let fast = {
@@ -994,7 +1001,7 @@ impl VirtualFs {
                 },
                 // Either a dirty file (local writes win until flushed) or any
                 // entry under a fully-listed parent we can trust as-is.
-                Some(entry) if entry.kind == InodeKind::File || parent_entry.children_loaded => {
+                Some(entry) if entry.kind == InodeKind::File || parent_entry.children_loaded() => {
                     FastResult::Hit(self.make_vfs_attr(entry))
                 }
                 // Cached non-file under an unloaded parent: we can't HEAD-probe
@@ -1003,14 +1010,22 @@ impl VirtualFs {
                 Some(_) => FastResult::NotLoaded,
                 // No cached entry but the parent listing is authoritative →
                 // the name really doesn't exist; populate the negative cache.
-                None if parent_entry.children_loaded => {
+                None if parent_entry.children_loaded() => {
                     let parent_path = &parent_entry.full_path;
                     let full_path = if parent_path.is_empty() {
                         name.to_string()
                     } else {
                         format!("{}/{}", parent_path, name)
                     };
-                    FastResult::Miss(full_path)
+                    // Skip the HEAD-on-miss revalidation when the listing was
+                    // just refreshed: workloads that rapidly look up unique
+                    // names (tarball extract, build systems, xfstests) would
+                    // otherwise pay one HEAD + list_tree per name despite the
+                    // cache being authoritative.
+                    FastResult::Miss {
+                        full_path,
+                        local_only: !parent_entry.children_from_remote,
+                    }
                 }
                 // No entry, no listing → slow path (HEAD then list_tree).
                 None => FastResult::NotLoaded,
@@ -1033,11 +1048,24 @@ impl VirtualFs {
                     None => Err(libc::ENOENT),
                 };
             }
-            FastResult::Miss(full_path) => {
+            FastResult::Miss { full_path, local_only } => {
                 // A cached listing can still hide entries added remotely after
                 // we listed. Re-validate before serving ENOENT, gated by the
                 // negative cache so repeated misses stay free.
                 if self.negative_cache_check(&full_path) {
+                    return Err(libc::ENOENT);
+                }
+                // Skip HEAD/list probes for purely-local directories
+                // (locally-mkdir'd this session, never seen on remote):
+                // there's no remote state to discover, so the cached listing
+                // is authoritative. Hot path for tarball extract / xfstests
+                // creating thousands of unique names under fresh dirs.
+                //
+                // Do NOT seed the global negative cache here — its TTL is
+                // longer than metadata_ttl, and remote churn could materialize
+                // these names while the entry hides them. The listing itself
+                // is the cache for these misses.
+                if local_only {
                     return Err(libc::ENOENT);
                 }
                 // HEAD probe catches files added remotely.
@@ -2482,7 +2510,10 @@ impl VirtualFs {
                 caller_gid,
             );
             if let Some(entry) = inodes.get_mut(ino) {
-                entry.children_loaded = true;
+                entry.children_loaded_at = Some(Instant::now());
+                // children_from_remote stays false: a freshly-mkdir'd dir has
+                // no remote presence yet, so lookup-miss can serve ENOENT
+                // without HEAD/list_tree probes.
             }
             // nlink already incremented by insert()
             inodes.touch_parent(parent, now);
@@ -2565,16 +2596,19 @@ impl VirtualFs {
             last_link && no_handles
         };
 
+        // Seed the negative cache before any await: with the inode already
+        // gone from the table, a concurrent lookup under a stale parent would
+        // otherwise HEAD the still-existing remote (the delete is only queued)
+        // and resurrect this name locally during the drop_locked await window.
+        self.negative_cache_insert(full_path.clone());
+
         // Clean up staging file only when the inode is actually gone. With an
         // open fd, drop_staging waits until release() so writes through the
         // surviving fd can still update bytes_used coherently.
         if inode_fully_removed {
-            self.drop_staging(ino);
+            self.staging.drop_locked(ino).await;
         }
 
-        // Remember locally that this path is gone so the lookup HEAD-on-miss
-        // recovery doesn't resurrect it from a not-yet-flushed remote delete.
-        self.negative_cache_insert(full_path.clone());
         info!("Deleted file: {}", full_path);
         Ok(())
     }
@@ -2774,11 +2808,15 @@ impl VirtualFs {
         // Destination-conflict errors (EEXIST, EISDIR, etc.) are propagated
         // since poll may not fix a dirty local inode at the destination path.
         match self.rename_apply_local(info, parent, name, newparent, newname, no_replace) {
-            Ok(()) => {
-                // Remember locally that the source path is gone so the lookup
-                // HEAD-on-miss recovery doesn't resurrect it from a
-                // not-yet-flushed remote delete.
+            Ok(replaced_staging_ino) => {
+                // Seed the negative cache before any await: with the source
+                // already moved locally, a concurrent lookup of `old_path`
+                // would otherwise HEAD the still-existing remote object
+                // during the drop_locked await window and resurrect it.
                 self.negative_cache_insert(old_path);
+                if let Some(ino) = replaced_staging_ino {
+                    self.staging.drop_locked(ino).await;
+                }
                 Ok(())
             }
             Err(libc::ENOENT) if remote_mutated => {
@@ -2955,6 +2993,9 @@ impl VirtualFs {
     }
 
     /// Phase 3: apply rename to local inode table under write lock.
+    /// Returns `Ok(Some(ino))` when a staging file for a replaced target needs
+    /// to be dropped; the caller must do that asynchronously under the
+    /// per-inode staging lock to serialize with in-flight flush uploads.
     fn rename_apply_local(
         &self,
         info: RenameInfo,
@@ -2963,7 +3004,7 @@ impl VirtualFs {
         newparent: u64,
         newname: &str,
         no_replace: bool,
-    ) -> VirtualFsResult<()> {
+    ) -> VirtualFsResult<Option<u64>> {
         self.negative_cache_remove(&info.new_full_path);
         // Cancel any queued remote delete for the destination path (e.g. rm a && mv b a).
         // For directories, also cancel descendant deletes (e.g. rm -rf dir && mv newdir dir).
@@ -2986,7 +3027,7 @@ impl VirtualFs {
         let replace_target = if let Some(existing) = inodes.lookup_child(newparent, newname) {
             // POSIX: rename(a, b) where a and b are hard links to the same inode is a no-op
             if existing.inode == info.ino {
-                return Ok(());
+                return Ok(None);
             }
             if no_replace {
                 return Err(libc::EEXIST);
@@ -3070,11 +3111,7 @@ impl VirtualFs {
         }
         drop(inodes);
 
-        if let Some(ino) = replaced_staging_ino {
-            self.drop_staging(ino);
-        }
-
-        Ok(())
+        Ok(replaced_staging_ino)
     }
 
     #[allow(clippy::too_many_arguments)]

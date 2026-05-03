@@ -43,6 +43,18 @@ impl StagingCoordinator {
             .clone()
     }
 
+    /// Unconditionally remove an inode's staging file under the per-inode
+    /// lock. Used by paths that have already decided the inode is gone
+    /// (unlink, rename-replaced target). Holding the lock serializes with
+    /// in-flight `flush_batch` uploads so xet-core never sees the file
+    /// vanish mid-read.
+    pub(crate) async fn drop_locked(&self, ino: u64) {
+        let Some(dir) = self.dir() else { return };
+        let lock = self.lock(ino);
+        let _guard = lock.lock().await;
+        dir.try_remove(ino);
+    }
+
     /// Reclaim a single clean inode's staging file when usage exceeds the
     /// disk budget. Takes the per-inode lock so in-flight opens can't race
     /// the unlink, then re-checks `is_dirty` under the inode read lock to
