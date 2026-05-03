@@ -3618,6 +3618,75 @@ fn flush_skips_hub_commit_when_hash_unchanged() {
     vfs.shutdown();
 }
 
+/// Regression test for the flush ↔ unlink race that produced
+/// "No such file or directory" / "failed to fill whole buffer" errors in
+/// xfstests CI.
+///
+/// flush_batch reads each staging file by path; without the per-inode
+/// staging lock, a concurrent unlink can drop the file mid-read. The test
+/// gates `MockXet::upload_files` to hold the upload at the exact point
+/// where the file is being read, then issues an unlink. The unlink must
+/// wait on the staging lock until the upload completes, and the upload
+/// must succeed (no errors recorded in the FlushManager).
+#[test]
+fn flush_unlink_race_serializes_via_staging_lock() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_advanced(&hub, &xet);
+
+    rt.block_on(async {
+        // Install the gate before triggering the flush.
+        let gate = xet.install_upload_gate();
+
+        let (_, fh) = vfs.create(ROOT_INODE, "racy.txt", 0o644, 0, 0, None).await.unwrap();
+        let ino = ROOT_INODE + 1;
+        write_blocking(&vfs, ino, fh, 0, b"payload").await.unwrap();
+        vfs.release(fh).await.unwrap();
+
+        // Wait for flush_batch to enter `upload_files` (gate.entered).
+        // At this point flush holds the per-inode staging lock.
+        gate.entered.notified().await;
+        assert_eq!(xet.uploads_inflight.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // Issue a concurrent unlink. With the fix it blocks on
+        // `staging.drop_locked` (same per-inode lock). Without the fix it
+        // would unlink the staging file immediately and the upload below
+        // would fail with ENOENT or short read.
+        let vfs_clone = vfs.clone();
+        let unlink_task = tokio::spawn(async move { vfs_clone.unlink(ROOT_INODE, "racy.txt").await });
+
+        // Give the unlink a chance to reach `drop_locked`. If the lock
+        // weren't held it would have completed by now.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!unlink_task.is_finished(), "unlink must wait for in-flight upload");
+
+        // Release the upload. flush completes, drops the lock, unlink
+        // proceeds to remove the staging file.
+        gate.release.notify_one();
+        unlink_task.await.unwrap().unwrap();
+
+        // Wait for the flush_batch to finish (post-upload commit + GC).
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // The upload must have succeeded — no flush error recorded for ino.
+        assert!(
+            vfs.flush_manager.as_ref().unwrap().check_error(ino).is_none(),
+            "upload should have succeeded (the lock prevented the race)"
+        );
+
+        // Hub commit (AddFile) ran before the unlink's pending delete drained.
+        let logs = hub.take_batch_log();
+        assert!(
+            logs.iter()
+                .flatten()
+                .any(|op| matches!(op, crate::hub_api::BatchOp::AddFile { path, .. } if path == "racy.txt")),
+            "AddFile should appear in the Hub log: {logs:?}"
+        );
+    });
+
+    vfs.shutdown();
+}
+
 /// In a batch with mixed changed/unchanged files, only changed files
 /// appear in the Hub commit. Unchanged files still get cleared dirty.
 #[test]

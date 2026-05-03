@@ -262,6 +262,18 @@ pub struct MockXet {
     pub stream_calls: Mutex<Vec<(u64, Option<u64>)>>,
     /// Count of download_to_file calls (used to assert staging cache reuse).
     pub download_to_file_calls: AtomicU64,
+    /// Test hook to pause `upload_files` mid-call so the test can drive
+    /// concurrent unlink/rename/truncate against a file the flush is reading.
+    upload_gate: Mutex<Option<UploadGate>>,
+    /// Number of `upload_files` calls currently inside the gate (pre-release).
+    pub uploads_inflight: AtomicU32,
+}
+
+/// One-shot synchronization handle: the next `upload_files` call signals
+/// `entered`, then awaits `release` before proceeding.
+pub struct UploadGate {
+    pub entered: Arc<tokio::sync::Notify>,
+    pub release: Arc<tokio::sync::Notify>,
 }
 
 impl MockXet {
@@ -277,7 +289,21 @@ impl MockXet {
             range_empty_count: AtomicU32::new(0),
             stream_calls: Mutex::new(Vec::new()),
             download_to_file_calls: AtomicU64::new(0),
+            upload_gate: Mutex::new(None),
+            uploads_inflight: AtomicU32::new(0),
         })
+    }
+
+    /// Install a one-shot gate: the next `upload_files` call signals
+    /// `entered` then awaits `release`. Used to drive race-condition tests.
+    pub fn install_upload_gate(&self) -> UploadGate {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        *self.upload_gate.lock().unwrap() = Some(UploadGate {
+            entered: entered.clone(),
+            release: release.clone(),
+        });
+        UploadGate { entered, release }
     }
 
     pub fn add_file(&self, hash: &str, content: &[u8]) {
@@ -341,6 +367,16 @@ impl XetOps for MockXet {
     }
 
     async fn upload_files(&self, paths: &[&Path]) -> Result<Vec<XetFileInfo>> {
+        // Test gate: signal entry, then block until released. Lets tests
+        // exercise races between an in-flight upload and concurrent
+        // unlink/rename/truncate.
+        let gate = self.upload_gate.lock().unwrap().take();
+        if let Some(gate) = gate {
+            self.uploads_inflight.fetch_add(1, Ordering::SeqCst);
+            gate.entered.notify_one();
+            gate.release.notified().await;
+            self.uploads_inflight.fetch_sub(1, Ordering::SeqCst);
+        }
         if self.upload_fail.swap(false, Ordering::SeqCst) {
             return Err(Error::Xet("mock upload failure".into()));
         }
