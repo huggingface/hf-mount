@@ -168,14 +168,23 @@ impl NFSFileSystem for NFSAdapter {
         let acquired = self.handle_pool.lock().expect("handle_pool poisoned").try_acquire(id);
         let (file_handle, source) = match acquired {
             AcquireResult::Acquired(handle) => (handle, HandleSource::Pooled),
-            AcquireResult::Pinned => {
-                let handle = self
-                    .virtual_fs
-                    .open(id, false, false, None)
-                    .await
-                    .map_err(errno_to_nfs)?;
-                (handle, HandleSource::Ephemeral)
-            }
+            AcquireResult::Pinned => match self.virtual_fs.open(id, false, false, None).await {
+                Ok(handle) => (handle, HandleSource::Ephemeral),
+                Err(_) => {
+                    // Ephemeral open failed (e.g. transient HTTP revalidation
+                    // error or fd exhaustion). Fall back to sharing the pooled
+                    // handle — this serializes behind the per-handle prefetch
+                    // mutex but still serves the read.
+                    let mut pool = self.handle_pool.lock().expect("handle_pool poisoned");
+                    match pool.get_unpinned(id) {
+                        Some(handle) => {
+                            pool.pin(id);
+                            (handle, HandleSource::Pooled)
+                        }
+                        None => return Err(nfsstat3::NFS3ERR_IO),
+                    }
+                }
+            },
             AcquireResult::Missing => self.get_or_open_handle(id).await?,
         };
 
