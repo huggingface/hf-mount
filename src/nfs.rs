@@ -161,31 +161,23 @@ impl NFSFileSystem for NFSAdapter {
     }
 
     async fn read(&self, id: fileid3, offset: u64, count: u32) -> Result<(Vec<u8>, bool), nfsstat3> {
-        // Try to use the pooled handle. If it is currently in use by another
-        // reader, open an ephemeral VFS handle so the two reads run in
-        // parallel rather than serializing behind the per-handle prefetch
-        // mutex (NFS shares one handle per inode across all clients).
-        let acquired = self.handle_pool.lock().expect("handle_pool poisoned").try_acquire(id);
-        let (file_handle, source) = match acquired {
-            AcquireResult::Acquired(handle) => (handle, HandleSource::Pooled),
-            AcquireResult::Pinned => match self.virtual_fs.open(id, false, false, None).await {
-                Ok(handle) => (handle, HandleSource::Ephemeral),
-                Err(_) => {
-                    // Ephemeral open failed (e.g. transient HTTP revalidation
-                    // error or fd exhaustion). Fall back to sharing the pooled
-                    // handle — this serializes behind the per-handle prefetch
-                    // mutex but still serves the read.
-                    let mut pool = self.handle_pool.lock().expect("handle_pool poisoned");
-                    match pool.get_unpinned(id) {
-                        Some(handle) => {
-                            pool.pin(id);
-                            (handle, HandleSource::Pooled)
-                        }
-                        None => return Err(nfsstat3::NFS3ERR_IO),
-                    }
-                }
-            },
-            AcquireResult::Missing => self.get_or_open_handle(id).await?,
+        // Share the pooled handle across concurrent readers. NFS readahead
+        // dispatches multiple READ RPCs for the same inode at adjacent
+        // offsets, and the prefetch buffer attached to the handle absorbs
+        // them efficiently — opening an extra VFS handle per concurrent RPC
+        // would start a fresh Xet stream and saturate the CAS client.
+        // pin_count just protects the entry from LRU eviction here.
+        let pooled = {
+            let mut pool = self.handle_pool.lock().expect("handle_pool poisoned");
+            match pool.try_acquire(id) {
+                AcquireResult::Acquired(handle) => Some(handle),
+                AcquireResult::Pinned => pool.get_unpinned(id).inspect(|_| pool.pin(id)),
+                AcquireResult::Missing => None,
+            }
+        };
+        let (file_handle, source) = match pooled {
+            Some(handle) => (handle, HandleSource::Pooled),
+            None => self.get_or_open_handle(id).await?,
         };
 
         let result = self.virtual_fs.read(file_handle, offset, count).await;
