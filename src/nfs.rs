@@ -166,11 +166,7 @@ impl NFSFileSystem for NFSAdapter {
                     .map_err(errno_to_nfs)?;
                 (handle, HandleSource::Ephemeral)
             }
-            AcquireResult::Missing => {
-                // First read on this inode: populate the pool so subsequent
-                // readers hit the fast path. get_or_open_handle pins the entry.
-                (self.get_or_open_handle(id).await?, HandleSource::Pooled)
-            }
+            AcquireResult::Missing => (self.get_or_open_handle(id).await?, HandleSource::Pooled),
         };
 
         let result = self.virtual_fs.read(file_handle, offset, count).await;
@@ -657,31 +653,25 @@ impl HandlePool {
         Some(file_handle)
     }
 
-    /// Acquire a pooled handle only if it is free (no in-flight reader).
-    /// Returns:
-    /// - `Acquired(handle)`: pinned with refcount 1, caller must `unpin`
-    /// - `Pinned`: entry exists but another reader is using it
-    /// - `Missing`: no entry for this ino
-    ///
-    /// Used by NFS read() to avoid serializing two readers behind the
-    /// per-handle prefetch mutex. On `Pinned`, the caller opens an
-    /// ephemeral VFS handle for parallel reads.
+    /// Acquire a pooled handle only if it is free. On `Pinned` the caller
+    /// opens an ephemeral VFS handle so two readers do not serialize behind
+    /// the per-handle prefetch mutex.
     fn try_acquire(&mut self, ino: u64) -> AcquireResult {
-        let (file_handle, free) = match self.handles.get(&ino) {
-            Some(entry) => (entry.file_handle, entry.pin_count == 0),
+        let entry = match self.handles.get_mut(&ino) {
+            Some(entry) => entry,
             None => return AcquireResult::Missing,
         };
-        if !free {
+        if entry.pin_count != 0 {
             return AcquireResult::Pinned;
         }
+        let file_handle = entry.file_handle;
+        entry.pin_count = 1;
         self.order_remove(ino);
         self.order.push_back(ino);
-        self.handles.get_mut(&ino).expect("just looked up").pin_count = 1;
         AcquireResult::Acquired(file_handle)
     }
 
-    /// Look up a handle WITHOUT pinning (for fire-and-forget operations
-    /// like write where the VFS call is synchronous).
+    /// Look up a handle and promote it to MRU without pinning.
     fn get_unpinned(&mut self, ino: u64) -> Option<u64> {
         self.get_inner(ino)
     }
@@ -693,7 +683,6 @@ impl HandlePool {
         Some(file_handle)
     }
 
-    /// Pin an entry without looking it up (e.g. right after insert).
     fn pin(&mut self, ino: u64) {
         if let Some(entry) = self.handles.get_mut(&ino) {
             entry.pin_count += 1;
@@ -743,8 +732,7 @@ impl HandlePool {
         } else {
             None
         };
-        // Evict unpinned entries until we are back at capacity.
-        // This also reclaims overflow from previous pinned bursts.
+        // Skip pinned entries; reclaim any overflow from a previous burst.
         let mut evicted = Vec::new();
         while self.handles.len() >= HANDLE_POOL_CAPACITY {
             let evict_pos = self.order.iter().enumerate().find_map(|(idx, &candidate)| {
