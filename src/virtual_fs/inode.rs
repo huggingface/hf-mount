@@ -1,7 +1,7 @@
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 pub const ROOT_INODE: u64 = 1;
 
@@ -122,12 +122,17 @@ pub struct InodeEntry {
     /// concurrent writers from silently losing their data.
     pub dirty_generation: u64,
     /// When the children listing was last refreshed. `Some` ⇔ "loaded": one
-    /// field answers both "is it populated?" and "how fresh is it?" so the
-    /// two can never drift. Set on remote listing or local mkdir, cleared on
-    /// invalidation/eviction. Lookup compares against `metadata_ttl` to skip
-    /// HEAD-on-miss probes for tight-loop unique-name workloads (tarball
-    /// extract, build dirs, xfstests).
+    /// field answers both "is it populated?" and "is it loaded?" so the two
+    /// can never drift. Set on remote listing or local mkdir, cleared on
+    /// invalidation/eviction.
     pub children_loaded_at: Option<Instant>,
+    /// True when the children listing came from a Hub list (i.e. the directory
+    /// has remote presence we may need to revalidate). False for directories
+    /// created locally in this session — there is no remote state to discover,
+    /// so lookup-miss can skip HEAD/list_tree probes entirely. This is the
+    /// hot path for write-heavy workloads (tarball extract, xfstests) that
+    /// create thousands of unique names under freshly-mkdir'd directories.
+    pub children_from_remote: bool,
     pub children: Vec<DirChild>,
     /// Old remote paths that should be deleted on next flush (set by rename of dirty files).
     pub pending_deletes: Vec<String>,
@@ -148,13 +153,6 @@ impl InodeEntry {
     /// meaningful for directories.
     pub fn children_loaded(&self) -> bool {
         self.children_loaded_at.is_some()
-    }
-
-    /// Returns true if the children listing was refreshed within `ttl`.
-    /// Used by lookup-miss to decide whether to skip the HEAD/list_tree
-    /// revalidation probes.
-    pub fn is_listing_fresh(&self, ttl: Duration) -> bool {
-        self.children_loaded_at.is_some_and(|t| t.elapsed() < ttl)
     }
 
     /// Mark the inode as dirty, incrementing the generation counter.
@@ -254,6 +252,7 @@ impl InodeTable {
             etag: None,
             dirty_generation: 0,
             children_loaded_at: None,
+            children_from_remote: false,
             children: Vec::new(),
             pending_deletes: Vec::new(),
             last_revalidated: None,
@@ -598,6 +597,7 @@ impl InodeTable {
             // None for them and is never read (gated on `kind` at the call
             // sites). Directories start unloaded until the first list.
             children_loaded_at: None,
+            children_from_remote: false,
             children: Vec::new(),
             pending_deletes: Vec::new(),
             last_revalidated: Some(Instant::now()),

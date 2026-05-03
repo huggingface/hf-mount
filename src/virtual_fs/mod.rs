@@ -709,7 +709,7 @@ impl VirtualFs {
             // since regrowth on rare child mutations is cheap.
             parent.children.shrink_to_fit();
             parent.children_loaded_at = Some(Instant::now());
-            parent.children_loaded_at = Some(Instant::now());
+            parent.children_from_remote = true;
         }
         Ok(())
     }
@@ -967,9 +967,10 @@ impl VirtualFs {
             },
             Miss {
                 full_path: String,
-                /// True when the parent's listing is fresh enough to trust
-                /// without a HEAD-on-miss revalidation probe.
-                listing_fresh: bool,
+                /// True when the parent has no remote presence (locally
+                /// created in this session); HEAD/list_tree probes are
+                /// pointless and can be skipped.
+                local_only: bool,
             },
             NotLoaded,
         }
@@ -1021,10 +1022,9 @@ impl VirtualFs {
                     // names (tarball extract, build systems, xfstests) would
                     // otherwise pay one HEAD + list_tree per name despite the
                     // cache being authoritative.
-                    let listing_fresh = parent_entry.is_listing_fresh(self.metadata_ttl);
                     FastResult::Miss {
                         full_path,
-                        listing_fresh,
+                        local_only: !parent_entry.children_from_remote,
                     }
                 }
                 // No entry, no listing → slow path (HEAD then list_tree).
@@ -1048,22 +1048,24 @@ impl VirtualFs {
                     None => Err(libc::ENOENT),
                 };
             }
-            FastResult::Miss {
-                full_path,
-                listing_fresh,
-            } => {
+            FastResult::Miss { full_path, local_only } => {
                 // A cached listing can still hide entries added remotely after
                 // we listed. Re-validate before serving ENOENT, gated by the
                 // negative cache so repeated misses stay free.
                 if self.negative_cache_check(&full_path) {
                     return Err(libc::ENOENT);
                 }
-                // Skip the HEAD/list probes if the parent's listing is fresh:
-                // anything added remotely within metadata_ttl will be picked up
-                // by the next listing or poll cycle, and we save 2 round-trips
-                // per unique miss in tight-loop workloads.
-                if listing_fresh {
-                    self.negative_cache_insert(full_path);
+                // Skip HEAD/list probes for purely-local directories
+                // (locally-mkdir'd this session, never seen on remote):
+                // there's no remote state to discover, so the cached listing
+                // is authoritative. Hot path for tarball extract / xfstests
+                // creating thousands of unique names under fresh dirs.
+                //
+                // Do NOT seed the global negative cache here — its TTL is
+                // longer than metadata_ttl, and remote churn could materialize
+                // these names while the entry hides them. The listing itself
+                // is the cache for these misses.
+                if local_only {
                     return Err(libc::ENOENT);
                 }
                 // HEAD probe catches files added remotely.
@@ -2509,7 +2511,9 @@ impl VirtualFs {
             );
             if let Some(entry) = inodes.get_mut(ino) {
                 entry.children_loaded_at = Some(Instant::now());
-                entry.children_loaded_at = Some(Instant::now());
+                // children_from_remote stays false: a freshly-mkdir'd dir has
+                // no remote presence yet, so lookup-miss can serve ENOENT
+                // without HEAD/list_tree probes.
             }
             // nlink already incremented by insert()
             inodes.touch_parent(parent, now);
@@ -2592,6 +2596,12 @@ impl VirtualFs {
             last_link && no_handles
         };
 
+        // Seed the negative cache before any await: with the inode already
+        // gone from the table, a concurrent lookup under a stale parent would
+        // otherwise HEAD the still-existing remote (the delete is only queued)
+        // and resurrect this name locally during the drop_locked await window.
+        self.negative_cache_insert(full_path.clone());
+
         // Clean up staging file only when the inode is actually gone. With an
         // open fd, drop_staging waits until release() so writes through the
         // surviving fd can still update bytes_used coherently.
@@ -2599,9 +2609,6 @@ impl VirtualFs {
             self.staging.drop_locked(ino).await;
         }
 
-        // Remember locally that this path is gone so the lookup HEAD-on-miss
-        // recovery doesn't resurrect it from a not-yet-flushed remote delete.
-        self.negative_cache_insert(full_path.clone());
         info!("Deleted file: {}", full_path);
         Ok(())
     }
@@ -2802,13 +2809,14 @@ impl VirtualFs {
         // since poll may not fix a dirty local inode at the destination path.
         match self.rename_apply_local(info, parent, name, newparent, newname, no_replace) {
             Ok(replaced_staging_ino) => {
+                // Seed the negative cache before any await: with the source
+                // already moved locally, a concurrent lookup of `old_path`
+                // would otherwise HEAD the still-existing remote object
+                // during the drop_locked await window and resurrect it.
+                self.negative_cache_insert(old_path);
                 if let Some(ino) = replaced_staging_ino {
                     self.staging.drop_locked(ino).await;
                 }
-                // Remember locally that the source path is gone so the lookup
-                // HEAD-on-miss recovery doesn't resurrect it from a
-                // not-yet-flushed remote delete.
-                self.negative_cache_insert(old_path);
                 Ok(())
             }
             Err(libc::ENOENT) if remote_mutated => {
