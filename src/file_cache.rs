@@ -61,17 +61,14 @@ impl FileCache {
     pub fn new(cache_dir: &Path, capacity: u64) -> Result<Arc<Self>> {
         let root = cache_dir.join(FILES_DIR);
         fs::create_dir_all(&root).map_err(|e| io_err(format!("mkdir {root:?}: {e}")))?;
-        // Per-process tmp dir so concurrent mounts sharing the same cache_dir
-        // don't clobber each other's in-flight downloads when one (re)starts.
-        let tmp_dir = root.join(TMP_DIR).join(std::process::id().to_string());
+        // Per-instance tmp dir so concurrent FileCache instances (e.g. several
+        // mounts running in the same process via the sidecar) never share or
+        // clobber each other's in-flight downloads. Per-pid was insufficient
+        // because the sidecar runs N mounts in one process; cleaning the
+        // shared tmp dir at startup could nuke another mount's active tmp
+        // file. The unique suffix removes that whole class of races.
+        let tmp_dir = root.join(TMP_DIR).join(ulid::Ulid::new().to_string());
         fs::create_dir_all(&tmp_dir).map_err(|e| io_err(format!("mkdir {tmp_dir:?}: {e}")))?;
-        // Reap our own leftovers from a prior crashed run with the same pid (rare
-        // but harmless). Other pids' tmp dirs are left alone.
-        if let Ok(rd) = fs::read_dir(&tmp_dir) {
-            for entry in rd.flatten() {
-                let _ = fs::remove_file(entry.path());
-            }
-        }
         let (state, max_seen_tick) = Self::scan_existing(&root);
         info!(
             "file_cache: dir={:?} capacity={} discovered_items={} discovered_bytes={}",
@@ -384,6 +381,15 @@ impl FileCache {
 
 fn io_err(msg: String) -> Error {
     Error::Io(std::io::Error::other(format!("file_cache: {msg}")))
+}
+
+impl Drop for FileCache {
+    fn drop(&mut self) {
+        // Best-effort cleanup of our per-instance tmp dir. Abnormal termination
+        // (SIGKILL, runtime panic before Drop) will leak; a follow-up could add
+        // a startup sweep of `<root>/.tmp/*` older than some threshold.
+        let _ = fs::remove_dir_all(&self.tmp_dir);
+    }
 }
 
 /// Drops the leader's inflight entry and notifies followers, regardless of
