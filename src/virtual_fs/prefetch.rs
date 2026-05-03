@@ -560,4 +560,102 @@ mod tests {
         let result = ps.try_serve_forward(0, 3).unwrap();
         assert_eq!(&result[..], &[1, 2, 3]);
     }
+
+    #[test]
+    fn prepare_fetch_first_read_start_stream() {
+        let mut ps = ps_with_chunks(0, &[]);
+        let plan = ps.prepare_fetch(0, 4096);
+        assert_eq!(plan.strategy, FetchStrategy::StartStream);
+        assert!(plan.fetch_size >= INITIAL_WINDOW);
+    }
+
+    #[test]
+    fn prepare_fetch_first_read_nonzero_offset() {
+        let mut ps = ps_with_chunks(0, &[]);
+        let plan = ps.prepare_fetch(1000, 4096);
+        assert_eq!(plan.strategy, FetchStrategy::StartStream);
+    }
+
+    #[test]
+    fn prepare_fetch_continue_sequential() {
+        // Buffer covers [0, INITIAL_WINDOW); next read at INITIAL_WINDOW is
+        // contiguous → ContinueStream and window doubles.
+        let data = vec![0u8; INITIAL_WINDOW as usize];
+        let mut ps = ps_with_chunks(0, &[&data]);
+        let plan = ps.prepare_fetch(INITIAL_WINDOW, 4096);
+        assert_eq!(plan.strategy, FetchStrategy::ContinueStream);
+        assert_eq!(ps.window_size, INITIAL_WINDOW * 2);
+    }
+
+    #[test]
+    fn prepare_fetch_window_doubles_to_max() {
+        let mut ps = PrefetchState::new("hash".into(), u64::MAX, false);
+        ps.buf_start = 0;
+        ps.chunks.push_back(Bytes::from(vec![0u8; 1]));
+        ps.chunks_len = 1;
+
+        let mut offset = 1u64;
+        let mut expected_window = INITIAL_WINDOW;
+        while expected_window < MAX_WINDOW {
+            let plan = ps.prepare_fetch(offset, 4096);
+            assert!(plan.strategy.is_stream());
+            expected_window = (expected_window * 2).min(MAX_WINDOW);
+            assert_eq!(ps.window_size, expected_window);
+
+            let fetched = plan.fetch_size as usize;
+            ps.store_fetched(offset, VecDeque::from(vec![Bytes::from(vec![0u8; fetched])]), fetched);
+            offset += fetched as u64;
+        }
+        // One more sequential call: window stays at MAX_WINDOW.
+        let plan = ps.prepare_fetch(offset, 4096);
+        assert!(plan.strategy.is_stream());
+        assert_eq!(ps.window_size, MAX_WINDOW);
+    }
+
+    #[test]
+    fn prepare_fetch_backward_seek_range_download() {
+        let data = vec![0u8; 4096];
+        let mut ps = ps_with_chunks(SEEK_WINDOW as u64, &[&data]);
+        ps.window_size = INITIAL_WINDOW * 4;
+
+        let plan = ps.prepare_fetch(0, 4096);
+        assert_eq!(plan.strategy, FetchStrategy::RangeDownload);
+        assert_eq!(ps.window_size, INITIAL_WINDOW);
+    }
+
+    #[test]
+    fn prepare_fetch_far_forward_jump_range_download() {
+        let data = vec![0u8; 4096];
+        let mut ps = ps_with_chunks(0, &[&data]);
+        let plan = ps.prepare_fetch(4096 + FORWARD_SKIP + 1, 4096);
+        assert_eq!(plan.strategy, FetchStrategy::RangeDownload);
+    }
+
+    #[test]
+    fn prepare_fetch_forward_skip_within_threshold() {
+        // Exactly at the FORWARD_SKIP boundary: still sequential, but the
+        // offset gap means StartStream (restart at new offset).
+        let data = vec![0u8; 4096];
+        let mut ps = ps_with_chunks(0, &[&data]);
+        let plan = ps.prepare_fetch(4096 + FORWARD_SKIP, 4096);
+        assert_eq!(plan.strategy, FetchStrategy::StartStream);
+    }
+
+    #[test]
+    fn prepare_fetch_range_download_fetch_size_exact() {
+        // RangeDownload fetches only `needed` bytes, not the full window.
+        let data = vec![0u8; 4096];
+        let mut ps = ps_with_chunks(0, &[&data]);
+        let read_size: u32 = 512;
+        let plan = ps.prepare_fetch(4096 + FORWARD_SKIP + 1, read_size);
+        assert_eq!(plan.strategy, FetchStrategy::RangeDownload);
+        assert_eq!(plan.fetch_size, read_size as u64);
+    }
+
+    #[test]
+    fn prepare_fetch_clamps_to_file_size() {
+        let mut ps = PrefetchState::new("hash".into(), 100, false);
+        let plan = ps.prepare_fetch(90, 20);
+        assert_eq!(plan.fetch_size, 10);
+    }
 }

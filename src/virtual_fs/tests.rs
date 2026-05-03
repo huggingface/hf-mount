@@ -4203,3 +4203,160 @@ fn lru_keeps_inode_table_bounded_under_lookup_churn() {
         );
     });
 }
+
+// ── Flush pipeline ─────────────────────────────────────────────────
+
+/// Multiple enqueues for the same inode collapse to a single upload.
+#[test]
+fn flush_dedup_same_inode() {
+    let hub = MockHub::new();
+    hub.add_file("file.txt", 100, Some("hash1"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_advanced(&hub, &xet);
+
+    rt.block_on(async {
+        let attr = vfs.lookup(ROOT_INODE, "file.txt").await.unwrap();
+        let ino = attr.ino;
+
+        let fh = vfs.open(ino, true, true, Some(42)).await.unwrap();
+        write_blocking(&vfs, ino, fh, 0, b"hello").await.unwrap();
+
+        let fm = vfs.flush_manager.as_ref().unwrap();
+        fm.enqueue(ino);
+        fm.enqueue(ino);
+        fm.enqueue(ino);
+
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+
+        let logs = hub.take_batch_log();
+        let add_count = logs
+            .iter()
+            .flatten()
+            .filter(|op| matches!(op, BatchOp::AddFile { path, .. } if path == "file.txt"))
+            .count();
+        assert_eq!(add_count, 1, "dedup should yield exactly 1 hub commit");
+
+        vfs.release(fh).await.unwrap();
+    });
+}
+
+#[test]
+fn flush_cancel_delete() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_advanced(&hub, &xet);
+
+    rt.block_on(async {
+        let fm = vfs.flush_manager.as_ref().unwrap();
+        fm.enqueue_delete("old/path.txt".to_string());
+        fm.cancel_delete("old/path.txt");
+
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+
+        let logs = hub.take_batch_log();
+        let has_delete = logs
+            .iter()
+            .flatten()
+            .any(|op| matches!(op, BatchOp::DeleteFile { path } if path == "old/path.txt"));
+        assert!(!has_delete, "cancelled delete should not appear in batch log");
+    });
+}
+
+#[test]
+fn flush_cancel_delete_prefix() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_advanced(&hub, &xet);
+
+    rt.block_on(async {
+        let fm = vfs.flush_manager.as_ref().unwrap();
+        fm.enqueue_delete("dir/a.txt".to_string());
+        fm.enqueue_delete("dir/b.txt".to_string());
+        fm.enqueue_delete("other.txt".to_string());
+        fm.cancel_delete_prefix("dir/");
+
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+
+        let logs = hub.take_batch_log();
+        let all_ops: Vec<&BatchOp> = logs.iter().flatten().collect();
+
+        let has_dir_delete = all_ops
+            .iter()
+            .any(|op| matches!(op, BatchOp::DeleteFile { path } if path.starts_with("dir/")));
+        assert!(!has_dir_delete, "dir/ deletes should have been cancelled");
+
+        let has_other_delete = all_ops
+            .iter()
+            .any(|op| matches!(op, BatchOp::DeleteFile { path } if path == "other.txt"));
+        assert!(has_other_delete, "other.txt delete should still be sent");
+    });
+}
+
+/// A failed delete batch is re-queued and retried on the next flush cycle.
+#[test]
+fn flush_pending_deletes_requeue_on_failure() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_advanced(&hub, &xet);
+
+    rt.block_on(async {
+        let fm = vfs.flush_manager.as_ref().unwrap();
+        hub.fail_next_batch(1);
+        fm.enqueue_delete("retry/file.txt".to_string());
+
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        // First attempt errored — batch_log records nothing.
+        let logs = hub.take_batch_log();
+        assert!(logs.is_empty(), "first attempt should have failed, no batch log");
+
+        // Re-queued path is sitting in pending_deletes but no WakeDeletes was
+        // sent; trigger a second cycle by enqueuing a dummy path.
+        fm.enqueue_delete("dummy_wake.txt".to_string());
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+
+        let logs = hub.take_batch_log();
+        let has_retry = logs
+            .iter()
+            .flatten()
+            .any(|op| matches!(op, BatchOp::DeleteFile { path } if path == "retry/file.txt"));
+        assert!(has_retry, "delete should succeed on retry after initial failure");
+    });
+}
+
+// ── Symlinks ────────────────────────────────────────────────────────
+
+#[test]
+fn symlink_create_and_readlink() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let attr = vfs
+            .symlink(ROOT_INODE, "link", "target.txt", 0o777, 1000, 1000)
+            .await
+            .unwrap();
+        let ino = attr.ino;
+
+        let looked_up = vfs.lookup(ROOT_INODE, "link").await.unwrap();
+        assert_eq!(looked_up.ino, ino);
+
+        let target = vfs.readlink(ino).unwrap();
+        assert_eq!(target, "target.txt");
+        assert_eq!(attr.kind, super::inode::InodeKind::Symlink);
+    });
+}
+
+#[test]
+fn readlink_regular_file_returns_error() {
+    let hub = MockHub::new();
+    hub.add_file("regular.txt", 100, Some("hash1"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let attr = vfs.lookup(ROOT_INODE, "regular.txt").await.unwrap();
+        let result = vfs.readlink(attr.ino);
+        assert_eq!(result.unwrap_err(), libc::EINVAL);
+    });
+}
