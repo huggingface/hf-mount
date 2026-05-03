@@ -42,32 +42,34 @@ impl NFSAdapter {
         }
     }
 
-    /// Get or open a read handle. Returns the handle plus its source so the
-    /// caller knows how to clean up. If two cold reads race on the same inode
-    /// and the loser arrives while the pool entry is already pinned, the
-    /// loser keeps its freshly-opened handle as Ephemeral so the two reads
-    /// run in parallel (rather than sharing one prefetch mutex).
-    async fn get_or_open_handle(&self, ino: u64) -> Result<(u64, HandleSource), nfsstat3> {
-        if let AcquireResult::Acquired(handle) = self.handle_pool.lock().expect("handle_pool poisoned").try_acquire(ino)
-        {
-            return Ok((handle, HandleSource::Pooled));
+    /// Get or open a pooled read handle, returning it with a shared pin. If
+    /// two cold reads race on the same inode, the loser shares the winner's
+    /// pooled handle: the per-handle prefetch buffer absorbs concurrent NFS
+    /// readahead RPCs more efficiently than a second Xet stream would.
+    async fn get_or_open_handle(&self, ino: u64) -> Result<u64, nfsstat3> {
+        if let Some(handle) = self.share_pooled_handle(ino) {
+            return Ok(handle);
         }
-        let file_handle = self
-            .virtual_fs
-            .open(ino, false, false, None)
-            .await
-            .map_err(errno_to_nfs)?;
+        let file_handle = match self.virtual_fs.open(ino, false, false, None).await {
+            Ok(handle) => handle,
+            // Open failed mid-race — another reader may have populated the
+            // pool in the meantime; share that handle rather than failing.
+            Err(err) => return self.share_pooled_handle(ino).ok_or_else(|| errno_to_nfs(err)),
+        };
 
         enum Outcome {
-            UseExisting(u64),
-            Ephemeral,
+            ShareExisting(u64),
             Inserted(InsertResult),
         }
         let outcome = {
             let mut pool = self.handle_pool.lock().expect("handle_pool poisoned");
             match pool.try_acquire(ino) {
-                AcquireResult::Acquired(existing) => Outcome::UseExisting(existing),
-                AcquireResult::Pinned => Outcome::Ephemeral,
+                AcquireResult::Acquired(existing) => Outcome::ShareExisting(existing),
+                AcquireResult::Pinned => {
+                    let existing = pool.get_unpinned(ino).expect("Pinned implies entry exists");
+                    pool.pin(ino);
+                    Outcome::ShareExisting(existing)
+                }
                 AcquireResult::Missing => {
                     let result = pool.insert(ino, file_handle);
                     pool.pin(ino);
@@ -77,11 +79,10 @@ impl NFSAdapter {
         };
 
         match outcome {
-            Outcome::UseExisting(existing) => {
+            Outcome::ShareExisting(existing) => {
                 let _ = self.virtual_fs.release(file_handle).await;
-                Ok((existing, HandleSource::Pooled))
+                Ok(existing)
             }
-            Outcome::Ephemeral => Ok((file_handle, HandleSource::Ephemeral)),
             Outcome::Inserted(result) => {
                 for (evicted_ino, evicted_handle) in result.evicted {
                     self.evict_handle(evicted_ino, evicted_handle).await;
@@ -89,8 +90,19 @@ impl NFSAdapter {
                 if let Some(replaced_handle) = result.replaced {
                     let _ = self.virtual_fs.release(replaced_handle).await;
                 }
-                Ok((file_handle, HandleSource::Pooled))
+                Ok(file_handle)
             }
+        }
+    }
+
+    /// Acquire a shared pin on an existing pooled handle, or `None` if the
+    /// pool has no entry for this inode.
+    fn share_pooled_handle(&self, ino: u64) -> Option<u64> {
+        let mut pool = self.handle_pool.lock().expect("handle_pool poisoned");
+        match pool.try_acquire(ino) {
+            AcquireResult::Acquired(handle) => Some(handle),
+            AcquireResult::Pinned => pool.get_unpinned(ino).inspect(|_| pool.pin(ino)),
+            AcquireResult::Missing => None,
         }
     }
 
@@ -167,31 +179,17 @@ impl NFSFileSystem for NFSAdapter {
         // them efficiently — opening an extra VFS handle per concurrent RPC
         // would start a fresh Xet stream and saturate the CAS client.
         // pin_count just protects the entry from LRU eviction here.
-        let pooled = {
-            let mut pool = self.handle_pool.lock().expect("handle_pool poisoned");
-            match pool.try_acquire(id) {
-                AcquireResult::Acquired(handle) => Some(handle),
-                AcquireResult::Pinned => pool.get_unpinned(id).inspect(|_| pool.pin(id)),
-                AcquireResult::Missing => None,
-            }
-        };
-        let (file_handle, source) = match pooled {
-            Some(handle) => (handle, HandleSource::Pooled),
+        let file_handle = match self.share_pooled_handle(id) {
+            Some(handle) => handle,
             None => self.get_or_open_handle(id).await?,
         };
 
         let result = self.virtual_fs.read(file_handle, offset, count).await;
-
-        match source {
-            HandleSource::Pooled => self.handle_pool.lock().expect("handle_pool poisoned").unpin(id),
-            HandleSource::Ephemeral => {
-                let _ = self.virtual_fs.release(file_handle).await;
-            }
-        }
+        self.handle_pool.lock().expect("handle_pool poisoned").unpin(id);
 
         match result {
             Ok((bytes, eof)) => Ok((bytes.to_vec(), eof)),
-            Err(libc::EBADF) if matches!(source, HandleSource::Pooled) => {
+            Err(libc::EBADF) => {
                 // Pinning prevents LRU eviction, but remove() (called by
                 // unlink/rename) can still drop the handle while a read is in
                 // flight. Purge the stale entry and retry once with a fresh
@@ -622,14 +620,6 @@ enum AcquireResult {
     Pinned,
     /// No pool entry for this ino.
     Missing,
-}
-
-#[derive(Clone, Copy)]
-enum HandleSource {
-    /// Handle is from the pool — caller must unpin after use.
-    Pooled,
-    /// Ephemeral handle opened just for this read — caller must release.
-    Ephemeral,
 }
 
 struct HandleEntry {
