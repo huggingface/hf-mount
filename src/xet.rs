@@ -277,6 +277,34 @@ impl StagingDir {
             })
             .ok();
     }
+
+    pub fn local_exists(&self, inode: u64) -> std::io::Result<bool> {
+        Ok(self.path(inode).exists())
+    }
+
+    pub fn open_local_file(
+        &self,
+        inode: u64,
+        read: bool,
+        write: bool,
+        create: bool,
+        truncate: bool,
+    ) -> std::io::Result<std::fs::File> {
+        let path = self.path(inode);
+        let mut options = std::fs::OpenOptions::new();
+        options.read(read).write(write);
+        if create {
+            options.create(true);
+        }
+        if truncate {
+            options.truncate(true);
+        }
+        options.open(path)
+    }
+
+    pub fn remove_local_file(&self, inode: u64) -> std::io::Result<()> {
+        std::fs::remove_file(self.path(inode))
+    }
 }
 
 fn rand_u64() -> u64 {

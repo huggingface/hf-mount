@@ -12,6 +12,7 @@ use xet_runtime::core::XetContext;
 use crate::cached_xet_client::CachedXetClient;
 use crate::file_cache::FileCache;
 use crate::hub_api::{HubApiClient, HubTokenRefresher, SourceKind, parse_repo_id, split_path_prefix};
+use crate::overlay::OverlayBacking;
 use crate::virtual_fs::{VfsConfig, VirtualFs};
 use crate::xet::{StagingDir, XetSessions};
 
@@ -187,6 +188,15 @@ pub struct MountOptions {
     /// when `--inode-soft-limit > 0`.
     #[arg(long, default_value_t = 5_000)]
     pub lru_sweep_interval_ms: u64,
+
+    /// Enable overlay mode. The mount point directory serves as the local
+    /// layer: pre-existing local files are visible through the mount, except
+    /// symlinks, which are skipped/hidden. New writes persist there in their
+    /// original path layout. Reads merge local files with remote bucket or
+    /// repo contents (local takes precedence). Implies --advanced-writes.
+    /// Writes are never pushed to remote.
+    #[arg(long, default_value_t = false)]
+    pub overlay: bool,
 }
 
 /// CLI args for the foreground FUSE/NFS binaries.
@@ -347,12 +357,20 @@ pub fn build_with_runtime(
         });
     }
 
-    let read_only = options.read_only || hub_client.is_repo();
-    if hub_client.is_repo() && !options.read_only {
+    if options.overlay && options.read_only {
+        panic!(
+            "--overlay with --read-only is pointless: overlay enables local writes, --read-only disables them. Use --read-only alone instead."
+        );
+    }
+
+    let read_only = (options.read_only || hub_client.is_repo()) && !options.overlay;
+    if hub_client.is_repo() && !options.read_only && !options.overlay {
         info!("Repo mounts are always read-only");
     }
 
-    let refresher = hub_client.token_refresher(read_only);
+    // Overlay: local writes allowed, but no remote write token/upload.
+    let remote_read_only = read_only || options.overlay;
+    let refresher = hub_client.token_refresher(remote_read_only);
     let xet_ctx = XetContext::default().expect("Failed to create XetContext");
     let cas_config = build_cas_config(&xet_ctx, &runtime, &refresher);
 
@@ -397,10 +415,27 @@ pub fn build_with_runtime(
         .expect("Failed to create storage client");
     let cached_client = CachedXetClient::new(raw_client);
     let download_session = FileDownloadSession::from_client(&xet_ctx, cached_client.clone(), xorb_cache.clone());
-    let upload_config = if read_only { None } else { Some(cas_config) };
+    let upload_config = if remote_read_only { None } else { Some(cas_config) };
     let xet_sessions = XetSessions::new(xet_ctx, download_session, upload_config, cached_client, xorb_cache);
 
-    let advanced_writes = options.advanced_writes || (is_nfs && !read_only);
+    let advanced_writes = options.advanced_writes || options.overlay || (is_nfs && !read_only);
+
+    // Overlay: open a pre-mount fd to the mount point directory. The fd is
+    // held by OverlayBacking so overlay-local filesystem ops can stay rooted
+    // at the covered directory after mount.
+    let overlay_fd = if options.overlay {
+        std::fs::create_dir_all(&mount_point)
+            .unwrap_or_else(|e| panic!("Failed to create mount point {:?} for overlay: {e}", mount_point));
+        Some(
+            std::fs::File::open(&mount_point)
+                .unwrap_or_else(|e| panic!("Failed to open mount point {:?} for overlay: {e}", mount_point)),
+        )
+    } else {
+        None
+    };
+
+    let overlay_backing = overlay_fd.map(OverlayBacking::new);
+
     // Repos need a staging dir for HTTP download cache (open_readonly),
     // even when advanced_writes is disabled.
     let staging_dir = if advanced_writes || hub_client.is_repo() {
@@ -430,19 +465,28 @@ pub fn build_with_runtime(
     } else {
         format!(" (subfolder: {})", hub_client.path_prefix())
     };
+    let access_mode = if options.overlay {
+        "overlay: remote read-only, local writes enabled"
+    } else if read_only {
+        "read-only"
+    } else {
+        "read-write"
+    };
     info!(
         "Mounting {}{} at {:?} ({}, backend={})",
         hub_client.source(),
         subfolder_info,
         mount_point,
-        if read_only { "read-only" } else { "read-write" },
+        access_mode,
         backend_name,
     );
     info!(
-        "Config: advanced_writes={} direct_io={} poll_interval={}s metadata_ttl={}ms \
+        "Config: advanced_writes={} overlay={} remote_read_only={} direct_io={} poll_interval={}s metadata_ttl={}ms \
          cache_dir={:?} cache_size={} no_disk_cache={} cache_mode={:?} max_staging_size={} max_threads={} \
          flush_debounce={}ms flush_max_batch={}ms uid={} gid={} filter_os_files={}",
         advanced_writes,
+        options.overlay,
+        remote_read_only,
         options.direct_io,
         options.poll_interval_secs,
         options.metadata_ttl_ms,
@@ -467,9 +511,11 @@ pub fn build_with_runtime(
         xet_sessions,
         staging_dir,
         file_cache,
+        overlay_backing,
         VfsConfig {
             read_only,
             advanced_writes,
+            overlay: options.overlay,
             uid,
             gid,
             poll_interval_secs: options.poll_interval_secs,
