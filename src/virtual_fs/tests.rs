@@ -74,6 +74,17 @@ fn vfs_readonly(
     (rt, vfs)
 }
 
+/// Force a directory's listing past `metadata_ttl` so the next lookup-miss
+/// takes the HEAD-on-miss revalidation branch instead of trusting the cache.
+fn age_listing(vfs: &VirtualFs, ino: u64) {
+    vfs.inode_table
+        .write()
+        .expect("inodes poisoned")
+        .get_mut(ino)
+        .expect("inode missing")
+        .children_loaded_at = None;
+}
+
 /// Build a VFS with the LRU evictor enabled at `soft_limit`.
 fn vfs_with_lru(
     hub: &std::sync::Arc<MockHub>,
@@ -924,15 +935,8 @@ fn lookup_miss_finds_remotely_added_file() {
         let _ = vfs.readdir(subdir.ino).await.unwrap();
         assert!(vfs.inode_table.read().unwrap().is_children_loaded(subdir.ino));
 
-        // Age the listing past metadata_ttl so the lookup-miss path takes the
-        // HEAD-on-miss revalidation branch (otherwise a fresh listing would
-        // be trusted and ENOENT served without probing).
-        vfs.inode_table
-            .write()
-            .unwrap()
-            .get_mut(subdir.ino)
-            .unwrap()
-            .children_loaded_at = None;
+        // Stale listing → lookup-miss must take the HEAD-on-miss path.
+        age_listing(&vfs, subdir.ino);
 
         // Simulate a remote concurrent upload after we listed.
         hub.add_file("subdir/freshly_added.txt", 9, Some("h_fresh"), None);
@@ -968,13 +972,8 @@ fn lookup_miss_finds_remotely_added_dir() {
         // Warm parent.children_loaded; the only known sub-dir is v1.0.0.
         let _ = vfs.readdir(repo.ino).await.unwrap();
 
-        // Age the listing past metadata_ttl so HEAD/list_tree probes fire.
-        vfs.inode_table
-            .write()
-            .unwrap()
-            .get_mut(repo.ino)
-            .unwrap()
-            .children_loaded_at = None;
+        // Stale listing → lookup-miss must take the HEAD/list_tree path.
+        age_listing(&vfs, repo.ino);
 
         // Simulate a remote upload of a new version directory.
         hub.add_file("repo/v2.0.0/file.txt", 4, Some("h_v2"), None);
@@ -1003,14 +1002,8 @@ fn lookup_miss_truly_absent_populates_neg_cache() {
         let subdir = vfs.lookup(ROOT_INODE, "subdir").await.unwrap();
         let _ = vfs.readdir(subdir.ino).await.unwrap();
 
-        // Age the listing past metadata_ttl to exercise the HEAD-on-miss
-        // probe (a fresh listing would short-circuit to ENOENT).
-        vfs.inode_table
-            .write()
-            .unwrap()
-            .get_mut(subdir.ino)
-            .unwrap()
-            .children_loaded_at = None;
+        // Stale listing → lookup-miss exercises the HEAD-on-miss probe.
+        age_listing(&vfs, subdir.ino);
 
         let pre_head = hub.head_file_call_count();
         let pre_list = hub.list_tree_call_count();
@@ -1216,7 +1209,7 @@ fn lookup_rechecks_cached_directory_when_parent_unloaded() {
 
         // Invalidate the parent's listing (mirrors what LRU eviction does).
         if let Some(e) = vfs.inode_table.write().unwrap().get_mut(area.ino) {
-            e.children_loaded = false;
+            e.children_loaded_at = None;
         }
 
         let pre_list = hub.list_tree_call_count();
@@ -1254,7 +1247,7 @@ fn lookup_replaces_stale_directory_with_file_via_head() {
 
         // Invalidate root's listing so lookup takes the slow path.
         if let Some(e) = vfs.inode_table.write().unwrap().get_mut(ROOT_INODE) {
-            e.children_loaded = false;
+            e.children_loaded_at = None;
         }
 
         let attr = vfs.lookup(ROOT_INODE, "swap").await.unwrap();
@@ -1293,7 +1286,7 @@ fn lookup_preserves_stale_directory_with_open_descendant() {
 
         // Invalidate root's listing so lookup hits the slow path.
         if let Some(e) = vfs.inode_table.write().unwrap().get_mut(ROOT_INODE) {
-            e.children_loaded = false;
+            e.children_loaded_at = None;
         }
 
         let attr = vfs.lookup(ROOT_INODE, "swap").await.unwrap();

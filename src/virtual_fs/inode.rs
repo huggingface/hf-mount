@@ -1,7 +1,7 @@
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const ROOT_INODE: u64 = 1;
 
@@ -121,11 +121,12 @@ pub struct InodeEntry {
     /// clears dirty (resets to 0) if the generation hasn't advanced, preventing
     /// concurrent writers from silently losing their data.
     pub dirty_generation: u64,
-    pub children_loaded: bool,
-    /// When `children_loaded` was last set to true (via remote listing or local
-    /// mkdir). Lookup uses this to skip HEAD-on-miss probes when the listing is
-    /// fresh — a hot path for workloads that lookup many unique names under a
-    /// recently-listed directory (e.g. tarball extraction, build dirs).
+    /// When the children listing was last refreshed. `Some` ⇔ "loaded": one
+    /// field answers both "is it populated?" and "how fresh is it?" so the
+    /// two can never drift. Set on remote listing or local mkdir, cleared on
+    /// invalidation/eviction. Lookup compares against `metadata_ttl` to skip
+    /// HEAD-on-miss probes for tight-loop unique-name workloads (tarball
+    /// extract, build dirs, xfstests).
     pub children_loaded_at: Option<Instant>,
     pub children: Vec<DirChild>,
     /// Old remote paths that should be deleted on next flush (set by rename of dirty files).
@@ -141,6 +142,19 @@ impl InodeEntry {
     /// Returns true if this inode has uncommitted changes.
     pub fn is_dirty(&self) -> bool {
         self.dirty_generation > 0
+    }
+
+    /// Returns true if the children listing has been populated. Only
+    /// meaningful for directories.
+    pub fn children_loaded(&self) -> bool {
+        self.children_loaded_at.is_some()
+    }
+
+    /// Returns true if the children listing was refreshed within `ttl`.
+    /// Used by lookup-miss to decide whether to skip the HEAD/list_tree
+    /// revalidation probes.
+    pub fn is_listing_fresh(&self, ttl: Duration) -> bool {
+        self.children_loaded_at.is_some_and(|t| t.elapsed() < ttl)
     }
 
     /// Mark the inode as dirty, incrementing the generation counter.
@@ -239,7 +253,6 @@ impl InodeTable {
             staging_is_current: false,
             etag: None,
             dirty_generation: 0,
-            children_loaded: false,
             children_loaded_at: None,
             children: Vec::new(),
             pending_deletes: Vec::new(),
@@ -448,7 +461,7 @@ impl InodeTable {
             // Force readdir to re-fetch so the inode can be re-materialized
             // on next access. Without this the kernel would ask for a child
             // that no longer exists in our in-memory tree.
-            parent.children_loaded = false;
+            parent.children_loaded_at = None;
         }
         true
     }
@@ -490,7 +503,7 @@ impl InodeTable {
                 parent.children.shrink_to_fit();
                 // Force readdir to re-fetch the listing so evicted inodes can
                 // be re-materialized on next access.
-                parent.children_loaded = false;
+                parent.children_loaded_at = None;
             }
         }
         evicted
@@ -581,7 +594,9 @@ impl InodeTable {
             staging_is_current: false,
             etag: None,
             dirty_generation: 0,
-            children_loaded: kind != InodeKind::Directory, // only dirs have children to load
+            // Non-directories don't carry a children listing; the field stays
+            // None for them and is never read (gated on `kind` at the call
+            // sites). Directories start unloaded until the first list.
             children_loaded_at: None,
             children: Vec::new(),
             pending_deletes: Vec::new(),
@@ -678,13 +693,13 @@ impl InodeTable {
     /// Reset children_loaded to false so the next readdir/lookup re-fetches.
     pub fn invalidate_children(&mut self, ino: u64) {
         if let Some(entry) = self.inodes.get_mut(&ino) {
-            entry.children_loaded = false;
+            entry.children_loaded_at = None;
         }
     }
 
     /// Check whether a directory's children have been loaded from the Hub API.
     pub fn is_children_loaded(&self, ino: u64) -> bool {
-        self.inodes.get(&ino).is_some_and(|e| e.children_loaded)
+        self.inodes.get(&ino).is_some_and(|e| e.children_loaded())
     }
 
     /// True if the inode or any descendant is either dirty or has an open
@@ -709,7 +724,7 @@ impl InodeTable {
     pub fn loaded_dir_prefixes(&self) -> Vec<String> {
         self.inodes
             .values()
-            .filter(|e| e.kind == InodeKind::Directory && e.children_loaded)
+            .filter(|e| e.kind == InodeKind::Directory && e.children_loaded())
             .map(|e| e.full_path.to_string())
             .collect()
     }
@@ -764,7 +779,7 @@ impl InodeTable {
         if let Some(parent) = self.inodes.get_mut(&parent_ino) {
             parent.children.retain(|c| c.ino != child_ino);
             if invalidate_children_loaded {
-                parent.children_loaded = false;
+                parent.children_loaded_at = None;
             }
             // POSIX: removing a subdirectory drops the parent's ".." nlink.
             if child_kind == InodeKind::Directory {
@@ -1412,12 +1427,12 @@ mod tests {
         );
 
         // Mark as loaded
-        table.get_mut(dir_ino).unwrap().children_loaded = true;
-        assert!(table.get(dir_ino).unwrap().children_loaded);
+        table.get_mut(dir_ino).unwrap().children_loaded_at = Some(Instant::now());
+        assert!(table.get(dir_ino).unwrap().children_loaded());
 
         // Invalidate
         table.invalidate_children(dir_ino);
-        assert!(!table.get(dir_ino).unwrap().children_loaded);
+        assert!(!table.get(dir_ino).unwrap().children_loaded());
 
         // Invalidating non-existent inode is a no-op
         table.invalidate_children(9999);
@@ -2029,7 +2044,7 @@ mod tests {
 
         // Parent's children_loaded is reset so readdir will re-fetch.
         let root = table.get(ROOT_INODE).unwrap();
-        assert!(!root.children_loaded);
+        assert!(!root.children_loaded());
         assert!(!root.children.iter().any(|c| c.ino == ino));
     }
 
@@ -2079,7 +2094,7 @@ mod tests {
             assert!(table.get(ino).is_none(), "evicted ino must be gone");
             let parent = table.get(parent_ino).unwrap();
             assert!(parent.children.is_empty(), "parent's children list cleared");
-            assert!(!parent.children_loaded, "children_loaded reset");
+            assert!(!parent.children_loaded(), "children_loaded reset");
         }
     }
 

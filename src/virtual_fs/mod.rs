@@ -569,7 +569,7 @@ impl VirtualFs {
             let inodes = self.inode_table.read().expect("inodes poisoned");
             match inodes.get(parent_ino) {
                 Some(e) if e.kind != InodeKind::Directory => return Err(libc::ENOTDIR),
-                Some(e) if e.children_loaded => return Ok(()),
+                Some(e) if e.children_loaded() => return Ok(()),
                 None => return Err(libc::ENOENT),
                 _ => {}
             }
@@ -584,7 +584,7 @@ impl VirtualFs {
             let inodes = self.inode_table.read().expect("inodes poisoned");
             match inodes.get(parent_ino) {
                 Some(e) if e.kind != InodeKind::Directory => return Err(libc::ENOTDIR),
-                Some(e) if e.children_loaded => return Ok(()),
+                Some(e) if e.children_loaded() => return Ok(()),
                 Some(e) => e.full_path.to_string(),
                 None => return Err(libc::ENOENT),
             }
@@ -600,7 +600,7 @@ impl VirtualFs {
 
         let mut inodes = self.inode_table.write().expect("inodes poisoned");
         match inodes.get(parent_ino) {
-            Some(e) if e.children_loaded => return Ok(()),
+            Some(e) if e.children_loaded() => return Ok(()),
             Some(e) if e.kind != InodeKind::Directory => return Err(libc::ENOTDIR),
             None => return Err(libc::ENOENT),
             _ => {}
@@ -708,7 +708,7 @@ impl VirtualFs {
             // directory we'd otherwise keep ~50% slack forever. Trim now,
             // since regrowth on rare child mutations is cheap.
             parent.children.shrink_to_fit();
-            parent.children_loaded = true;
+            parent.children_loaded_at = Some(Instant::now());
             parent.children_loaded_at = Some(Instant::now());
         }
         Ok(())
@@ -1000,7 +1000,7 @@ impl VirtualFs {
                 },
                 // Either a dirty file (local writes win until flushed) or any
                 // entry under a fully-listed parent we can trust as-is.
-                Some(entry) if entry.kind == InodeKind::File || parent_entry.children_loaded => {
+                Some(entry) if entry.kind == InodeKind::File || parent_entry.children_loaded() => {
                     FastResult::Hit(self.make_vfs_attr(entry))
                 }
                 // Cached non-file under an unloaded parent: we can't HEAD-probe
@@ -1009,7 +1009,7 @@ impl VirtualFs {
                 Some(_) => FastResult::NotLoaded,
                 // No cached entry but the parent listing is authoritative →
                 // the name really doesn't exist; populate the negative cache.
-                None if parent_entry.children_loaded => {
+                None if parent_entry.children_loaded() => {
                     let parent_path = &parent_entry.full_path;
                     let full_path = if parent_path.is_empty() {
                         name.to_string()
@@ -1021,9 +1021,7 @@ impl VirtualFs {
                     // names (tarball extract, build systems, xfstests) would
                     // otherwise pay one HEAD + list_tree per name despite the
                     // cache being authoritative.
-                    let listing_fresh = parent_entry
-                        .children_loaded_at
-                        .is_some_and(|t| t.elapsed() < self.metadata_ttl);
+                    let listing_fresh = parent_entry.is_listing_fresh(self.metadata_ttl);
                     FastResult::Miss {
                         full_path,
                         listing_fresh,
@@ -2510,7 +2508,7 @@ impl VirtualFs {
                 caller_gid,
             );
             if let Some(entry) = inodes.get_mut(ino) {
-                entry.children_loaded = true;
+                entry.children_loaded_at = Some(Instant::now());
                 entry.children_loaded_at = Some(Instant::now());
             }
             // nlink already incremented by insert()
@@ -2598,12 +2596,7 @@ impl VirtualFs {
         // open fd, drop_staging waits until release() so writes through the
         // surviving fd can still update bytes_used coherently.
         if inode_fully_removed {
-            // Take the per-inode staging lock so an in-flight flush upload
-            // (which holds the same lock) finishes reading the file before
-            // we unlink it. Without this, xet-core sees ENOENT mid-upload.
-            let staging_lock = self.staging.lock(ino);
-            let _staging_guard = staging_lock.lock().await;
-            self.drop_staging(ino);
+            self.staging.drop_locked(ino).await;
         }
 
         // Remember locally that this path is gone so the lookup HEAD-on-miss
@@ -2810,10 +2803,7 @@ impl VirtualFs {
         match self.rename_apply_local(info, parent, name, newparent, newname, no_replace) {
             Ok(replaced_staging_ino) => {
                 if let Some(ino) = replaced_staging_ino {
-                    // Serialize with in-flight flush upload for this inode.
-                    let staging_lock = self.staging.lock(ino);
-                    let _staging_guard = staging_lock.lock().await;
-                    self.drop_staging(ino);
+                    self.staging.drop_locked(ino).await;
                 }
                 // Remember locally that the source path is gone so the lookup
                 // HEAD-on-miss recovery doesn't resurrect it from a
