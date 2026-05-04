@@ -234,10 +234,7 @@ impl VirtualFs {
             }
         }
     }
-}
 
-/// Where to read file content from when opening read-only.
-impl VirtualFs {
     pub fn new(
         runtime: tokio::runtime::Handle,
         hub_client: Arc<dyn HubOps>,
