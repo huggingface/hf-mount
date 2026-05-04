@@ -515,7 +515,6 @@ pub fn build_with_runtime(
         VfsConfig {
             read_only,
             advanced_writes,
-            overlay: options.overlay,
             uid,
             gid,
             poll_interval_secs: options.poll_interval_secs,

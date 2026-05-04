@@ -72,7 +72,6 @@ fn is_os_junk(name: &str) -> bool {
 pub struct VfsConfig {
     pub read_only: bool,
     pub advanced_writes: bool,
-    pub overlay: bool,
     pub uid: u32,
     pub gid: u32,
     pub poll_interval_secs: u64,
@@ -189,15 +188,12 @@ impl VirtualFs {
         overlay_backing: Option<OverlayBacking>,
         config: VfsConfig,
     ) -> Arc<Self> {
-        assert!(
-            !config.overlay || overlay_backing.is_some(),
-            "overlay mode requires an overlay backing"
-        );
         let inodes = Arc::new(RwLock::new(InodeTable::new(config.inode_soft_limit > 0)));
         let negative_cache = Arc::new(RwLock::new(HashMap::new()));
 
         let staging = Arc::new(StagingCoordinator::new(staging_dir));
         let overlay_backing = overlay_backing.map(Arc::new);
+        let overlay = overlay_backing.is_some();
 
         // Staging GC orders eviction by `last_touched`. When the inode evictor
         // is off (`soft_limit==0`) the touch hook is a no-op, so arm it
@@ -208,7 +204,7 @@ impl VirtualFs {
         }
 
         // Overlay mode keeps writes local: skip the flush pipeline entirely.
-        let flush_manager = if !config.read_only && config.advanced_writes && !config.overlay {
+        let flush_manager = if !config.read_only && config.advanced_writes && !overlay {
             staging.dir().expect("--advanced-writes requires a staging directory");
             Some(flush::FlushManager::new(
                 xet_sessions.clone(),
@@ -255,7 +251,7 @@ impl VirtualFs {
             overlay_backing,
             read_only: config.read_only,
             // Overlay implies advanced_writes (random writes via local backing file).
-            advanced_writes: config.advanced_writes || config.overlay,
+            advanced_writes: config.advanced_writes || overlay,
             inode_table: inodes,
             open_files,
             next_file_handle: AtomicU64::new(1),

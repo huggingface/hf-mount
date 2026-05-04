@@ -581,7 +581,6 @@ pub fn make_test_vfs(
         crate::virtual_fs::VfsConfig {
             read_only: opts.read_only,
             advanced_writes: opts.advanced_writes,
-            overlay: opts.overlay,
             uid: 1000,
             gid: 1000,
             poll_interval_secs: 0,
@@ -624,7 +623,6 @@ pub fn make_overlay_test_vfs_with_root(
         crate::virtual_fs::VfsConfig {
             read_only: false,
             advanced_writes: false,
-            overlay: true,
             uid: 1000,
             gid: 1000,
             poll_interval_secs: 0,
