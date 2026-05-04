@@ -3044,9 +3044,7 @@ impl VirtualFs {
         let old_path = info.old_path.clone();
 
         // Overlay: move the on-disk file to match the new path.
-        if self.overlay()
-            && let Some(overlay) = self.overlay_backing.as_deref()
-        {
+        if let Some(overlay) = &self.overlay_backing {
             let old_exists = overlay.exists(&info.old_path).map_err(|e| {
                 error!("Overlay rename: failed to stat {}: {}", info.old_path, e);
                 libc::EIO
