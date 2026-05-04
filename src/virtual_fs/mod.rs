@@ -175,6 +175,65 @@ impl VirtualFs {
     fn overlay(&self) -> bool {
         self.overlay_backing.is_some()
     }
+
+    /// Splice local overlay entries into the inode table for `parent_ino`,
+    /// overriding remote entries on name conflict (kind mismatch removes the
+    /// remote inode first, then re-inserts as local). No-op when not in
+    /// overlay mode.
+    fn merge_overlay_entries(&self, inodes: &mut InodeTable, parent_ino: u64) {
+        let Some(overlay) = &self.overlay_backing else {
+            return;
+        };
+        let dir_path = inodes.get(parent_ino).map(|e| e.full_path.clone()).unwrap_or_default();
+        let Ok(entries) = overlay.read_dir(&dir_path) else {
+            return;
+        };
+        for entry in entries {
+            if entry.is_symlink || (self.filter_os_files && is_os_junk(&entry.name)) {
+                continue;
+            }
+            let kind = if entry.is_dir {
+                InodeKind::Directory
+            } else {
+                InodeKind::File
+            };
+            let full_path = inode::child_path(&dir_path, &entry.name);
+            // If existing entry has a different kind (e.g. remote file vs
+            // local dir), remove it first so local wins cleanly.
+            let conflict = inodes
+                .lookup_child(parent_ino, &entry.name)
+                .filter(|e| e.kind != kind)
+                .map(|e| e.inode);
+            if let Some(old_ino) = conflict {
+                inodes.remove(old_ino);
+            }
+            let ino = inodes.insert(
+                parent_ino,
+                entry.name,
+                full_path,
+                kind,
+                entry.size,
+                entry.mtime,
+                None,
+                entry.mode,
+                self.uid,
+                self.gid,
+            );
+            // Local overrides remote: clear remote identity, mark dirty.
+            if let Some(e) = inodes.get_mut(ino) {
+                e.size = entry.size;
+                e.mtime = entry.mtime;
+                e.mode = entry.mode;
+                e.xet_hash = None;
+                if !e.is_dirty() {
+                    e.set_dirty();
+                }
+                if kind == InodeKind::Directory {
+                    e.children_loaded_at = None;
+                }
+            }
+        }
+    }
 }
 
 /// Where to read file content from when opening read-only.
@@ -726,57 +785,7 @@ impl VirtualFs {
             }
         }
 
-        // Overlay: merge local entries (local overrides remote, via pre-mount fd).
-        if self.overlay()
-            && let Some(overlay) = &self.overlay_backing
-        {
-            let dir_path = inodes.get(parent_ino).map(|e| e.full_path.clone()).unwrap_or_default();
-            if let Ok(entries) = overlay.read_dir(&dir_path) {
-                for entry in entries {
-                    let name = entry.name;
-                    if self.filter_os_files && is_os_junk(&name) {
-                        continue;
-                    }
-                    if entry.is_symlink {
-                        continue;
-                    }
-                    let kind = if entry.is_dir {
-                        InodeKind::Directory
-                    } else {
-                        InodeKind::File
-                    };
-                    let full_path = inode::child_path(&dir_path, &name);
-                    let mtime = entry.mtime;
-                    let size = entry.size;
-                    let mode = entry.mode;
-                    // If existing entry has a different kind (e.g. remote file
-                    // vs local dir), remove it first so local wins cleanly.
-                    let conflict = inodes
-                        .lookup_child(parent_ino, &name)
-                        .filter(|e| e.kind != kind)
-                        .map(|e| e.inode);
-                    if let Some(old_ino) = conflict {
-                        inodes.remove(old_ino);
-                    }
-                    let ino = inodes.insert(
-                        parent_ino, name, full_path, kind, size, mtime, None, mode, self.uid, self.gid,
-                    );
-                    // Local overrides remote: update metadata, clear remote identity.
-                    if let Some(e) = inodes.get_mut(ino) {
-                        e.size = size;
-                        e.mtime = mtime;
-                        e.mode = mode;
-                        e.xet_hash = None;
-                        if !e.is_dirty() {
-                            e.set_dirty();
-                        }
-                        if kind == InodeKind::Directory {
-                            e.children_loaded_at = None; // will be lazy-loaded on access
-                        }
-                    }
-                }
-            }
-        }
+        self.merge_overlay_entries(&mut inodes, parent_ino);
 
         if let Some(parent) = inodes.get_mut(parent_ino) {
             // Vec growth doubles capacity; for a one-shot readdir of a stable
