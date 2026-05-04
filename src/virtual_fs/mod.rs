@@ -2929,18 +2929,17 @@ impl VirtualFs {
         // Load remote children so we don't miss any before the emptiness check
         self.ensure_children_loaded(ino).await?;
 
-        // Re-check ENOTEMPTY + remove under a single write lock to prevent
-        // a concurrent create/mkdir from inserting a child in between.
-        // Overlay: remove on-disk dir before mutating the inode table so
-        // a failure can't leave the inode tree out of sync with the backing.
-        if self.overlay()
-            && let Some(overlay) = self.overlay_backing.as_deref()
+        // Overlay: remove on-disk dir before mutating the inode table so a
+        // failure can't leave the inode tree out of sync with the backing.
+        if let Some(overlay) = &self.overlay_backing
             && let Err(e) = overlay.remove_dir(&full_path)
             && e.kind() != std::io::ErrorKind::NotFound
         {
             return Err(e.raw_os_error().unwrap_or(libc::EIO));
         }
 
+        // Re-check ENOTEMPTY + remove under a single write lock to prevent
+        // a concurrent create/mkdir from inserting a child in between.
         {
             let mut inodes = self.inode_table.write().expect("inodes poisoned");
             match inodes.get(ino) {
