@@ -91,6 +91,36 @@ jobs:
       - name: Integration tests (repo mount)
         run: unset HF_TOKEN && cargo test --release --test repo_ops -- --test-threads=1 --nocapture
 
+  smoke-test-windows:
+    name: Smoke Tests (Windows NFS)
+    runs-on: windows-2022
+    needs: lint-test
+    env:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      HF_ENDPOINT: https://huggingface.co
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: smoke-windows
+
+      - name: Enable Client for NFS feature
+        shell: powershell
+        run: Install-WindowsFeature -Name NFS-Client
+
+      - name: Build hf-mount-nfs
+        shell: powershell
+        run: cargo build --release --no-default-features --features nfs --bin hf-mount-nfs
+
+      - name: Integration tests (NFS, bucket lifecycle)
+        shell: powershell
+        run: cargo test --release --no-default-features --features nfs --test nfs_ops -- --test-threads=1 --nocapture
+
   fsx:
     name: fsx (data integrity)
     runs-on:
