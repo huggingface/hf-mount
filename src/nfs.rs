@@ -530,6 +530,10 @@ pub async fn mount_nfs(
             ))
         })?;
     #[cfg(windows)]
+    let skip_auto_mount = std::env::var_os("HF_MOUNT_SKIP_AUTO_MOUNT").is_some();
+    #[cfg(not(windows))]
+    let skip_auto_mount = false;
+    #[cfg(windows)]
     {
         let _ = actimeo; // Windows mount.exe has no actimeo equivalent.
         let mut opts = String::from("nolock,anon,mtype=hard,rsize=32,wsize=32,timeout=60");
@@ -537,7 +541,7 @@ pub async fn mount_nfs(
             opts.push_str(",ro");
         }
         let share = "\\\\127.0.0.1\\!";
-        if std::env::var_os("HF_MOUNT_SKIP_AUTO_MOUNT").is_some() {
+        if skip_auto_mount {
             info!(
                 "HF_MOUNT_SKIP_AUTO_MOUNT set — server + portmapper running, mount.exe NOT invoked.\n\
                  Run manually in another admin shell:\n  \
@@ -608,7 +612,7 @@ pub async fn mount_nfs(
                 break;
             }
             _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {
-                if !is_mounted(mount_point_str) {
+                if !skip_auto_mount && !is_mounted(mount_point_str) {
                     info!("NFS mount disappeared, shutting down");
                     break;
                 }
