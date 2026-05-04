@@ -2377,16 +2377,33 @@ impl VirtualFs {
         if let Some(ino) = released_ino
             && !self.has_open_handles(ino)
         {
-            let (removed, is_clean) = {
+            let (removed, is_clean, overlay_path) = {
                 let mut inodes = self.inode_table.write().expect("inodes poisoned");
+                // Capture path before removal so we can clean up the overlay
+                // backing file for an unlink-while-open case (POSIX delete on
+                // last close): unlink() saw open handles and skipped the
+                // overlay-side remove, so we have to do it here.
+                let overlay_path = self
+                    .overlay_backing
+                    .is_some()
+                    .then(|| inodes.get(ino).map(|e| e.full_path.clone()))
+                    .flatten();
                 let orphan = inodes.remove_orphan(ino);
                 let evicted = inodes.take_evict_pending(ino) && inodes.evict_if_safe(ino);
                 let removed = orphan || evicted;
                 let is_clean = !removed && inodes.get(ino).is_some_and(|entry| !entry.is_dirty());
-                (removed, is_clean)
+                (removed, is_clean, overlay_path.filter(|_| removed))
             };
             if removed {
-                self.drop_staging(ino);
+                if let Some(path) = overlay_path {
+                    if let Err(e) = self.remove_local_backing_file(ino, &path)
+                        && e.kind() != std::io::ErrorKind::NotFound
+                    {
+                        warn!("Failed to remove overlay file for ino={} on release: {}", ino, e);
+                    }
+                } else {
+                    self.drop_staging(ino);
+                }
             } else if is_clean && self.staging.gc_one(ino, &self.inode_table).await {
                 debug!("staging GC: removed ino={} on release", ino);
             }
