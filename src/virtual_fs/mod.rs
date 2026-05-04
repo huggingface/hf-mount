@@ -1607,12 +1607,9 @@ impl VirtualFs {
             if let Some(entry) = self.inode_table.write().expect("inodes poisoned").get_mut(ino) {
                 entry.staging_is_current = false;
             }
-            // GC accounting only matters for non-overlay (overlay files live in user dir).
-            let old_size = if self.overlay() {
-                0
-            } else {
-                self.staging.dir().map(|sd| sd.file_size(ino)).unwrap_or(0)
-            };
+            // GC accounting only matters for non-overlay (overlay files live
+            // in user dir, so file_size returns 0 here on miss).
+            let old_size = self.staging.dir().map(|sd| sd.file_size(ino)).unwrap_or(0);
             let needs_download = !self.overlay() && !truncate && !xet_hash.is_empty() && size > 0;
             let new_size = if needs_download {
                 let staging_path = self
