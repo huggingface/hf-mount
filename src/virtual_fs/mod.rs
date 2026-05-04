@@ -168,8 +168,14 @@ pub struct VirtualFs {
     /// xet hash is already populated; misses kick a background populate so the
     /// next open is fast. Mutually exclusive with xet-core's chunk cache.
     file_cache: Option<Arc<FileCache>>,
-    /// When true, writes stay local and no remote mutations (unlink, rename, flush) are sent.
-    overlay: bool,
+}
+
+impl VirtualFs {
+    /// True when the VFS is in overlay mode (writes stay local, no remote
+    /// mutations). Derived from the presence of an overlay backing.
+    fn overlay(&self) -> bool {
+        self.overlay_backing.is_some()
+    }
 }
 
 /// Where to read file content from when opening read-only.
@@ -268,7 +274,6 @@ impl VirtualFs {
             filter_os_files: config.filter_os_files,
             direct_io: config.direct_io,
             file_cache,
-            overlay: config.overlay,
         });
 
         // Set root inode mtime and ownership (repos use the last commit date).
@@ -311,7 +316,7 @@ impl VirtualFs {
 
     /// True if the entry is a clean remote entry that overlay mode treats as immutable.
     fn is_overlay_immutable(&self, entry: &inode::InodeEntry) -> bool {
-        self.overlay && !entry.is_dirty()
+        self.overlay() && !entry.is_dirty()
     }
 
     /// Set the kernel cache invalidation callback. Called after mount setup
@@ -726,7 +731,7 @@ impl VirtualFs {
         }
 
         // Overlay: merge local entries (local overrides remote, via pre-mount fd).
-        if self.overlay
+        if self.overlay()
             && let Some(overlay) = &self.overlay_backing
         {
             let dir_path = inodes.get(parent_ino).map(|e| e.full_path.clone()).unwrap_or_default();
@@ -1405,7 +1410,7 @@ impl VirtualFs {
             match files.get(&file_handle) {
                 Some(OpenFile::Streaming { .. }) => return Ok(()),
                 // Overlay: sync local fd for durability, skip remote upload.
-                Some(OpenFile::Local { file, .. }) if self.overlay => Some(Arc::clone(file)),
+                Some(OpenFile::Local { file, .. }) if self.overlay() => Some(Arc::clone(file)),
                 _ => None,
             }
         };
@@ -1541,7 +1546,7 @@ impl VirtualFs {
         let file_entry = self.get_file_entry(ino)?;
         let staging_path = self.staging.path(ino);
 
-        if writable && self.overlay {
+        if writable && self.overlay() {
             self.ensure_local_backing_parents(&file_entry.full_path).map_err(|e| {
                 error!("Failed to create staging parent dirs for ino={}: {}", ino, e);
                 libc::EIO
@@ -1595,7 +1600,7 @@ impl VirtualFs {
             libc::EIO
         })?;
         // Overlay never downloads from remote — only existing local files (or dirty drafts) are writable.
-        if self.overlay && !is_dirty && !local_exists {
+        if self.overlay() && !is_dirty && !local_exists {
             return Err(libc::EPERM);
         }
 
@@ -1609,12 +1614,12 @@ impl VirtualFs {
                 entry.staging_is_current = false;
             }
             // GC accounting only matters for non-overlay (overlay files live in user dir).
-            let old_size = if self.overlay {
+            let old_size = if self.overlay() {
                 0
             } else {
                 self.staging.dir().map(|sd| sd.file_size(ino)).unwrap_or(0)
             };
-            let needs_download = !self.overlay && !truncate && !xet_hash.is_empty() && size > 0;
+            let needs_download = !self.overlay() && !truncate && !xet_hash.is_empty() && size > 0;
             let new_size = if needs_download {
                 let staging_path = self
                     .staging
@@ -1636,7 +1641,7 @@ impl VirtualFs {
                     })?;
                 0
             };
-            if !self.overlay
+            if !self.overlay()
                 && let Some(sd) = self.staging.dir()
             {
                 sd.resize_bytes(old_size, new_size);
@@ -1650,7 +1655,7 @@ impl VirtualFs {
             //   inode and here, so the downloaded hash is now stale — detected
             //   by the `entry.xet_hash == xet_hash` post-check.
             // Skip in overlay mode: there's no remote materialization concept.
-            let materializes_remote = !self.overlay && (needs_download || (xet_hash.is_empty() && size == 0));
+            let materializes_remote = !self.overlay() && (needs_download || (xet_hash.is_empty() && size == 0));
             if materializes_remote
                 && let Some(entry) = self.inode_table.write().expect("inodes poisoned").get_mut(ino)
                 && entry.xet_hash.as_deref().unwrap_or("") == xet_hash
@@ -1737,7 +1742,7 @@ impl VirtualFs {
         };
 
         // Overlay mode: dirty file is in the overlay backing, not the staging path.
-        if fe.is_dirty && self.overlay {
+        if fe.is_dirty && self.overlay() {
             let local_exists = self.local_backing_exists(ino, &fe.full_path).map_err(|e| {
                 error!("Failed to check local backing file for {}: {}", fe.full_path, e);
                 libc::EIO
@@ -2435,7 +2440,7 @@ impl VirtualFs {
 
     /// Finalize a streaming write: send Finish to the worker, await CAS upload, commit to Hub.
     async fn streaming_commit(&self, ino: u64, channel: &StreamingChannel) -> Result<(), i32> {
-        assert!(!self.overlay, "overlay forces advanced_writes; streaming unreachable");
+        assert!(!self.overlay(), "overlay forces advanced_writes; streaming unreachable");
 
         // Unlinked files (nlink=0) must not be re-committed on close —
         // user deleted the file, uploading would resurrect it.
@@ -2710,7 +2715,7 @@ impl VirtualFs {
                 // children_from_remote stays false: a freshly-mkdir'd dir has
                 // no remote presence yet, so lookup-miss can serve ENOENT
                 // without HEAD/list_tree probes.
-                if self.overlay {
+                if self.overlay() {
                     entry.set_dirty();
                 }
             }
@@ -2722,7 +2727,7 @@ impl VirtualFs {
         self.negative_cache_remove(&full_path);
 
         // Overlay: persist directory to disk.
-        if self.overlay {
+        if self.overlay() {
             let overlay = self.overlay_backing()?;
             if let Err(e) = overlay.create_parent_dirs(&full_path) {
                 error!("Failed to create overlay parent directories for {}: {}", full_path, e);
@@ -2763,7 +2768,7 @@ impl VirtualFs {
             }
             // Remote delete only when last link is removed and file exists on the hub.
             // Skipped in overlay mode (writes never propagate to remote).
-            let needs_remote = !self.overlay && entry.xet_hash.is_some() && entry.nlink <= 1;
+            let needs_remote = !self.overlay() && entry.xet_hash.is_some() && entry.nlink <= 1;
             (entry.inode, entry.full_path.to_string(), needs_remote)
         };
 
@@ -2826,7 +2831,7 @@ impl VirtualFs {
         // open fd, drop_staging waits until release() so writes through the
         // surviving fd can still update bytes_used coherently.
         if inode_fully_removed {
-            if self.overlay {
+            if self.overlay() {
                 if let Err(e) = self.remove_local_backing_file(ino, &full_path)
                     && e.kind() != std::io::ErrorKind::NotFound
                 {
@@ -2949,7 +2954,7 @@ impl VirtualFs {
         // a concurrent create/mkdir from inserting a child in between.
         // Overlay: remove on-disk dir before mutating the inode table so
         // a failure can't leave the inode tree out of sync with the backing.
-        if self.overlay
+        if self.overlay()
             && let Some(overlay) = self.overlay_backing.as_deref()
             && let Err(e) = overlay.remove_dir(&full_path)
             && e.kind() != std::io::ErrorKind::NotFound
@@ -3053,7 +3058,7 @@ impl VirtualFs {
 
         // Phase 2: sync to remote (add + delete ops). Skipped in overlay mode
         // since writes never propagate beyond the local backing.
-        let remote_mutated = if self.overlay {
+        let remote_mutated = if self.overlay() {
             false
         } else {
             self.rename_remote(&info).await?
@@ -3061,7 +3066,7 @@ impl VirtualFs {
         let old_path = info.old_path.clone();
 
         // Overlay: move the on-disk file to match the new path.
-        if self.overlay
+        if self.overlay()
             && let Some(overlay) = self.overlay_backing.as_deref()
         {
             let old_exists = overlay.exists(&info.old_path).map_err(|e| {
@@ -3101,7 +3106,7 @@ impl VirtualFs {
                 }
                 Ok(())
             }
-            Err(libc::ENOENT) if remote_mutated || self.overlay => {
+            Err(libc::ENOENT) if remote_mutated || self.overlay() => {
                 warn!("rename: source gone after rename; next dir load will reconcile");
                 // Invalidate parents so the next lookup re-fetches from remote
                 // instead of trusting the stale children_loaded state.
@@ -3433,7 +3438,7 @@ impl VirtualFs {
                 let staging_mutex = self.staging.lock(ino);
                 let _staging_guard = staging_mutex.lock().await;
 
-                if self.overlay {
+                if self.overlay() {
                     self.ensure_local_backing_parents(&full_path).map_err(|e| {
                         error!("Failed to create overlay parent dirs for ino={}: {}", ino, e);
                         e.raw_os_error().unwrap_or(libc::EIO)
@@ -3444,7 +3449,7 @@ impl VirtualFs {
                     e.raw_os_error().unwrap_or(libc::EIO)
                 })?;
 
-                if self.overlay && !local_exists {
+                if self.overlay() && !local_exists {
                     return Err(libc::EPERM);
                 }
 
@@ -3453,7 +3458,7 @@ impl VirtualFs {
                 let old_staging_size = self
                     .staging
                     .dir()
-                    .filter(|_| !self.overlay)
+                    .filter(|_| !self.overlay())
                     .map(|sd| sd.file_size(ino))
                     .unwrap_or(0);
 
@@ -3501,7 +3506,7 @@ impl VirtualFs {
                     error!("Failed to set local backing file length: {}", e);
                     return Err(libc::EIO);
                 }
-                if !self.overlay
+                if !self.overlay()
                     && let Some(sd) = self.staging.dir()
                 {
                     sd.resize_bytes(old_staging_size, sd.file_size(ino));
@@ -3526,7 +3531,7 @@ impl VirtualFs {
 
         // Apply metadata-only changes (mode, uid, gid, atime, mtime)
         if mode.is_some() || uid.is_some() || gid.is_some() || atime.is_some() || mtime.is_some() {
-            if self.overlay
+            if self.overlay()
                 && let Some(new_mode) = mode
             {
                 let full_path = {

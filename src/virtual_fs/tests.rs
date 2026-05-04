@@ -4390,7 +4390,7 @@ fn overlay_constructor_forces_advanced_writes() {
         &rt,
     );
 
-    assert!(vfs.overlay);
+    assert!(vfs.overlay());
     assert!(vfs.advanced_writes);
     assert!(vfs.flush_manager.is_none());
 }
