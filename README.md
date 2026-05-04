@@ -228,6 +228,7 @@ hf-mount stop /tmp/data          # daemon mounts
 | `--token-file` | | Path to a token file (re-read on each request for credential rotation) |
 | `--inode-soft-limit` | `0` | Soft cap on the in-memory inode table (0 disables). See "Bounding inode memory" below. |
 | `--lru-sweep-interval-ms` | `5000` | Background LRU sweep interval in milliseconds. Only meaningful when `--inode-soft-limit > 0`. |
+| `--overlay` | `false` | Treat the mount point as a writable local layer over the remote source. Local files persist on disk; writes are never pushed to the remote. See "Overlay mode" below. |
 
 ### Bounding inode memory
 
@@ -239,6 +240,25 @@ Under workloads that enumerate large trees (a `find`, a documentation scraper, `
 2. **Background LRU sweep** (every `--lru-sweep-interval-ms`): for inodes the kernel has cached but our table doesn't want, send `FUSE_NOTIFY_INVAL_ENTRY` so the kernel drops its dentry and sends us `forget`. Bounded to 1024 invalidations per sweep with EAGAIN backoff so we don't flood the notify channel.
 
 Tuning: pick `N` below what a full-tree enumeration of your bucket would produce. For `hf-doc-build/doc-dev` with ~20k files, `--inode-soft-limit 10000` keeps sidecar RSS ~250 MiB with a 1 GiB cgroup cap.
+
+### Overlay mode
+
+`--overlay` turns the mount point itself into a writable local layer on top of the remote bucket or repo. Useful when several processes (or pods) need to share a read-only remote view but each layer their own files on top — e.g. a shared model cache where users drop training artifacts, configs, or fine-tuned weights without pushing them back to the Hub.
+
+```bash
+hf-mount start --overlay repo openai/gpt-oss-20b /shared/cache
+# Pre-existing files under /shared/cache stay visible, plus the remote contents
+# Writes (and any new files) go to /shared/cache on local disk, never to the Hub
+```
+
+Behavior:
+- **Reads** merge the local layer and the remote source. When a path exists in both, the local copy wins.
+- **Writes** (creates, modifications, deletes, renames, chmod...) hit the local layer only. The remote is never mutated, even on a bucket.
+- **Symlinks** in the local layer are skipped (hidden) to keep the merged view sandboxed.
+- **Implies `--advanced-writes`**: random writes, seek, and overwrite are supported.
+- **Cannot be combined with `--read-only`** — overlay's whole point is to allow local writes.
+
+The mount point directory is opened once at startup and all overlay I/O is rooted at that fd (`openat`/`fstatat`/...), so even concurrent renames of the mount point can't trick overlay paths into escaping the original directory.
 
 ### Logging
 
@@ -255,6 +275,7 @@ RUST_LOG=hf_mount=debug hf-mount-fuse repo gpt2 /mnt/gpt2
 - **Advanced writes** (`--advanced-writes`) -- staging files on disk, random writes + seek, async debounced flush
 - **Remote sync** -- background polling detects remote changes and updates the local view
 - **POSIX metadata** -- chmod, chown, timestamps, symlinks (in-memory only, lost on unmount)
+- **Overlay mode** (`--overlay`) -- mount point doubles as a writable local layer; remote stays read-only
 
 ## Consistency model
 
