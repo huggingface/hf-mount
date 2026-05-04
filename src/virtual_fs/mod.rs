@@ -3518,13 +3518,14 @@ impl VirtualFs {
 
         // Apply metadata-only changes (mode, uid, gid, atime, mtime)
         if mode.is_some() || uid.is_some() || gid.is_some() || atime.is_some() || mtime.is_some() {
-            if self.overlay()
-                && let Some(new_mode) = mode
-            {
+            if self.overlay() {
                 let full_path = {
                     let inodes = self.inode_table.read().expect("inodes poisoned");
                     inodes.get(ino).ok_or(libc::ENOENT)?.full_path.clone()
                 };
+                // Reject any metadata-only mutation on a clean remote entry:
+                // there is no local backing to record it on, and the change
+                // would silently disappear at the next remote refresh.
                 let local_exists = self.local_backing_exists(ino, &full_path).map_err(|e| {
                     error!("Failed to check local backing file for ino={}: {}", ino, e);
                     e.raw_os_error().unwrap_or(libc::EIO)
@@ -3532,10 +3533,12 @@ impl VirtualFs {
                 if !local_exists {
                     return Err(libc::EPERM);
                 }
-                self.set_local_backing_mode(&full_path, new_mode).map_err(|e| {
-                    error!("Failed to update local backing mode for ino={}: {}", ino, e);
-                    e.raw_os_error().unwrap_or(libc::EIO)
-                })?;
+                if let Some(new_mode) = mode {
+                    self.set_local_backing_mode(&full_path, new_mode).map_err(|e| {
+                        error!("Failed to update local backing mode for ino={}: {}", ino, e);
+                        e.raw_os_error().unwrap_or(libc::EIO)
+                    })?;
+                }
             }
 
             let mut inodes = self.inode_table.write().expect("inodes poisoned");
