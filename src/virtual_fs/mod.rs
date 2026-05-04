@@ -1547,9 +1547,12 @@ impl VirtualFs {
         let file_entry = self.get_file_entry(ino)?;
         let staging_path = self.staging.path(ino);
 
+        // Overlay write opens at <overlay_root>/<full_path>; parent dirs may
+        // exist as inodes from a remote listing without being materialized
+        // locally, so create_dir_all them first to avoid ENOENT on O_CREAT.
         if writable && self.overlay() {
             self.ensure_local_backing_parents(&file_entry.full_path).map_err(|e| {
-                error!("Failed to create staging parent dirs for ino={}: {}", ino, e);
+                error!("Failed to create overlay parent dirs for ino={}: {}", ino, e);
                 libc::EIO
             })?;
         }
