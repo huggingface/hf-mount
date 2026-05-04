@@ -28,7 +28,8 @@ jobs:
           key: windows-build
 
       - name: Build hf-mount-nfs
-        run: cargo build --release --target x86_64-pc-windows-msvc --no-default-features --features nfs,vendored-openssl --bin hf-mount-nfs
+        # No vendored-openssl: native-tls uses Schannel on Windows, no OpenSSL dependency.
+        run: cargo build --release --target x86_64-pc-windows-msvc --no-default-features --features nfs --bin hf-mount-nfs
 
       - name: Stage artifacts
         shell: bash

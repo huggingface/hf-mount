@@ -250,7 +250,8 @@ jobs:
           key: release-${{ matrix.target }}
 
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }} --no-default-features --features nfs,vendored-openssl --bin hf-mount-nfs
+        # No vendored-openssl: native-tls uses Schannel on Windows, no OpenSSL dependency.
+        run: cargo build --release --target ${{ matrix.target }} --no-default-features --features nfs --bin hf-mount-nfs
 
       - name: Package
         shell: bash
