@@ -5119,3 +5119,219 @@ fn overlay_rmdir_remote_dir_eperm() {
         assert_eq!(err, libc::EPERM);
     });
 }
+
+// ── Sparse-write integration tests ──────────────────────────────────
+
+/// Open an existing file for write: staging is sparse (no download), inode tracks
+/// SparseWriteState pointing at the original CAS hash.
+#[test]
+fn sparse_open_for_write_no_download() {
+    let hub = MockHub::new();
+    hub.add_file("sparse.txt", 26, Some("hash_orig"), None);
+    let xet = MockXet::new();
+    xet.add_file("hash_orig", b"ABCDEFGHIJKLMNOPQRSTUVWXYZ");
+
+    let (rt, vfs) = vfs_advanced(&hub, &xet);
+
+    rt.block_on(async {
+        let attr = vfs.lookup(ROOT_INODE, "sparse.txt").await.unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open(ino, true, false, None).await.unwrap();
+
+        // sparse_write set, no dirty ranges, no CAS download
+        {
+            let inodes = vfs.inode_table.read().unwrap();
+            let entry = inodes.get(ino).unwrap();
+            assert!(entry.is_dirty(), "open-for-write marks dirty");
+            let sw = entry.sparse_write.as_ref().expect("sparse_write set");
+            assert_eq!(sw.original_hash, "hash_orig");
+            assert_eq!(sw.original_size, 26);
+            assert!(sw.dirty_ranges.is_empty());
+        }
+
+        // Staging file is the right size but contains zeros (no download happened)
+        let staging_path = vfs.staging.path(ino).expect("staging path");
+        let on_disk = std::fs::read(&staging_path).unwrap();
+        assert_eq!(on_disk.len(), 26);
+        assert_eq!(&on_disk[..], &[0u8; 26]);
+
+        vfs.release(fh).await.unwrap();
+    });
+}
+
+/// Read of a sparse staging file returns original CAS data via `fill_sparse_holes`.
+#[test]
+fn sparse_read_unwritten_returns_cas() {
+    let hub = MockHub::new();
+    hub.add_file("file.txt", 10, Some("orig_hash"), None);
+    let xet = MockXet::new();
+    xet.add_file("orig_hash", b"0123456789");
+    let (rt, vfs) = vfs_advanced(&hub, &xet);
+
+    rt.block_on(async {
+        let attr = vfs.lookup(ROOT_INODE, "file.txt").await.unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open(ino, true, false, None).await.unwrap();
+
+        let (data, _) = vfs.read(fh, 0, 10).await.unwrap();
+        assert_eq!(&data[..], b"0123456789");
+
+        vfs.release(fh).await.unwrap();
+    });
+}
+
+/// Mid-file write + read: dirty bytes from staging, holes filled from CAS.
+#[test]
+fn sparse_read_dirty_and_hole() {
+    let hub = MockHub::new();
+    hub.add_file("file.txt", 10, Some("orig_hash"), None);
+    let xet = MockXet::new();
+    xet.add_file("orig_hash", b"0123456789");
+    let (rt, vfs) = vfs_advanced(&hub, &xet);
+
+    rt.block_on(async {
+        let attr = vfs.lookup(ROOT_INODE, "file.txt").await.unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open(ino, true, false, None).await.unwrap();
+
+        write_blocking(&vfs, ino, fh, 5, b"ABC").await.unwrap();
+
+        let (data, _) = vfs.read(fh, 0, 10).await.unwrap();
+        assert_eq!(&data[..], b"01234ABC89");
+
+        vfs.release(fh).await.unwrap();
+    });
+}
+
+/// Write past EOF: dirty range starts at original_size, file grows.
+#[test]
+fn sparse_append_then_read() {
+    let hub = MockHub::new();
+    hub.add_file("file.txt", 10, Some("orig_hash"), None);
+    let xet = MockXet::new();
+    xet.add_file("orig_hash", b"0123456789");
+    let (rt, vfs) = vfs_advanced(&hub, &xet);
+
+    rt.block_on(async {
+        let attr = vfs.lookup(ROOT_INODE, "file.txt").await.unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open(ino, true, false, None).await.unwrap();
+
+        write_blocking(&vfs, ino, fh, 10, b"XYZ").await.unwrap();
+
+        let (data, _) = vfs.read(fh, 0, 20).await.unwrap();
+        assert_eq!(&data[..], b"0123456789XYZ");
+
+        vfs.release(fh).await.unwrap();
+    });
+}
+
+/// Write at offset 0: prefix becomes dirty, suffix still comes from CAS.
+#[test]
+fn sparse_write_at_zero_then_read() {
+    let hub = MockHub::new();
+    hub.add_file("file.txt", 10, Some("orig_hash"), None);
+    let xet = MockXet::new();
+    xet.add_file("orig_hash", b"0123456789");
+    let (rt, vfs) = vfs_advanced(&hub, &xet);
+
+    rt.block_on(async {
+        let attr = vfs.lookup(ROOT_INODE, "file.txt").await.unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open(ino, true, false, None).await.unwrap();
+
+        write_blocking(&vfs, ino, fh, 0, b"abc").await.unwrap();
+
+        let (data, _) = vfs.read(fh, 0, 10).await.unwrap();
+        assert_eq!(&data[..], b"abc3456789");
+
+        vfs.release(fh).await.unwrap();
+    });
+}
+
+/// Multiple non-adjacent writes: each tracked separately.
+#[test]
+fn sparse_multiple_writes_then_read() {
+    let hub = MockHub::new();
+    hub.add_file("file.txt", 10, Some("orig_hash"), None);
+    let xet = MockXet::new();
+    xet.add_file("orig_hash", b"0123456789");
+    let (rt, vfs) = vfs_advanced(&hub, &xet);
+
+    rt.block_on(async {
+        let attr = vfs.lookup(ROOT_INODE, "file.txt").await.unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open(ino, true, false, None).await.unwrap();
+
+        write_blocking(&vfs, ino, fh, 2, b"XX").await.unwrap();
+        write_blocking(&vfs, ino, fh, 7, b"YY").await.unwrap();
+
+        let (data, _) = vfs.read(fh, 0, 10).await.unwrap();
+        assert_eq!(&data[..], b"01XX456YY9");
+
+        // Two non-adjacent dirty ranges
+        {
+            let inodes = vfs.inode_table.read().unwrap();
+            let entry = inodes.get(ino).unwrap();
+            let sw = entry.sparse_write.as_ref().expect("sparse_write set");
+            assert_eq!(sw.dirty_ranges, vec![(2, 4), (7, 9)]);
+        }
+        vfs.release(fh).await.unwrap();
+    });
+}
+
+/// Open with truncate: sparse_write cleared, no CAS download.
+#[test]
+fn sparse_open_with_truncate_clears_state() {
+    let hub = MockHub::new();
+    hub.add_file("file.txt", 10, Some("orig_hash"), None);
+    let xet = MockXet::new();
+    xet.add_file("orig_hash", b"0123456789");
+    let (rt, vfs) = vfs_advanced(&hub, &xet);
+
+    rt.block_on(async {
+        let attr = vfs.lookup(ROOT_INODE, "file.txt").await.unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open(ino, true, true, None).await.unwrap();
+
+        {
+            let inodes = vfs.inode_table.read().unwrap();
+            let entry = inodes.get(ino).unwrap();
+            assert!(entry.is_dirty());
+            assert_eq!(entry.size, 0);
+            assert!(entry.sparse_write.is_none(), "truncate clears sparse state");
+        }
+
+        vfs.release(fh).await.unwrap();
+    });
+}
+
+/// setattr(truncate to N < original_size) trims dirty ranges and clips original_size.
+#[test]
+fn sparse_setattr_shrink_clips_state() {
+    let hub = MockHub::new();
+    hub.add_file("file.txt", 10, Some("orig_hash"), None);
+    let xet = MockXet::new();
+    xet.add_file("orig_hash", b"0123456789");
+    let (rt, vfs) = vfs_advanced(&hub, &xet);
+
+    rt.block_on(async {
+        let attr = vfs.lookup(ROOT_INODE, "file.txt").await.unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open(ino, true, false, None).await.unwrap();
+
+        // Write past original size, then truncate below it
+        write_blocking(&vfs, ino, fh, 8, b"XXX").await.unwrap();
+        vfs.setattr(ino, Some(5), None, None, None, None, None).await.unwrap();
+
+        {
+            let inodes = vfs.inode_table.read().unwrap();
+            let entry = inodes.get(ino).unwrap();
+            let sw = entry.sparse_write.as_ref().expect("sparse_write preserved on shrink");
+            assert_eq!(sw.original_size, 5);
+            assert!(sw.dirty_ranges.is_empty(), "dirty ranges past 5 are trimmed");
+        }
+
+        vfs.release(fh).await.unwrap();
+    });
+}

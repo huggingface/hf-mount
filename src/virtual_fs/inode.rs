@@ -144,12 +144,9 @@ pub struct InodeEntry {
     /// Tracks the original file state and dirty byte ranges when the file is opened
     /// for write without downloading the full original content (sparse staging).
     /// At flush time, only the dirty windows need to be re-uploaded via `upload_ranges`.
-    /// `None` means either a new file or the full file was downloaded.
+    /// `None` means either a new file or the full file was downloaded. Race protection
+    /// (concurrent writes during flush) reuses `dirty_generation` — see `apply_commit`.
     pub sparse_write: Option<Arc<SparseWriteState>>,
-    /// Incremented on each write(). flush_batch snapshots this value; at commit time,
-    /// it only clears dirty/sparse_write if the generation still matches (no concurrent
-    /// writes happened since the snapshot).
-    pub flush_generation: u64,
 }
 
 /// Tracks which regions of a sparse staging file have been modified.
@@ -344,7 +341,6 @@ impl InodeTable {
             last_revalidated: None,
             eviction: EvictionState::default(),
             sparse_write: None,
-            flush_generation: 0,
         };
         table.inodes.insert(ROOT_INODE, root);
         table.path_to_inode.insert(root_path, ROOT_INODE);
@@ -694,7 +690,6 @@ impl InodeTable {
                 ..Default::default()
             },
             sparse_write: None,
-            flush_generation: 0,
         };
 
         self.inodes.insert(inode, entry);
