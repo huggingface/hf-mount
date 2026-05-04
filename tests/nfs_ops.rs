@@ -9,7 +9,7 @@ async fn test_nfs_read_only() {
         None => return,
     };
 
-    let mount_point = format!("/tmp/hf-mount-nfs-{}", std::process::id());
+    let mount_point = common::nfs_mount_point("ro");
     let cache_dir = format!("/tmp/hf-mount-nfs-cache-{}", std::process::id());
 
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -46,7 +46,7 @@ async fn test_nfs_point_lookup_in_large_dir() {
     };
     let (target_rel, target_content) = common::seed_big_dir_with_target(&guard.hub, "nfs-pl").await;
 
-    let mount_point = format!("/tmp/hf-mount-nfs-pl-mnt-{}", std::process::id());
+    let mount_point = common::nfs_mount_point("pl");
     let cache_dir = format!("/tmp/hf-mount-nfs-pl-cache-{}", std::process::id());
 
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -76,7 +76,7 @@ async fn test_nfs_deep_cold_read() {
     };
     let (deep_rel, payload) = common::seed_deep_tree(&guard.hub, "nfs-dr").await;
 
-    let mount_point = format!("/tmp/hf-mount-nfs-dr-mnt-{}", std::process::id());
+    let mount_point = common::nfs_mount_point("dr");
     let cache_dir = format!("/tmp/hf-mount-nfs-dr-cache-{}", std::process::id());
 
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -106,7 +106,7 @@ async fn test_nfs_writes() {
         None => return,
     };
 
-    let mount_point = format!("/tmp/hf-mount-nfs-w-{}", std::process::id());
+    let mount_point = common::nfs_mount_point("w");
     let cache_dir = format!("/tmp/hf-mount-nfs-w-cache-{}", std::process::id());
 
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

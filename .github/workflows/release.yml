@@ -224,6 +224,46 @@ jobs:
           name: macos-${{ matrix.arch }}
           path: dist/
 
+  build-windows:
+    name: Build Windows (${{ matrix.arch }})
+    needs: [bump]
+    if: |
+      always() &&
+      (startsWith(github.ref, 'refs/tags/') || needs.bump.result == 'success')
+    runs-on: windows-2022
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.bump.outputs.new_tag || github.ref }}
+
+      - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Build
+        # No vendored-openssl: native-tls uses Schannel on Windows, no OpenSSL dependency.
+        run: cargo build --release --target ${{ matrix.target }} --no-default-features --features nfs --bin hf-mount-nfs
+
+      - name: Package
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/hf-mount-nfs.exe dist/hf-mount-nfs-${{ matrix.arch }}-windows.exe
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-${{ matrix.arch }}
+          path: dist/
+
   # Compute the docker tag base + whether to push :latest. A bumped
   # release wins, then a manually-pushed tag, else fall back to sha-<sha>.
   # `latest` only on stable releases (tag matches `v\d` and has no `-`).
@@ -263,18 +303,19 @@ jobs:
 
   release:
     name: Create Release
-    needs: [bump, build-linux, build-macos]
+    needs: [bump, build-linux, build-macos, build-windows]
     if: |
       always() &&
       needs.build-linux.result == 'success' &&
       needs.build-macos.result == 'success' &&
+      needs.build-windows.result == 'success' &&
       (startsWith(github.ref, 'refs/tags/') || needs.bump.result == 'success')
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
-          pattern: '{linux-*,macos-*}'
+          pattern: '{linux-*,macos-*,windows-*}'
           merge-multiple: true
 
       - name: List artifacts

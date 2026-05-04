@@ -516,6 +516,56 @@ pub async fn mount_nfs(
         }
     }
 
+    // Windows NFS client (Services for NFS / Client for NFS feature).
+    // The mount point must be a drive letter (e.g. "Z:") or an empty NTFS dir.
+    // Windows mount.exe can't bypass portmapper, so spawn nfsserve's
+    // `portmap_listener` on 127.0.0.1:111 to map NFS/MOUNT v3 to the actual
+    // server port. Requires Administrator (port 111 is privileged).
+    #[cfg(windows)]
+    let portmapper_handle = nfsserve::portmap_listener::spawn("127.0.0.1:111".parse().unwrap(), port)
+        .await
+        .map_err(|e| {
+            std::io::Error::other(format!(
+                "failed to bind portmapper on 127.0.0.1:111: {e} (Administrator required, or another portmap is running)"
+            ))
+        })?;
+    #[cfg(windows)]
+    let skip_auto_mount = std::env::var_os("HF_MOUNT_SKIP_AUTO_MOUNT").is_some();
+    #[cfg(not(windows))]
+    let skip_auto_mount = false;
+    #[cfg(windows)]
+    {
+        let _ = actimeo; // mount.exe has no actimeo equivalent.
+        let mut opts = String::from("nolock,anon,mtype=hard,rsize=32,wsize=32,timeout=60");
+        if read_only {
+            opts.push_str(",ro");
+        }
+        let share = "\\\\127.0.0.1\\!";
+        let cmd = format!("mount.exe -o {opts} {share} {mount_point_str}");
+        if skip_auto_mount {
+            info!(
+                "HF_MOUNT_SKIP_AUTO_MOUNT set — server + portmapper running, mount.exe NOT invoked.\n\
+                 Run manually in another admin shell:\n  {cmd}"
+            );
+        } else {
+            info!("Running: {cmd}");
+            let output = tokio::process::Command::new("mount")
+                .args(["-o", &opts, share, mount_point_str])
+                .output()
+                .await?;
+            if !output.status.success() {
+                server_handle.abort();
+                portmapper_handle.abort();
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                return Err(std::io::Error::other(format!(
+                    "mount.exe failed with {} (is the 'Client for NFS' feature enabled? is the process running as Administrator?): cmd=`{cmd}` stdout={stdout} stderr={stderr}",
+                    output.status
+                )));
+            }
+        }
+    }
+
     info!("NFS mount active at {}", mount_point_str);
 
     // Signal the parent process that the mount is live (daemon mode).
@@ -528,9 +578,15 @@ pub async fn mount_nfs(
     // handle_forever() is an infinite accept() loop that never returns on its own.
     // On Linux, `umount` doesn't always send the UMNT RPC, so we also poll
     // /proc/mounts as a fallback to detect when the mount disappears.
+    // SIGTERM future: real signal listener on Unix, never-completing on Windows.
+    #[cfg(unix)]
     let mut sigterm =
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("Failed to register SIGTERM");
-    tokio::pin!(server_handle);
+    #[cfg(unix)]
+    let sigterm_fut = async move { sigterm.recv().await };
+    #[cfg(not(unix))]
+    let sigterm_fut = std::future::pending::<Option<()>>();
+    tokio::pin!(server_handle, sigterm_fut);
     loop {
         tokio::select! {
             msg = mount_rx.recv() => {
@@ -551,19 +607,26 @@ pub async fn mount_nfs(
                 unmount_nfs(mount_point_str);
                 break;
             }
-            _ = sigterm.recv() => {
+            _ = &mut sigterm_fut => {
                 info!("Received SIGTERM, unmounting...");
                 unmount_nfs(mount_point_str);
                 break;
             }
             _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {
-                if !is_mounted(mount_point_str) {
+                if !skip_auto_mount && !is_mounted(mount_point_str) {
                     info!("NFS mount disappeared, shutting down");
                     break;
                 }
             }
         }
     }
+
+    // Stop the NFS server task explicitly (dropping the JoinHandle does not
+    // cancel a tokio task — the server would keep accept()ing on its socket).
+    server_handle.abort();
+    let _ = server_handle.await;
+    #[cfg(windows)]
+    portmapper_handle.abort();
 
     // Drain handle pool: flush and release all cached handles before VFS shutdown.
     let entries = pool_for_shutdown.lock().expect("handle_pool poisoned").drain();
@@ -751,31 +814,14 @@ fn system_time_to_nfstime(t: SystemTime) -> nfstime3 {
 
 /// Check if a path is still an active mount point.
 fn unmount_nfs(mount_point: &str) {
-    use std::ffi::CString;
-
-    // Try libc unmount first (no external process dependency).
-    if let Ok(c_path) = CString::new(mount_point) {
-        #[cfg(target_os = "linux")]
-        {
-            if unsafe { libc::umount2(c_path.as_ptr(), libc::MNT_DETACH) } == 0 {
-                return;
-            }
-        }
-        #[cfg(target_os = "macos")]
-        {
-            if unsafe { libc::unmount(c_path.as_ptr(), libc::MNT_FORCE) } == 0 {
-                return;
-            }
-        }
-    }
-
-    // Fallback: external command.
-    #[cfg(target_os = "macos")]
-    if let Err(e) = std::process::Command::new("umount").arg(mount_point).status() {
-        tracing::warn!("NFS unmount fallback failed for {}: {}", mount_point, e);
-    }
     #[cfg(target_os = "linux")]
     {
+        use std::ffi::CString;
+        if let Ok(c_path) = CString::new(mount_point)
+            && unsafe { libc::umount2(c_path.as_ptr(), libc::MNT_DETACH) } == 0
+        {
+            return;
+        }
         let result = if unsafe { libc::getuid() } == 0 {
             std::process::Command::new("umount").arg(mount_point).status()
         } else {
@@ -787,6 +833,26 @@ fn unmount_nfs(mount_point: &str) {
             tracing::warn!("NFS unmount fallback failed for {}: {}", mount_point, e);
         }
     }
+
+    #[cfg(target_os = "macos")]
+    {
+        use std::ffi::CString;
+        if let Ok(c_path) = CString::new(mount_point)
+            && unsafe { libc::unmount(c_path.as_ptr(), libc::MNT_FORCE) } == 0
+        {
+            return;
+        }
+        if let Err(e) = std::process::Command::new("umount").arg(mount_point).status() {
+            tracing::warn!("NFS unmount fallback failed for {}: {}", mount_point, e);
+        }
+    }
+
+    // `umount.exe` ships with the Windows NFS client. `-f` forces unmount
+    // even if handles are still open.
+    #[cfg(windows)]
+    if let Err(e) = std::process::Command::new("umount").args(["-f", mount_point]).status() {
+        tracing::warn!("NFS unmount fallback failed for {}: {}", mount_point, e);
+    }
 }
 
 fn is_mounted(path: &str) -> bool {
@@ -795,6 +861,12 @@ fn is_mounted(path: &str) -> bool {
         std::fs::read_to_string("/proc/mounts")
             .map(|s| s.lines().any(|line| line.split_whitespace().nth(1) == Some(path)))
             .unwrap_or(false)
+    }
+    #[cfg(windows)]
+    {
+        // Best-effort: the drive letter / mount path disappears from the FS namespace
+        // when the NFS mount is torn down. metadata() succeeds while it's live.
+        std::fs::metadata(path).is_ok()
     }
     #[cfg(target_os = "macos")]
     {

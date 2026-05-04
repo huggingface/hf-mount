@@ -1,3 +1,5 @@
+#![cfg_attr(not(unix), allow(dead_code, unused_imports))]
+
 use std::path::PathBuf;
 
 use clap::Parser;
@@ -30,6 +32,13 @@ enum Command {
     Status,
 }
 
+#[cfg(not(unix))]
+fn main() {
+    eprintln!("hf-mount daemon controller is Unix-only. On Windows, run hf-mount-nfs.exe directly.");
+    std::process::exit(1);
+}
+
+#[cfg(unix)]
 fn main() {
     let cli = Cli::parse();
 
@@ -110,6 +119,7 @@ fn main() {
 
 /// Replace the current process with the backend binary via execvp.
 /// Passes the ready-notification fd via the HF_MOUNT_DAEMON_FD env var.
+#[cfg(unix)]
 fn exec_backend(backend: &std::path::Path, args: &[String], guard: &hf_mount::daemon::DaemonGuard) -> std::io::Error {
     use std::os::unix::process::CommandExt;
 

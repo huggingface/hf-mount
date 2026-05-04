@@ -21,14 +21,13 @@ bytes = "1"
 chrono = "0.4"
 clap = { version = "4", features = ["derive", "env"] }
 ctrlc = { version = "3", features = ["termination"] }
-fuser = { version = "0.17", optional = true }
 futures = "0.3"
 libc = "0.2"
 nfsserve = { version = "0.11", optional = true }
 reqwest = { version = "0.12", features = ["json", "stream"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "process"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ulid = "1"
@@ -39,6 +38,12 @@ default = []
 fuse = ["dep:fuser"]
 nfs = ["dep:nfsserve"]
 vendored-openssl = ["openssl-sys/vendored"]
+
+# fuser is Unix-only (Linux/macOS FUSE bindings). Gating it as a Unix-target
+# dep means the `fuse` feature is effectively unavailable on Windows; the NFS
+# backend (`hf-mount-nfs`) is the supported path on Windows.
+[target.'cfg(unix)'.dependencies]
+fuser = { version = "0.17", optional = true }
 
 [dependencies.openssl-sys]
 version = "0.9"
@@ -68,5 +73,8 @@ tempfile = "3"
 
 # Pin fuser to the HF fork until cberner/fuser merges Session::from_fds
 # (sidecar with externally pre-cloned fds — see #94).
+# Pin nfsserve to the HF fork until the portmap_listener PR is merged & released
+# (Windows NFS clients need a portmapper on 127.0.0.1:111 — see nfsserve#44).
 [patch.crates-io]
 fuser = { git = "https://github.com/huggingface/fuser.git", branch = "sidecar-multi-fd" }
+nfsserve = { git = "https://github.com/huggingface/nfsserve.git", branch = "feat/portmap-listener" }
