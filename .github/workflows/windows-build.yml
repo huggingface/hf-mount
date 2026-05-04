@@ -30,15 +30,11 @@ jobs:
       - name: Build hf-mount-nfs
         run: cargo build --release --target x86_64-pc-windows-msvc --no-default-features --features nfs,vendored-openssl --bin hf-mount-nfs
 
-      - name: Build hf-mount
-        run: cargo build --release --target x86_64-pc-windows-msvc --no-default-features --features vendored-openssl --bin hf-mount
-
       - name: Stage artifacts
         shell: bash
         run: |
           mkdir -p dist
           cp target/x86_64-pc-windows-msvc/release/hf-mount-nfs.exe dist/
-          cp target/x86_64-pc-windows-msvc/release/hf-mount.exe dist/
 
       - uses: actions/upload-artifact@v4
         with:

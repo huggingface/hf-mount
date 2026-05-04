@@ -250,17 +250,13 @@ jobs:
           key: release-${{ matrix.target }}
 
       - name: Build
-        run: |
-          cargo build --release --target ${{ matrix.target }} --no-default-features --features nfs,vendored-openssl --bin hf-mount-nfs
-          cargo build --release --target ${{ matrix.target }} --no-default-features --features vendored-openssl --bin hf-mount
+        run: cargo build --release --target ${{ matrix.target }} --no-default-features --features nfs,vendored-openssl --bin hf-mount-nfs
 
       - name: Package
         shell: bash
         run: |
           mkdir -p dist
-          for bin in hf-mount-nfs hf-mount; do
-            cp target/${{ matrix.target }}/release/${bin}.exe dist/${bin}-${{ matrix.arch }}-windows.exe
-          done
+          cp target/${{ matrix.target }}/release/hf-mount-nfs.exe dist/hf-mount-nfs-${{ matrix.arch }}-windows.exe
 
       - uses: actions/upload-artifact@v4
         with:
