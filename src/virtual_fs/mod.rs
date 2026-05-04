@@ -365,6 +365,26 @@ impl VirtualFs {
         }
     }
 
+    /// In overlay mode, signal that `full_path` exists locally and a remote
+    /// HEAD/list probe must be skipped to preserve local-overrides-remote.
+    /// On hit, re-runs `merge_overlay_entries` on the parent so the entry
+    /// shows up in the inode table even when it was added to the backing
+    /// after the parent's listing was loaded.
+    fn overlay_lookup_takes_precedence(&self, parent: u64, full_path: &str) -> VirtualFsResult<bool> {
+        let Some(overlay) = &self.overlay_backing else {
+            return Ok(false);
+        };
+        let exists = overlay.exists(full_path).map_err(|e| {
+            error!("Failed to stat overlay path {}: {}", full_path, e);
+            libc::EIO
+        })?;
+        if exists {
+            let mut inodes = self.inode_table.write().expect("inodes poisoned");
+            self.merge_overlay_entries(&mut inodes, parent);
+        }
+        Ok(exists)
+    }
+
     /// True if the entry is a clean remote entry that overlay mode treats as immutable.
     fn is_overlay_immutable(&self, entry: &inode::InodeEntry) -> bool {
         self.overlay() && !entry.is_dirty()
@@ -1216,6 +1236,17 @@ impl VirtualFs {
                 if local_only {
                     return Err(libc::ENOENT);
                 }
+                // Overlay precedence: a file added to the overlay backing
+                // after the parent listing was loaded must shadow whatever the
+                // remote HEAD returns. Otherwise a clean remote inode wins,
+                // and a later open(write) would truncate the local backing.
+                if self.overlay_lookup_takes_precedence(parent, &full_path)? {
+                    let inodes = self.inode_table.read().expect("inodes poisoned");
+                    return inodes
+                        .lookup_child(parent, name)
+                        .map(|e| self.make_vfs_attr(e))
+                        .ok_or(libc::ENOENT);
+                }
                 // HEAD probe catches files added remotely.
                 if let Ok(Some(head)) = self.hub_client.head_file(&full_path).await
                     && head.size.is_some()
@@ -1248,6 +1279,17 @@ impl VirtualFs {
         if self.negative_cache_check(&full_path) {
             debug!("negative cache hit: {}", full_path);
             return Err(libc::ENOENT);
+        }
+
+        // Overlay precedence (see FastResult::Miss): defer to the parent
+        // listing + merge so the local entry is what we resolve.
+        if self.overlay_lookup_takes_precedence(parent, &full_path)? {
+            self.ensure_children_loaded(parent).await?;
+            let inodes = self.inode_table.read().expect("inodes poisoned");
+            return inodes
+                .lookup_child(parent, name)
+                .map(|e| self.make_vfs_attr(e))
+                .ok_or(libc::ENOENT);
         }
 
         // Resolve the single requested path via HEAD instead of listing the
