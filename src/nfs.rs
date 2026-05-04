@@ -536,18 +536,28 @@ pub async fn mount_nfs(
         if read_only {
             opts.push_str(",ro");
         }
-        let output = std::process::Command::new("mount")
-            .args(["-o", &opts, "\\\\127.0.0.1\\!", mount_point_str])
-            .output()?;
-        if !output.status.success() {
-            server_handle.abort();
-            portmapper_handle.abort();
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            return Err(std::io::Error::other(format!(
-                "mount.exe failed with {} (is the 'Client for NFS' feature enabled? is the process running as Administrator?): stdout={stdout} stderr={stderr}",
-                output.status
-            )));
+        let share = "\\\\127.0.0.1\\!";
+        if std::env::var_os("HF_MOUNT_SKIP_AUTO_MOUNT").is_some() {
+            info!(
+                "HF_MOUNT_SKIP_AUTO_MOUNT set — server + portmapper running, mount.exe NOT invoked.\n\
+                 Run manually in another admin shell:\n  \
+                 mount.exe -o {opts} {share} {mount_point_str}"
+            );
+        } else {
+            info!("Running: mount.exe -o {opts} {share} {mount_point_str}");
+            let output = std::process::Command::new("mount")
+                .args(["-o", &opts, share, mount_point_str])
+                .output()?;
+            if !output.status.success() {
+                server_handle.abort();
+                portmapper_handle.abort();
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                return Err(std::io::Error::other(format!(
+                    "mount.exe failed with {} (is the 'Client for NFS' feature enabled? is the process running as Administrator?): cmd=`mount.exe -o {opts} {share} {mount_point_str}` stdout={stdout} stderr={stderr}",
+                    output.status
+                )));
+            }
         }
     }
 
