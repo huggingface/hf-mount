@@ -3073,6 +3073,21 @@ impl VirtualFs {
         };
         if let Some(src_ino) = src_dir {
             self.ensure_subtree_loaded(src_ino).await?;
+            // Overlay shadow guard: a local dir that shares its name with a
+            // remote dir is dirty (set by merge_overlay_entries), so the
+            // top-level immutable check above lets it through. After loading
+            // the subtree we can spot remote descendants — moving them
+            // locally without a remote rename would leave them dangling on
+            // the new local path while the remote tree keeps the old one.
+            if self.overlay()
+                && self
+                    .inode_table
+                    .read()
+                    .expect("inodes poisoned")
+                    .has_clean_descendants(src_ino)
+            {
+                return Err(libc::EPERM);
+            }
         }
         if let Some(dst_ino) = dst_dir {
             self.ensure_children_loaded(dst_ino).await?;

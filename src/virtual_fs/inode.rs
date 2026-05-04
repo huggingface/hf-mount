@@ -719,6 +719,30 @@ impl InodeTable {
         false
     }
 
+    /// True if any *descendant* (not the root of the walk) is a clean entry,
+    /// i.e. one that mirrors remote state and is not locally modified.
+    /// Used by overlay rename to refuse moving a shadow directory whose
+    /// remote-only descendants would silently follow on the local FS while
+    /// the remote tree stays in place.
+    pub fn has_clean_descendants(&self, ino: u64) -> bool {
+        let mut stack: Vec<u64> = self
+            .inodes
+            .get(&ino)
+            .map(|e| e.children.iter().map(|c| c.ino).collect())
+            .unwrap_or_default();
+        while let Some(current) = stack.pop() {
+            if let Some(entry) = self.inodes.get(&current) {
+                if !entry.is_dirty() {
+                    return true;
+                }
+                for child in &entry.children {
+                    stack.push(child.ino);
+                }
+            }
+        }
+        false
+    }
+
     /// Return the full_path of every directory whose children have been loaded.
     /// Used by the poll loop to only re-fetch directories the user has visited.
     pub fn loaded_dir_prefixes(&self) -> Vec<String> {
