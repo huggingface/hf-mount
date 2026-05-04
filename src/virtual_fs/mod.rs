@@ -860,13 +860,6 @@ impl VirtualFs {
         })
     }
 
-    fn ensure_local_backing_parents(&self, full_path: &str) -> std::io::Result<()> {
-        match self.overlay_backing.as_deref() {
-            Some(overlay) => overlay.create_parent_dirs(full_path),
-            None => Ok(()),
-        }
-    }
-
     fn local_backing_exists(&self, ino: u64, full_path: &str) -> std::io::Result<bool> {
         match self.overlay_backing.as_deref() {
             Some(overlay) => overlay.exists(full_path),
@@ -888,7 +881,15 @@ impl VirtualFs {
         truncate: bool,
     ) -> std::io::Result<File> {
         match self.overlay_backing.as_deref() {
-            Some(overlay) => overlay.open_file(full_path, read, write, create, truncate),
+            Some(overlay) => {
+                // Overlay paths are hierarchical; parents may exist as inodes
+                // (from a remote listing) without being materialized locally.
+                // Staging is flat ino-keyed, so this branch never applies.
+                if create {
+                    overlay.create_parent_dirs(full_path)?;
+                }
+                overlay.open_file(full_path, read, write, create, truncate)
+            }
             None => {
                 let path = self
                     .staging
@@ -1625,18 +1626,9 @@ impl VirtualFs {
                     })?;
                 size
             } else {
-                // Overlay opens at <overlay_root>/<full_path>; parent dirs may
-                // exist as inodes from a remote listing without being
-                // materialized locally, so ensure them before O_CREAT.
-                if self.overlay() {
-                    self.ensure_local_backing_parents(full_path).map_err(|e| {
-                        error!("Failed to create overlay parent dirs for ino={}: {}", ino, e);
-                        libc::EIO
-                    })?;
-                }
                 self.open_local_backing_file(ino, full_path, true, true, true, true)
                     .map_err(|e| {
-                        error!("Failed to create staging file: {}", e);
+                        error!("Failed to create local backing file: {}", e);
                         libc::EIO
                     })?;
                 0
@@ -2601,11 +2593,6 @@ impl VirtualFs {
 
         if self.advanced_writes {
             // Advanced mode: staging file on disk + async flush (or overlay file in overlay mode).
-            if let Err(e) = self.ensure_local_backing_parents(&full_path) {
-                error!("Failed to create staging parent dirs for {}: {}", full_path, e);
-                self.inode_table.write().expect("inodes poisoned").remove(ino);
-                return Err(libc::EIO);
-            }
             match self.open_local_backing_file(ino, &full_path, true, true, true, true) {
                 Ok(file) => {
                     if let Err(e) = self.set_local_backing_mode(&full_path, mode) {
@@ -3438,12 +3425,6 @@ impl VirtualFs {
                 let staging_mutex = self.staging.lock(ino);
                 let _staging_guard = staging_mutex.lock().await;
 
-                if self.overlay() {
-                    self.ensure_local_backing_parents(&full_path).map_err(|e| {
-                        error!("Failed to create overlay parent dirs for ino={}: {}", ino, e);
-                        e.raw_os_error().unwrap_or(libc::EIO)
-                    })?;
-                }
                 let local_exists = self.local_backing_exists(ino, &full_path).map_err(|e| {
                     error!("Failed to check local backing file for ino={}: {}", ino, e);
                     e.raw_os_error().unwrap_or(libc::EIO)
