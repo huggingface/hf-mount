@@ -170,71 +170,6 @@ pub struct VirtualFs {
 }
 
 impl VirtualFs {
-    /// True when the VFS is in overlay mode (writes stay local, no remote
-    /// mutations). Derived from the presence of an overlay backing.
-    fn overlay(&self) -> bool {
-        self.overlay_backing.is_some()
-    }
-
-    /// Splice local overlay entries into the inode table for `parent_ino`,
-    /// overriding remote entries on name conflict (kind mismatch removes the
-    /// remote inode first, then re-inserts as local). No-op when not in
-    /// overlay mode.
-    fn merge_overlay_entries(&self, inodes: &mut InodeTable, parent_ino: u64) {
-        let Some(overlay) = &self.overlay_backing else {
-            return;
-        };
-        let dir_path = inodes.get(parent_ino).map(|e| e.full_path.clone()).unwrap_or_default();
-        let Ok(entries) = overlay.read_dir(&dir_path) else {
-            return;
-        };
-        for entry in entries {
-            if entry.is_symlink || (self.filter_os_files && is_os_junk(&entry.name)) {
-                continue;
-            }
-            let kind = if entry.is_dir {
-                InodeKind::Directory
-            } else {
-                InodeKind::File
-            };
-            let full_path = inode::child_path(&dir_path, &entry.name);
-            // If existing entry has a different kind (e.g. remote file vs
-            // local dir), remove it first so local wins cleanly.
-            let conflict = inodes
-                .lookup_child(parent_ino, &entry.name)
-                .filter(|e| e.kind != kind)
-                .map(|e| e.inode);
-            if let Some(old_ino) = conflict {
-                inodes.remove(old_ino);
-            }
-            let ino = inodes.insert(
-                parent_ino,
-                entry.name,
-                full_path,
-                kind,
-                entry.size,
-                entry.mtime,
-                None,
-                entry.mode,
-                self.uid,
-                self.gid,
-            );
-            // Local overrides remote: clear remote identity, mark dirty.
-            if let Some(e) = inodes.get_mut(ino) {
-                e.size = entry.size;
-                e.mtime = entry.mtime;
-                e.mode = entry.mode;
-                e.xet_hash = None;
-                if !e.is_dirty() {
-                    e.set_dirty();
-                }
-                if kind == InodeKind::Directory {
-                    e.children_loaded_at = None;
-                }
-            }
-        }
-    }
-
     pub fn new(
         runtime: tokio::runtime::Handle,
         hub_client: Arc<dyn HubOps>,
@@ -364,6 +299,70 @@ impl VirtualFs {
         }
 
         vfs
+    }
+    /// True when the VFS is in overlay mode (writes stay local, no remote
+    /// mutations). Derived from the presence of an overlay backing.
+    fn overlay(&self) -> bool {
+        self.overlay_backing.is_some()
+    }
+
+    /// Splice local overlay entries into the inode table for `parent_ino`,
+    /// overriding remote entries on name conflict (kind mismatch removes the
+    /// remote inode first, then re-inserts as local). No-op when not in
+    /// overlay mode.
+    fn merge_overlay_entries(&self, inodes: &mut InodeTable, parent_ino: u64) {
+        let Some(overlay) = &self.overlay_backing else {
+            return;
+        };
+        let dir_path = inodes.get(parent_ino).map(|e| e.full_path.clone()).unwrap_or_default();
+        let Ok(entries) = overlay.read_dir(&dir_path) else {
+            return;
+        };
+        for entry in entries {
+            if entry.is_symlink || (self.filter_os_files && is_os_junk(&entry.name)) {
+                continue;
+            }
+            let kind = if entry.is_dir {
+                InodeKind::Directory
+            } else {
+                InodeKind::File
+            };
+            let full_path = inode::child_path(&dir_path, &entry.name);
+            // If existing entry has a different kind (e.g. remote file vs
+            // local dir), remove it first so local wins cleanly.
+            let conflict = inodes
+                .lookup_child(parent_ino, &entry.name)
+                .filter(|e| e.kind != kind)
+                .map(|e| e.inode);
+            if let Some(old_ino) = conflict {
+                inodes.remove(old_ino);
+            }
+            let ino = inodes.insert(
+                parent_ino,
+                entry.name,
+                full_path,
+                kind,
+                entry.size,
+                entry.mtime,
+                None,
+                entry.mode,
+                self.uid,
+                self.gid,
+            );
+            // Local overrides remote: clear remote identity, mark dirty.
+            if let Some(e) = inodes.get_mut(ino) {
+                e.size = entry.size;
+                e.mtime = entry.mtime;
+                e.mode = entry.mode;
+                e.xet_hash = None;
+                if !e.is_dirty() {
+                    e.set_dirty();
+                }
+                if kind == InodeKind::Directory {
+                    e.children_loaded_at = None;
+                }
+            }
+        }
     }
 
     /// True if the entry is a clean remote entry that overlay mode treats as immutable.
