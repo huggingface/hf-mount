@@ -853,13 +853,6 @@ impl VirtualFs {
         arc
     }
 
-    fn overlay_backing(&self) -> VirtualFsResult<&OverlayBacking> {
-        self.overlay_backing.as_deref().ok_or_else(|| {
-            error!("overlay backing missing in overlay mode");
-            libc::EIO
-        })
-    }
-
     fn local_backing_exists(&self, ino: u64, full_path: &str) -> std::io::Result<bool> {
         match self.overlay_backing.as_deref() {
             Some(overlay) => overlay.exists(full_path),
@@ -2714,8 +2707,7 @@ impl VirtualFs {
         self.negative_cache_remove(&full_path);
 
         // Overlay: persist directory to disk.
-        if self.overlay() {
-            let overlay = self.overlay_backing()?;
+        if let Some(overlay) = &self.overlay_backing {
             if let Err(e) = overlay.create_parent_dirs(&full_path) {
                 error!("Failed to create overlay parent directories for {}: {}", full_path, e);
                 self.inode_table.write().expect("inodes poisoned").remove(ino);
