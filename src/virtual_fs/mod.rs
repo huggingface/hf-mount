@@ -2023,30 +2023,55 @@ impl VirtualFs {
         for attempt in 0..MAX_ATTEMPTS {
             let stream = match first_stream.take() {
                 Some(s) => Some(s),
-                None => match self.xet_sessions.download_stream_boxed(
-                    &file_info,
-                    cursor,
-                    // For range downloads (random reads / seeks), bound the request
-                    // so CAS only returns terms covering the needed bytes.
-                    // For streaming, leave unbounded so the stream can continue.
-                    if plan.strategy == prefetch::FetchStrategy::RangeDownload {
-                        Some(cursor + plan.fetch_size)
-                    } else {
-                        None
-                    },
-                ) {
-                    Ok(s) => Some(s),
-                    Err(e) => {
-                        warn!(
-                            "prefetch: stream open failed: cursor={}, attempt={}/{}: {}",
-                            cursor,
-                            attempt + 1,
-                            MAX_ATTEMPTS,
-                            e,
-                        );
-                        None
+                None => {
+                    debug!(
+                        "prefetch: opening stream cursor={} attempt={}/{} strategy={:?} fetch_size={}",
+                        cursor,
+                        attempt + 1,
+                        MAX_ATTEMPTS,
+                        plan.strategy,
+                        plan.fetch_size,
+                    );
+                    let open_start = Instant::now();
+                    let result = self.xet_sessions.download_stream_boxed(
+                        &file_info,
+                        cursor,
+                        // For range downloads (random reads / seeks), bound the request
+                        // so CAS only returns terms covering the needed bytes.
+                        // For streaming, leave unbounded so the stream can continue.
+                        if plan.strategy == prefetch::FetchStrategy::RangeDownload {
+                            Some(cursor + plan.fetch_size)
+                        } else {
+                            None
+                        },
+                    );
+                    let open_elapsed = open_start.elapsed();
+                    match result {
+                        Ok(s) => {
+                            if open_elapsed > Duration::from_secs(2) {
+                                warn!(
+                                    "prefetch: slow stream open cursor={} attempt={}/{} elapsed={:?}",
+                                    cursor,
+                                    attempt + 1,
+                                    MAX_ATTEMPTS,
+                                    open_elapsed,
+                                );
+                            }
+                            Some(s)
+                        }
+                        Err(e) => {
+                            warn!(
+                                "prefetch: stream open failed: cursor={}, attempt={}/{}, elapsed={:?}: {}",
+                                cursor,
+                                attempt + 1,
+                                MAX_ATTEMPTS,
+                                open_elapsed,
+                                e,
+                            );
+                            None
+                        }
                     }
-                },
+                }
             };
 
             if let Some(mut stream) = stream {
@@ -2055,10 +2080,35 @@ impl VirtualFs {
                 let mut total = 0usize;
                 let mut failed = false;
                 let mut stream_eof = false;
+                let read_start = Instant::now();
+                let mut last_progress = read_start;
+                debug!(
+                    "prefetch: reading chunks cursor={} fetch_size={} attempt={}/{}",
+                    cursor,
+                    plan.fetch_size,
+                    attempt + 1,
+                    MAX_ATTEMPTS,
+                );
                 while (total as u64) < plan.fetch_size {
-                    match stream.next().await {
+                    let chunk_start = Instant::now();
+                    let next = stream.next().await;
+                    let chunk_elapsed = chunk_start.elapsed();
+                    if chunk_elapsed > Duration::from_secs(5) {
+                        warn!(
+                            "prefetch: slow chunk cursor={} got={}/{} attempt={}/{} chunk_elapsed={:?} since_last_progress={:?}",
+                            cursor,
+                            total,
+                            plan.fetch_size,
+                            attempt + 1,
+                            MAX_ATTEMPTS,
+                            chunk_elapsed,
+                            last_progress.elapsed(),
+                        );
+                    }
+                    match next {
                         Ok(Some(chunk)) => {
                             total += chunk.len();
+                            last_progress = Instant::now();
                             chunks.push_back(chunk);
                         }
                         Ok(None) => {
@@ -2067,18 +2117,33 @@ impl VirtualFs {
                         }
                         Err(e) => {
                             warn!(
-                                "prefetch: stream read error at cursor={}, got={}/{}, attempt={}/{}: {}",
+                                "prefetch: stream read error at cursor={}, got={}/{}, attempt={}/{}, read_elapsed={:?}: {}",
                                 cursor,
                                 total,
                                 plan.fetch_size,
                                 attempt + 1,
                                 MAX_ATTEMPTS,
+                                read_start.elapsed(),
                                 e,
                             );
                             failed = true;
                             break;
                         }
                     }
+                }
+                let read_elapsed = read_start.elapsed();
+                if read_elapsed > Duration::from_secs(10) {
+                    warn!(
+                        "prefetch: slow fetch cursor={} got={}/{} attempt={}/{} read_elapsed={:?} eof={} failed={}",
+                        cursor,
+                        total,
+                        plan.fetch_size,
+                        attempt + 1,
+                        MAX_ATTEMPTS,
+                        read_elapsed,
+                        stream_eof,
+                        failed,
+                    );
                 }
 
                 // Early EOF sanity check: only meaningful when we got some data
@@ -2168,7 +2233,19 @@ impl VirtualFs {
                 }
             }
             ReadTarget::Remote { prefetch } => {
+                debug!(
+                    "read: awaiting prefetch lock fh={} offset={} size={}",
+                    file_handle, offset, size
+                );
+                let lock_start = Instant::now();
                 let mut prefetch_state = prefetch.lock().await;
+                let lock_elapsed = lock_start.elapsed();
+                if lock_elapsed > Duration::from_millis(500) {
+                    warn!(
+                        "read: prefetch lock contention fh={} offset={} size={} waited={:?}",
+                        file_handle, offset, size, lock_elapsed,
+                    );
+                }
 
                 let file_size = prefetch_state.file_size;
 
