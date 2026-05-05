@@ -410,6 +410,16 @@ pub fn run_write_tests(mp: &str, remote_file: &str, remote_content: &str) -> Tes
     }
 
     // ── Sparse write tests (operate on CAS-backed remote file) ──
+    //
+    // These exercise the full range_upload + fill_sparse_holes pipeline (PR #41 +
+    // xet-core PR #717). They require the new `/v2/file-chunk-hashes/{file_id}`
+    // CAS endpoint with the `windows + hash_ranges` response shape. Skip by
+    // default until the endpoint is deployed; opt in with HF_MOUNT_SPARSE_TESTS=1.
+    if std::env::var("HF_MOUNT_SPARSE_TESTS").is_err() {
+        eprintln!("  [write] skipping sparse-write tests (set HF_MOUNT_SPARSE_TESTS=1 to enable)");
+        eprintln!("  [write] all passed");
+        return Ok(());
+    }
 
     // 19. Mid-file write on CAS file: overwrite a few bytes in the middle,
     //     read back the full file — prefix and suffix should be original CAS content.
