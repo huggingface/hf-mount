@@ -243,22 +243,28 @@ Tuning: pick `N` below what a full-tree enumeration of your bucket would produce
 
 ### Overlay mode
 
-`--overlay` turns the mount point itself into a writable local layer on top of the remote bucket or repo. Useful when several processes (or pods) need to share a read-only remote view but each layer their own files on top — e.g. a shared model cache where users drop training artifacts, configs, or fine-tuned weights without pushing them back to the Hub.
+`--overlay` makes the mount point itself a writable local layer on top of the remote source. Reads return whatever the remote has, plus anything you've put on local disk under the mount point. Writes go only to local disk — the remote is never touched. Local files survive an unmount/remount.
+
+Useful when several machines or processes need to share a read-only remote view but each layer their own files on top — for example, a shared compilation cache where producer machines populate a bucket with compiled artifacts (torch.compile, vLLM, JAX/XLA, AWS Neuron) and every consumer mounts the same bucket with `--overlay`. Cache hits are served from the bucket without recompiling; cache misses compile locally and stay on the local disk, never pushed back to the bucket.
 
 ```bash
-hf-mount start --overlay repo openai/gpt-oss-20b /shared/cache
-# Pre-existing files under /shared/cache stay visible, plus the remote contents
-# Writes (and any new files) go to /shared/cache on local disk, never to the Hub
+# Producer (writes compiled artifacts to the bucket — regular bucket mount)
+hf-mount start bucket myorg/torch-compile-cache "$TORCHINDUCTOR_CACHE_DIR"
+
+# Consumer (reads from the bucket, compiles locally on miss)
+hf-mount start --overlay bucket myorg/torch-compile-cache "$TORCHINDUCTOR_CACHE_DIR"
 ```
 
-Behavior:
-- **Reads** merge the local layer and the remote source. When a path exists in both, the local copy wins.
-- **Writes** (creates, modifications, deletes, renames, chmod...) hit the local layer only. The remote is never mutated, even on a bucket.
-- **Symlinks** in the local layer are skipped (hidden) to keep the merged view sandboxed.
-- **Implies `--advanced-writes`**: random writes, seek, and overwrite are supported.
-- **Cannot be combined with `--read-only`** — overlay's whole point is to allow local writes.
+What you can do:
+- Read every file from the remote source.
+- Read every file already present in the local layer; when a name exists in both, the local copy wins.
+- Create new files and directories — they land in the local layer.
+- Modify, rename, delete, or chmod any file or directory that lives in the local layer.
 
-The mount point directory is opened once at startup and all overlay I/O is rooted at that fd (`openat`/`fstatat`/...), so even concurrent renames of the mount point can't trick overlay paths into escaping the original directory.
+What you can't do:
+- Modify, rename, delete, or chmod a file that exists only on the remote. These operations fail with a permission error. To diverge from a remote file, copy it under a new name through the mount; the copy is a regular local file you own.
+- Shadow an existing remote name with a new local file once the mount is active. If you need a local file at a name that already exists on the remote, drop it in the mount-point directory *before* starting the mount — pre-existing files at the mount point stay visible and take precedence.
+- Place symlinks in the local layer and expect them to show up. Symlinks are hidden from the merged view so the mount can't be tricked into reading or writing outside the mount point.
 
 ### Logging
 
