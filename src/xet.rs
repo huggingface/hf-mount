@@ -199,15 +199,11 @@ impl XetOps for XetSessions {
 
         // Build DirtyInput list in original-file coordinates. Each dirty range
         // (start, end) is expressed in current-file coordinates; track_write
-        // snaps writes past `original_size` back to it, so `start <= original_size`
-        // always holds.
+        // snaps writes past `effective_original_size` back to it, so
+        // `start <= effective_original_size <= original_size` always holds.
         let mut dirty_inputs: Vec<DirtyInput> = Vec::with_capacity(sparse_state.dirty_ranges.len() + 1);
         for &(start, end) in &sparse_state.dirty_ranges {
             let new_length = end - start;
-            // Map to original-file coordinates:
-            // - end <= original_size       → in-place edit
-            // - start >= original_size     → pure append at EOF (track_write snaps; only when == original_size)
-            // - else (straddles boundary)  → in-place + extend (replace [start..original_size] with new_length bytes)
             let original_range = if end <= sparse_state.original_size {
                 start..end
             } else if start >= sparse_state.original_size {

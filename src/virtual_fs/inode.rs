@@ -161,8 +161,16 @@ pub struct InodeEntry {
 pub struct SparseWriteState {
     /// Hash of the original file in CAS.
     pub original_hash: String,
-    /// Size of the original file in CAS.
+    /// Size of the original file in CAS. Immutable after construction; passed to
+    /// `upload_ranges`, which validates it against the reconstruction info for
+    /// `original_hash`. A truncate-shrink does NOT change this — see
+    /// `effective_original_size` instead.
     pub original_size: u64,
+    /// Effective live region of the original CAS file. Equals `original_size`
+    /// initially, then capped by truncate-shrinks. Used by `track_write` (to
+    /// know where the live "fillable" region ends) and `fill_sparse_holes` (to
+    /// stop reading CAS bytes past a truncate boundary). Always <= original_size.
+    pub effective_original_size: u64,
     /// Sorted, non-overlapping dirty byte ranges (start, end), in current-file coordinates.
     pub dirty_ranges: Vec<(u64, u64)>,
 }
@@ -172,6 +180,7 @@ impl SparseWriteState {
         Self {
             original_hash,
             original_size,
+            effective_original_size: original_size,
             dirty_ranges: Vec::new(),
         }
     }
@@ -183,12 +192,12 @@ impl SparseWriteState {
         if len == 0 {
             return;
         }
-        // If writing past original_size, extend the range back to original_size.
-        // The gap [original_size, offset) is zeros in the sparse staging file and
-        // must be included in dirty_inputs so upload_ranges doesn't miss them
-        // (CAS has no data beyond original_size).
-        let mut new_start = if offset > self.original_size {
-            self.original_size
+        // If writing past the live region, extend the range back to its end.
+        // The gap [effective_original_size, offset) is zeros in the sparse staging
+        // file (either never-touched holes, or zeroed by a prior truncate) and must
+        // be included in dirty_inputs so upload_ranges doesn't miss them.
+        let mut new_start = if offset > self.effective_original_size {
+            self.effective_original_size
         } else {
             offset
         };
@@ -210,7 +219,7 @@ impl SparseWriteState {
     }
 
     /// Remove dirty ranges past `new_size` and cap overlapping ones.
-    pub fn trim_dirty_ranges(&mut self, new_size: u64) {
+    fn trim_dirty_ranges(&mut self, new_size: u64) {
         self.dirty_ranges.retain_mut(|&mut (ref s, ref mut e)| {
             if *s >= new_size {
                 return false;
@@ -220,10 +229,12 @@ impl SparseWriteState {
         });
     }
 
-    /// Clip the sparse state to a new (smaller) file size.
-    /// Removes dirty ranges past new_size, caps original_size.
+    /// Clip the sparse state to a new (smaller) file size after a truncate-shrink.
+    /// Removes dirty ranges past `new_size` and lowers `effective_original_size`
+    /// so subsequent writes past the new EOF zero-fill the gap correctly.
+    /// `original_size` is left untouched — it is the immutable CAS object size.
     pub fn clip_to_size(&mut self, new_size: u64) {
-        self.original_size = self.original_size.min(new_size);
+        self.effective_original_size = self.effective_original_size.min(new_size);
         self.trim_dirty_ranges(new_size);
     }
 }
@@ -2711,7 +2722,10 @@ mod tests {
         sw.track_write(10, 10);
         sw.track_write(50, 10);
         sw.clip_to_size(30);
-        assert_eq!(sw.original_size, 30);
+        // original_size is the immutable CAS object size — clip only affects
+        // effective_original_size and trims dirty ranges.
+        assert_eq!(sw.original_size, 100);
+        assert_eq!(sw.effective_original_size, 30);
         assert_eq!(sw.dirty_ranges, vec![(10, 20)]);
     }
 
@@ -2723,7 +2737,8 @@ mod tests {
         let mut sw = SparseWriteState::new("h".into(), 100);
         sw.track_write(5, 10);
         sw.clip_to_size(10);
-        assert_eq!(sw.original_size, 10);
+        assert_eq!(sw.original_size, 100);
+        assert_eq!(sw.effective_original_size, 10);
         assert_eq!(sw.dirty_ranges, vec![(5, 10)]);
     }
 
@@ -2734,7 +2749,21 @@ mod tests {
         sw.track_write(10, 10);
         sw.clip_to_size(100);
         assert_eq!(sw.original_size, 50);
+        assert_eq!(sw.effective_original_size, 50);
         assert_eq!(sw.dirty_ranges, vec![(10, 20)]);
+    }
+
+    // After a truncate-shrink, a write past the new EOF must extend the dirty
+    // range back to `effective_original_size` (not `original_size`), so the
+    // intervening zero-gap is included in the upload composition.
+    #[test]
+    fn sparse_track_write_past_effective_eof_after_shrink() {
+        let mut sw = SparseWriteState::new("h".into(), 100);
+        sw.clip_to_size(20);
+        assert_eq!(sw.original_size, 100);
+        assert_eq!(sw.effective_original_size, 20);
+        sw.track_write(50, 5);
+        assert_eq!(sw.dirty_ranges, vec![(20, 55)]);
     }
 
     //  0                              100
@@ -2785,7 +2814,8 @@ mod tests {
         sw.track_write(10, 10);
         sw.track_write(50, 10);
         sw.clip_to_size(0);
-        assert_eq!(sw.original_size, 0);
+        assert_eq!(sw.original_size, 100);
+        assert_eq!(sw.effective_original_size, 0);
         assert!(sw.dirty_ranges.is_empty());
     }
 

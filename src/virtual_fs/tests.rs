@@ -5428,7 +5428,8 @@ fn sparse_open_with_truncate_clears_state() {
     });
 }
 
-/// setattr(truncate to N < original_size) trims dirty ranges and clips original_size.
+/// setattr(truncate to N < original_size) trims dirty ranges and clips effective_original_size
+/// (but leaves original_size — the immutable CAS object size — intact).
 #[test]
 fn sparse_setattr_shrink_clips_state() {
     let hub = MockHub::new();
@@ -5450,7 +5451,11 @@ fn sparse_setattr_shrink_clips_state() {
             let inodes = vfs.inode_table.read().unwrap();
             let entry = inodes.get(ino).unwrap();
             let sw = entry.sparse_write.as_ref().expect("sparse_write preserved on shrink");
-            assert_eq!(sw.original_size, 5);
+            assert_eq!(sw.original_size, 10, "original_size is the immutable CAS size");
+            assert_eq!(
+                sw.effective_original_size, 5,
+                "effective_original_size clipped to truncate target"
+            );
             assert!(sw.dirty_ranges.is_empty(), "dirty ranges past 5 are trimmed");
         }
 

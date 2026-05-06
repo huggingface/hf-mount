@@ -2061,7 +2061,7 @@ impl VirtualFs {
         offset: u64,
     ) -> Result<(), i32> {
         let read_end = offset + buffer.len() as u64;
-        let orig_end = sparse_write_state.original_size.min(read_end);
+        let orig_end = sparse_write_state.effective_original_size.min(read_end);
         if offset >= orig_end {
             return Ok(());
         }

@@ -261,6 +261,13 @@ async fn flush_pending_deletes(queue: &Mutex<Vec<String>>, hub_client: &dyn HubO
     }
 }
 
+fn abort_batch(items: &[FlushItem], flush_errors: &Mutex<HashMap<u64, String>>, msg: String) {
+    let mut errs = flush_errors.lock().expect("flush_errors poisoned");
+    for it in items {
+        errs.insert(it.ino, msg.clone());
+    }
+}
+
 struct FlushItem {
     ino: u64,
     full_path: String,
@@ -379,19 +386,11 @@ async fn flush_batch(
                     upload_results.push(file_info);
                 }
                 Err(e) => {
-                    // Don't fall back to download_to_file: that would overwrite the
-                    // staging file (which contains the user's dirty writes) with the
-                    // original CAS content, silently losing data. Let the error
-                    // propagate so the flush can be retried.
                     error!(
                         "flush: range_upload failed ino={} path={}: {}",
                         item.ino, item.full_path, e
                     );
-                    let msg = format!("range_upload failed: {e}");
-                    let mut errs = flush_errors.lock().expect("flush_errors poisoned");
-                    for it in &to_flush {
-                        errs.insert(it.ino, msg.clone());
-                    }
+                    abort_batch(&to_flush, flush_errors, format!("range_upload failed: {e}"));
                     return;
                 }
             }
@@ -419,14 +418,8 @@ async fn flush_batch(
                 upload_results.extend(results);
             }
             Err(e) => {
-                // Abort the entire batch: committing partial results could apply
-                // deletes without the corresponding adds from this failed chunk.
                 error!("Batch upload failed, aborting flush: {}", e);
-                let msg = format!("upload failed: {e}");
-                let mut errs = flush_errors.lock().expect("flush_errors poisoned");
-                for it in &to_flush {
-                    errs.insert(it.ino, msg.clone());
-                }
+                abort_batch(&to_flush, flush_errors, format!("upload failed: {e}"));
                 return;
             }
         }
