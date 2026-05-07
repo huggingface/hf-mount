@@ -599,7 +599,7 @@ impl HubApiClient {
 
     async fn list_tree_bucket(&self, bucket_id: &str, prefix: &str) -> Result<Vec<TreeEntry>> {
         let mut all_entries = Vec::new();
-        let recursive_param = "?recursive=false&limit=10000";
+        let recursive_param = "?recursive=false&limit=5000";
         let mut url = if prefix.is_empty() {
             format!("{}/api/buckets/{}/tree{recursive_param}", self.endpoint, bucket_id)
         } else {
