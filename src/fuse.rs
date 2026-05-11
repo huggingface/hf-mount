@@ -671,14 +671,41 @@ pub fn mount_fuse(
     };
     let notifier = session.notifier();
     let notifier_for_inode = notifier.clone();
+    // `inval_inode` is a synchronous writev to /dev/fuse that maps to
+    // `invalidate_inode_pages2_range` on the kernel side, which locks folios
+    // and waits on per-folio bits. Under contention it can take seconds and
+    // has been observed to block indefinitely (folio_wait_bit_common). Log
+    // every call that crosses the threshold so the next time a pod wedges we
+    // get a smoking-gun entry in `kubectl logs` instead of silence.
     setup.virtual_fs.set_invalidator(Box::new(move |ino| {
-        if let Err(e) = notifier_for_inode.inval_inode(fuser::INodeNo(ino), 0, -1) {
-            tracing::debug!("inval_inode({}) failed: {}", ino, e);
+        let started = std::time::Instant::now();
+        let result = notifier_for_inode.inval_inode(fuser::INodeNo(ino), 0, -1);
+        let elapsed = started.elapsed();
+        if elapsed >= std::time::Duration::from_millis(500) {
+            tracing::warn!(
+                "inval_inode(ino={}) SLOW: took {} ms (kernel folio contention?)",
+                ino,
+                elapsed.as_millis()
+            );
+        }
+        if let Err(e) = result {
+            tracing::debug!("inval_inode({}) failed after {} ms: {}", ino, elapsed.as_millis(), e);
         }
     }));
     setup.virtual_fs.set_entry_invalidator(Box::new(move |parent, name| {
         let name_os = std::ffi::OsStr::new(name);
-        match notifier.inval_entry(fuser::INodeNo(parent), name_os) {
+        let started = std::time::Instant::now();
+        let result = notifier.inval_entry(fuser::INodeNo(parent), name_os);
+        let elapsed = started.elapsed();
+        if elapsed >= std::time::Duration::from_millis(500) {
+            tracing::warn!(
+                "inval_entry(parent={}, name={:?}) SLOW: took {} ms",
+                parent,
+                name,
+                elapsed.as_millis()
+            );
+        }
+        match result {
             Ok(()) => true,
             // ENOENT means the kernel already released the dentry — nothing
             // went wrong, keep sweeping.
