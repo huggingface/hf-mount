@@ -10,19 +10,22 @@ use crate::hub_api::HubOps;
 use super::Invalidator;
 use super::inode::{self, InodeTable};
 
-/// Cap on concurrent tree-listing requests per poll round. Without this, every loaded
-/// directory prefix is fetched in parallel, which produces a thundering-herd burst
-/// against the Hub API and triggers 504s on large mounts (e.g. transformers/docs).
-const POLL_TREE_LISTING_CONCURRENCY: usize = 4;
-
 impl super::VirtualFs {
     /// Background task: polls Hub API tree listing to detect remote changes.
+    ///
+    /// `listing_concurrency` caps concurrent tree-listing requests per poll
+    /// round. Without this, every loaded directory prefix is fetched in
+    /// parallel, which produces a thundering-herd burst against the Hub API
+    /// and triggers 504s on large mounts (e.g. transformers/docs). It is also
+    /// the main knob to throttle hf-mount's load on the Hub `/api` endpoint
+    /// when many mounts share the same upstream (e.g. Spaces).
     pub(super) async fn poll_remote_changes(
         hub_client: Arc<dyn HubOps>,
         inodes: Arc<RwLock<InodeTable>>,
         negative_cache: Arc<RwLock<HashMap<String, Instant>>>,
         invalidator: Invalidator,
         interval: Duration,
+        listing_concurrency: usize,
     ) {
         loop {
             tokio::time::sleep(interval).await;
@@ -40,7 +43,7 @@ impl super::VirtualFs {
                         (prefix, result)
                     }
                 })
-                .buffer_unordered(POLL_TREE_LISTING_CONCURRENCY)
+                .buffer_unordered(listing_concurrency)
                 .collect()
                 .await;
             let mut all_entries = Vec::new();

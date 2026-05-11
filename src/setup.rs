@@ -108,6 +108,15 @@ pub struct MountOptions {
     #[arg(long, default_value_t = 30)]
     pub poll_interval_secs: u64,
 
+    /// Maximum number of concurrent tree-listing requests per poll round.
+    /// Each loaded directory prefix issues one Hub API request; this cap
+    /// prevents thundering-herd bursts on large mounts (e.g. transformers/docs)
+    /// and is the main knob to throttle hf-mount's load on the Hub `/api`
+    /// endpoint. Lower it in shared environments (e.g. Spaces) where many
+    /// mounts poll in parallel.
+    #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u32).range(1..))]
+    pub poll_listing_concurrency: u32,
+
     /// Maximum size in bytes for the on-disk chunk cache.
     #[arg(long, default_value_t = 10_000_000_000)]
     pub cache_size: u64,
@@ -481,7 +490,8 @@ pub fn build_with_runtime(
         backend_name,
     );
     info!(
-        "Config: advanced_writes={} overlay={} remote_read_only={} direct_io={} poll_interval={}s metadata_ttl={}ms \
+        "Config: advanced_writes={} overlay={} remote_read_only={} direct_io={} poll_interval={}s \
+         poll_listing_concurrency={} metadata_ttl={}ms \
          cache_dir={:?} cache_size={} no_disk_cache={} cache_mode={:?} max_staging_size={} max_threads={} \
          flush_debounce={}ms flush_max_batch={}ms uid={} gid={} filter_os_files={}",
         advanced_writes,
@@ -489,6 +499,7 @@ pub fn build_with_runtime(
         remote_read_only,
         options.direct_io,
         options.poll_interval_secs,
+        options.poll_listing_concurrency,
         options.metadata_ttl_ms,
         options.cache_dir,
         options.cache_size,
@@ -518,6 +529,7 @@ pub fn build_with_runtime(
             uid,
             gid,
             poll_interval_secs: options.poll_interval_secs,
+            poll_listing_concurrency: options.poll_listing_concurrency as usize,
             metadata_ttl,
             serve_lookup_from_cache: !options.metadata_ttl_minimal,
             filter_os_files: !options.no_filter_os_files,
