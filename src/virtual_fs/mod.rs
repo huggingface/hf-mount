@@ -591,17 +591,21 @@ impl VirtualFs {
             }
         };
 
+        // Collect kernel invalidations to issue after we drop the inode_table
+        // write lock. `inval_inode` issues a synchronous writev to /dev/fuse that
+        // ends up in `invalidate_inode_pages2_range` on the kernel side, which
+        // blocks on per-folio waits. Calling it under the global write lock can
+        // stall the whole VFS (and has been observed to deadlock production
+        // pods). Apply the mutation, drop the lock, then notify.
+        let mut to_invalidate: Vec<u64> = Vec::new();
         match remote {
             None => {
                 // File deleted remotely → remove from inode table
                 info!("Remote deletion detected via HEAD: {}", full_path);
                 let mut inodes = self.inode_table.write().expect("inodes poisoned");
                 if let Some(entry) = inodes.get(ino) {
-                    let parent_ino = entry.parent;
-                    if let Some(invalidate) = self.invalidator.get() {
-                        invalidate(parent_ino);
-                        invalidate(ino);
-                    }
+                    to_invalidate.push(entry.parent);
+                    to_invalidate.push(ino);
                 }
                 inodes.remove(ino);
             }
@@ -636,9 +640,7 @@ impl VirtualFs {
                         remote_size,
                         remote_mtime,
                     );
-                    if let Some(invalidate) = self.invalidator.get() {
-                        invalidate(ino);
-                    }
+                    to_invalidate.push(ino);
                 } else {
                     // Update stored etag even when content didn't change,
                     // so future revalidations have the latest value.
@@ -652,6 +654,17 @@ impl VirtualFs {
                 if let Some(entry) = inodes.get_mut(ino) {
                     entry.last_revalidated = Some(Instant::now());
                 }
+            }
+        }
+
+        // Drop happened at scope end above. Notify after the new state is
+        // published so a racing lookup repopulating the kernel cache cannot
+        // beat the invalidation.
+        if !to_invalidate.is_empty()
+            && let Some(invalidate) = self.invalidator.get()
+        {
+            for ino in to_invalidate {
+                invalidate(ino);
             }
         }
     }
