@@ -75,6 +75,9 @@ pub struct VfsConfig {
     pub uid: u32,
     pub gid: u32,
     pub poll_interval_secs: u64,
+    /// Maximum concurrent tree-listing requests per poll round.
+    /// Must be >= 1.
+    pub poll_listing_concurrency: usize,
     pub metadata_ttl: Duration,
     pub serve_lookup_from_cache: bool,
     pub filter_os_files: bool,
@@ -221,6 +224,8 @@ impl VirtualFs {
             let bg_neg_cache = negative_cache.clone();
             let bg_invalidator = invalidator.clone();
             let interval = Duration::from_secs(config.poll_interval_secs);
+            // Clamp to >= 1 in case a caller (library use) constructs VfsConfig directly.
+            let listing_concurrency = config.poll_listing_concurrency.max(1);
 
             Some(runtime.spawn(Self::poll_remote_changes(
                 bg_hub,
@@ -228,6 +233,7 @@ impl VirtualFs {
                 bg_neg_cache,
                 bg_invalidator,
                 interval,
+                listing_concurrency,
             )))
         } else {
             None
