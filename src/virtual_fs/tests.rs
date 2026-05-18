@@ -2732,6 +2732,51 @@ fn poll_detects_file_update_in_loaded_dir() {
     });
 }
 
+/// Regression for #160: poll calls the invalidator with the changed inode.
+///
+/// The NFS adapter relies on this callback to evict its pooled file handle —
+/// pooled handles bind to the xet_hash captured at open() time, so without
+/// eviction subsequent reads serve pre-update content while `stat` already
+/// reports the new size.
+#[test]
+fn poll_calls_invalidator_for_updated_file() {
+    let hub = MockHub::new_repo();
+    hub.add_file("data.txt", 10, Some("old_hash"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_repo(&hub, &xet);
+
+    let invalidated: Arc<std::sync::Mutex<Vec<u64>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    {
+        let sink = invalidated.clone();
+        vfs.set_invalidator(Box::new(move |ino| {
+            sink.lock().unwrap().push(ino);
+        }));
+    }
+
+    rt.block_on(async {
+        let attr = vfs.lookup(ROOT_INODE, "data.txt").await.unwrap();
+        let ino = attr.ino;
+
+        // Remote update: same path, new hash and size.
+        hub.add_file("data.txt", 99, Some("new_hash"), None);
+
+        let prefixes = vfs.inode_table.read().unwrap().loaded_dir_prefixes();
+        let mut remote = Vec::new();
+        for prefix in &prefixes {
+            remote.extend(hub.list_tree(prefix).await.unwrap());
+        }
+        let polled: std::collections::HashSet<String> = prefixes.into_iter().collect();
+        VirtualFs::apply_poll_diff(remote, &polled, &vfs.inode_table, &vfs.negative_cache, &vfs.invalidator);
+
+        let calls = invalidated.lock().unwrap();
+        assert!(
+            calls.contains(&ino),
+            "invalidator must be called for the updated inode (got {:?})",
+            *calls,
+        );
+    });
+}
+
 /// Poll detects a remote file deletion in a loaded directory.
 #[test]
 fn poll_detects_file_deletion_in_loaded_dir() {
