@@ -443,6 +443,29 @@ pub async fn mount_nfs(
     let vfs_for_shutdown = virtual_fs.clone();
     let adapter = NFSAdapter::new(virtual_fs, read_only);
     let pool_for_shutdown = adapter.handle_pool.clone();
+
+    // When the poll loop detects a remote change on `ino`, drop the pooled
+    // file handle. Pooled handles are bound to the xet_hash captured at
+    // open() time (see `open_lazy`); without eviction, subsequent NFS reads
+    // keep streaming the pre-update content even though `stat()` already
+    // reports the new size — see issue #160.
+    {
+        let pool = pool_for_shutdown.clone();
+        let vfs = vfs_for_shutdown.clone();
+        let rt = tokio::runtime::Handle::current();
+        vfs_for_shutdown.set_invalidator(Box::new(move |ino| {
+            let evicted = pool.lock().expect("handle_pool poisoned").remove(ino);
+            if let Some(fh) = evicted {
+                let vfs = vfs.clone();
+                rt.spawn(async move {
+                    if let Err(e) = vfs.release(fh).await {
+                        tracing::debug!("NFS invalidator: release ino={} failed: errno={}", ino, e);
+                    }
+                });
+            }
+        }));
+    }
+
     let mut listener = NFSTcpListener::bind("127.0.0.1:0", adapter).await?;
     let port = listener.get_listen_port();
     info!("NFS server listening on 127.0.0.1:{}", port);
