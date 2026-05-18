@@ -449,22 +449,20 @@ pub async fn mount_nfs(
     // open() time (see `open_lazy`); without eviction, subsequent NFS reads
     // keep streaming the pre-update content even though `stat()` already
     // reports the new size — see issue #160.
-    {
-        let pool = pool_for_shutdown.clone();
-        let vfs = vfs_for_shutdown.clone();
-        let rt = tokio::runtime::Handle::current();
-        vfs_for_shutdown.set_invalidator(Box::new(move |ino| {
-            let evicted = pool.lock().expect("handle_pool poisoned").remove(ino);
-            if let Some(fh) = evicted {
-                let vfs = vfs.clone();
-                rt.spawn(async move {
-                    if let Err(e) = vfs.release(fh).await {
-                        tracing::debug!("NFS invalidator: release ino={} failed: errno={}", ino, e);
-                    }
-                });
+    let pool = pool_for_shutdown.clone();
+    let vfs = vfs_for_shutdown.clone();
+    let rt = tokio::runtime::Handle::current();
+    vfs_for_shutdown.set_invalidator(Box::new(move |ino| {
+        let Some(fh) = pool.lock().expect("handle_pool poisoned").remove(ino) else {
+            return;
+        };
+        let vfs = vfs.clone();
+        rt.spawn(async move {
+            if let Err(e) = vfs.release(fh).await {
+                tracing::debug!("NFS invalidator: release ino={} failed: errno={}", ino, e);
             }
-        }));
-    }
+        });
+    }));
 
     let mut listener = NFSTcpListener::bind("127.0.0.1:0", adapter).await?;
     let port = listener.get_listen_port();
