@@ -135,9 +135,10 @@ pub struct InodeEntry {
     pub children_from_remote: bool,
     pub children: Vec<DirChild>,
     /// Name → ino lookup for `lookup_child`. Kept in sync with `children`
-    /// so a directory with thousands of entries (large model repos) doesn't
-    /// pay O(N) on every dentry probe.
-    pub child_index: HashMap<Arc<str>, u64>,
+    /// via the `add_child` / `remove_child_*` helpers so a directory with
+    /// thousands of entries (large model repos) doesn't pay O(N) on every
+    /// dentry probe.
+    pub(crate) child_index: HashMap<Arc<str>, u64>,
     /// Old remote paths that should be deleted on next flush (set by rename of dirty files).
     pub pending_deletes: Vec<String>,
     /// When this inode's metadata was last validated against the remote (via HEAD).
@@ -151,6 +152,37 @@ impl InodeEntry {
     /// Returns true if this inode has uncommitted changes.
     pub fn is_dirty(&self) -> bool {
         self.dirty_generation > 0
+    }
+
+    /// Append a child to this directory and register it in the lookup index.
+    /// `name` is moved into both structures (shared `Arc`).
+    pub(crate) fn add_child(&mut self, ino: u64, name: Arc<str>) {
+        self.child_index.insert(name.clone(), ino);
+        self.children.push(DirChild { ino, name });
+    }
+
+    /// Remove a child by ino. Returns the removed name (for callers that
+    /// need to fix up external state).
+    pub(crate) fn remove_child_by_ino(&mut self, ino: u64) -> Option<Arc<str>> {
+        let pos = self.children.iter().position(|c| c.ino == ino)?;
+        let removed = self.children.remove(pos);
+        self.child_index.remove(&removed.name);
+        Some(removed.name)
+    }
+
+    /// Remove a child by name. Returns the removed ino.
+    pub(crate) fn remove_child_by_name(&mut self, name: &str) -> Option<u64> {
+        let ino = self.child_index.remove(name)?;
+        if let Some(pos) = self.children.iter().position(|c| c.ino == ino) {
+            self.children.remove(pos);
+        }
+        Some(ino)
+    }
+
+    /// Drop excess capacity from both child stores after a bulk removal.
+    pub(crate) fn shrink_children(&mut self) {
+        self.children.shrink_to_fit();
+        self.child_index.shrink_to_fit();
     }
 
     /// Returns true if the children listing has been populated. Only
@@ -461,8 +493,7 @@ impl InodeTable {
         self.path_to_inode.remove(&*entry.full_path);
 
         if let Some(parent) = self.inodes.get_mut(&entry.parent) {
-            parent.children.retain(|c| c.ino != ino);
-            parent.child_index.remove(&entry.name);
+            parent.remove_child_by_ino(ino);
             // Force readdir to re-fetch so the inode can be re-materialized
             // on next access. Without this the kernel would ask for a child
             // that no longer exists in our in-memory tree.
@@ -494,15 +525,13 @@ impl InodeTable {
         }
 
         let mut evicted = Vec::new();
-        let mut names_per_parent: HashMap<u64, Vec<Arc<str>>> = HashMap::new();
         for (parent_ino, set) in &by_parent {
             for &ino in set {
                 if let Some(entry) = self.inodes.remove(&ino) {
                     self.path_to_inode.remove(&*entry.full_path);
-                    names_per_parent
-                        .entry(*parent_ino)
-                        .or_default()
-                        .push(entry.name.clone());
+                    if let Some(parent) = self.inodes.get_mut(parent_ino) {
+                        parent.child_index.remove(&entry.name);
+                    }
                     evicted.push(ino);
                 }
             }
@@ -510,12 +539,7 @@ impl InodeTable {
         for (parent_ino, evicted_set) in &by_parent {
             if let Some(parent) = self.inodes.get_mut(parent_ino) {
                 parent.children.retain(|c| !evicted_set.contains(&c.ino));
-                parent.children.shrink_to_fit();
-                if let Some(names) = names_per_parent.get(parent_ino) {
-                    for name in names {
-                        parent.child_index.remove(name);
-                    }
-                }
+                parent.shrink_children();
                 // Force readdir to re-fetch the listing so evicted inodes can
                 // be re-materialized on next access.
                 parent.children_loaded_at = None;
@@ -529,7 +553,6 @@ impl InodeTable {
     }
 
     /// Find a child of `parent` by name. O(1) via `child_index`.
-    /// A stale index entry (inode already removed) returns None.
     pub fn lookup_child(&self, parent: u64, name: &str) -> Option<&InodeEntry> {
         let parent_entry = self.inodes.get(&parent)?;
         let ino = *parent_entry.child_index.get(name)?;
@@ -623,11 +646,7 @@ impl InodeTable {
 
         // Add to parent's children
         if let Some(parent_entry) = self.inodes.get_mut(&parent) {
-            parent_entry.child_index.insert(name_arc.clone(), inode);
-            parent_entry.children.push(DirChild {
-                ino: inode,
-                name: name_arc,
-            });
+            parent_entry.add_child(inode, name_arc);
             // POSIX: new subdirectory's ".." links to parent
             if kind == InodeKind::Directory {
                 parent_entry.nlink += 1;
@@ -809,13 +828,11 @@ impl InodeTable {
         &mut self,
         parent_ino: u64,
         child_ino: u64,
-        child_name: &str,
         child_kind: InodeKind,
         invalidate_children_loaded: bool,
     ) {
         if let Some(parent) = self.inodes.get_mut(&parent_ino) {
-            parent.children.retain(|c| c.ino != child_ino);
-            parent.child_index.remove(child_name);
+            parent.remove_child_by_ino(child_ino);
             if invalidate_children_loaded {
                 parent.children_loaded_at = None;
             }
@@ -832,7 +849,7 @@ impl InodeTable {
     pub fn remove(&mut self, inode: u64) -> Option<InodeEntry> {
         let entry = self.inodes.remove(&inode)?;
         self.path_to_inode.remove(&*entry.full_path);
-        self.detach_from_parent(entry.parent, inode, &entry.name, entry.kind, false);
+        self.detach_from_parent(entry.parent, inode, entry.kind, false);
 
         // Recursively remove all descendants to avoid orphans
         let mut stack: Vec<u64> = entry.children.iter().map(|c| c.ino).collect();
@@ -861,12 +878,8 @@ impl InodeTable {
             (ino, path)
         };
 
-        // Remove the DirChild from parent
-        if let Some(parent_entry) = self.inodes.get_mut(&parent)
-            && let Some(pos) = parent_entry.children.iter().position(|c| &*c.name == name)
-        {
-            parent_entry.children.remove(pos);
-            parent_entry.child_index.remove(name);
+        if let Some(parent_entry) = self.inodes.get_mut(&parent) {
+            parent_entry.remove_child_by_name(name);
         }
 
         self.path_to_inode.remove(full_path.as_str());
@@ -890,11 +903,8 @@ impl InodeTable {
         let is_dir = self.inodes.get(&ino).is_some_and(|e| e.kind == InodeKind::Directory);
 
         // Detach from old parent
-        if let Some(old_p) = self.inodes.get_mut(&old_parent)
-            && let Some(pos) = old_p.children.iter().position(|c| c.ino == ino && &*c.name == old_name)
-        {
-            old_p.children.remove(pos);
-            old_p.child_index.remove(old_name);
+        if let Some(old_p) = self.inodes.get_mut(&old_parent) {
+            old_p.remove_child_by_name(old_name);
         }
 
         // Allocate the new name once, share with the InodeEntry below.
@@ -902,11 +912,7 @@ impl InodeTable {
 
         // Attach to new parent
         if let Some(new_p) = self.inodes.get_mut(&new_parent) {
-            new_p.child_index.insert(new_name_arc.clone(), ino);
-            new_p.children.push(DirChild {
-                ino,
-                name: new_name_arc.clone(),
-            });
+            new_p.add_child(ino, new_name_arc.clone());
         }
 
         // Adjust parent nlink for cross-parent directory moves
