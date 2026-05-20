@@ -45,21 +45,14 @@ impl super::VirtualFs {
             tokio::time::sleep(interval.saturating_mul(1u32 << auth_backoff_exp)).await;
 
             // Cheap probe: if the source hasn't changed since last poll, skip the
-            // full fan-out entirely. On probe error or unsupported source, fall
-            // through to the full fan-out — the probe is an optimization, not a gate.
+            // full fan-out entirely. On probe error, fall through to the full
+            // fan-out — the probe is an optimization, not a gate.
             match hub_client.probe_revision().await {
-                Ok(Some(rev)) => {
+                Ok(rev) => {
                     if last_revision.as_ref() == Some(&rev) {
                         continue;
                     }
                     last_revision = Some(rev);
-                }
-                Ok(None) => {
-                    // Production HubApiClient always returns Some (sha/lastModified
-                    // for repos, updatedAt for buckets). Reaching this branch in
-                    // prod means the Hub stopped exposing those fields — fall
-                    // through to the full fan-out and warn so we notice.
-                    warn!("Revision probe returned no token; falling back to full poll");
                 }
                 Err(e) => {
                     if matches!(e, Error::Hub { status: Some(401), .. }) {

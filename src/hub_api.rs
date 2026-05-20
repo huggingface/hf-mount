@@ -29,11 +29,11 @@ pub trait HubOps: Send + Sync {
     /// buckets it is `updatedAt`. The poll loop uses this to skip the full
     /// tree-listing fan-out when nothing has changed.
     ///
-    /// Returns `Ok(None)` if the source doesn't expose a revision token (in
-    /// which case the poll loop always fans out). Errors fall through to a
-    /// full fan-out as well — the probe is an optimization, not a gate.
-    async fn probe_revision(&self) -> Result<Option<String>> {
-        Ok(None)
+    /// Errors fall through to a full fan-out — the probe is an optimization,
+    /// not a gate. The default impl errors out so mocks that don't care about
+    /// the probe path keep doing full polls.
+    async fn probe_revision(&self) -> Result<String> {
+        Err(Error::hub("probe_revision not implemented"))
     }
 }
 
@@ -601,7 +601,9 @@ impl HubApiClient {
     ///
     /// Repos: prefer `sha` (commit head) — changes on every push and only on
     /// pushes. Buckets: `updatedAt` — set by Hub on every bucket mutation.
-    pub async fn probe_revision(&self) -> Result<Option<String>> {
+    /// Errors if the Hub response omits the expected field (should not happen
+    /// against the production Hub).
+    pub async fn probe_revision(&self) -> Result<String> {
         let url = match &self.source {
             SourceKind::Repo { repo_id, repo_type, .. } => {
                 format!("{}/api/{}/{}", self.endpoint, repo_type.api_prefix(), repo_id)
@@ -612,11 +614,15 @@ impl HubApiClient {
         };
         let resp = send_with_retry(|| self.auth(self.client.get(&url)), "revision probe", false).await?;
         let probe: RevisionProbe = resp.json().await?;
-        let token = match &self.source {
-            SourceKind::Repo { .. } => probe.sha.or(probe.last_modified),
-            SourceKind::Bucket { .. } => probe.updated_at,
-        };
-        Ok(token)
+        match &self.source {
+            SourceKind::Repo { .. } => probe
+                .sha
+                .or(probe.last_modified)
+                .ok_or_else(|| Error::hub("revision probe: repo response missing sha and lastModified")),
+            SourceKind::Bucket { .. } => probe
+                .updated_at
+                .ok_or_else(|| Error::hub("revision probe: bucket response missing updatedAt")),
+        }
     }
 
     /// List tree entries at the given prefix (single directory level).
@@ -1049,7 +1055,7 @@ impl HubOps for HubApiClient {
     fn is_repo(&self) -> bool {
         self.is_repo()
     }
-    async fn probe_revision(&self) -> Result<Option<String>> {
+    async fn probe_revision(&self) -> Result<String> {
         self.probe_revision().await
     }
 }
