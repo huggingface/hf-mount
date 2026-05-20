@@ -24,12 +24,12 @@ const MAX_CACHE_ENTRIES: usize = 4096;
 const CACHE_TTL: Duration = Duration::from_secs(59 * 60);
 
 struct CacheEntry {
-    response: QueryReconstructionResponseV2,
+    response: Arc<QueryReconstructionResponseV2>,
     inserted_at: Instant,
 }
 
 impl CacheEntry {
-    fn new(response: QueryReconstructionResponseV2) -> Self {
+    fn new(response: Arc<QueryReconstructionResponseV2>) -> Self {
         Self {
             response,
             inserted_at: Instant::now(),
@@ -156,8 +156,8 @@ impl Client for CachedXetClient {
             // at chunk granularity) than what derive_range_response produces from the
             // full plan, so prefer it when available.
             enum CacheResult {
-                ExactHit(QueryReconstructionResponseV2),
-                FullPlan(QueryReconstructionResponseV2, FileRange),
+                ExactHit(Arc<QueryReconstructionResponseV2>),
+                FullPlan(Arc<QueryReconstructionResponseV2>, FileRange),
                 Miss,
             }
 
@@ -194,7 +194,7 @@ impl Client for CachedXetClient {
                         bytes_range,
                         resp.terms.len()
                     );
-                    return Ok(Some(resp));
+                    return Ok(Some((*resp).clone()));
                 }
                 CacheResult::FullPlan(full, range) => {
                     let resp = derive_range_response(&full, range);
@@ -260,7 +260,7 @@ impl Client for CachedXetClient {
                                 }
                             }
                         }
-                        cache.insert(key, CacheEntry::new(response.clone()));
+                        cache.insert(key, CacheEntry::new(Arc::new(response.clone())));
                     }
 
                     // Notify waiters and clean up.
