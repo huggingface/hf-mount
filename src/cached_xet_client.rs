@@ -25,14 +25,21 @@ const CACHE_TTL: Duration = Duration::from_secs(59 * 60);
 
 struct CacheEntry {
     response: Arc<QueryReconstructionResponseV2>,
+    /// When the CAS response was received. Used for TTL (presigned URLs in
+    /// `terms` expire ~1h after the server issued them). Not updated on hit.
     inserted_at: Instant,
+    /// Bumped on every cache hit. Used to pick the eviction victim under
+    /// overflow — keeps hot entries warm even if they were inserted long ago.
+    last_accessed: Instant,
 }
 
 impl CacheEntry {
     fn new(response: Arc<QueryReconstructionResponseV2>) -> Self {
+        let now = Instant::now();
         Self {
             response,
-            inserted_at: Instant::now(),
+            inserted_at: now,
+            last_accessed: now,
         }
     }
 
@@ -164,14 +171,20 @@ impl Client for CachedXetClient {
             let cached = {
                 let mut cache = self.cache.lock().expect("cache poisoned");
 
-                let try_get = |cache: &mut HashMap<ReconCacheKey, CacheEntry>, key: ReconCacheKey| match cache.get(&key)
-                {
-                    Some(entry) if entry.is_valid(self.ttl) => Some(entry.response.clone()),
-                    Some(_) => {
-                        cache.remove(&key);
-                        None
+                let try_get = |cache: &mut HashMap<ReconCacheKey, CacheEntry>,
+                               key: ReconCacheKey|
+                 -> Option<Arc<QueryReconstructionResponseV2>> {
+                    match cache.get_mut(&key) {
+                        Some(entry) if entry.is_valid(self.ttl) => {
+                            entry.last_accessed = Instant::now();
+                            Some(entry.response.clone())
+                        }
+                        Some(_) => {
+                            cache.remove(&key);
+                            None
+                        }
+                        None => None,
                     }
-                    None => None,
                 };
 
                 if let Some(resp) = try_get(&mut cache, key) {
@@ -252,10 +265,13 @@ impl Client for CachedXetClient {
                             // First pass: evict range entries (less valuable than full plans).
                             cache.retain(|(_hash, range), _| range.is_none());
                             if cache.len() >= MAX_CACHE_ENTRIES {
-                                // Still full (all full plans). Evict one arbitrary entry
-                                // to make room — never skip the insert, as single-flight
-                                // waiters expect the result to be in cache.
-                                if let Some(victim) = cache.keys().next().copied() {
+                                // Still full (all full plans). Evict the LRU victim — keeps
+                                // hot plans warm even if they were inserted long ago.
+                                let victim = cache
+                                    .iter()
+                                    .min_by_key(|(_, entry)| entry.last_accessed)
+                                    .map(|(k, _)| *k);
+                                if let Some(victim) = victim {
                                     cache.remove(&victim);
                                 }
                             }
@@ -561,6 +577,48 @@ mod tests {
         client.get_reconstruction(&key, None).await.unwrap();
 
         assert_eq!(inner_impl.call_count((key, None)), 2);
+    }
+
+    #[tokio::test]
+    async fn cache_evicts_lru_full_plan_on_overflow() {
+        let inner_impl = Arc::new(MockClient::new(MockMode::ReturnSome));
+        let inner: Arc<dyn Client> = inner_impl.clone();
+        let client = CachedXetClient::new(inner);
+
+        // Fill the cache with full plans, in order 0..N.
+        for i in 0..MAX_CACHE_ENTRIES {
+            client.get_reconstruction(&hash_for(i), None).await.unwrap();
+        }
+
+        // Bump entry 0 to make it the most-recently-accessed. Now entry 1
+        // should be the LRU victim.
+        client.get_reconstruction(&hash_for(0), None).await.unwrap();
+        assert_eq!(
+            inner_impl.call_count((hash_for(0), None)),
+            1,
+            "hit should not recall CAS"
+        );
+
+        // Overflow: triggers eviction of the LRU victim (entry 1).
+        let overflow = hash_for(MAX_CACHE_ENTRIES);
+        client.get_reconstruction(&overflow, None).await.unwrap();
+
+        // Entry 0 (recently touched) must survive.
+        client.get_reconstruction(&hash_for(0), None).await.unwrap();
+        assert_eq!(
+            inner_impl.call_count((hash_for(0), None)),
+            1,
+            "hot entry must survive LRU eviction"
+        );
+
+        // Entry 1 (least-recently-accessed) should have been evicted: another
+        // get re-fetches it from CAS.
+        client.get_reconstruction(&hash_for(1), None).await.unwrap();
+        assert_eq!(
+            inner_impl.call_count((hash_for(1), None)),
+            2,
+            "LRU victim must have been evicted"
+        );
     }
 
     #[tokio::test]
