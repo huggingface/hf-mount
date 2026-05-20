@@ -54,7 +54,13 @@ impl super::VirtualFs {
                     }
                     last_revision = Some(rev);
                 }
-                Ok(None) => {} // Source doesn't expose a revision token; always fan out.
+                Ok(None) => {
+                    // Production HubApiClient always returns Some (sha/lastModified
+                    // for repos, updatedAt for buckets). Reaching this branch in
+                    // prod means the Hub stopped exposing those fields — fall
+                    // through to the full fan-out and warn so we notice.
+                    warn!("Revision probe returned no token; falling back to full poll");
+                }
                 Err(e) => {
                     if matches!(e, Error::Hub { status: Some(401), .. }) {
                         auth_backoff_exp = (auth_backoff_exp + 1).min(MAX_AUTH_BACKOFF_EXP);
