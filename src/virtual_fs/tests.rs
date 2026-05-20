@@ -5241,3 +5241,59 @@ fn overlay_rmdir_remote_dir_eperm() {
         assert_eq!(err, libc::EPERM);
     });
 }
+
+// ── readdir snapshot vs cache microbench ───────────────────────────────
+//
+// Measures the per-readdir-call cost the FUSE adapter's dir_cache PR
+// (#172) is designed to avoid. Run with:
+//
+//   cargo test --release readdir_snapshot_vs_cache_cost -- --nocapture --ignored
+//
+// The cached-lookup column models what the patched fuse readdir does on
+// every paginated call (Mutex lookup + Arc::clone). The snapshot column
+// is what the kernel forced us to do once per paginated call before #172.
+#[test]
+#[ignore]
+fn readdir_snapshot_vs_cache_cost() {
+    use std::sync::Mutex;
+    use std::time::Instant;
+
+    for &n_children in &[100usize, 1000, 5000] {
+        let hub = MockHub::new();
+        for i in 0..n_children {
+            hub.add_file(&format!("file_{i:05}.bin"), 4096, Some("h"), None);
+        }
+        let xet = MockXet::new();
+        let (rt, vfs) = vfs_simple(&hub, &xet);
+
+        rt.block_on(async {
+            // Prime: warm up children_loaded.
+            let _ = vfs.readdir(ROOT_INODE).await.unwrap();
+
+            // Number of paginated calls the kernel typically makes for a dir
+            // this size (kernel reply buffer ~4-8 KiB / ~64 B per entry).
+            let pages = (n_children / 80).max(2);
+
+            // OLD: rebuild the snapshot on each call.
+            let t0 = Instant::now();
+            for _ in 0..pages {
+                let _ = vfs.readdir(ROOT_INODE).await.unwrap();
+            }
+            let old = t0.elapsed();
+
+            // NEW: snapshot once, lookup an Arc on each call.
+            let cache: Mutex<Option<Arc<Vec<VirtualFsDirEntry>>>> = Mutex::new(None);
+            *cache.lock().unwrap() = Some(Arc::new(vfs.readdir(ROOT_INODE).await.unwrap()));
+            let t0 = Instant::now();
+            for _ in 0..pages {
+                let _ = cache.lock().unwrap().as_ref().unwrap().clone();
+            }
+            let new = t0.elapsed();
+
+            eprintln!(
+                "n={n_children:5}  pages={pages:3}  old={old:>10.2?}  new={new:>10.2?}  ratio={:.1}x",
+                old.as_secs_f64() / new.as_secs_f64()
+            );
+        });
+    }
+}
