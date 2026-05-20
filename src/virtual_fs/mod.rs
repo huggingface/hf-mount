@@ -127,6 +127,10 @@ pub struct VirtualFs {
     inode_table: Arc<RwLock<InodeTable>>,
     /// Maps file_handle → OpenFile (local fd or lazy remote reference).
     open_files: Arc<RwLock<HashMap<u64, OpenFile>>>,
+    /// Directory readdir snapshots, keyed by the fh allocated in `opendir`.
+    /// Lets adapters serve paginated readdir from a stable snapshot without
+    /// re-walking the inode table under read lock on every kernel round-trip.
+    dir_snapshots: Mutex<HashMap<u64, Arc<Vec<VirtualFsDirEntry>>>>,
     next_file_handle: AtomicU64,
     uid: u32,
     gid: u32,
@@ -215,6 +219,7 @@ impl VirtualFs {
 
         // Create open_files before poll task so we can share with it
         let open_files: Arc<RwLock<HashMap<u64, OpenFile>>> = Arc::new(RwLock::new(HashMap::new()));
+        let dir_snapshots: Mutex<HashMap<u64, Arc<Vec<VirtualFsDirEntry>>>> = Mutex::new(HashMap::new());
 
         // Spawn remote change polling task (if interval > 0)
         let invalidator: Invalidator = Arc::new(OnceLock::new());
@@ -251,6 +256,7 @@ impl VirtualFs {
             advanced_writes: config.advanced_writes || overlay,
             inode_table: inodes,
             open_files,
+            dir_snapshots,
             next_file_handle: AtomicU64::new(1),
             uid: config.uid,
             gid: config.gid,
@@ -860,16 +866,39 @@ impl VirtualFs {
         self.next_file_handle.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// Bump the per-inode open-handle refcount. Used by the FUSE adapter
-    /// on `opendir` so a directory with an active readdir can't be evicted.
-    #[cfg(feature = "fuse")]
-    pub(crate) fn bump_open_handles(&self, ino: u64) {
+    /// Open a directory: snapshot the children once, allocate an fh, pin the
+    /// inode against eviction. Adapters that paginate readdir (FUSE, NFS) call
+    /// `readdir_snapshot(fh)` to serve subsequent kernel round-trips from the
+    /// snapshot instead of re-walking the inode table each time.
+    pub async fn opendir(&self, ino: u64) -> VirtualFsResult<u64> {
+        let attr = self.getattr(ino)?;
+        if attr.kind != InodeKind::Directory {
+            return Err(libc::ENOTDIR);
+        }
+        let entries = self.readdir(ino).await?;
+        let fh = self.alloc_file_handle();
         self.inode_table.read().expect("inodes poisoned").bump_open_handles(ino);
+        self.dir_snapshots
+            .lock()
+            .expect("dir_snapshots poisoned")
+            .insert(fh, Arc::new(entries));
+        Ok(fh)
     }
 
-    /// Counterpart to `bump_open_handles`, called from `releasedir`.
-    #[cfg(feature = "fuse")]
-    pub(crate) fn drop_open_handles(&self, ino: u64) {
+    /// Look up the cached snapshot for an opendir-allocated fh. Returns `None`
+    /// if the fh wasn't issued by `opendir` (or was already released); callers
+    /// should fall back to a live `readdir(ino)` snapshot in that case.
+    pub fn readdir_snapshot(&self, fh: u64) -> Option<Arc<Vec<VirtualFsDirEntry>>> {
+        self.dir_snapshots
+            .lock()
+            .expect("dir_snapshots poisoned")
+            .get(&fh)
+            .cloned()
+    }
+
+    /// Counterpart to `opendir`: drop the snapshot and the eviction pin.
+    pub fn releasedir(&self, ino: u64, fh: u64) {
+        self.dir_snapshots.lock().expect("dir_snapshots poisoned").remove(&fh);
         self.inode_table.read().expect("inodes poisoned").drop_open_handles(ino);
     }
 

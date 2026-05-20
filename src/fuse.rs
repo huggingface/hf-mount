@@ -1,11 +1,10 @@
-use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::io;
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use fuser::{
@@ -33,12 +32,6 @@ pub struct FuseAdapter {
     advanced_writes: bool,
     /// FOPEN_DIRECT_IO flag on open/create, bypassing kernel page cache.
     direct_io: bool,
-    /// Cached readdir snapshots keyed by directory file handle. Populated in
-    /// `opendir`, consumed by paginated `readdir` calls, dropped in `releasedir`.
-    /// Without this, the kernel's paginated readdir (3-4 round-trips on a
-    /// 1000+ entry dir) would re-snapshot the entire children list under the
-    /// inode table read lock each call.
-    dir_cache: Mutex<HashMap<u64, Arc<Vec<crate::virtual_fs::VirtualFsDirEntry>>>>,
 }
 
 impl FuseAdapter {
@@ -57,7 +50,6 @@ impl FuseAdapter {
             read_only,
             advanced_writes,
             direct_io,
-            dir_cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -217,10 +209,8 @@ impl Filesystem for FuseAdapter {
     }
 
     /// List directory entries from the snapshot captured at opendir.
-    /// `offset` is the index of the last entry already returned.
     fn readdir(&self, _req: &Request, ino: INodeNo, fh: FileHandle, offset: u64, mut reply: ReplyDirectory) {
-        let cached = self.dir_cache.lock().expect("dir_cache poisoned").get(&fh.0).cloned();
-        let entries = match cached {
+        let entries = match self.virtual_fs.readdir_snapshot(fh.0) {
             Some(arc) => arc,
             // Defensive: fuser always issues opendir before readdir, but fall
             // back to a live snapshot rather than EBADF on contract drift.
@@ -522,36 +512,15 @@ impl Filesystem for FuseAdapter {
         }
     }
 
-    /// Open a directory: snapshot the children list, register an fh.
     fn opendir(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
-        match self.virtual_fs.getattr(ino.0) {
-            Ok(attr) if attr.kind == InodeKind::Directory => {
-                // Pin the dir against eviction until the matching releasedir.
-                // Otherwise a concurrent force-evict could drop the inode
-                // between opendir and the readdir that follows.
-                self.virtual_fs.bump_open_handles(ino.0);
-                match self.runtime.block_on(self.virtual_fs.readdir(ino.0)) {
-                    Ok(entries) => {
-                        let fh = self.virtual_fs.alloc_file_handle();
-                        self.dir_cache.lock().expect("dir_cache poisoned").insert(fh, Arc::new(entries));
-                        reply.opened(FileHandle(fh), FopenFlags::empty());
-                    }
-                    Err(e) => {
-                        self.virtual_fs.drop_open_handles(ino.0);
-                        reply.error(Errno::from_i32(e));
-                    }
-                }
-            }
-            Ok(_) => reply.error(Errno::ENOTDIR),
+        match self.runtime.block_on(self.virtual_fs.opendir(ino.0)) {
+            Ok(fh) => reply.opened(FileHandle(fh), FopenFlags::empty()),
             Err(e) => reply.error(Errno::from_i32(e)),
         }
     }
 
-    /// Release a directory handle. Drops the refcount bumped by `opendir`
-    /// and the cached snapshot.
     fn releasedir(&self, _req: &Request, ino: INodeNo, fh: FileHandle, _flags: OpenFlags, reply: ReplyEmpty) {
-        self.dir_cache.lock().expect("dir_cache poisoned").remove(&fh.0);
-        self.virtual_fs.drop_open_handles(ino.0);
+        self.virtual_fs.releasedir(ino.0, fh.0);
         reply.ok();
     }
 
