@@ -217,15 +217,13 @@ impl Filesystem for FuseAdapter {
     }
 
     /// List directory entries from the snapshot captured at opendir.
-    /// `offset` is the index of the last entry already returned; entries
-    /// before it are skipped so the kernel can paginate large directories.
+    /// `offset` is the index of the last entry already returned.
     fn readdir(&self, _req: &Request, ino: INodeNo, fh: FileHandle, offset: u64, mut reply: ReplyDirectory) {
-        // Fast path: cached snapshot from opendir.
         let cached = self.dir_cache.lock().unwrap().get(&fh.0).cloned();
         let entries = match cached {
             Some(arc) => arc,
-            // Fallback: a readdir without a matching opendir (shouldn't happen
-            // for FUSE but be defensive). Snapshot on the fly.
+            // Defensive: fuser always issues opendir before readdir, but fall
+            // back to a live snapshot rather than EBADF on contract drift.
             None => match self.runtime.block_on(self.virtual_fs.readdir(ino.0)) {
                 Ok(v) => Arc::new(v),
                 Err(e) => {
@@ -234,7 +232,9 @@ impl Filesystem for FuseAdapter {
                 }
             },
         };
-        for (i, entry) in entries.iter().enumerate().skip(offset as usize) {
+        let offset = (offset as usize).min(entries.len());
+        for (idx, entry) in entries[offset..].iter().enumerate() {
+            let i = offset + idx;
             let file_type = match entry.kind {
                 InodeKind::File => FileType::RegularFile,
                 InodeKind::Directory => FileType::Directory,
@@ -522,9 +522,7 @@ impl Filesystem for FuseAdapter {
         }
     }
 
-    /// Open a directory (allocates a handle for readdir) and snapshot the
-    /// children list once. Paginated `readdir` calls then iterate the
-    /// snapshot instead of re-listing under the inode table read lock.
+    /// Open a directory: snapshot the children list, register an fh.
     fn opendir(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
         match self.virtual_fs.getattr(ino.0) {
             Ok(attr) if attr.kind == InodeKind::Directory => {
