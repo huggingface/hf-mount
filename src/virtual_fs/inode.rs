@@ -134,6 +134,10 @@ pub struct InodeEntry {
     /// create thousands of unique names under freshly-mkdir'd directories.
     pub children_from_remote: bool,
     pub children: Vec<DirChild>,
+    /// Name → ino lookup for `lookup_child`. Kept in sync with `children`
+    /// via the `add_child` / `remove_child_*` helpers so a directory with
+    /// thousands of entries doesn't pay O(N) on every dentry probe.
+    pub child_index: HashMap<Arc<str>, u64>,
     /// Old remote paths that should be deleted on next flush (set by rename of dirty files).
     pub pending_deletes: Vec<String>,
     /// When this inode's metadata was last validated against the remote (via HEAD).
@@ -147,6 +151,37 @@ impl InodeEntry {
     /// Returns true if this inode has uncommitted changes.
     pub fn is_dirty(&self) -> bool {
         self.dirty_generation > 0
+    }
+
+    /// Append a child to this directory and register it in the lookup index.
+    /// `name` is moved into both structures (shared `Arc`).
+    pub fn add_child(&mut self, ino: u64, name: Arc<str>) {
+        self.child_index.insert(name.clone(), ino);
+        self.children.push(DirChild { ino, name });
+    }
+
+    /// Remove a child by ino. Returns the removed name (for callers that
+    /// need to fix up external state).
+    pub fn remove_child_by_ino(&mut self, ino: u64) -> Option<Arc<str>> {
+        let pos = self.children.iter().position(|c| c.ino == ino)?;
+        let removed = self.children.remove(pos);
+        self.child_index.remove(&removed.name);
+        Some(removed.name)
+    }
+
+    /// Remove a child by name. Returns the removed ino.
+    pub fn remove_child_by_name(&mut self, name: &str) -> Option<u64> {
+        let ino = self.child_index.remove(name)?;
+        if let Some(pos) = self.children.iter().position(|c| c.ino == ino) {
+            self.children.remove(pos);
+        }
+        Some(ino)
+    }
+
+    /// Drop excess capacity from both child stores after a bulk removal.
+    pub fn shrink_children(&mut self) {
+        self.children.shrink_to_fit();
+        self.child_index.shrink_to_fit();
     }
 
     /// Returns true if the children listing has been populated. Only
@@ -254,6 +289,7 @@ impl InodeTable {
             children_loaded_at: None,
             children_from_remote: false,
             children: Vec::new(),
+            child_index: HashMap::new(),
             pending_deletes: Vec::new(),
             last_revalidated: None,
             eviction: EvictionState::default(),
@@ -456,7 +492,7 @@ impl InodeTable {
         self.path_to_inode.remove(&*entry.full_path);
 
         if let Some(parent) = self.inodes.get_mut(&entry.parent) {
-            parent.children.retain(|c| c.ino != ino);
+            parent.remove_child_by_ino(ino);
             // Force readdir to re-fetch so the inode can be re-materialized
             // on next access. Without this the kernel would ask for a child
             // that no longer exists in our in-memory tree.
@@ -488,10 +524,13 @@ impl InodeTable {
         }
 
         let mut evicted = Vec::new();
-        for set in by_parent.values() {
+        for (parent_ino, set) in &by_parent {
             for &ino in set {
                 if let Some(entry) = self.inodes.remove(&ino) {
                     self.path_to_inode.remove(&*entry.full_path);
+                    if let Some(parent) = self.inodes.get_mut(parent_ino) {
+                        parent.child_index.remove(&entry.name);
+                    }
                     evicted.push(ino);
                 }
             }
@@ -499,7 +538,7 @@ impl InodeTable {
         for (parent_ino, evicted_set) in &by_parent {
             if let Some(parent) = self.inodes.get_mut(parent_ino) {
                 parent.children.retain(|c| !evicted_set.contains(&c.ino));
-                parent.children.shrink_to_fit();
+                parent.shrink_children();
                 // Force readdir to re-fetch the listing so evicted inodes can
                 // be re-materialized on next access.
                 parent.children_loaded_at = None;
@@ -512,18 +551,11 @@ impl InodeTable {
         self.path_to_inode.get(path).and_then(|ino| self.inodes.get(ino))
     }
 
-    /// Find a child of `parent` by name.
-    /// Skips stale DirChild entries whose inode has been removed.
+    /// Find a child of `parent` by name. O(1) via `child_index`.
     pub fn lookup_child(&self, parent: u64, name: &str) -> Option<&InodeEntry> {
         let parent_entry = self.inodes.get(&parent)?;
-        for child in &parent_entry.children {
-            if &*child.name == name
-                && let Some(entry) = self.inodes.get(&child.ino)
-            {
-                return Some(entry);
-            }
-        }
-        None
+        let ino = *parent_entry.child_index.get(name)?;
+        self.inodes.get(&ino)
     }
 
     /// Insert a new inode, returning its inode number.
@@ -599,6 +631,7 @@ impl InodeTable {
             children_loaded_at: None,
             children_from_remote: false,
             children: Vec::new(),
+            child_index: HashMap::new(),
             pending_deletes: Vec::new(),
             last_revalidated: Some(Instant::now()),
             eviction: EvictionState {
@@ -612,10 +645,7 @@ impl InodeTable {
 
         // Add to parent's children
         if let Some(parent_entry) = self.inodes.get_mut(&parent) {
-            parent_entry.children.push(DirChild {
-                ino: inode,
-                name: name_arc,
-            });
+            parent_entry.add_child(inode, name_arc);
             // POSIX: new subdirectory's ".." links to parent
             if kind == InodeKind::Directory {
                 parent_entry.nlink += 1;
@@ -801,7 +831,7 @@ impl InodeTable {
         invalidate_children_loaded: bool,
     ) {
         if let Some(parent) = self.inodes.get_mut(&parent_ino) {
-            parent.children.retain(|c| c.ino != child_ino);
+            parent.remove_child_by_ino(child_ino);
             if invalidate_children_loaded {
                 parent.children_loaded_at = None;
             }
@@ -826,6 +856,9 @@ impl InodeTable {
             if let Some(child) = self.inodes.remove(&child_ino) {
                 self.path_to_inode.remove(&*child.full_path);
                 stack.extend(child.children.iter().map(|c| c.ino));
+                // The descendants' parents are also being removed in this
+                // sweep (entire subtree), so their child_index will be
+                // discarded — no per-entry cleanup needed.
             }
         }
 
@@ -839,16 +872,13 @@ impl InodeTable {
         // Find child ino and build full_path in a single parent lookup
         let (child_ino, full_path) = {
             let parent_entry = self.inodes.get(&parent)?;
-            let ino = parent_entry.children.iter().find(|c| &*c.name == name).map(|c| c.ino)?;
+            let ino = *parent_entry.child_index.get(name)?;
             let path = child_path(&parent_entry.full_path, name);
             (ino, path)
         };
 
-        // Remove the DirChild from parent
-        if let Some(parent_entry) = self.inodes.get_mut(&parent)
-            && let Some(pos) = parent_entry.children.iter().position(|c| &*c.name == name)
-        {
-            parent_entry.children.remove(pos);
+        if let Some(parent_entry) = self.inodes.get_mut(&parent) {
+            parent_entry.remove_child_by_name(name);
         }
 
         self.path_to_inode.remove(full_path.as_str());
@@ -872,10 +902,8 @@ impl InodeTable {
         let is_dir = self.inodes.get(&ino).is_some_and(|e| e.kind == InodeKind::Directory);
 
         // Detach from old parent
-        if let Some(old_p) = self.inodes.get_mut(&old_parent)
-            && let Some(pos) = old_p.children.iter().position(|c| c.ino == ino && &*c.name == old_name)
-        {
-            old_p.children.remove(pos);
+        if let Some(old_p) = self.inodes.get_mut(&old_parent) {
+            old_p.remove_child_by_name(old_name);
         }
 
         // Allocate the new name once, share with the InodeEntry below.
@@ -883,10 +911,7 @@ impl InodeTable {
 
         // Attach to new parent
         if let Some(new_p) = self.inodes.get_mut(&new_parent) {
-            new_p.children.push(DirChild {
-                ino,
-                name: new_name_arc.clone(),
-            });
+            new_p.add_child(ino, new_name_arc.clone());
         }
 
         // Adjust parent nlink for cross-parent directory moves
@@ -2408,5 +2433,60 @@ mod tests {
         assert!(table.has_open_handles(busy));
         table.drop_open_handles(busy);
         assert!(!table.has_open_handles(busy));
+    }
+
+    // ── child_index invariants ─────────────────────────────────────
+
+    /// Assert that every parent's `child_index` exactly matches its
+    /// `children` Vec (same names mapped to same inos, no extras).
+    fn assert_child_index_consistent(table: &InodeTable) {
+        for (ino, entry) in &table.inodes {
+            if entry.kind != InodeKind::Directory {
+                continue;
+            }
+            assert_eq!(
+                entry.children.len(),
+                entry.child_index.len(),
+                "directory ino={ino} children/child_index length mismatch"
+            );
+            for c in &entry.children {
+                assert_eq!(
+                    entry.child_index.get(&c.name).copied(),
+                    Some(c.ino),
+                    "directory ino={ino} child_index missing name={}",
+                    c.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_child_index_stays_consistent_across_mutations() {
+        let mut table = InodeTable::new(false);
+
+        let a = mk_file(&mut table, "a.txt");
+        let b = mk_file(&mut table, "b.txt");
+        mk_file(&mut table, "c.txt");
+        assert_child_index_consistent(&table);
+
+        // O(1) lookup via index.
+        assert_eq!(table.lookup_child(ROOT_INODE, "a.txt").map(|e| e.inode), Some(a));
+        assert_eq!(table.lookup_child(ROOT_INODE, "b.txt").map(|e| e.inode), Some(b));
+        assert!(table.lookup_child(ROOT_INODE, "missing.txt").is_none());
+
+        // remove() path.
+        table.remove(b);
+        assert_child_index_consistent(&table);
+        assert!(table.lookup_child(ROOT_INODE, "b.txt").is_none());
+
+        // unlink_one() path.
+        let (_, _) = table.unlink_one(ROOT_INODE, "a.txt").unwrap();
+        assert_child_index_consistent(&table);
+        assert!(table.lookup_child(ROOT_INODE, "a.txt").is_none());
+
+        // Re-insert under same name should rebuild the index entry.
+        let a2 = mk_file(&mut table, "a.txt");
+        assert_child_index_consistent(&table);
+        assert_eq!(table.lookup_child(ROOT_INODE, "a.txt").map(|e| e.inode), Some(a2));
     }
 }
