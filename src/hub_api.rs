@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -23,6 +23,18 @@ pub trait HubOps: Send + Sync {
     fn default_mtime(&self) -> SystemTime;
     fn source(&self) -> &SourceKind;
     fn is_repo(&self) -> bool;
+
+    /// Cheap probe returning an opaque "revision" token that changes whenever
+    /// the source content changes. For repos this is the commit head SHA; for
+    /// buckets it is `updatedAt`. The poll loop uses this to skip the full
+    /// tree-listing fan-out when nothing has changed.
+    ///
+    /// Returns `Ok(None)` if the source doesn't expose a revision token (in
+    /// which case the poll loop always fans out). Errors fall through to a
+    /// full fan-out as well — the probe is an optimization, not a gate.
+    async fn probe_revision(&self) -> Result<Option<String>> {
+        Ok(None)
+    }
 }
 
 // ── Repo / Bucket types ───────────────────────────────────────────────
@@ -362,13 +374,29 @@ async fn send_with_retry(
 
 fn make_clients(backend: &str) -> (Client, Client) {
     let user_agent = format!("hf-mount/{}; fs/{}", env!("CARGO_PKG_VERSION"), backend);
+    // Control-plane client: many small JSON calls (tree listing, head, auth).
+    // Generous pool to avoid TLS re-handshakes when polling many prefixes in
+    // parallel; modest per-request timeout so a hung Hub doesn't freeze the
+    // poll loop forever.
     let client = Client::builder()
         .user_agent(&user_agent)
+        .pool_max_idle_per_host(128)
+        .pool_idle_timeout(Duration::from_secs(90))
+        .tcp_keepalive(Some(Duration::from_secs(60)))
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(60))
         .build()
         .expect("failed to build client");
+    // head_client: HEAD on resolve endpoint, no redirect-follow (we read the
+    // Location header ourselves). Same pooling rationale.
     let head_client = Client::builder()
         .user_agent(&user_agent)
         .redirect(reqwest::redirect::Policy::none())
+        .pool_max_idle_per_host(64)
+        .pool_idle_timeout(Duration::from_secs(90))
+        .tcp_keepalive(Some(Duration::from_secs(60)))
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(30))
         .build()
         .expect("failed to build head_client");
     (client, head_client)
@@ -565,6 +593,30 @@ impl HubApiClient {
             )));
         }
         Ok(())
+    }
+
+    /// Cheap probe: fetch `/api/{type}/{id}` or `/api/buckets/{id}` and return
+    /// an opaque revision token. The poll loop calls this once per round and
+    /// skips the full tree fan-out when the token matches the previous one.
+    ///
+    /// Repos: prefer `sha` (commit head) — changes on every push and only on
+    /// pushes. Buckets: `updatedAt` — set by Hub on every bucket mutation.
+    pub async fn probe_revision(&self) -> Result<Option<String>> {
+        let url = match &self.source {
+            SourceKind::Repo { repo_id, repo_type, .. } => {
+                format!("{}/api/{}/{}", self.endpoint, repo_type.api_prefix(), repo_id)
+            }
+            SourceKind::Bucket { bucket_id } => {
+                format!("{}/api/buckets/{}", self.endpoint, bucket_id)
+            }
+        };
+        let resp = send_with_retry(|| self.auth(self.client.get(&url)), "revision probe", false).await?;
+        let probe: RevisionProbe = resp.json().await?;
+        let token = match &self.source {
+            SourceKind::Repo { .. } => probe.sha.or(probe.last_modified),
+            SourceKind::Bucket { .. } => probe.updated_at,
+        };
+        Ok(token)
     }
 
     /// List tree entries at the given prefix (single directory level).
@@ -997,6 +1049,23 @@ impl HubOps for HubApiClient {
     fn is_repo(&self) -> bool {
         self.is_repo()
     }
+    async fn probe_revision(&self) -> Result<Option<String>> {
+        self.probe_revision().await
+    }
+}
+
+/// Fields read from `/api/{type}/{id}` for the cheap-probe path. For repos,
+/// `sha` is the commit head and changes on every push; `last_modified` is a
+/// fallback when `sha` is absent (older Hub responses). For buckets,
+/// `updated_at` is the only signal.
+#[derive(serde::Deserialize)]
+struct RevisionProbe {
+    #[serde(default)]
+    sha: Option<String>,
+    #[serde(default, rename = "lastModified")]
+    last_modified: Option<String>,
+    #[serde(default, rename = "updatedAt")]
+    updated_at: Option<String>,
 }
 
 /// Parse `Link` header to extract the URL with `rel="next"`.

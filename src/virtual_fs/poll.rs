@@ -36,8 +36,37 @@ impl super::VirtualFs {
         // Exponent applied to `interval` when the Hub returns 401 (token expired
         // or revoked). Reset to 0 as soon as we see a successful round.
         let mut auth_backoff_exp: u32 = 0;
+        // Last successful revision probe (repo commit sha or bucket updatedAt).
+        // When the next probe matches this, the tree fan-out is skipped — most
+        // mounts are inactive most of the time, so this collapses the per-round
+        // cost from N requests to 1.
+        let mut last_revision: Option<String> = None;
         loop {
             tokio::time::sleep(interval.saturating_mul(1u32 << auth_backoff_exp)).await;
+
+            // Cheap probe: if the source hasn't changed since last poll, skip the
+            // full fan-out entirely. On probe error or unsupported source, fall
+            // through to the full fan-out — the probe is an optimization, not a gate.
+            match hub_client.probe_revision().await {
+                Ok(Some(rev)) => {
+                    if last_revision.as_ref() == Some(&rev) {
+                        continue;
+                    }
+                    last_revision = Some(rev);
+                }
+                Ok(None) => {} // Source doesn't expose a revision token; always fan out.
+                Err(e) => {
+                    if matches!(e, Error::Hub { status: Some(401), .. }) {
+                        auth_backoff_exp = (auth_backoff_exp + 1).min(MAX_AUTH_BACKOFF_EXP);
+                        warn!(
+                            "Revision probe saw 401 Unauthorized; backing off next poll to {:?}",
+                            interval.saturating_mul(1u32 << auth_backoff_exp)
+                        );
+                        continue;
+                    }
+                    warn!("Revision probe failed, falling back to full poll: {e}");
+                }
+            }
 
             // Only poll directories the user has actually visited (children_loaded).
             // This avoids fetching the entire tree for large repos where most
