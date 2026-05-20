@@ -5242,16 +5242,6 @@ fn overlay_rmdir_remote_dir_eperm() {
     });
 }
 
-// ── readdir snapshot vs cache microbench ───────────────────────────────
-//
-// Measures the per-readdir-call cost the FUSE adapter's dir_cache PR
-// (#172) is designed to avoid. Run with:
-//
-//   cargo test --release readdir_snapshot_vs_cache_cost -- --nocapture --ignored
-//
-// The cached-lookup column models what the patched fuse readdir does on
-// every paginated call (Mutex lookup + Arc::clone). The snapshot column
-// is what the kernel forced us to do once per paginated call before #172.
 #[test]
 #[ignore]
 fn readdir_snapshot_vs_cache_cost() {
