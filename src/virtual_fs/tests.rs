@@ -2531,6 +2531,83 @@ fn unlink_cleans_staging() {
 
 // ── poll_remote_changes ─────────────────────────────────────────────
 
+/// poll_remote_changes calls probe_revision once per round and skips the
+/// tree-listing fan-out when the value is unchanged. When the revision
+/// advances, list_tree fires again. When the probe returns a non-401 error,
+/// the loop falls back to a full fan-out.
+#[test]
+fn poll_skips_list_tree_when_revision_unchanged() {
+    let hub = MockHub::new_repo();
+    hub.add_file("file.txt", 10, Some("h1"), None);
+    hub.set_revision("rev-a");
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_repo(&hub, &xet);
+
+    rt.block_on(async {
+        // Mark root as loaded so loaded_dir_prefixes() returns at least one prefix.
+        let _ = vfs.lookup(ROOT_INODE, "file.txt").await.unwrap();
+        // The lookup above triggered ensure_children_loaded -> 1 list_tree call.
+        let baseline_list_tree = hub.list_tree_call_count();
+
+        let stop = Arc::new(tokio::sync::Notify::new());
+        let stop_clone = stop.clone();
+        let hub_dyn: Arc<dyn crate::hub_api::HubOps> = hub.clone();
+        let inodes = vfs.inode_table.clone();
+        let neg = vfs.negative_cache.clone();
+        let inv = vfs.invalidator.clone();
+        let handle = tokio::spawn(async move {
+            tokio::select! {
+                _ = VirtualFs::poll_remote_changes(
+                    hub_dyn, inodes, neg, inv,
+                    Duration::from_millis(10), 4,
+                ) => {}
+                _ = stop_clone.notified() => {}
+            }
+        });
+
+        // Let 5 rounds run with identical revision -> probe fires, list_tree does not.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert!(hub.probe_revision_call_count() >= 3, "probe should run each round");
+        assert_eq!(
+            hub.list_tree_call_count(),
+            baseline_list_tree,
+            "list_tree must not fire when revision is unchanged"
+        );
+
+        // Advance the revision -> next round fans out.
+        let probes_before = hub.probe_revision_call_count();
+        hub.set_revision("rev-b");
+        // Wait until at least one more probe + one fan-out.
+        for _ in 0..50 {
+            if hub.probe_revision_call_count() > probes_before && hub.list_tree_call_count() > baseline_list_tree {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            hub.list_tree_call_count() > baseline_list_tree,
+            "list_tree must fire after revision change"
+        );
+
+        // Probe error (non-401) -> fall back to full fan-out.
+        let lists_before = hub.list_tree_call_count();
+        hub.fail_revision(crate::error::Error::hub("simulated probe failure"));
+        for _ in 0..50 {
+            if hub.list_tree_call_count() > lists_before {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            hub.list_tree_call_count() > lists_before,
+            "list_tree must fire when probe fails (fallback)"
+        );
+
+        stop.notify_one();
+        let _ = handle.await;
+    });
+}
+
 /// Revalidation detects remote file content change (hash changed via HEAD).
 #[test]
 fn revalidation_detects_hash_change() {

@@ -40,7 +40,12 @@ impl super::VirtualFs {
         // When the next probe matches this, the tree fan-out is skipped — most
         // mounts are inactive most of the time, so this collapses the per-round
         // cost from N requests to 1.
-        let mut last_revision: Option<String> = None;
+        //
+        // Primed with an initial probe at startup so the first round after the
+        // initial mount-time listing doesn't redundantly fan out when nothing
+        // has changed. On probe error we leave it at None, the first round will
+        // do a full fan-out and re-prime.
+        let mut last_revision: Option<String> = hub_client.probe_revision().await.ok();
         loop {
             tokio::time::sleep(interval.saturating_mul(1u32 << auth_backoff_exp)).await;
 
