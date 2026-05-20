@@ -676,14 +676,14 @@ impl InodeTable {
 
     /// Snapshot of all file entries: (ino, full_path, xet_hash, etag, size, is_dirty)
     #[allow(clippy::type_complexity)]
-    pub fn file_snapshot(&self) -> Vec<(u64, String, Option<String>, Option<String>, u64, bool)> {
+    pub fn file_snapshot(&self) -> Vec<(u64, Arc<str>, Option<String>, Option<String>, u64, bool)> {
         self.inodes
             .values()
             .filter(|e| e.kind == InodeKind::File)
             .map(|e| {
                 (
                     e.inode,
-                    e.full_path.to_string(),
+                    e.full_path.clone(),
                     e.xet_hash.clone(),
                     e.etag.clone(),
                     e.size,
@@ -1412,14 +1412,14 @@ mod tests {
         assert_eq!(snapshot.len(), 2, "only files, not directories");
 
         let a = snapshot.iter().find(|(ino, ..)| *ino == ino1).unwrap();
-        assert_eq!(a.1, "a.txt");
+        assert_eq!(&*a.1, "a.txt");
         assert_eq!(a.2, Some("hash_a".to_string()));
         assert_eq!(a.3, None); // etag
         assert_eq!(a.4, 100);
         assert!(a.5, "a.txt should be dirty");
 
         let b = snapshot.iter().find(|(ino, ..)| *ino == ino2).unwrap();
-        assert_eq!(b.1, "b.txt");
+        assert_eq!(&*b.1, "b.txt");
         assert!(!b.5, "b.txt should not be dirty");
     }
 

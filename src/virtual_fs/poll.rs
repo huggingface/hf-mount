@@ -173,7 +173,7 @@ impl super::VirtualFs {
             if *is_dirty {
                 continue;
             }
-            match remote_map.get(path.as_str()) {
+            match remote_map.get(path.as_ref()) {
                 Some(remote) => {
                     let remote_hash = remote.xet_hash.as_deref();
                     let remote_oid = remote.oid.as_deref();
