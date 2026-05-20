@@ -3,7 +3,7 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use futures::stream::{self, StreamExt};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::error::Error;
 use crate::hub_api::HubOps;
@@ -55,8 +55,10 @@ impl super::VirtualFs {
             match hub_client.probe_revision().await {
                 Ok(rev) => {
                     if last_revision.as_ref() == Some(&rev) {
+                        debug!("Revision unchanged ({rev}); skipping tree fan-out");
                         continue;
                     }
+                    debug!("Revision changed to {rev}; running full poll");
                     last_revision = Some(rev);
                 }
                 Err(e) => {
