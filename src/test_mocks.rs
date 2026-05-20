@@ -29,9 +29,9 @@ pub struct MockHub {
     list_tree_calls: AtomicU32,
     head_file_calls: AtomicU32,
     probe_revision_calls: AtomicU32,
-    /// Returned by `probe_revision`. `Ok(Some(s))` -> `Ok(s)`, `Ok(None)` ->
-    /// `Err(not implemented)` (the trait default), `Err(_)` -> propagate.
-    revision: Mutex<Result<Option<String>>>,
+    /// `Ok(rev)` returns the token; `Err((status, msg))` rebuilds an
+    /// `Error::Hub` with that status so the poll loop's 401-branch still fires.
+    revision: Mutex<std::result::Result<String, (Option<u16>, String)>>,
 }
 
 #[allow(dead_code)]
@@ -52,7 +52,7 @@ impl MockHub {
             list_tree_calls: AtomicU32::new(0),
             head_file_calls: AtomicU32::new(0),
             probe_revision_calls: AtomicU32::new(0),
-            revision: Mutex::new(Ok(Some("rev-0".to_string()))),
+            revision: Mutex::new(Ok("rev-0".to_string())),
         })
     }
 
@@ -74,7 +74,7 @@ impl MockHub {
             list_tree_calls: AtomicU32::new(0),
             head_file_calls: AtomicU32::new(0),
             probe_revision_calls: AtomicU32::new(0),
-            revision: Mutex::new(Ok(Some("rev-0".to_string()))),
+            revision: Mutex::new(Ok("rev-0".to_string())),
         })
     }
 
@@ -141,11 +141,11 @@ impl MockHub {
     }
 
     pub fn set_revision(&self, rev: &str) {
-        *self.revision.lock().unwrap() = Ok(Some(rev.to_string()));
+        *self.revision.lock().unwrap() = Ok(rev.to_string());
     }
 
-    pub fn fail_revision(&self, err: Error) {
-        *self.revision.lock().unwrap() = Err(err);
+    pub fn fail_revision(&self, status: Option<u16>, message: &str) {
+        *self.revision.lock().unwrap() = Err((status, message.to_string()));
     }
 
     pub fn fail_next_download(&self) {
@@ -268,9 +268,9 @@ impl HubOps for MockHub {
     async fn probe_revision(&self) -> Result<String> {
         self.probe_revision_calls.fetch_add(1, Ordering::SeqCst);
         match &*self.revision.lock().unwrap() {
-            Ok(Some(s)) => Ok(s.clone()),
-            Ok(None) => Err(Error::hub("mock probe_revision: not set")),
-            Err(e) => Err(Error::hub(format!("{e}"))),
+            Ok(s) => Ok(s.clone()),
+            Err((Some(status), msg)) => Err(Error::hub_status(*status, msg.clone())),
+            Err((None, msg)) => Err(Error::hub(msg.clone())),
         }
     }
 }

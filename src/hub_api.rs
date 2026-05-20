@@ -374,28 +374,21 @@ async fn send_with_retry(
 
 fn make_clients(backend: &str) -> (Client, Client) {
     let user_agent = format!("hf-mount/{}; fs/{}", env!("CARGO_PKG_VERSION"), backend);
-    // Control-plane client: many small JSON calls (tree listing, head, auth).
-    // Generous pool to avoid TLS re-handshakes when polling many prefixes in
-    // parallel; modest per-request timeout so a hung Hub doesn't freeze the
-    // poll loop forever.
-    let client = Client::builder()
-        .user_agent(&user_agent)
-        .pool_max_idle_per_host(128)
-        .pool_idle_timeout(Duration::from_secs(90))
-        .tcp_keepalive(Some(Duration::from_secs(60)))
-        .connect_timeout(Duration::from_secs(10))
+    // Idle pool / keep-alive shared across both clients so a hung Hub doesn't
+    // freeze the poll loop and TLS handshakes are amortized across rounds.
+    let base = || {
+        reqwest::Client::builder()
+            .user_agent(&user_agent)
+            .pool_idle_timeout(Duration::from_secs(90))
+            .tcp_keepalive(Some(Duration::from_secs(60)))
+            .connect_timeout(Duration::from_secs(10))
+    };
+    let client = base()
         .timeout(Duration::from_secs(60))
         .build()
         .expect("failed to build client");
-    // head_client: HEAD on resolve endpoint, no redirect-follow (we read the
-    // Location header ourselves). Same pooling rationale.
-    let head_client = Client::builder()
-        .user_agent(&user_agent)
+    let head_client = base()
         .redirect(reqwest::redirect::Policy::none())
-        .pool_max_idle_per_host(64)
-        .pool_idle_timeout(Duration::from_secs(90))
-        .tcp_keepalive(Some(Duration::from_secs(60)))
-        .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(30))
         .build()
         .expect("failed to build head_client");

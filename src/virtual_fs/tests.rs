@@ -2591,7 +2591,7 @@ fn poll_skips_list_tree_when_revision_unchanged() {
 
         // Probe error (non-401) -> fall back to full fan-out.
         let lists_before = hub.list_tree_call_count();
-        hub.fail_revision(crate::error::Error::hub("simulated probe failure"));
+        hub.fail_revision(None, "simulated probe failure");
         for _ in 0..50 {
             if hub.list_tree_call_count() > lists_before {
                 break;

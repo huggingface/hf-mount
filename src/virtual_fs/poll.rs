@@ -36,22 +36,12 @@ impl super::VirtualFs {
         // Exponent applied to `interval` when the Hub returns 401 (token expired
         // or revoked). Reset to 0 as soon as we see a successful round.
         let mut auth_backoff_exp: u32 = 0;
-        // Last successful revision probe (repo commit sha or bucket updatedAt).
-        // When the next probe matches this, the tree fan-out is skipped — most
-        // mounts are inactive most of the time, so this collapses the per-round
-        // cost from N requests to 1.
-        //
-        // Primed with an initial probe at startup so the first round after the
-        // initial mount-time listing doesn't redundantly fan out when nothing
-        // has changed. On probe error we leave it at None, the first round will
-        // do a full fan-out and re-prime.
+        // None forces a full fan-out next round; primed with an initial probe so
+        // a freshly mounted source doesn't redundantly re-list once.
         let mut last_revision: Option<String> = hub_client.probe_revision().await.ok();
         loop {
             tokio::time::sleep(interval.saturating_mul(1u32 << auth_backoff_exp)).await;
 
-            // Cheap probe: if the source hasn't changed since last poll, skip the
-            // full fan-out entirely. On probe error, fall through to the full
-            // fan-out — the probe is an optimization, not a gate.
             match hub_client.probe_revision().await {
                 Ok(rev) => {
                     if last_revision.as_ref() == Some(&rev) {
