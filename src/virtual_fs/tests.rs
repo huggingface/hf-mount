@@ -5241,4 +5241,3 @@ fn overlay_rmdir_remote_dir_eperm() {
         assert_eq!(err, libc::EPERM);
     });
 }
-

@@ -533,7 +533,10 @@ impl Filesystem for FuseAdapter {
                 match self.runtime.block_on(self.virtual_fs.readdir(ino.0)) {
                     Ok(entries) => {
                         let fh = self.virtual_fs.alloc_file_handle();
-                        self.dir_cache.lock().expect("dir_cache poisoned").insert(fh, Arc::new(entries));
+                        self.dir_cache
+                            .lock()
+                            .expect("dir_cache poisoned")
+                            .insert(fh, Arc::new(entries));
                         reply.opened(FileHandle(fh), FopenFlags::empty());
                     }
                     Err(e) => {
