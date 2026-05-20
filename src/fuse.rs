@@ -219,7 +219,7 @@ impl Filesystem for FuseAdapter {
     /// List directory entries from the snapshot captured at opendir.
     /// `offset` is the index of the last entry already returned.
     fn readdir(&self, _req: &Request, ino: INodeNo, fh: FileHandle, offset: u64, mut reply: ReplyDirectory) {
-        let cached = self.dir_cache.lock().unwrap().get(&fh.0).cloned();
+        let cached = self.dir_cache.lock().expect("dir_cache poisoned").get(&fh.0).cloned();
         let entries = match cached {
             Some(arc) => arc,
             // Defensive: fuser always issues opendir before readdir, but fall
@@ -533,7 +533,7 @@ impl Filesystem for FuseAdapter {
                 match self.runtime.block_on(self.virtual_fs.readdir(ino.0)) {
                     Ok(entries) => {
                         let fh = self.virtual_fs.alloc_file_handle();
-                        self.dir_cache.lock().unwrap().insert(fh, Arc::new(entries));
+                        self.dir_cache.lock().expect("dir_cache poisoned").insert(fh, Arc::new(entries));
                         reply.opened(FileHandle(fh), FopenFlags::empty());
                     }
                     Err(e) => {
@@ -550,7 +550,7 @@ impl Filesystem for FuseAdapter {
     /// Release a directory handle. Drops the refcount bumped by `opendir`
     /// and the cached snapshot.
     fn releasedir(&self, _req: &Request, ino: INodeNo, fh: FileHandle, _flags: OpenFlags, reply: ReplyEmpty) {
-        self.dir_cache.lock().unwrap().remove(&fh.0);
+        self.dir_cache.lock().expect("dir_cache poisoned").remove(&fh.0);
         self.virtual_fs.drop_open_handles(ino.0);
         reply.ok();
     }
