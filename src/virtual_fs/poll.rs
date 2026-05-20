@@ -3,7 +3,7 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use futures::stream::{self, StreamExt};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::error::Error;
 use crate::hub_api::HubOps;
@@ -36,8 +36,33 @@ impl super::VirtualFs {
         // Exponent applied to `interval` when the Hub returns 401 (token expired
         // or revoked). Reset to 0 as soon as we see a successful round.
         let mut auth_backoff_exp: u32 = 0;
+        // None forces a full fan-out next round; primed with an initial probe so
+        // a freshly mounted source doesn't redundantly re-list once.
+        let mut last_revision: Option<String> = hub_client.probe_revision().await.ok();
         loop {
             tokio::time::sleep(interval.saturating_mul(1u32 << auth_backoff_exp)).await;
+
+            match hub_client.probe_revision().await {
+                Ok(rev) => {
+                    if last_revision.as_ref() == Some(&rev) {
+                        debug!("Revision unchanged ({rev}); skipping tree fan-out");
+                        continue;
+                    }
+                    debug!("Revision changed to {rev}; running full poll");
+                    last_revision = Some(rev);
+                }
+                Err(e) => {
+                    if matches!(e, Error::Hub { status: Some(401), .. }) {
+                        auth_backoff_exp = (auth_backoff_exp + 1).min(MAX_AUTH_BACKOFF_EXP);
+                        warn!(
+                            "Revision probe saw 401 Unauthorized; backing off next poll to {:?}",
+                            interval.saturating_mul(1u32 << auth_backoff_exp)
+                        );
+                        continue;
+                    }
+                    warn!("Revision probe failed, falling back to full poll: {e}");
+                }
+            }
 
             // Only poll directories the user has actually visited (children_loaded).
             // This avoids fetching the entire tree for large repos where most
