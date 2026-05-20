@@ -793,29 +793,33 @@ impl InodeTable {
         })
     }
 
-    /// Recursively update full_path and path_to_inode for an inode and all its descendants.
+    /// Update full_path and path_to_inode for an inode and all its descendants.
     /// Used after a rename to keep the path mappings consistent.
-    /// Hard-linked inodes whose full_path doesn't match their expected position in the tree
-    /// are skipped (they belong elsewhere and their canonical path must not be rewritten).
+    ///
+    /// Iterative walk over a worklist so a deep subtree doesn't blow the stack.
+    /// `Arc::<str>::from(String)` transfers ownership without re-copying the
+    /// bytes; the earlier recursive form went through `Arc::from(&str)` which
+    /// allocated and memcpy'd once per node on top of the format!() that built
+    /// the path.
     pub fn update_subtree_paths(&mut self, inode: u64, new_full_path: String) {
-        if let Some(entry) = self.inodes.get(&inode) {
-            let old_path: Arc<str> = entry.full_path.clone();
+        let mut stack: Vec<(u64, String)> = vec![(inode, new_full_path)];
+        while let Some((ino, new_path)) = stack.pop() {
+            let new_arc: Arc<str> = Arc::from(new_path);
+            let Some(entry) = self.inodes.get_mut(&ino) else {
+                continue;
+            };
+            let old_path = std::mem::replace(&mut entry.full_path, new_arc.clone());
+            // Build the next level of (child_ino, child_full_path) pairs while
+            // we still hold the mutable borrow; child entries aren't touched
+            // here, only read.
+            let next: Vec<(u64, String)> = entry
+                .children
+                .iter()
+                .map(|c| (c.ino, child_path(&new_arc, &c.name)))
+                .collect();
             self.path_to_inode.remove(&*old_path);
-        }
-
-        let new_full_path_arc: Arc<str> = Arc::from(new_full_path.as_str());
-        let children = if let Some(entry) = self.inodes.get_mut(&inode) {
-            entry.full_path = new_full_path_arc.clone();
-            self.path_to_inode.insert(new_full_path_arc, inode);
-            entry.children.clone()
-        } else {
-            return;
-        };
-
-        // Recursively update children
-        for child in children {
-            let child_path = child_path(&new_full_path, &child.name);
-            self.update_subtree_paths(child.ino, child_path);
+            self.path_to_inode.insert(new_arc, ino);
+            stack.extend(next);
         }
     }
 
