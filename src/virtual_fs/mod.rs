@@ -1148,7 +1148,7 @@ impl VirtualFs {
             Hit(VirtualFsAttr),
             NeedsRevalidation {
                 ino: u64,
-                full_path: String,
+                full_path: Arc<str>,
                 current_hash: Option<String>,
                 current_etag: Option<String>,
             },
@@ -1182,7 +1182,7 @@ impl VirtualFs {
                 // so size/hash/mtime stay fresh between poll cycles.
                 Some(entry) if entry.kind == InodeKind::File && !entry.is_dirty() => FastResult::NeedsRevalidation {
                     ino: entry.inode,
-                    full_path: entry.full_path.to_string(),
+                    full_path: entry.full_path.clone(),
                     current_hash: entry.xet_hash.clone(),
                     current_etag: entry.etag.clone(),
                 },
