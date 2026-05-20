@@ -136,9 +136,8 @@ pub struct InodeEntry {
     pub children: Vec<DirChild>,
     /// Name → ino lookup for `lookup_child`. Kept in sync with `children`
     /// via the `add_child` / `remove_child_*` helpers so a directory with
-    /// thousands of entries (large model repos) doesn't pay O(N) on every
-    /// dentry probe.
-    pub(crate) child_index: HashMap<Arc<str>, u64>,
+    /// thousands of entries doesn't pay O(N) on every dentry probe.
+    pub child_index: HashMap<Arc<str>, u64>,
     /// Old remote paths that should be deleted on next flush (set by rename of dirty files).
     pub pending_deletes: Vec<String>,
     /// When this inode's metadata was last validated against the remote (via HEAD).
@@ -156,14 +155,14 @@ impl InodeEntry {
 
     /// Append a child to this directory and register it in the lookup index.
     /// `name` is moved into both structures (shared `Arc`).
-    pub(crate) fn add_child(&mut self, ino: u64, name: Arc<str>) {
+    pub fn add_child(&mut self, ino: u64, name: Arc<str>) {
         self.child_index.insert(name.clone(), ino);
         self.children.push(DirChild { ino, name });
     }
 
     /// Remove a child by ino. Returns the removed name (for callers that
     /// need to fix up external state).
-    pub(crate) fn remove_child_by_ino(&mut self, ino: u64) -> Option<Arc<str>> {
+    pub fn remove_child_by_ino(&mut self, ino: u64) -> Option<Arc<str>> {
         let pos = self.children.iter().position(|c| c.ino == ino)?;
         let removed = self.children.remove(pos);
         self.child_index.remove(&removed.name);
@@ -171,7 +170,7 @@ impl InodeEntry {
     }
 
     /// Remove a child by name. Returns the removed ino.
-    pub(crate) fn remove_child_by_name(&mut self, name: &str) -> Option<u64> {
+    pub fn remove_child_by_name(&mut self, name: &str) -> Option<u64> {
         let ino = self.child_index.remove(name)?;
         if let Some(pos) = self.children.iter().position(|c| c.ino == ino) {
             self.children.remove(pos);
@@ -180,7 +179,7 @@ impl InodeEntry {
     }
 
     /// Drop excess capacity from both child stores after a bulk removal.
-    pub(crate) fn shrink_children(&mut self) {
+    pub fn shrink_children(&mut self) {
         self.children.shrink_to_fit();
         self.child_index.shrink_to_fit();
     }
