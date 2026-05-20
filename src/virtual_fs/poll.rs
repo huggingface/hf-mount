@@ -16,6 +16,18 @@ use super::inode::{self, InodeTable};
 /// the max delay between polls becomes `30s * 2^6 = 32 min`.
 const MAX_AUTH_BACKOFF_EXP: u32 = 6;
 
+/// Cap on the exponential-backoff multiplier for per-prefix 5xx failures.
+/// With `interval = 30s` and `MAX_PREFIX_BACKOFF_EXP = 5`, a chronically
+/// failing prefix is re-tried at most every `30s * 2^5 = 16 min`.
+const MAX_PREFIX_BACKOFF_EXP: u32 = 5;
+
+/// Backoff state for a single prefix that recently failed. Skips re-listing
+/// until `not_before`; consecutive failures grow the delay exponentially.
+struct PrefixBackoff {
+    consecutive_fails: u32,
+    not_before: Instant,
+}
+
 impl super::VirtualFs {
     /// Background task: polls Hub API tree listing to detect remote changes.
     ///
@@ -39,6 +51,11 @@ impl super::VirtualFs {
         // None forces a full fan-out next round; primed with an initial probe so
         // a freshly mounted source doesn't redundantly re-list once.
         let mut last_revision: Option<String> = hub_client.probe_revision().await.ok();
+        // Per-prefix backoff for 5xx / non-auth failures. A prefix that errored
+        // out shouldn't be re-listed at full concurrency on the next round —
+        // during a partial Hub outage that would clump retries and aggravate
+        // the load.
+        let mut prefix_backoff: HashMap<String, PrefixBackoff> = HashMap::new();
         loop {
             tokio::time::sleep(interval.saturating_mul(1u32 << auth_backoff_exp)).await;
 
@@ -67,7 +84,18 @@ impl super::VirtualFs {
             // Only poll directories the user has actually visited (children_loaded).
             // This avoids fetching the entire tree for large repos where most
             // directories have never been accessed.
-            let prefixes = inodes.read().expect("inodes poisoned").loaded_dir_prefixes();
+            let all_prefixes = inodes.read().expect("inodes poisoned").loaded_dir_prefixes();
+            let now = Instant::now();
+            // Skip prefixes still in their backoff window. Stale entries (for
+            // prefixes the user no longer has loaded) are cleaned up too so the
+            // map doesn't grow forever.
+            let loaded: HashSet<&String> = all_prefixes.iter().collect();
+            prefix_backoff.retain(|prefix, _| loaded.contains(prefix));
+            let prefixes: Vec<String> = all_prefixes
+                .iter()
+                .filter(|p| prefix_backoff.get(*p).is_none_or(|b| b.not_before <= now))
+                .cloned()
+                .collect();
             // buffer_unordered yields out of order, so carry the prefix alongside the result.
             let results: Vec<(String, _)> = stream::iter(prefixes)
                 .map(|prefix| {
@@ -87,12 +115,24 @@ impl super::VirtualFs {
             for (prefix, result) in results {
                 match result {
                     Ok(entries) => {
+                        prefix_backoff.remove(&prefix);
                         polled_prefixes.insert(prefix);
                         all_entries.extend(entries);
                     }
                     Err(e) => {
-                        if matches!(e, Error::Hub { status: Some(401), .. }) {
+                        let is_auth = matches!(e, Error::Hub { status: Some(401), .. });
+                        if is_auth {
                             saw_auth_failure = true;
+                        } else {
+                            // 5xx / network / parse error → arm the per-prefix backoff.
+                            // 401 already has the mount-wide auth_backoff path; layering
+                            // both would slow recovery once the token is refreshed.
+                            let entry = prefix_backoff.entry(prefix.clone()).or_insert(PrefixBackoff {
+                                consecutive_fails: 0,
+                                not_before: now,
+                            });
+                            entry.consecutive_fails = (entry.consecutive_fails + 1).min(MAX_PREFIX_BACKOFF_EXP);
+                            entry.not_before = now + interval.saturating_mul(1u32 << entry.consecutive_fails);
                         }
                         warn!("Remote poll failed for prefix '{prefix}': {e}");
                         failed_prefixes.push(prefix);

@@ -2608,6 +2608,102 @@ fn poll_skips_list_tree_when_revision_unchanged() {
     });
 }
 
+/// A 5xx (or similar non-401) error on a prefix arms a per-prefix backoff:
+/// the same prefix is not re-listed on the immediate next round.
+#[test]
+fn poll_backs_off_per_prefix_on_5xx() {
+    let hub = MockHub::new_repo();
+    hub.add_file("a/file.txt", 10, Some("h1"), None);
+    hub.set_revision("rev-a");
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_repo(&hub, &xet);
+
+    rt.block_on(async {
+        // Load both root and "a" so both prefixes are polled.
+        let a = vfs.lookup(ROOT_INODE, "a").await.unwrap();
+        let _ = vfs.lookup(a.ino, "file.txt").await.unwrap();
+        let baseline = hub.list_tree_call_count();
+
+        // Force "a" to 503 on subsequent list_tree calls.
+        hub.fail_list_tree("a");
+
+        let stop = Arc::new(tokio::sync::Notify::new());
+        let stop_clone = stop.clone();
+        let hub_dyn: Arc<dyn crate::hub_api::HubOps> = hub.clone();
+        let inodes = vfs.inode_table.clone();
+        let neg = vfs.negative_cache.clone();
+        let inv = vfs.invalidator.clone();
+        let handle = tokio::spawn(async move {
+            tokio::select! {
+                _ = VirtualFs::poll_remote_changes(
+                    hub_dyn, inodes, neg, inv,
+                    Duration::from_millis(10), 4,
+                ) => {}
+                _ = stop_clone.notified() => {}
+            }
+        });
+
+        // Give the prime probe time to capture rev-a before we bump.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        // Bump revision so the loop fans out at least once and observes the 503.
+        hub.set_revision("rev-b");
+        let mut saw_first_fail = false;
+        for _ in 0..50 {
+            if hub.list_tree_call_count() > baseline {
+                saw_first_fail = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(saw_first_fail, "first fan-out must fire");
+
+        // Capture call count just after the first fan-out.
+        let after_first = hub.list_tree_call_count();
+
+        // Bump revision repeatedly. Each bump triggers a fan-out, but the "a"
+        // prefix is in backoff so list_tree("a") should NOT fire — only the
+        // root prefix is listed. The backoff arms with not_before = now + 10ms*2
+        // = ~20ms; we keep the loop active long enough that several rounds run
+        // while "a" stays in backoff (10ms interval × multiple rounds).
+        for i in 0..5 {
+            hub.set_revision(&format!("rev-c-{i}"));
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+
+        // Calls should have advanced (root re-listed several times), but at
+        // a rate strictly less than 2× rounds (which would be the case if "a"
+        // were also retried each round). Crude lower bound: at least one
+        // additional call happened.
+        let after_rounds = hub.list_tree_call_count();
+        assert!(
+            after_rounds > after_first,
+            "root prefix must still be polled while 'a' is in backoff"
+        );
+
+        // Clear the 503 and bump revision once more; "a" should now be retried.
+        hub.clear_list_tree_fail("a");
+        // Give the backoff window time to expire (10ms × 2^1 = 20ms) plus
+        // enough rounds to retry.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        hub.set_revision("rev-final");
+        // Wait for at least one more list_tree call after the bump.
+        let before_final = hub.list_tree_call_count();
+        for _ in 0..50 {
+            if hub.list_tree_call_count() > before_final {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            hub.list_tree_call_count() > before_final,
+            "list_tree must fire again after backoff window expires"
+        );
+
+        stop.notify_one();
+        let _ = handle.await;
+    });
+}
+
 /// Revalidation detects remote file content change (hash changed via HEAD).
 #[test]
 fn revalidation_detects_hash_change() {

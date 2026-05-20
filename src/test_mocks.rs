@@ -32,6 +32,9 @@ pub struct MockHub {
     /// `Ok(rev)` returns the token; `Err((status, msg))` rebuilds an
     /// `Error::Hub` with that status so the poll loop's 401-branch still fires.
     revision: Mutex<std::result::Result<String, (Option<u16>, String)>>,
+    /// Prefixes for which `list_tree` should return Err — used to exercise
+    /// per-prefix backoff. Failures persist until the entry is removed.
+    list_tree_fail: Mutex<std::collections::HashSet<String>>,
 }
 
 #[allow(dead_code)]
@@ -53,6 +56,7 @@ impl MockHub {
             head_file_calls: AtomicU32::new(0),
             probe_revision_calls: AtomicU32::new(0),
             revision: Mutex::new(Ok("rev-0".to_string())),
+            list_tree_fail: Mutex::new(std::collections::HashSet::new()),
         })
     }
 
@@ -75,6 +79,7 @@ impl MockHub {
             head_file_calls: AtomicU32::new(0),
             probe_revision_calls: AtomicU32::new(0),
             revision: Mutex::new(Ok("rev-0".to_string())),
+            list_tree_fail: Mutex::new(std::collections::HashSet::new()),
         })
     }
 
@@ -148,6 +153,16 @@ impl MockHub {
         *self.revision.lock().unwrap() = Err((status, message.to_string()));
     }
 
+    /// Make `list_tree(prefix)` return Err on subsequent calls until
+    /// `clear_list_tree_fail` is called for the same prefix.
+    pub fn fail_list_tree(&self, prefix: &str) {
+        self.list_tree_fail.lock().unwrap().insert(prefix.to_string());
+    }
+
+    pub fn clear_list_tree_fail(&self, prefix: &str) {
+        self.list_tree_fail.lock().unwrap().remove(prefix);
+    }
+
     pub fn fail_next_download(&self) {
         self.download_fail.store(true, Ordering::SeqCst);
     }
@@ -165,6 +180,9 @@ impl MockHub {
 impl HubOps for MockHub {
     async fn list_tree(&self, prefix: &str) -> Result<Vec<TreeEntry>> {
         self.list_tree_calls.fetch_add(1, Ordering::SeqCst);
+        if self.list_tree_fail.lock().unwrap().contains(prefix) {
+            return Err(Error::hub_status(503, format!("mock list_tree failure for '{prefix}'")));
+        }
         let tree = self.tree.lock().unwrap();
         let prefix_slash = if prefix.is_empty() {
             String::new()
