@@ -931,10 +931,12 @@ impl HubApiClient {
             }
         };
 
-        // Read cached ETag if present.
+        // Read cached ETag only if dest exists — otherwise an orphan sidecar
+        // (e.g. user manually deleted dest) could trick us into a 304 and
+        // `return Ok(())` without dest actually being on disk.
         let etag_path = dest.with_extension("etag");
-        let cached_etag = if dest.exists() {
-            std::fs::read_to_string(&etag_path).ok()
+        let cached_etag = if tokio::fs::try_exists(dest).await.unwrap_or(false) {
+            tokio::fs::read_to_string(&etag_path).await.ok()
         } else {
             None
         };
@@ -969,7 +971,7 @@ impl HubApiClient {
 
         // Stream response body to a temp file, then atomic-rename to dest.
         if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent)?;
+            tokio::fs::create_dir_all(parent).await?;
         }
         let tmp = dest.with_extension(format!("tmp.{}", std::process::id()));
         let result: std::result::Result<(), Error> = async {
