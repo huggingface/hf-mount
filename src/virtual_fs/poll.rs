@@ -37,12 +37,7 @@ impl super::VirtualFs {
         // or revoked). Reset to 0 as soon as we see a successful round.
         let mut auth_backoff_exp: u32 = 0;
         loop {
-            let sleep_dur = if auth_backoff_exp == 0 {
-                interval
-            } else {
-                interval.saturating_mul(1u32 << auth_backoff_exp.min(MAX_AUTH_BACKOFF_EXP))
-            };
-            tokio::time::sleep(sleep_dur).await;
+            tokio::time::sleep(interval.saturating_mul(1u32 << auth_backoff_exp)).await;
 
             // Only poll directories the user has actually visited (children_loaded).
             // This avoids fetching the entire tree for large repos where most
@@ -81,10 +76,9 @@ impl super::VirtualFs {
             }
             if saw_auth_failure {
                 auth_backoff_exp = (auth_backoff_exp + 1).min(MAX_AUTH_BACKOFF_EXP);
-                let next_delay = interval.saturating_mul(1u32 << auth_backoff_exp);
                 warn!(
-                    "Remote poll saw 401 Unauthorized; backing off next poll to {:?} (exp={})",
-                    next_delay, auth_backoff_exp
+                    "Remote poll saw 401 Unauthorized; backing off next poll to {:?}",
+                    interval.saturating_mul(1u32 << auth_backoff_exp)
                 );
             } else if auth_backoff_exp > 0 {
                 info!("Remote poll auth recovered, resetting backoff");
