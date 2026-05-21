@@ -5831,10 +5831,7 @@ fn write_tracked_range_clamped_to_staging_after_concurrent_shrink() {
             (entry.size, sw.dirty_ranges.clone())
         };
         assert_eq!(entry_size, 12, "setattr clipped entry.size");
-        assert!(
-            staging_len >= entry_size,
-            "staging file at least as long as entry.size"
-        );
+        assert!(staging_len >= entry_size, "staging file at least as long as entry.size");
         // Tracked ranges must be within [0, entry_size).
         for (s, e) in &dirty_ranges {
             assert!(
@@ -5884,9 +5881,7 @@ fn write_setattr_concurrent_keeps_size_consistent_with_staging() {
         let truncator = tokio::spawn(async move {
             for i in 0..200u64 {
                 let new_size = (i % 16) + 1; // 1..=16
-                let _ = vfs_t
-                    .setattr(ino, Some(new_size), None, None, None, None, None)
-                    .await;
+                let _ = vfs_t.setattr(ino, Some(new_size), None, None, None, None, None).await;
             }
         });
 
