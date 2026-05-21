@@ -2153,12 +2153,27 @@ impl VirtualFs {
                 error!("sparse read CAS download failed: {}", e);
                 libc::EIO
             })?;
-        let mut cas_data = Vec::with_capacity((orig_end - offset) as usize);
+        let expected = (orig_end - offset) as usize;
+        let mut cas_data = Vec::with_capacity(expected);
         while let Some(chunk) = stream.next().await.map_err(|e| {
             error!("sparse read CAS stream error: {}", e);
             libc::EIO
         })? {
             cas_data.extend_from_slice(&chunk);
+        }
+        // Bounds check: a short stream would later panic in the copy_from_slice
+        // calls below (which index cas_data assuming the full range arrived).
+        // Surface EIO instead so the read returns a recoverable error.
+        if cas_data.len() < expected {
+            error!(
+                "sparse read CAS stream truncated: expected {} bytes for hash {} range [{}, {}), got {}",
+                expected,
+                sparse_write_state.original_hash,
+                offset,
+                orig_end,
+                cas_data.len()
+            );
+            return Err(libc::EIO);
         }
 
         // Copy CAS bytes into the buffer for gaps between dirty ranges. Dirty ranges

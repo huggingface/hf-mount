@@ -312,8 +312,15 @@ impl InodeEntry {
         if self.clear_dirty_if(dirty_generation) {
             self.pending_deletes.clear();
             self.sparse_write = None;
-            self.last_revalidated = Some(Instant::now());
         }
+        // mtime/ctime are bumped unconditionally — same as apply_commit. A
+        // no-op flush still ran an open/dirty/flush cycle, and observers that
+        // poll mtime (build systems, rsync-style sync tools) need to see the
+        // touch even when the content hash is unchanged.
+        let now = SystemTime::now();
+        self.mtime = now;
+        self.ctime = now;
+        self.last_revalidated = Some(Instant::now());
     }
 
     /// Apply a successful commit: update hash, size, timestamps, and

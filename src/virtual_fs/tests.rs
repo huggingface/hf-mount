@@ -5902,3 +5902,115 @@ fn write_setattr_concurrent_keeps_size_consistent_with_staging() {
         vfs.release(fh).await.unwrap();
     });
 }
+
+// ─── REPRODUCERS: review findings ─────────────────────────────────────
+// These tests REPRODUCE bugs flagged by the code review. They are expected
+// to FAIL on the current code; the corresponding fix should make them pass.
+
+/// Review finding #1: fill_sparse_holes copies cas_data into the buffer with
+/// no bounds check on the stream's actual length. If the CAS download returns
+/// fewer bytes than `orig_end - offset`, copy_from_slice indexes past
+/// cas_data.len() and panics in the FUSE/NFS read hot path.
+#[test]
+fn repro_fill_sparse_holes_panics_on_short_cas_stream() {
+    let hub = MockHub::new();
+    hub.add_file("file.txt", 10, Some("orig_hash"), None);
+    let xet = MockXet::new();
+    xet.add_file("orig_hash", b"0123456789");
+    let (rt, vfs) = vfs_advanced(&hub, &xet);
+
+    rt.block_on(async {
+        let attr = vfs.lookup(ROOT_INODE, "file.txt").await.unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open(ino, true, false, None).await.unwrap();
+
+        // Next CAS download returns an empty stream. fill_sparse_holes sees
+        // cas_data.len()==0 but the read range [0..10) is fully sparse, so it
+        // attempts buffer[0..10].copy_from_slice(&cas_data[0..10]) — OOB.
+        xet.empty_range_downloads(1);
+
+        let result = std::panic::AssertUnwindSafe(vfs.read(fh, 0, 10));
+        let panicked = futures::FutureExt::catch_unwind(result).await.is_err();
+        assert!(
+            !panicked,
+            "fill_sparse_holes must surface EIO on a short CAS stream, not panic"
+        );
+
+        vfs.release(fh).await.unwrap();
+    });
+}
+
+/// Review finding #5: apply_noop_commit clears dirty/sparse_write but does
+/// not refresh mtime/ctime. The old apply_commit set them unconditionally.
+/// After a no-op flush, observers relying on mtime miss the cycle.
+#[test]
+fn repro_noop_flush_does_not_bump_mtime() {
+    let hub = MockHub::new();
+    hub.add_file("file.txt", 10, Some("orig_hash"), None);
+    let xet = MockXet::new();
+    xet.add_file("orig_hash", b"0123456789");
+    let (rt, vfs) = vfs_advanced(&hub, &xet);
+
+    rt.block_on(async {
+        let attr = vfs.lookup(ROOT_INODE, "file.txt").await.unwrap();
+        let ino = attr.ino;
+        let mtime_before = vfs.inode_table.read().unwrap().get(ino).unwrap().mtime;
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let fh = vfs.open(ino, true, false, None).await.unwrap();
+        vfs.fsync(ino, fh, None).await.unwrap();
+        vfs.release(fh).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        let mtime_after = vfs.inode_table.read().unwrap().get(ino).unwrap().mtime;
+        assert!(
+            mtime_after > mtime_before,
+            "mtime should advance after a dirty open+flush cycle even on a no-op upload \
+             (was {mtime_before:?}, still {mtime_after:?})"
+        );
+    });
+}
+
+/// Review finding #3: abort_batch marks every inode in to_flush with the
+/// upload error, including items whose CAS upload had already succeeded in a
+/// prior chunk of the same batch. Spurious EIO on a file already in CAS.
+#[test]
+fn repro_abort_batch_marks_already_uploaded_items() {
+    let hub = MockHub::new();
+    hub.add_file("sparse.txt", 10, Some("orig_hash"), None);
+    let xet = MockXet::new();
+    xet.add_file("orig_hash", b"0123456789");
+    let (rt, vfs) = vfs_advanced(&hub, &xet);
+
+    rt.block_on(async {
+        let (regular_attr, fh_reg) = vfs
+            .create(ROOT_INODE, "regular.txt", 0o644, 1000, 1000, None)
+            .await
+            .unwrap();
+        let regular_ino = regular_attr.ino;
+        write_blocking(&vfs, regular_ino, fh_reg, 0, b"hello").await.unwrap();
+
+        let sparse_attr = vfs.lookup(ROOT_INODE, "sparse.txt").await.unwrap();
+        let sparse_ino = sparse_attr.ino;
+        let fh_sp = vfs.open(sparse_ino, true, false, None).await.unwrap();
+        write_blocking(&vfs, sparse_ino, fh_sp, 0, b"XY").await.unwrap();
+
+        // Next range_upload will fail.
+        xet.fail_range_upload();
+
+        vfs.fsync(regular_ino, fh_reg, None).await.unwrap();
+        vfs.fsync(sparse_ino, fh_sp, None).await.unwrap();
+        vfs.release(fh_reg).await.unwrap();
+        vfs.release(fh_sp).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        let fm = vfs.flush_manager.as_ref().expect("flush manager active");
+        let regular_err = fm.check_error(regular_ino);
+        assert!(
+            regular_err.is_none(),
+            "regular item must not surface a flush error when only the sparse item failed; \
+             got {regular_err:?}"
+        );
+    });
+}

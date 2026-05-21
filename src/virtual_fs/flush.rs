@@ -261,8 +261,13 @@ async fn flush_pending_deletes(queue: &Mutex<Vec<String>>, hub_client: &dyn HubO
     }
 }
 
+/// Mark the given items with `msg` in the flush error map. Pass only the items
+/// whose own upload genuinely failed — siblings whose CAS upload succeeded in
+/// a prior chunk (or were never reached) stay dirty and will retry on the next
+/// flush cycle; surfacing an error on them would produce spurious EIO on files
+/// whose bytes are already in CAS.
 fn abort_batch(items: &[FlushItem], flush_errors: &Mutex<HashMap<u64, String>>, msg: String) {
-    error!("Aborting flush batch ({} items): {}", items.len(), msg);
+    error!("Aborting flush ({} item(s) affected): {}", items.len(), msg);
     let mut errs = flush_errors.lock().expect("flush_errors poisoned");
     for it in items {
         errs.insert(it.ino, msg.clone());
@@ -401,8 +406,13 @@ async fn flush_batch(
                     upload_results.push(file_info);
                 }
                 Err(e) => {
+                    // Only the failing sparse item gets the error. Sibling
+                    // items in this batch keep their dirty state and will be
+                    // retried on the next flush cycle (CAS dedup makes the
+                    // re-upload cheap); marking them errored here would
+                    // surface spurious EIO on files whose data is fine.
                     abort_batch(
-                        &to_flush,
+                        std::slice::from_ref(item),
                         flush_errors,
                         format!("range_upload failed (ino={} path={}): {e}", item.ino, item.full_path),
                     );
@@ -428,7 +438,10 @@ async fn flush_batch(
                 upload_results.extend(results);
             }
             Err(e) => {
-                abort_batch(&to_flush, flush_errors, format!("upload failed: {e}"));
+                // Only mark the chunk that actually failed; items in other
+                // chunks (already uploaded or not yet reached) stay dirty and
+                // retry on the next flush.
+                abort_batch(chunk, flush_errors, format!("upload failed: {e}"));
                 return;
             }
         }
