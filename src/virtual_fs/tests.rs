@@ -5650,3 +5650,189 @@ fn sparse_post_flush_read_returns_cas_bytes_not_zeros() {
         vfs.release(fh).await.unwrap();
     });
 }
+
+/// range_upload truncate-past-end: setattr(truncate to N < original_size) must
+/// produce a CAS file of size N composed of the original prefix [0..N) plus
+/// any dirty patches inside that range. Exercises the synthetic-delete branch
+/// at xet.rs:228-238 (`truncate_start..original_size` DirtyInput with an empty
+/// reader to drop the tail).
+#[test]
+fn sparse_truncate_shrink_then_flush_drops_tail() {
+    let hub = MockHub::new();
+    hub.add_file("file.txt", 10, Some("orig_hash"), None);
+    let xet = MockXet::new();
+    xet.add_file("orig_hash", b"0123456789");
+    let (rt, vfs) = vfs_advanced(&hub, &xet);
+
+    rt.block_on(async {
+        let attr = vfs.lookup(ROOT_INODE, "file.txt").await.unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open(ino, true, false, None).await.unwrap();
+
+        // Dirty a window inside what will remain after truncate.
+        write_blocking(&vfs, ino, fh, 1, b"AA").await.unwrap();
+        // Truncate to 5 — tail [5..10) must be dropped from the new CAS file.
+        vfs.setattr(ino, Some(5), None, None, None, None, None).await.unwrap();
+
+        // Pre-flush read on the open handle should already reflect the truncate:
+        // bytes 0,3,4 from CAS, bytes 1-2 from staging.
+        let (data, _) = vfs.read(fh, 0, 5).await.unwrap();
+        assert_eq!(&data[..], b"0AA34", "pre-flush read after truncate");
+
+        // Drive the flush and verify the new CAS file is the truncated composition.
+        vfs.fsync(ino, fh, None).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        let new_hash = {
+            let inodes = vfs.inode_table.read().unwrap();
+            inodes.get(ino).unwrap().xet_hash.clone().expect("new hash committed")
+        };
+        assert_ne!(new_hash, "orig_hash", "truncate must produce a fresh CAS hash");
+        let new_content = xet.get_file(&new_hash).expect("composed CAS file present");
+        assert_eq!(new_content, b"0AA34", "CAS file = original[0..5) with dirty patch");
+        assert_eq!(new_content.len(), 5, "tail past truncate boundary was dropped");
+
+        vfs.release(fh).await.unwrap();
+    });
+}
+
+/// Pure truncate (no writes) variant: the synthetic-delete branch must still
+/// fire when `dirty_inputs` is otherwise empty.
+#[test]
+fn sparse_pure_truncate_shrink_then_flush_drops_tail() {
+    let hub = MockHub::new();
+    hub.add_file("file.txt", 10, Some("orig_hash"), None);
+    let xet = MockXet::new();
+    xet.add_file("orig_hash", b"0123456789");
+    let (rt, vfs) = vfs_advanced(&hub, &xet);
+
+    rt.block_on(async {
+        let attr = vfs.lookup(ROOT_INODE, "file.txt").await.unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open(ino, true, false, None).await.unwrap();
+
+        vfs.setattr(ino, Some(3), None, None, None, None, None).await.unwrap();
+        vfs.fsync(ino, fh, None).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        let new_hash = {
+            let inodes = vfs.inode_table.read().unwrap();
+            inodes.get(ino).unwrap().xet_hash.clone().expect("new hash committed")
+        };
+        let new_content = xet.get_file(&new_hash).expect("composed CAS file present");
+        assert_eq!(new_content, b"012", "pure truncate = original[0..3)");
+
+        vfs.release(fh).await.unwrap();
+    });
+}
+
+/// Regression for the clean→dirty fallback in write() (mod.rs:2392-2400).
+///
+/// In normal flows open_advanced_write set_dirty's the inode before write()
+/// runs, so this defensive branch never fires through public APIs. But the
+/// branch exists to keep the invariant safe if a write() ever reaches a clean
+/// inode + xet_hash + no sparse_write (e.g. a future NFS upgrade path that
+/// doesn't go through open). Test it by force-clearing dirty + sparse_write
+/// between open and write, then asserting the fallback installs a fresh
+/// SparseWriteState pinned to the current xet_hash / size.
+#[test]
+fn write_lazy_installs_sparse_write_on_clean_inode_transition() {
+    let hub = MockHub::new();
+    hub.add_file("file.txt", 11, Some("orig_hash"), None);
+    let xet = MockXet::new();
+    xet.add_file("orig_hash", b"hello world");
+    let (rt, vfs) = vfs_advanced(&hub, &xet);
+
+    rt.block_on(async {
+        let attr = vfs.lookup(ROOT_INODE, "file.txt").await.unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open(ino, true, false, None).await.unwrap();
+
+        // Simulate an out-of-band transition to clean (the branch's documented
+        // trigger — a writable handle existing while the inode is clean and
+        // has a hash but no sparse_write). Just clearing what open installed
+        // is enough: dirty_generation back to 0, sparse_write gone.
+        {
+            let mut inodes = vfs.inode_table.write().unwrap();
+            let entry = inodes.get_mut(ino).unwrap();
+            entry.dirty_generation = 0;
+            entry.sparse_write = None;
+            assert!(!entry.is_dirty(), "precondition: inode is clean");
+            assert!(entry.xet_hash.is_some(), "precondition: hash retained");
+        }
+
+        write_blocking(&vfs, ino, fh, 6, b"RUST!").await.unwrap();
+
+        let sw = {
+            let inodes = vfs.inode_table.read().unwrap();
+            inodes.get(ino).unwrap().sparse_write.clone()
+        };
+        let sw = sw.expect("write() must install sparse_write on the clean→dirty transition");
+        assert_eq!(sw.original_hash, "orig_hash", "fallback pins to entry.xet_hash");
+        assert_eq!(sw.original_size, 11, "fallback pins to entry.size");
+        assert_eq!(sw.dirty_ranges, vec![(6, 11)], "the write range is tracked");
+
+        vfs.release(fh).await.unwrap();
+    });
+}
+
+/// Stress: hammer the inode with concurrent writes and setattr-truncates and
+/// verify the (post-write) entry.size never exceeds the staging file length.
+/// This is the invariant the guard at mod.rs:2384-2385 (`new_end.min(actual_size)`)
+/// is supposed to preserve. The race window between pwrite and the metadata
+/// read is too tight to hit deterministically, but the stress loop exercises
+/// it and asserts the resulting state is always consistent.
+#[test]
+fn write_setattr_concurrent_keeps_size_consistent_with_staging() {
+    let hub = MockHub::new();
+    hub.add_file("file.txt", 16, Some("orig_hash"), None);
+    let xet = MockXet::new();
+    xet.add_file("orig_hash", &[0u8; 16]);
+    let (rt, vfs) = vfs_advanced(&hub, &xet);
+
+    rt.block_on(async {
+        let attr = vfs.lookup(ROOT_INODE, "file.txt").await.unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open(ino, true, false, None).await.unwrap();
+
+        let staging_path = vfs.staging.path(ino).expect("staging path");
+
+        // Spin up two tasks: one writes to advancing offsets, one truncates to
+        // sizes that may cross into the write window. We don't try to force the
+        // race window; we just iterate enough to exercise the path and check
+        // the invariant after each settle.
+        let vfs_w = vfs.clone();
+        let writer = tokio::spawn(async move {
+            for i in 0..200u64 {
+                let off = i % 12;
+                let _ = write_blocking(&vfs_w, ino, fh, off, b"AA").await;
+            }
+        });
+
+        let vfs_t = vfs.clone();
+        let truncator = tokio::spawn(async move {
+            for i in 0..200u64 {
+                let new_size = (i % 16) + 1; // 1..=16
+                let _ = vfs_t
+                    .setattr(ino, Some(new_size), None, None, None, None, None)
+                    .await;
+            }
+        });
+
+        let _ = tokio::join!(writer, truncator);
+
+        // After the storm: the invariant must hold — entry.size must not
+        // exceed the staging file length. Without the guard, the writer could
+        // record entry.size = new_end while a concurrent truncate had already
+        // shrunk staging below new_end, leaving entry.size > staging len and
+        // breaking future reads/flushes.
+        let entry_size = vfs.inode_table.read().unwrap().get(ino).unwrap().size;
+        let staging_len = std::fs::metadata(&staging_path).map(|m| m.len()).unwrap_or(0);
+        assert!(
+            entry_size <= staging_len,
+            "invariant violated: entry.size ({entry_size}) > staging len ({staging_len})"
+        );
+
+        vfs.release(fh).await.unwrap();
+    });
+}
