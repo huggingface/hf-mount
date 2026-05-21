@@ -262,10 +262,25 @@ async fn flush_pending_deletes(queue: &Mutex<Vec<String>>, hub_client: &dyn HubO
 }
 
 fn abort_batch(items: &[FlushItem], flush_errors: &Mutex<HashMap<u64, String>>, msg: String) {
+    error!("Aborting flush batch ({} items): {}", items.len(), msg);
     let mut errs = flush_errors.lock().expect("flush_errors poisoned");
     for it in items {
         errs.insert(it.ino, msg.clone());
     }
+}
+
+/// Length of the contiguous run of non-sparse FlushItems starting at `start`,
+/// capped to `max` items. `start` must point to a non-sparse item — sparse
+/// items are dispatched one-by-one through `range_upload` and never get
+/// included in a batched `upload_files` chunk.
+fn find_regular_run_end(items: &[FlushItem], start: usize, max: usize) -> usize {
+    debug_assert!(items[start].sparse_write.is_none());
+    let upper = (start + max).min(items.len());
+    items[start..upper]
+        .iter()
+        .take_while(|it| it.sparse_write.is_none())
+        .count()
+        + start
 }
 
 struct FlushItem {
@@ -386,11 +401,11 @@ async fn flush_batch(
                     upload_results.push(file_info);
                 }
                 Err(e) => {
-                    error!(
-                        "flush: range_upload failed ino={} path={}: {}",
-                        item.ino, item.full_path, e
+                    abort_batch(
+                        &to_flush,
+                        flush_errors,
+                        format!("range_upload failed (ino={} path={}): {e}", item.ino, item.full_path),
                     );
-                    abort_batch(&to_flush, flush_errors, format!("range_upload failed: {e}"));
                     return;
                 }
             }
@@ -398,12 +413,7 @@ async fn flush_batch(
             continue;
         }
 
-        let chunk_end = (i + UPLOAD_CHUNK_SIZE).min(to_flush.len());
-        let chunk_end = (i..chunk_end)
-            .take_while(|j| to_flush[*j].sparse_write.is_none())
-            .last()
-            .map(|j| j + 1)
-            .unwrap_or(i + 1);
+        let chunk_end = find_regular_run_end(&to_flush, i, UPLOAD_CHUNK_SIZE);
         let chunk = &to_flush[i..chunk_end];
         let staging_paths: Vec<&std::path::Path> = chunk.iter().map(|it| it.staging_path.as_path()).collect();
         match xet_sessions.upload_files(&staging_paths).await {
@@ -418,7 +428,6 @@ async fn flush_batch(
                 upload_results.extend(results);
             }
             Err(e) => {
-                error!("Batch upload failed, aborting flush: {}", e);
                 abort_batch(&to_flush, flush_errors, format!("upload failed: {e}"));
                 return;
             }
