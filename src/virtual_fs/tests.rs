@@ -5462,3 +5462,64 @@ fn sparse_setattr_shrink_clips_state() {
         vfs.release(fh).await.unwrap();
     });
 }
+
+/// Regression: a read on the still-open handle AFTER a sparse range_upload flush
+/// must return the new CAS content (composed from the upload) for untouched regions,
+/// not zeros from the sparse staging holes.
+///
+/// Pre-fix bug: apply_commit unconditionally set `staging_is_current = true` and
+/// cleared `sparse_write` on every commit. After a sparse flush the staging file
+/// still only contained the dirty patches over a sparse hole, so reads through
+/// the open handle would skip `fill_sparse_holes` and return zeros for the bytes
+/// that were never written.
+#[test]
+fn sparse_post_flush_read_returns_cas_bytes_not_zeros() {
+    let hub = MockHub::new();
+    hub.add_file("file.txt", 10, Some("orig_hash"), None);
+    let xet = MockXet::new();
+    xet.add_file("orig_hash", b"0123456789");
+    let (rt, vfs) = vfs_advanced(&hub, &xet);
+
+    rt.block_on(async {
+        let attr = vfs.lookup(ROOT_INODE, "file.txt").await.unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open(ino, true, false, None).await.unwrap();
+
+        // Dirty a small window in the middle of the file. Staging now holds
+        // zeros everywhere except "XX" at [2..4); the rest are sparse holes.
+        write_blocking(&vfs, ino, fh, 2, b"XX").await.unwrap();
+
+        // Trigger the background flush and wait for it to settle.
+        vfs.fsync(ino, fh, None).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let is_clean = vfs.inode_table.read().unwrap().get(ino).is_some_and(|e| !e.is_dirty());
+        assert!(is_clean, "inode should be clean after the sparse flush");
+
+        // Sanity-check the inode state the fix enforces.
+        {
+            let inodes = vfs.inode_table.read().unwrap();
+            let entry = inodes.get(ino).unwrap();
+            assert!(
+                !entry.staging_is_current,
+                "staging must not be flagged current after a sparse flush — it still has holes"
+            );
+            let sw = entry
+                .sparse_write
+                .as_ref()
+                .expect("sparse_write must persist after sparse flush so reads can fill holes");
+            assert!(sw.dirty_ranges.is_empty(), "fresh sparse state has no dirty ranges");
+            assert_eq!(sw.original_size, 10);
+        }
+
+        // The actual read regression: bytes that the user never wrote must come
+        // back from CAS (composed file), not zero-filled holes from staging.
+        let (data, _) = vfs.read(fh, 0, 10).await.unwrap();
+        assert_eq!(
+            &data[..],
+            b"01XX456789",
+            "post-flush read on open handle must return composed CAS bytes, not staging zeros"
+        );
+
+        vfs.release(fh).await.unwrap();
+    });
+}
