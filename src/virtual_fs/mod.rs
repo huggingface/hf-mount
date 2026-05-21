@@ -1603,15 +1603,35 @@ impl VirtualFs {
         let staging_path = self.staging.path(ino);
 
         if writable && self.advanced_writes {
-            // Staging file + async flush (supports random writes and seek)
-            self.open_advanced_write(
-                ino,
-                &file_entry.full_path,
-                &file_entry.xet_hash,
-                file_entry.size,
-                truncate,
-            )
-            .await
+            // Staging file + async flush (supports random writes and seek).
+            // open_advanced_write returns EAGAIN if the inode drifted under us
+            // (poll_remote_changes updated xet_hash/size during prep). Retry
+            // a few times with a fresh snapshot before surfacing EAGAIN to
+            // userspace — the race window is tiny so a bounded retry is
+            // overwhelmingly enough.
+            const MAX_RETRIES: usize = 3;
+            let mut last_entry = file_entry;
+            for attempt in 0..MAX_RETRIES {
+                match self
+                    .open_advanced_write(
+                        ino,
+                        &last_entry.full_path,
+                        &last_entry.xet_hash,
+                        last_entry.size,
+                        truncate,
+                    )
+                    .await
+                {
+                    Ok(fh) => return Ok(fh),
+                    Err(libc::EAGAIN) if attempt + 1 < MAX_RETRIES => {
+                        debug!("open: ino={} drift retry {}/{}", ino, attempt + 1, MAX_RETRIES);
+                        last_entry = self.get_file_entry(ino)?;
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            unreachable!("MAX_RETRIES loop exited without a result")
         } else if writable && truncate {
             // Simple streaming write (append-only, synchronous commit on close)
             self.open_streaming_write(ino, pid).await

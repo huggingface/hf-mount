@@ -5465,19 +5465,22 @@ fn sparse_setattr_shrink_clips_state() {
 
 /// Regression: if the inode's xet_hash or size drifts (remote poller updates it)
 /// between the snapshot in `open` and the install branch in `open_advanced_write`,
-/// we must bail with EAGAIN rather than proceeding. The sparse staging was sized
-/// to the snapshot; carrying on would either upload zeros over unchanged ranges
-/// (no `sparse_write` install branch pre-fix) or commit old snapshot content
-/// truncated to the drifted size over the newer remote revision.
+/// the inner call bails with EAGAIN. The outer `open` catches it, re-snapshots
+/// from the now-quiesced inode state, and retries — the user never sees EAGAIN
+/// unless drift persists across MAX_RETRIES iterations.
 ///
-/// Once `set_dirty()` is called, `update_remote_file` skips the dirty inode, so
-/// detecting drift BEFORE set_dirty closes the entire race window.
+/// The end-to-end invariant: open succeeds, the resulting sparse_write reflects
+/// the CURRENT (drifted) inode state, and no half-completed sparse/dirty state
+/// from the bailed first attempt is left behind. Once `set_dirty()` runs in the
+/// successful attempt, `update_remote_file` skips the dirty inode, so the race
+/// window is fully closed.
 #[test]
-fn sparse_open_returns_eagain_on_inode_drift_mid_open() {
+fn sparse_open_retries_on_inode_drift_mid_open() {
     let hub = MockHub::new();
     hub.add_file("file.txt", 10, Some("orig_hash"), None);
     let xet = MockXet::new();
     xet.add_file("orig_hash", b"0123456789");
+    xet.add_file("drifted_hash", b"AAAAA");
     let (rt, vfs) = vfs_advanced(&hub, &xet);
 
     rt.block_on(async {
@@ -5508,22 +5511,34 @@ fn sparse_open_returns_eagain_on_inode_drift_mid_open() {
         }
 
         drop(guard);
-        let err = open_task
+        // open() catches the EAGAIN from the first inner attempt and retries
+        // with a fresh snapshot — the user sees a successful open.
+        let fh = open_task
             .await
             .unwrap()
-            .expect_err("open must bail when drift is detected");
-        assert_eq!(err, libc::EAGAIN, "drift should surface as EAGAIN for retry");
+            .expect("open should transparently retry on drift");
 
-        // The inode keeps the drifted state (not silently rolled back) and is
-        // not left in a dirty/sparse-mid-flight state.
+        // The successful attempt installed sparse_write against the CURRENT
+        // (drifted) state, not the stale snapshot from the first attempt.
         {
             let inodes = vfs.inode_table.read().unwrap();
             let entry = inodes.get(ino).unwrap();
-            assert_eq!(entry.xet_hash.as_deref(), Some("drifted_hash"));
+            assert_eq!(
+                entry.xet_hash.as_deref(),
+                Some("drifted_hash"),
+                "post-retry snapshot reflects drift"
+            );
             assert_eq!(entry.size, 5);
-            assert!(!entry.is_dirty(), "no half-completed dirty state from a bailed open");
-            assert!(entry.sparse_write.is_none());
+            assert!(entry.is_dirty(), "successful open marks the inode dirty");
+            let sw = entry
+                .sparse_write
+                .as_ref()
+                .expect("sparse_write installed against the drifted snapshot");
+            assert_eq!(sw.original_hash, "drifted_hash");
+            assert_eq!(sw.original_size, 5);
         }
+
+        vfs.release(fh).await.unwrap();
     });
 }
 
