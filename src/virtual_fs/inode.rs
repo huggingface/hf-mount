@@ -299,6 +299,20 @@ impl InodeEntry {
         }
     }
 
+    /// Clear dirty state after a no-op flush (the upload returned the same hash
+    /// the snapshot pointed at — no Hub commit needed). Used when the open made
+    /// no actual modifications. We must NOT roll `xet_hash`/`size` back to the
+    /// snapshot here, because `poll_remote_changes` may have legitimately
+    /// updated them to a newer remote revision during the open window; doing so
+    /// would silently revert the inode to the snapshot.
+    pub fn apply_noop_commit(&mut self, dirty_generation: u64) {
+        if self.clear_dirty_if(dirty_generation) {
+            self.pending_deletes.clear();
+            self.sparse_write = None;
+            self.last_revalidated = Some(Instant::now());
+        }
+    }
+
     /// Apply a successful commit: update hash, size, timestamps, and
     /// conditionally clear dirty + pending_deletes if the generation matches.
     ///

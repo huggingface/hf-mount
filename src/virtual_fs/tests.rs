@@ -5522,6 +5522,74 @@ fn sparse_open_installs_sparse_write_even_if_inode_hash_drifts_mid_open() {
     });
 }
 
+/// Regression: drift + open-close with NO writes must not commit the snapshot
+/// hash back over a newer remote revision.
+///
+/// Scenario: the inode's xet_hash drifts (poll_remote_changes detected a newer
+/// remote revision) while a sparse open is in-flight. The user releases without
+/// writing anything. `range_upload` is a no-op and returns the snapshot hash.
+/// The flush must NOT issue an AddFile Hub op with the snapshot hash — that
+/// would silently roll the remote back to the pre-drift content. The drifted
+/// xet_hash on the inode must be preserved.
+#[test]
+fn sparse_open_close_no_writes_does_not_rollback_drifted_hash() {
+    let hub = MockHub::new();
+    hub.add_file("file.txt", 10, Some("orig_hash"), None);
+    let xet = MockXet::new();
+    xet.add_file("orig_hash", b"0123456789");
+    let (rt, vfs) = vfs_advanced(&hub, &xet);
+
+    rt.block_on(async {
+        let attr = vfs.lookup(ROOT_INODE, "file.txt").await.unwrap();
+        let ino = attr.ino;
+
+        let staging_lock = vfs.staging.lock(ino);
+        let guard = staging_lock.lock().await;
+
+        let vfs2 = vfs.clone();
+        let open_task = tokio::spawn(async move { vfs2.open(ino, true, false, None).await });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!open_task.is_finished());
+
+        // Simulate the poller advancing the inode to a newer remote revision.
+        {
+            let mut inodes = vfs.inode_table.write().unwrap();
+            inodes.get_mut(ino).unwrap().xet_hash = Some("drifted_hash".into());
+        }
+
+        drop(guard);
+        let fh = open_task.await.unwrap().unwrap();
+
+        let batch_log_before = hub.batch_log.lock().unwrap().len();
+
+        // Release with no writes. fsync triggers the flush, then we wait for it.
+        vfs.fsync(ino, fh, None).await.unwrap();
+        vfs.release(fh).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        let batch_log_after = hub.batch_log.lock().unwrap().len();
+        assert_eq!(
+            batch_log_before, batch_log_after,
+            "no Hub batch op should fire when a sparse open had no writes"
+        );
+
+        // Drifted xet_hash on the inode must be preserved — not silently rolled
+        // back to the snapshot.
+        {
+            let inodes = vfs.inode_table.read().unwrap();
+            let entry = inodes.get(ino).unwrap();
+            assert_eq!(
+                entry.xet_hash.as_deref(),
+                Some("drifted_hash"),
+                "drifted hash must survive a no-write sparse open"
+            );
+            assert!(!entry.is_dirty(), "dirty flag should be cleared on no-op flush");
+            assert!(entry.sparse_write.is_none(), "sparse_write should be cleared on no-op flush");
+        }
+    });
+}
+
 /// Regression: a read on the still-open handle AFTER a sparse range_upload flush
 /// must return the new CAS content (composed from the upload) for untouched regions,
 /// not zeros from the sparse staging holes.

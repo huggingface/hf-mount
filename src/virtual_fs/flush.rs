@@ -445,7 +445,21 @@ async fn flush_batch(
     let mut unchanged = vec![false; to_flush.len()];
 
     for (i, (item, file_info)) in to_flush.iter().zip(upload_results.iter()).enumerate() {
-        if item.pending_deletes.is_empty() && item.prev_xet_hash.as_deref() == Some(file_info.hash()) {
+        // Was this a no-op upload? Two cases:
+        //  * Sparse: `range_upload` returns `sparse_write.original_hash` when
+        //    dirty_ranges is empty and the size matches — i.e. the open made no
+        //    actual modifications since the snapshot. Compare against the
+        //    snapshot, NOT `entry.xet_hash`, because `poll_remote_changes` may
+        //    have updated the inode mid-flight; using prev_xet_hash here would
+        //    treat the no-op as a change and roll the remote back to the snapshot.
+        //  * Regular: full upload preserves the prior hash when content is
+        //    identical (idempotent edits).
+        let is_no_op = if let Some(sw) = &item.sparse_write {
+            file_info.hash() == sw.original_hash
+        } else {
+            item.prev_xet_hash.as_deref() == Some(file_info.hash())
+        };
+        if item.pending_deletes.is_empty() && is_no_op {
             debug!(
                 "flush_batch: unchanged ino={} path={} (hash {})",
                 item.ino,
@@ -474,18 +488,16 @@ async fn flush_batch(
     }
 
     // Clear dirty on unchanged files without waiting for the Hub round-trip.
+    // Use apply_noop_commit (not apply_commit) so we don't rewrite xet_hash/size
+    // — they may have legitimately been updated by poll_remote_changes during
+    // the open window.
     {
         let mut inode_table = inodes.write().expect("inodes poisoned");
-        for (i, (item, file_info)) in to_flush.iter().zip(upload_results.iter()).enumerate() {
+        for (i, item) in to_flush.iter().enumerate() {
             if unchanged[i]
                 && let Some(entry) = inode_table.get_mut(item.ino)
             {
-                entry.apply_commit(
-                    file_info.hash(),
-                    file_info.file_size().expect("upload returned XetFileInfo without size"),
-                    item.dirty_generation,
-                    item.sparse_write.is_some(),
-                );
+                entry.apply_noop_commit(item.dirty_generation);
             }
         }
     }

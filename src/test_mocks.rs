@@ -448,10 +448,19 @@ impl XetOps for MockXet {
         &self,
         sparse_state: &SparseWriteState,
         staging_path: &std::path::Path,
-        _file_size: u64,
+        file_size: u64,
     ) -> crate::error::Result<XetFileInfo> {
         if self.range_upload_fail.swap(false, Ordering::SeqCst) {
             return Err(crate::error::Error::Xet("mock range_upload failure".into()));
+        }
+
+        // Mirror real XetSessions::range_upload: nothing dirty + size unchanged
+        // means the original hash is preserved (no upload, no Hub commit).
+        if sparse_state.dirty_ranges.is_empty() && file_size == sparse_state.original_size {
+            return Ok(XetFileInfo::new(
+                sparse_state.original_hash.clone(),
+                sparse_state.original_size,
+            ));
         }
 
         let original = self
