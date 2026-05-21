@@ -484,6 +484,7 @@ async fn flush_batch(
                     file_info.hash(),
                     file_info.file_size().expect("upload returned XetFileInfo without size"),
                     item.dirty_generation,
+                    item.sparse_write.is_some(),
                 );
             }
         }
@@ -523,6 +524,7 @@ async fn flush_batch(
                     file_info.hash(),
                     file_info.file_size().expect("upload returned XetFileInfo without size"),
                     item.dirty_generation,
+                    item.sparse_write.is_some(),
                 );
             }
         }

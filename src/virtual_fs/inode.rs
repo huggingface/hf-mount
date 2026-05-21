@@ -301,19 +301,32 @@ impl InodeEntry {
 
     /// Apply a successful commit: update hash, size, timestamps, and
     /// conditionally clear dirty + pending_deletes if the generation matches.
-    pub fn apply_commit(&mut self, hash: &str, size: u64, dirty_generation: u64) {
+    ///
+    /// `was_sparse_upload = true` means the flush composed the new CAS file via
+    /// `range_upload` from sparse staging. In that case the on-disk staging file
+    /// only contains the dirty patches over a sparse hole — it does NOT match the
+    /// new CAS file, so we must keep `sparse_write` set (re-keyed to the new hash
+    /// with empty dirty_ranges) and clear `staging_is_current`. Reads through the
+    /// still-open handle then go through `fill_sparse_holes` against the new hash,
+    /// and the next open-for-write will rebuild a fresh sparse staging.
+    pub fn apply_commit(&mut self, hash: &str, size: u64, dirty_generation: u64, was_sparse_upload: bool) {
         if self.clear_dirty_if(dirty_generation) {
             // Only update metadata when the generation matches. A concurrent
             // writer may have advanced the generation with newer content;
             // overwriting size/hash here would clobber the in-progress data.
             self.xet_hash = Some(hash.to_string());
-            // The on-disk staging file is the just-uploaded content — valid
-            // cache for the next write-open.
-            self.staging_is_current = true;
+            if was_sparse_upload {
+                // Staging is sparse (holes + dirty patches), not a clean cache.
+                self.staging_is_current = false;
+                self.sparse_write = Some(Arc::new(SparseWriteState::new(hash.to_string(), size)));
+            } else {
+                // The on-disk staging file is the just-uploaded content — valid
+                // cache for the next write-open.
+                self.staging_is_current = true;
+                self.sparse_write = None;
+            }
             self.size = size;
             self.pending_deletes.clear();
-            // Successful flush clears the sparse-write state — staging now matches CAS.
-            self.sparse_write = None;
         }
         let now = SystemTime::now();
         self.mtime = now;
@@ -1150,13 +1163,76 @@ mod tests {
         entry.pending_deletes.push("old_path".to_string());
         let snap = entry.dirty_generation;
 
-        entry.apply_commit("new_hash", 200, snap);
+        entry.apply_commit("new_hash", 200, snap, false);
 
         assert!(!entry.is_dirty());
         assert_eq!(entry.xet_hash.as_deref(), Some("new_hash"));
         assert_eq!(entry.size, 200);
         assert!(entry.pending_deletes.is_empty());
         assert!(entry.mtime > UNIX_EPOCH);
+    }
+
+    #[test]
+    fn apply_commit_sparse_upload_keeps_sparse_state() {
+        let mut table = InodeTable::new(false);
+        let ino = table.insert(
+            ROOT_INODE,
+            "test".to_string(),
+            "test".to_string(),
+            InodeKind::File,
+            100,
+            UNIX_EPOCH,
+            Some("old_hash".to_string()),
+            0o644,
+            0,
+            0,
+        );
+        let entry = table.get_mut(ino).unwrap();
+        entry.set_dirty();
+        entry.sparse_write = Some(Arc::new(SparseWriteState::new("old_hash".into(), 100)));
+        entry.staging_is_current = true; // pretend a prior full-cache state
+        let snap = entry.dirty_generation;
+
+        entry.apply_commit("new_hash", 200, snap, true);
+
+        // Sparse upload: staging only has dirty patches over holes, NOT a clean cache.
+        assert!(!entry.is_dirty(), "dirty flag should be cleared");
+        assert_eq!(entry.xet_hash.as_deref(), Some("new_hash"));
+        assert_eq!(entry.size, 200);
+        assert!(
+            !entry.staging_is_current,
+            "staging cannot be marked current after sparse upload"
+        );
+        let sw = entry.sparse_write.as_ref().expect("sparse_write must persist");
+        assert_eq!(sw.original_hash, "new_hash", "sparse state re-keyed to new hash");
+        assert_eq!(sw.original_size, 200);
+        assert!(sw.dirty_ranges.is_empty(), "fresh sparse state has no dirty ranges");
+    }
+
+    #[test]
+    fn apply_commit_full_upload_clears_sparse_state() {
+        let mut table = InodeTable::new(false);
+        let ino = table.insert(
+            ROOT_INODE,
+            "test".to_string(),
+            "test".to_string(),
+            InodeKind::File,
+            100,
+            UNIX_EPOCH,
+            Some("old_hash".to_string()),
+            0o644,
+            0,
+            0,
+        );
+        let entry = table.get_mut(ino).unwrap();
+        entry.set_dirty();
+        entry.sparse_write = Some(Arc::new(SparseWriteState::new("old_hash".into(), 100)));
+        let snap = entry.dirty_generation;
+
+        entry.apply_commit("new_hash", 200, snap, false);
+
+        assert!(entry.staging_is_current, "full upload: staging matches CAS");
+        assert!(entry.sparse_write.is_none(), "full upload clears sparse state");
     }
 
     #[test]
@@ -1179,7 +1255,7 @@ mod tests {
         entry.pending_deletes.push("old_path".to_string());
         entry.set_dirty(); // gen=2 (simulates concurrent writer)
 
-        entry.apply_commit("new_hash", 200, 1); // stale snapshot
+        entry.apply_commit("new_hash", 200, 1, false); // stale snapshot
 
         // Generation mismatch: dirty stays, and size/hash must NOT be overwritten
         // (a concurrent writer may have newer content in staging).

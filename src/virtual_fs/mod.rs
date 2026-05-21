@@ -2734,6 +2734,8 @@ impl VirtualFs {
                 file_info.hash(),
                 file_info.file_size().expect("upload returned XetFileInfo without size"),
                 channel.dirty_generation_at_open.load(Ordering::Relaxed),
+                // Streaming write always performs a full upload — staging matches new CAS.
+                false,
             );
         }
 
