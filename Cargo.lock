@@ -947,7 +947,7 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "hf-mount"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "async-trait",
  "bytes",
@@ -3751,7 +3751,7 @@ checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
 [[package]]
 name = "xet-client"
 version = "1.5.2"
-source = "git+https://github.com/huggingface/xet-core.git?branch=main#6f0cf38065004950040d0a811f8684c93160a551"
+source = "git+https://github.com/huggingface/xet-core.git?branch=main#51a20410c0b869cd12da20e4704f93130322b1a1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3788,7 +3788,7 @@ dependencies = [
 [[package]]
 name = "xet-core-structures"
 version = "1.5.2"
-source = "git+https://github.com/huggingface/xet-core.git?branch=main#6f0cf38065004950040d0a811f8684c93160a551"
+source = "git+https://github.com/huggingface/xet-core.git?branch=main#51a20410c0b869cd12da20e4704f93130322b1a1"
 dependencies = [
  "async-trait",
  "base64",
@@ -3824,7 +3824,7 @@ dependencies = [
 [[package]]
 name = "xet-data"
 version = "1.5.2"
-source = "git+https://github.com/huggingface/xet-core.git?branch=main#6f0cf38065004950040d0a811f8684c93160a551"
+source = "git+https://github.com/huggingface/xet-core.git?branch=main#51a20410c0b869cd12da20e4704f93130322b1a1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3856,7 +3856,7 @@ dependencies = [
 [[package]]
 name = "xet-runtime"
 version = "1.5.2"
-source = "git+https://github.com/huggingface/xet-core.git?branch=main#6f0cf38065004950040d0a811f8684c93160a551"
+source = "git+https://github.com/huggingface/xet-core.git?branch=main#51a20410c0b869cd12da20e4704f93130322b1a1"
 dependencies = [
  "anyhow",
  "async-trait",
