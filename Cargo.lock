@@ -947,7 +947,7 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "hf-mount"
-version = "0.6.3"
+version = "0.6.4"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2417,9 +2417,9 @@ dependencies = [
 
 [[package]]
 name = "serde_json"
-version = "1.0.149"
+version = "1.0.150"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "83fc039473c5595ace860d8c4fafa220ff474b3fc6bfdb4293327f1a37e94d86"
+checksum = "e8014e44b4736ed0538adeecded0fce2a272f22dc9578a7eb6b2d9993c74cfb9"
 dependencies = [
  "itoa",
  "memchr",
@@ -3751,7 +3751,7 @@ checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
 [[package]]
 name = "xet-client"
 version = "1.5.2"
-source = "git+https://github.com/huggingface/xet-core.git?branch=main#51a20410c0b869cd12da20e4704f93130322b1a1"
+source = "git+https://github.com/huggingface/xet-core.git?branch=main#40f9530753e48f9517b5ad09e2339df7059d8de4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3788,7 +3788,7 @@ dependencies = [
 [[package]]
 name = "xet-core-structures"
 version = "1.5.2"
-source = "git+https://github.com/huggingface/xet-core.git?branch=main#51a20410c0b869cd12da20e4704f93130322b1a1"
+source = "git+https://github.com/huggingface/xet-core.git?branch=main#40f9530753e48f9517b5ad09e2339df7059d8de4"
 dependencies = [
  "async-trait",
  "base64",
@@ -3824,7 +3824,7 @@ dependencies = [
 [[package]]
 name = "xet-data"
 version = "1.5.2"
-source = "git+https://github.com/huggingface/xet-core.git?branch=main#51a20410c0b869cd12da20e4704f93130322b1a1"
+source = "git+https://github.com/huggingface/xet-core.git?branch=main#40f9530753e48f9517b5ad09e2339df7059d8de4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3856,7 +3856,7 @@ dependencies = [
 [[package]]
 name = "xet-runtime"
 version = "1.5.2"
-source = "git+https://github.com/huggingface/xet-core.git?branch=main#51a20410c0b869cd12da20e4704f93130322b1a1"
+source = "git+https://github.com/huggingface/xet-core.git?branch=main#40f9530753e48f9517b5ad09e2339df7059d8de4"
 dependencies = [
  "anyhow",
  "async-trait",
