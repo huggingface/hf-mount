@@ -1741,17 +1741,23 @@ impl VirtualFs {
                 entry.mtime = now;
                 entry.ctime = now;
                 entry.sparse_write = None;
-            } else if created_sparse_staging
-                && !is_dirty
-                && !xet_hash.is_empty()
-                && size > 0
-                && entry.xet_hash.as_deref() == Some(xet_hash)
-            {
-                // Track the original CAS file so flush can use range_upload to
-                // re-chunk only the dirty windows. Only install when we actually
-                // created a sparse staging hole — reusing an existing full staging
-                // would cause `fill_sparse_holes` to re-download bytes already on
-                // disk on every read.
+            } else if created_sparse_staging {
+                // We created a sparse hole sized to the snapshot. The staging file
+                // has no real content for [0, size) outside future dirty writes —
+                // every byte must come from CAS via `fill_sparse_holes` at read
+                // time and via `range_upload` at flush time. Install `sparse_write`
+                // pointing at the snapshot (hash, size) unconditionally.
+                //
+                // We previously also required `entry.xet_hash == xet_hash` as a
+                // paranoia check, but if `poll_remote_changes` updated the inode
+                // between the snapshot and here, that condition could fail while
+                // the zero-filled sparse staging was still marked dirty. The flush
+                // would then see `sparse_write = None` and commit zeros via the
+                // regular `upload_files` path — data loss. Honor the snapshot
+                // instead; the user is editing the version of the file they saw
+                // at open time, and any newer remote revision is reconciled
+                // through the Hub commit semantics, not by silently overwriting
+                // with zeros.
                 entry.sparse_write = Some(Arc::new(inode::SparseWriteState::new(xet_hash.to_string(), size)));
             }
         }

@@ -5463,6 +5463,65 @@ fn sparse_setattr_shrink_clips_state() {
     });
 }
 
+/// Regression: if the inode's xet_hash drifts (remote poller updates it) between
+/// the snapshot in `open` and the install branch in `open_advanced_write`, we
+/// must still install `sparse_write` for the zero-filled sparse staging.
+///
+/// Pre-fix bug: the install branch required `entry.xet_hash == xet_hash` and
+/// silently skipped on mismatch, leaving the file marked dirty with no sparse
+/// metadata. Flush then treated it as a regular full upload and committed the
+/// zeros from the sparse hole — silent data loss.
+#[test]
+fn sparse_open_installs_sparse_write_even_if_inode_hash_drifts_mid_open() {
+    let hub = MockHub::new();
+    hub.add_file("file.txt", 10, Some("orig_hash"), None);
+    let xet = MockXet::new();
+    xet.add_file("orig_hash", b"0123456789");
+    let (rt, vfs) = vfs_advanced(&hub, &xet);
+
+    rt.block_on(async {
+        let attr = vfs.lookup(ROOT_INODE, "file.txt").await.unwrap();
+        let ino = attr.ino;
+
+        // Hold the per-inode staging mutex so the spawned `open` blocks before
+        // taking its internal snapshot and creating the sparse staging file.
+        let staging_lock = vfs.staging.lock(ino);
+        let guard = staging_lock.lock().await;
+
+        let vfs2 = vfs.clone();
+        let open_task = tokio::spawn(async move { vfs2.open(ino, true, false, None).await });
+
+        // Let the task reach the staging-lock contention.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!open_task.is_finished(), "open should be blocked on staging mutex");
+
+        // Simulate a concurrent poll_remote_changes update: the inode's recorded
+        // xet_hash drifts to a new value before `open_advanced_write` reaches its
+        // install branch.
+        {
+            let mut inodes = vfs.inode_table.write().unwrap();
+            inodes.get_mut(ino).unwrap().xet_hash = Some("drifted_hash".into());
+        }
+
+        drop(guard);
+        let fh = open_task.await.unwrap().unwrap();
+
+        {
+            let inodes = vfs.inode_table.read().unwrap();
+            let entry = inodes.get(ino).unwrap();
+            let sw = entry
+                .sparse_write
+                .as_ref()
+                .expect("sparse_write must be installed even when inode hash drifts mid-open");
+            assert_eq!(sw.original_hash, "orig_hash", "sparse state honors the open-time snapshot");
+            assert_eq!(sw.original_size, 10);
+            assert!(entry.is_dirty());
+        }
+
+        vfs.release(fh).await.unwrap();
+    });
+}
+
 /// Regression: a read on the still-open handle AFTER a sparse range_upload flush
 /// must return the new CAS content (composed from the upload) for untouched regions,
 /// not zeros from the sparse staging holes.
