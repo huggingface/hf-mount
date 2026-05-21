@@ -1655,6 +1655,12 @@ impl VirtualFs {
 
         let can_reuse_staging = !truncate && (is_dirty || staging_is_current) && local_exists;
 
+        // True only when this call freshly created a sparse staging file (a hole of
+        // `size` bytes). When `can_reuse_staging` is true we keep the existing full
+        // staging — installing `sparse_write` then would force `fill_sparse_holes` to
+        // re-download bytes the staging already has.
+        let mut created_sparse_staging = false;
+
         if !can_reuse_staging {
             // Clear the flag before touching disk so a partial failure (e.g.
             // mid-download CAS error, async cancel) never leaves the cache
@@ -1666,6 +1672,7 @@ impl VirtualFs {
             // in user dir, so file_size returns 0 here on miss).
             let old_size = self.staging.dir().map(|sd| sd.file_size(ino)).unwrap_or(0);
             let needs_sparse = !self.overlay() && !truncate && !xet_hash.is_empty() && size > 0;
+            created_sparse_staging = needs_sparse;
             let new_size = if needs_sparse {
                 // Sparse staging: create the staging file as a hole of `size` bytes
                 // instead of downloading the original. Reads in [0, size) outside
@@ -1734,9 +1741,17 @@ impl VirtualFs {
                 entry.mtime = now;
                 entry.ctime = now;
                 entry.sparse_write = None;
-            } else if !is_dirty && !xet_hash.is_empty() && size > 0 && entry.xet_hash.as_deref() == Some(xet_hash) {
+            } else if created_sparse_staging
+                && !is_dirty
+                && !xet_hash.is_empty()
+                && size > 0
+                && entry.xet_hash.as_deref() == Some(xet_hash)
+            {
                 // Track the original CAS file so flush can use range_upload to
-                // re-chunk only the dirty windows (sparse staging is set up above).
+                // re-chunk only the dirty windows. Only install when we actually
+                // created a sparse staging hole — reusing an existing full staging
+                // would cause `fill_sparse_holes` to re-download bytes already on
+                // disk on every read.
                 entry.sparse_write = Some(Arc::new(inode::SparseWriteState::new(xet_hash.to_string(), size)));
             }
         }
