@@ -5726,56 +5726,6 @@ fn sparse_pure_truncate_shrink_then_flush_drops_tail() {
     });
 }
 
-/// Regression for the clean→dirty fallback in write() (mod.rs:2392-2400).
-///
-/// In normal flows open_advanced_write set_dirty's the inode before write()
-/// runs, so this defensive branch never fires through public APIs. But the
-/// branch exists to keep the invariant safe if a write() ever reaches a clean
-/// inode + xet_hash + no sparse_write (e.g. a future NFS upgrade path that
-/// doesn't go through open). Test it by force-clearing dirty + sparse_write
-/// between open and write, then asserting the fallback installs a fresh
-/// SparseWriteState pinned to the current xet_hash / size.
-#[test]
-fn write_lazy_installs_sparse_write_on_clean_inode_transition() {
-    let hub = MockHub::new();
-    hub.add_file("file.txt", 11, Some("orig_hash"), None);
-    let xet = MockXet::new();
-    xet.add_file("orig_hash", b"hello world");
-    let (rt, vfs) = vfs_advanced(&hub, &xet);
-
-    rt.block_on(async {
-        let attr = vfs.lookup(ROOT_INODE, "file.txt").await.unwrap();
-        let ino = attr.ino;
-        let fh = vfs.open(ino, true, false, None).await.unwrap();
-
-        // Simulate an out-of-band transition to clean (the branch's documented
-        // trigger — a writable handle existing while the inode is clean and
-        // has a hash but no sparse_write). Just clearing what open installed
-        // is enough: dirty_generation back to 0, sparse_write gone.
-        {
-            let mut inodes = vfs.inode_table.write().unwrap();
-            let entry = inodes.get_mut(ino).unwrap();
-            entry.dirty_generation = 0;
-            entry.sparse_write = None;
-            assert!(!entry.is_dirty(), "precondition: inode is clean");
-            assert!(entry.xet_hash.is_some(), "precondition: hash retained");
-        }
-
-        write_blocking(&vfs, ino, fh, 6, b"RUST!").await.unwrap();
-
-        let sw = {
-            let inodes = vfs.inode_table.read().unwrap();
-            inodes.get(ino).unwrap().sparse_write.clone()
-        };
-        let sw = sw.expect("write() must install sparse_write on the clean→dirty transition");
-        assert_eq!(sw.original_hash, "orig_hash", "fallback pins to entry.xet_hash");
-        assert_eq!(sw.original_size, 11, "fallback pins to entry.size");
-        assert_eq!(sw.dirty_ranges, vec![(6, 11)], "the write range is tracked");
-
-        vfs.release(fh).await.unwrap();
-    });
-}
-
 /// Regression: tracked dirty range must be clamped to staging file length.
 ///
 /// If a setattr(truncate) shrinks the staging file between pwrite and the

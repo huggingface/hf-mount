@@ -283,7 +283,7 @@ impl HubOps for MockHub {
 // ── MockXet ───────────────────────────────────────────────────────────
 
 pub struct MockXet {
-    files: Mutex<HashMap<String, Vec<u8>>>,
+    files: Arc<Mutex<HashMap<String, Vec<u8>>>>,
     pub next_hash: AtomicU64,
     writer_create_fail: AtomicBool,
     upload_fail: AtomicBool,
@@ -315,7 +315,7 @@ pub struct UploadGate {
 impl MockXet {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
-            files: Mutex::new(HashMap::new()),
+            files: Arc::new(Mutex::new(HashMap::new())),
             next_hash: AtomicU64::new(1),
             writer_create_fail: AtomicBool::new(false),
             upload_fail: AtomicBool::new(false),
@@ -395,6 +395,7 @@ impl XetOps for MockXet {
             data: Vec::new(),
             hash: self.next_hash_string(),
             fail_after,
+            files: self.files.clone(),
         }))
     }
 
@@ -536,6 +537,12 @@ pub struct MockStreamingWriter {
     data: Vec<u8>,
     hash: String,
     fail_after: u64,
+    /// Shared handle into the parent MockXet's file map. Registering the
+    /// uploaded data here on finish mirrors the production CAS behavior where
+    /// a successful streaming upload makes the new hash retrievable via
+    /// download_stream — needed for read paths (e.g. fill_sparse_holes) that
+    /// re-read the freshly-uploaded content.
+    files: Arc<Mutex<HashMap<String, Vec<u8>>>>,
 }
 
 #[async_trait::async_trait]
@@ -550,7 +557,8 @@ impl StreamingWriterOps for MockStreamingWriter {
 
     async fn finish_boxed(self: Box<Self>) -> Result<XetFileInfo> {
         let size = self.data.len() as u64;
-        Ok(XetFileInfo::new(self.hash.clone(), size))
+        self.files.lock().unwrap().insert(self.hash.clone(), self.data);
+        Ok(XetFileInfo::new(self.hash, size))
     }
 
     fn len(&self) -> u64 {

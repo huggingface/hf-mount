@@ -1669,12 +1669,6 @@ impl VirtualFs {
 
         let can_reuse_staging = !truncate && (is_dirty || staging_is_current) && local_exists;
 
-        // True only when this call freshly created a sparse staging file (a hole of
-        // `size` bytes). When `can_reuse_staging` is true we keep the existing full
-        // staging — installing `sparse_write` then would force `fill_sparse_holes` to
-        // re-download bytes the staging already has.
-        let mut created_sparse_staging = false;
-
         if !can_reuse_staging {
             // Clear the flag before touching disk so a partial failure (e.g.
             // mid-download CAS error, async cancel) never leaves the cache
@@ -1686,7 +1680,6 @@ impl VirtualFs {
             // in user dir, so file_size returns 0 here on miss).
             let old_size = self.staging.dir().map(|sd| sd.file_size(ino)).unwrap_or(0);
             let needs_sparse = !self.overlay() && !truncate && !xet_hash.is_empty() && size > 0;
-            created_sparse_staging = needs_sparse;
             let new_size = if needs_sparse {
                 // Sparse staging: create the staging file as a hole of `size` bytes
                 // instead of downloading the original. Reads in [0, size) outside
@@ -1752,18 +1745,30 @@ impl VirtualFs {
         {
             let mut inodes = self.inode_table.write().expect("inodes poisoned");
             let entry = inodes.get_mut(ino).ok_or(libc::ENOENT)?;
-            if !truncate && created_sparse_staging {
+            // Drift check applies whenever we'd key sparse_write to the snapshot
+            // hash/size: both the freshly-sparse path AND the reused-staging path
+            // (where the staging file on disk matches the snapshot hash but a
+            // concurrent poll may have updated entry.xet_hash to a different
+            // remote revision). Excluded:
+            //  * truncate: clears sparse semantics outright
+            //  * is_dirty: staging holds in-flight modifications that no longer
+            //    correspond to entry.xet_hash (e.g. truncate+write between two
+            //    opens). Keying sparse_write to the stale hash here would make
+            //    fill_sparse_holes download bytes that have no relation to what
+            //    the staging file actually contains.
+            let has_xet = !xet_hash.is_empty() && size > 0;
+            let will_install_sparse = !truncate && !is_dirty && !self.overlay() && has_xet;
+            if will_install_sparse {
                 let snapshot_hash = Some(xet_hash);
                 let drift_hash = entry.xet_hash.as_deref() != snapshot_hash;
                 let drift_size = entry.size != size;
                 if drift_hash || drift_size {
-                    // The staging file we created (set_len to the snapshot size)
-                    // no longer reflects what the user would see post-drift.
+                    // Staging no longer reflects what the user opened against.
                     // Bail with EAGAIN so the caller retries against the now-
-                    // current inode state. The orphan sparse staging file will
-                    // be overwritten on the retry (can_reuse_staging is false:
-                    // we cleared staging_is_current above, and the inode is
-                    // not dirty since we never called set_dirty here).
+                    // current inode state. Any sparse staging we created will
+                    // be overwritten on the retry (we cleared staging_is_current
+                    // above, and the inode is not dirty since we never called
+                    // set_dirty here).
                     debug!(
                         "open_advanced_write: ino={} drift detected (hash {}, size {}), retrying",
                         ino, drift_hash, drift_size
@@ -1779,12 +1784,16 @@ impl VirtualFs {
                 entry.mtime = now;
                 entry.ctime = now;
                 entry.sparse_write = None;
-            } else if created_sparse_staging {
-                // Sparse hole sized to the snapshot. Every byte in [0, size)
-                // comes from CAS via `fill_sparse_holes` at read time and via
-                // `range_upload` at flush time. Now safe to install sparse_write
-                // against the snapshot — no drift can occur from here on because
-                // the inode is dirty (update_remote_file skips dirty inodes).
+            } else if will_install_sparse && entry.sparse_write.is_none() {
+                // Install sparse tracking against the snapshot hash. Covers two
+                // cases under the same drift guard:
+                //  * created_sparse_staging: staging is a hole sized to snapshot;
+                //    reads fill from CAS via `fill_sparse_holes`.
+                //  * reused staging: on-disk file matches the snapshot hash
+                //    fully (staging_is_current path); reads serve from staging
+                //    and fill_sparse_holes is a no-op for non-dirty regions.
+                // Once set_dirty has fired, poll skips this inode so the snapshot
+                // remains valid for the lifetime of the open.
                 entry.sparse_write = Some(Arc::new(inode::SparseWriteState::new(xet_hash.to_string(), size)));
             }
         }
@@ -2395,32 +2404,29 @@ impl VirtualFs {
                     let written = n as u32;
                     let new_end = offset + written as u64;
 
-                    // Guard against a concurrent setattr(truncate) that shrank the
-                    // staging file between pwrite and the inode update — without
-                    // this, entry.size could exceed the staging length and
-                    // range_upload would hit EOF on the now-smaller file.
+                    // Acquire the inode lock BEFORE reading the staging length. setattr
+                    // performs ftruncate + size update under this same lock, so reading
+                    // metadata.len() outside the lock would race: setattr could shrink
+                    // the file between pwrite and the inode update, leaving entry.size
+                    // > actual staging length and causing range_upload to short-read
+                    // at flush time.
+                    let mut inodes = self.inode_table.write().expect("inodes poisoned");
                     let actual_size = file.metadata().map(|m| m.len()).unwrap_or(new_end);
                     let effective_end = new_end.min(actual_size);
-                    // The dirty range MUST also be clamped to the same boundary.
-                    // range_upload seeks to `offset` and reads `end - offset` bytes
-                    // from staging; if we recorded the unclamped `written` here the
-                    // shrink would leave a dirty range past EOF and the upload
-                    // would short-read at flush time.
+                    // The dirty range MUST be clamped to the same boundary as entry.size.
+                    // range_upload seeks to `start` and reads `end - start` bytes from
+                    // staging; an unclamped dirty range past EOF would short-read.
                     let tracked_len = effective_end.saturating_sub(offset);
 
-                    let mut inodes = self.inode_table.write().expect("inodes poisoned");
                     if let Some(entry) = inodes.get_mut(handle_ino) {
                         // Track the dirty range for sparse-staging flushes.
+                        // open_advanced_write installs sparse_write up front (under
+                        // the same drift guard) whenever sparse semantics apply, so
+                        // we never reach here with a None sparse_write on a file
+                        // that has a CAS-backed original — no risky keying-to-
+                        // current-hash fallback is needed.
                         if let Some(sw) = entry.sparse_write.as_mut() {
                             Arc::make_mut(sw).track_write(offset, tracked_len);
-                        } else if !entry.is_dirty()
-                            && let Some(hash) = entry.xet_hash.clone()
-                        {
-                            // Clean → dirty transition (e.g. NFS handle upgrade): set
-                            // up sparse tracking so flush can use range_upload.
-                            let mut sw = inode::SparseWriteState::new(hash, entry.size);
-                            sw.track_write(offset, tracked_len);
-                            entry.sparse_write = Some(Arc::new(sw));
                         }
                         if effective_end > entry.size {
                             if let Some(sd) = self.staging.dir() {
