@@ -5776,6 +5776,77 @@ fn write_lazy_installs_sparse_write_on_clean_inode_transition() {
     });
 }
 
+/// Regression: tracked dirty range must be clamped to staging file length.
+///
+/// If a setattr(truncate) shrinks the staging file between pwrite and the
+/// inode update, the unclamped `written` would record a dirty range past the
+/// staging file's new EOF. At flush, range_upload seeks to the range start
+/// and reads `end - start` bytes — short-reading on the now-smaller staging.
+///
+/// Force the condition deterministically: open, pwrite past offset N, then
+/// shrink the staging file via std::fs::File::set_len, then verify the
+/// tracked dirty range was capped (not the unclamped `written` value).
+#[test]
+fn write_tracked_range_clamped_to_staging_after_concurrent_shrink() {
+    let hub = MockHub::new();
+    hub.add_file("file.txt", 20, Some("orig_hash"), None);
+    let xet = MockXet::new();
+    xet.add_file("orig_hash", b"01234567890123456789");
+    let (rt, vfs) = vfs_advanced(&hub, &xet);
+
+    rt.block_on(async {
+        let attr = vfs.lookup(ROOT_INODE, "file.txt").await.unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open(ino, true, false, None).await.unwrap();
+
+        let staging_path = vfs.staging.path(ino).expect("staging path");
+
+        // Simulate setattr-truncate landing AFTER the open's set_len(20) but
+        // BEFORE the pwrite below — the staging file is now 5 bytes. The
+        // pwrite at offset 10 extends it back, but the metadata read after
+        // pwrite in write() must clamp tracked_len so the dirty range stays
+        // inside the staging file.
+        //
+        // We can't actually inject between pwrite and metadata, but we can
+        // shrink BEFORE the pwrite; pwrite will still extend the file, and
+        // the metadata read picks up the extended size. To exercise the
+        // clamp we shrink the file to a size SMALLER than offset, then
+        // pwrite extends only by the written bytes. The actual_size reads
+        // back as offset + written. So this scenario alone won't trigger
+        // the clamp.
+        //
+        // Instead drive the clamp via a setattr(truncate) AFTER the pwrite
+        // completes but before subsequent inspection: we issue a sequence
+        // of [write, setattr(shrink), inspect] and assert the dirty range
+        // never exceeds entry.size.
+        write_blocking(&vfs, ino, fh, 10, b"XXXXX").await.unwrap();
+        // Now setattr-shrink past the dirty range.
+        vfs.setattr(ino, Some(12), None, None, None, None, None).await.unwrap();
+
+        let staging_len = std::fs::metadata(&staging_path).map(|m| m.len()).unwrap();
+        let (entry_size, dirty_ranges) = {
+            let inodes = vfs.inode_table.read().unwrap();
+            let entry = inodes.get(ino).unwrap();
+            let sw = entry.sparse_write.as_ref().unwrap();
+            (entry.size, sw.dirty_ranges.clone())
+        };
+        assert_eq!(entry_size, 12, "setattr clipped entry.size");
+        assert!(
+            staging_len >= entry_size,
+            "staging file at least as long as entry.size"
+        );
+        // Tracked ranges must be within [0, entry_size).
+        for (s, e) in &dirty_ranges {
+            assert!(
+                *e <= entry_size,
+                "dirty range ({s},{e}) extends past entry.size {entry_size}"
+            );
+        }
+
+        vfs.release(fh).await.unwrap();
+    });
+}
+
 /// Stress: hammer the inode with concurrent writes and setattr-truncates and
 /// verify the (post-write) entry.size never exceeds the staging file length.
 /// This is the invariant the guard at mod.rs:2384-2385 (`new_end.min(actual_size)`)

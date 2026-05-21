@@ -218,14 +218,17 @@ impl SparseWriteState {
         self.dirty_ranges.splice(first..last, [(new_start, new_end)]);
     }
 
-    /// Remove dirty ranges past `new_size` and cap overlapping ones.
+    /// Remove dirty ranges past `new_size`, cap overlapping ones, and drop any
+    /// range that becomes empty after clipping (defense — `track_write` never
+    /// produces zero-length ranges, but keeping the invariant `s < e` here means
+    /// downstream consumers don't have to worry about it).
     fn trim_dirty_ranges(&mut self, new_size: u64) {
         self.dirty_ranges.retain_mut(|&mut (ref s, ref mut e)| {
             if *s >= new_size {
                 return false;
             }
             *e = (*e).min(new_size);
-            true
+            *s < *e
         });
     }
 
@@ -315,6 +318,17 @@ impl InodeEntry {
 
     /// Apply a successful commit: update hash, size, timestamps, and
     /// conditionally clear dirty + pending_deletes if the generation matches.
+    ///
+    /// Generation mismatch is the concurrent-writer case: a write landed
+    /// between the flush snapshot and this call, so `dirty_generation` is
+    /// ahead of the snapshot. We skip the metadata updates here to avoid
+    /// clobbering the in-progress write. The CAS upload and the Hub commit
+    /// already fired with the now-stale content; `entry.xet_hash` therefore
+    /// remains pointing at the pre-flush hash, and the next flush will
+    /// re-upload the file. The CAS layer dedups identical content, but the
+    /// sparse path makes a redundant flush more visible because
+    /// `range_upload` is more expensive than a true no-op — worth keeping
+    /// in mind if hot paths show repeat flushes under contention.
     ///
     /// `was_sparse_upload = true` means the flush composed the new CAS file via
     /// `range_upload` from sparse staging. In that case the on-disk staging file

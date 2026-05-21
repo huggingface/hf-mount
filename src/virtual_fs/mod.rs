@@ -1610,28 +1610,22 @@ impl VirtualFs {
             // userspace — the race window is tiny so a bounded retry is
             // overwhelmingly enough.
             const MAX_RETRIES: usize = 3;
-            let mut last_entry = file_entry;
-            for attempt in 0..MAX_RETRIES {
+            let mut entry = file_entry;
+            for attempt in 1..=MAX_RETRIES {
                 match self
-                    .open_advanced_write(
-                        ino,
-                        &last_entry.full_path,
-                        &last_entry.xet_hash,
-                        last_entry.size,
-                        truncate,
-                    )
+                    .open_advanced_write(ino, &entry.full_path, &entry.xet_hash, entry.size, truncate)
                     .await
                 {
                     Ok(fh) => return Ok(fh),
-                    Err(libc::EAGAIN) if attempt + 1 < MAX_RETRIES => {
-                        debug!("open: ino={} drift retry {}/{}", ino, attempt + 1, MAX_RETRIES);
-                        last_entry = self.get_file_entry(ino)?;
-                        continue;
+                    Err(libc::EAGAIN) if attempt < MAX_RETRIES => {
+                        debug!("open: ino={} drift retry {}/{}", ino, attempt, MAX_RETRIES);
+                        entry = self.get_file_entry(ino)?;
                     }
                     Err(e) => return Err(e),
                 }
             }
-            unreachable!("MAX_RETRIES loop exited without a result")
+            // All MAX_RETRIES attempts saw drift — surface EAGAIN to userspace.
+            Err(libc::EAGAIN)
         } else if writable && truncate {
             // Simple streaming write (append-only, synchronous commit on close)
             self.open_streaming_write(ino, pid).await
@@ -2104,6 +2098,15 @@ impl VirtualFs {
     /// dirty ranges are zeros (holes). This method downloads those regions from CAS
     /// and overlays them onto `buf`, leaving dirty bytes untouched.
     ///
+    /// Simplification: the CAS download covers the whole `[offset, orig_end)`
+    /// range even when most of it overlaps dirty ranges (the unused bytes are
+    /// just thrown away). Fetching only the hole sub-segments would save
+    /// bandwidth in mid-edit read patterns, but the reconstruction cache in
+    /// `CachedXetClient` amortizes repeated fetches and the early-return on
+    /// fully-covered reads handles the common heavy-write case. Worth
+    /// revisiting if profiling shows reads spend time in CAS downloads while
+    /// dirty_ranges cover most of the buffer.
+    ///
     /// We do not backfill the staging file with downloaded CAS bytes — that would
     /// require a separate `fetched_ranges` tracker (reusing `dirty_ranges` would
     /// cause `range_upload` to re-upload unmodified data). The reconstruction cache
@@ -2383,19 +2386,25 @@ impl VirtualFs {
                     // range_upload would hit EOF on the now-smaller file.
                     let actual_size = file.metadata().map(|m| m.len()).unwrap_or(new_end);
                     let effective_end = new_end.min(actual_size);
+                    // The dirty range MUST also be clamped to the same boundary.
+                    // range_upload seeks to `offset` and reads `end - offset` bytes
+                    // from staging; if we recorded the unclamped `written` here the
+                    // shrink would leave a dirty range past EOF and the upload
+                    // would short-read at flush time.
+                    let tracked_len = effective_end.saturating_sub(offset);
 
                     let mut inodes = self.inode_table.write().expect("inodes poisoned");
                     if let Some(entry) = inodes.get_mut(handle_ino) {
                         // Track the dirty range for sparse-staging flushes.
                         if let Some(sw) = entry.sparse_write.as_mut() {
-                            Arc::make_mut(sw).track_write(offset, written as u64);
+                            Arc::make_mut(sw).track_write(offset, tracked_len);
                         } else if !entry.is_dirty()
                             && let Some(hash) = entry.xet_hash.clone()
                         {
                             // Clean → dirty transition (e.g. NFS handle upgrade): set
                             // up sparse tracking so flush can use range_upload.
                             let mut sw = inode::SparseWriteState::new(hash, entry.size);
-                            sw.track_write(offset, written as u64);
+                            sw.track_write(offset, tracked_len);
                             entry.sparse_write = Some(Arc::new(sw));
                         }
                         if effective_end > entry.size {
