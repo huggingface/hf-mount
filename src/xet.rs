@@ -1,12 +1,12 @@
-use std::io::SeekFrom;
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::task::{Context, Poll};
 
 use bytes::Bytes;
-use tokio::fs::File as TokioFile;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt};
+use tokio::io::{AsyncRead, ReadBuf};
 use tracing::info;
 use xet_client::cas_client::Client;
 use xet_client::cas_types::FileRange;
@@ -197,6 +197,12 @@ impl XetOps for XetSessions {
             ));
         }
 
+        // Open the staging file once and share it across all per-range readers.
+        // Each PreadReader holds an Arc<File> and tracks its own (offset, remaining),
+        // using pread(2) so independent positions don't fight a shared file cursor —
+        // avoids N open(2) syscalls for an N-fragment file.
+        let staging_file = Arc::new(std::fs::File::open(staging_path).map_err(Error::Io)?);
+
         // Build DirtyInput list in original-file coordinates. Each dirty range
         // (start, end) is expressed in current-file coordinates; track_write
         // snaps writes past `effective_original_size` back to it, so
@@ -212,9 +218,11 @@ impl XetOps for XetSessions {
                 start..sparse_state.original_size
             };
 
-            let mut file = TokioFile::open(staging_path).await.map_err(Error::Io)?;
-            file.seek(SeekFrom::Start(start)).await.map_err(Error::Io)?;
-            let reader: Pin<Box<dyn AsyncRead + Send>> = Box::pin(file.take(new_length));
+            let reader: Pin<Box<dyn AsyncRead + Send>> = Box::pin(PreadReader {
+                file: staging_file.clone(),
+                offset: start,
+                remaining: new_length,
+            });
             dirty_inputs.push(DirtyInput {
                 original_range,
                 reader,
@@ -256,6 +264,51 @@ impl XetOps for XetSessions {
         );
 
         Ok(result)
+    }
+}
+
+// ── PreadReader ──────────────────────────────────────────────────────
+
+/// `AsyncRead` over a positional window of a shared `std::fs::File`, using
+/// `pread(2)` so multiple readers can target distinct regions of the same file
+/// without contending on a shared cursor. Used by `range_upload` to feed
+/// `xet-core` per-range readers from a single open FD on the staging file.
+///
+/// `pread` is synchronous, but staging files live on local SSD and `xet-core`
+/// reads in bounded chunks, so the per-poll latency stays in the microseconds
+/// range — small enough not to starve the runtime in practice.
+struct PreadReader {
+    file: Arc<std::fs::File>,
+    offset: u64,
+    remaining: u64,
+}
+
+impl AsyncRead for PreadReader {
+    fn poll_read(self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        if this.remaining == 0 {
+            return Poll::Ready(Ok(()));
+        }
+        let want = buf.remaining().min(this.remaining as usize);
+        if want == 0 {
+            return Poll::Ready(Ok(()));
+        }
+        let slice = &mut buf.initialize_unfilled_to(want)[..want];
+        match this.file.read_at(slice, this.offset) {
+            Ok(0) => {
+                // Short read: staging file ended before `remaining` was met.
+                // Surface as a clean EOF so `xet-core` can decide how to react.
+                this.remaining = 0;
+                Poll::Ready(Ok(()))
+            }
+            Ok(n) => {
+                buf.advance(n);
+                this.offset += n as u64;
+                this.remaining -= n as u64;
+                Poll::Ready(Ok(()))
+            }
+            Err(e) => Poll::Ready(Err(e)),
+        }
     }
 }
 
