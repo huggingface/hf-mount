@@ -640,12 +640,30 @@ pub fn mount_fuse(
     // ignores `n_threads`. We still set it for parity in the empty-Vec
     // path (Session::new) where it does drive thread count.
     if cfg!(target_os = "linux") {
-        config.clone_fd = fuse_fds.is_empty();
-        config.n_threads = if fuse_fds.is_empty() {
-            Some(setup.max_threads)
+        if fuse_fds.is_empty() {
+            // fuser's clone_fd path opens /dev/fuse fresh, which requires
+            // CAP_SYS_ADMIN. In unprivileged containers (e.g. SkyPilot on
+            // Kubernetes without device access) the initial mount goes via
+            // setuid fusermount but /dev/fuse direct open is denied, so
+            // clone_fd would EPERM mid-`session.run()` and crash the daemon.
+            // Probe once; if open fails, drop to a single shared Arc<fd>.
+            let can_open_dev_fuse = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open("/dev/fuse")
+                .is_ok();
+            config.clone_fd = can_open_dev_fuse;
+            config.n_threads = Some(setup.max_threads);
+            if !can_open_dev_fuse {
+                info!(
+                    "/dev/fuse not directly openable (unprivileged container?); \
+                     disabling per-thread fd clone, all worker threads share one fd"
+                );
+            }
         } else {
-            Some(fuse_fds.len())
-        };
+            config.clone_fd = false;
+            config.n_threads = Some(fuse_fds.len());
+        }
     }
 
     let session = if fuse_fds.is_empty() {
