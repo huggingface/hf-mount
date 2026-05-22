@@ -331,15 +331,22 @@ impl InodeEntry {
         if self.clear_dirty_if(dirty_generation) {
             self.pending_deletes.clear();
             // Keep `sparse_write` (still-open handles need it for
-            // `fill_sparse_holes`) but reset its `dirty_ranges`. The no-op
-            // means the on-disk staging matches `original_hash`, so nothing
-            // is dirty wrt that hash anymore. If we left the old ranges
-            // here and the staging later got recreated as a sparse hole
-            // (e.g. release + reopen → fresh staging), reads would see
-            // those positions as "covered by dirty range" → skip CAS fill
-            // → return zeros from the hole.
+            // `fill_sparse_holes`) but reset the parts that describe staging
+            // contents:
+            //  * `dirty_ranges`: the no-op means staging matches
+            //    `original_hash`, so nothing is dirty wrt that hash. Stale
+            //    ranges would mark zero positions as "covered by dirty"
+            //    on a subsequent reopen with fresh sparse staging → reads
+            //    return zeros from the hole.
+            //  * `staging_holds_full_original`: the on-disk staging file may
+            //    be GC'd or recreated as a hole later. Leaving this true
+            //    would make `fill_sparse_holes` short-circuit and return
+            //    those zeros. Pessimistic but correct: subsequent reads
+            //    fetch from CAS again.
             if let Some(sw) = self.sparse_write.as_mut() {
-                Arc::make_mut(sw).dirty_ranges.clear();
+                let sw = Arc::make_mut(sw);
+                sw.dirty_ranges.clear();
+                sw.staging_holds_full_original = false;
             }
         }
         // mtime/ctime are bumped unconditionally — same as apply_commit. A
@@ -866,7 +873,15 @@ impl InodeTable {
             .collect()
     }
 
-    /// Update remote file metadata (only if not dirty). Returns true if updated.
+    /// Update remote file metadata (only if not dirty and no open handles).
+    /// Returns true if updated.
+    ///
+    /// Skipping while handles are open preserves the open snapshot semantics:
+    /// any handle holding a `sparse_write` keyed to the old xet_hash continues
+    /// to operate on its snapshot until released. Without this guard, poll
+    /// could change the inode's hash mid-open, causing later operations on
+    /// the same inode (reads via fill_sparse_holes, setattr, second opens) to
+    /// see inconsistent state across the open's lifetime.
     pub fn update_remote_file(
         &mut self,
         ino: u64,
@@ -875,8 +890,9 @@ impl InodeTable {
         new_size: u64,
         new_mtime: SystemTime,
     ) -> bool {
+        let has_handles = self.has_open_handles(ino);
         if let Some(entry) = self.inodes.get_mut(&ino) {
-            if entry.is_dirty() {
+            if entry.is_dirty() || has_handles {
                 return false;
             }
             entry.xet_hash = new_hash;

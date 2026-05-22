@@ -1819,6 +1819,14 @@ impl VirtualFs {
                         inode::SparseWriteState::new(xet_hash.to_string(), size)
                     };
                     entry.sparse_write = Some(Arc::new(sw));
+                } else if !can_reuse_staging && let Some(sw) = entry.sparse_write.as_mut() {
+                    // Hash matched the snapshot so we kept the existing
+                    // `sparse_write`, but staging was just recreated as a
+                    // fresh sparse hole (above, line ~1700). The leftover
+                    // `staging_holds_full_original` flag is now a lie —
+                    // force it false so `fill_sparse_holes` refetches from
+                    // CAS instead of short-circuiting and returning zeros.
+                    Arc::make_mut(sw).staging_holds_full_original = false;
                 }
             }
         }
