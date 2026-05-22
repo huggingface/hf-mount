@@ -7,7 +7,8 @@ use xet_client::ClientError;
 use xet_client::cas_client::adaptive_concurrency::ConnectionPermit;
 use xet_client::cas_client::{Client, ProgressCallback, URLProvider};
 use xet_client::cas_types::{
-    BatchQueryReconstructionResponse, FileRange, HexMerkleHash, QueryReconstructionResponseV2, XorbReconstructionTerm,
+    BatchQueryReconstructionResponse, FileChunkHashesResponse, FileRange, HexMerkleHash, QueryReconstructionResponseV2,
+    XorbReconstructionTerm,
 };
 use xet_core_structures::merklehash::MerkleHash;
 use xet_core_structures::metadata_shard::file_structs::MDBFileInfo;
@@ -296,6 +297,14 @@ impl Client for CachedXetClient {
         self.inner.get_file_reconstruction_info(file_hash).await
     }
 
+    async fn get_file_chunk_hashes(
+        &self,
+        file_id: &MerkleHash,
+        dirty_ranges: Vec<FileRange>,
+    ) -> Result<FileChunkHashesResponse> {
+        self.inner.get_file_chunk_hashes(file_id, dirty_ranges).await
+    }
+
     async fn batch_get_reconstruction(&self, file_ids: &[MerkleHash]) -> Result<BatchQueryReconstructionResponse> {
         self.inner.batch_get_reconstruction(file_ids).await
     }
@@ -434,6 +443,14 @@ mod tests {
             &self,
             _file_hash: &MerkleHash,
         ) -> Result<Option<(MDBFileInfo, Option<MerkleHash>)>> {
+            unimplemented!("not needed in these tests")
+        }
+
+        async fn get_file_chunk_hashes(
+            &self,
+            _file_id: &MerkleHash,
+            _dirty_ranges: Vec<FileRange>,
+        ) -> Result<FileChunkHashesResponse> {
             unimplemented!("not needed in these tests")
         }
 
