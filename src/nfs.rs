@@ -301,21 +301,50 @@ impl NFSFileSystem for NFSAdapter {
                         .map_err(errno_to_nfs);
                 }
                 Err(libc::EBADF) => {
-                    // Handle was opened read-only. Upgrade to writable.
+                    // Handle was opened read-only. Evict + remove from pool so
+                    // a concurrent caller doesn't peek a freshly-released fh.
+                    // Mirrors the analogous EBADF retry in `read()` above.
+                    // Guard against removing a different fh: a successful
+                    // concurrent upgrader may have already replaced our entry.
+                    {
+                        let mut pool = self.handle_pool.lock().expect("handle_pool poisoned");
+                        if pool.peek(id) == Some(fh) {
+                            pool.remove(id);
+                        }
+                    }
                     self.evict_handle(id, fh).await;
                 }
                 Err(e) => return Err(errno_to_nfs(e)),
             }
         }
 
-        // Slow path: open a writable handle and retry the write.
+        // Slow path: open a writable handle, run the pwrite, THEN publish the
+        // handle to the pool. Two concurrent writers can both reach this
+        // branch and open distinct writable handles (open is serialized by
+        // VirtualFs's per-inode staging lock, so the calls don't overlap, but
+        // they DO produce two distinct fh). If we inserted before the pwrite,
+        // the second writer's `insert_handle` would release the first
+        // writer's freshly-opened fh as `replaced` — and the first writer's
+        // subsequent pwrite would hit EBADF on a closed fh, mapping back to
+        // NFS3ERR_STALE (silent data loss, the very symptom this code path
+        // exists to avoid). By writing before publishing, the fh stays
+        // private to this task until its pwrite completes; nothing else can
+        // see it, nothing else can release it.
         let fh = self
             .virtual_fs
             .open(id, true, false, None)
             .await
             .map_err(errno_to_nfs)?;
+        if let Err(e) = self.virtual_fs.write(id, fh, offset, data) {
+            // Write failed — release the fh we opened so we don't leak it.
+            let _ = self.virtual_fs.release(fh).await;
+            return Err(errno_to_nfs(e));
+        }
+        // Publish only on success. Any concurrent writer that reaches this
+        // point will release its own fh via the same Err path or replace
+        // ours via insert_handle's eviction, but by then our pwrite has
+        // committed to the staging file.
         self.insert_handle(id, fh).await;
-        self.virtual_fs.write(id, fh, offset, data).map_err(errno_to_nfs)?;
         // NFS has no close/flush RPC, so schedule a debounced flush after
         // each write to ensure data eventually gets committed to the Hub.
         self.virtual_fs.schedule_flush(id);
