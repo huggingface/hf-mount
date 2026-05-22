@@ -1784,26 +1784,42 @@ impl VirtualFs {
                 entry.mtime = now;
                 entry.ctime = now;
                 entry.sparse_write = None;
-            } else if will_install_sparse && entry.sparse_write.is_none() {
-                // Install sparse tracking against the snapshot hash. Covers two
-                // cases under the same drift guard:
-                //  * fresh sparse staging (can_reuse_staging=false): staging is
-                //    a hole sized to snapshot; reads must fill from CAS via
-                //    `fill_sparse_holes`.
-                //  * reused staging (can_reuse_staging=true with staging_is_current
-                //    snapshotted true): on-disk file already holds the full
-                //    original content for the snapshot hash. Mark it via
-                //    `new_with_full_staging` so `fill_sparse_holes` is a no-op
-                //    and reads serve directly from staging without an extra
-                //    CAS round-trip.
-                // Once set_dirty has fired, poll skips this inode so the snapshot
-                // remains valid for the lifetime of the open.
-                let sw = if can_reuse_staging {
-                    inode::SparseWriteState::new_with_full_staging(xet_hash.to_string(), size)
-                } else {
-                    inode::SparseWriteState::new(xet_hash.to_string(), size)
+            } else if will_install_sparse {
+                // `sparse_write` may already be set from a previous open of
+                // this inode (kept alive across `release` for any handle
+                // that may still be reading via `fill_sparse_holes`).
+                //
+                // Re-install when it's missing OR stale: stale = its
+                // `original_hash` doesn't match the snapshot xet_hash. That
+                // happens after a poll updated the inode's hash to a newer
+                // remote revision while a prior sparse_write was lingering
+                // — without this refresh, the next `range_upload` would
+                // compose the new writes against the stale hash and lose
+                // the remote update.
+                let need_install = match entry.sparse_write.as_ref() {
+                    None => true,
+                    Some(sw) => sw.original_hash != xet_hash,
                 };
-                entry.sparse_write = Some(Arc::new(sw));
+                if need_install {
+                    // Covers two cases under the same drift guard:
+                    //  * fresh sparse staging (can_reuse_staging=false):
+                    //    staging is a hole sized to snapshot; reads must
+                    //    fill from CAS via `fill_sparse_holes`.
+                    //  * reused staging (can_reuse_staging=true with
+                    //    staging_is_current snapshotted true): on-disk
+                    //    file already holds the full original content for
+                    //    the snapshot hash. Mark it via
+                    //    `new_with_full_staging` so `fill_sparse_holes`
+                    //    is a no-op and reads serve directly from staging.
+                    // Once set_dirty has fired, poll skips this inode so
+                    // the snapshot remains valid for the open's lifetime.
+                    let sw = if can_reuse_staging {
+                        inode::SparseWriteState::new_with_full_staging(xet_hash.to_string(), size)
+                    } else {
+                        inode::SparseWriteState::new(xet_hash.to_string(), size)
+                    };
+                    entry.sparse_write = Some(Arc::new(sw));
+                }
             }
         }
 

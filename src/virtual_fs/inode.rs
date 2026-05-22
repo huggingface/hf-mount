@@ -330,13 +330,17 @@ impl InodeEntry {
     pub fn apply_noop_commit(&mut self, dirty_generation: u64) {
         if self.clear_dirty_if(dirty_generation) {
             self.pending_deletes.clear();
-            // Do NOT clear `sparse_write` here. A no-op flush means the
-            // upload returned the same hash as the snapshot — typical case:
-            // the user opened the file but never wrote, then released. If a
-            // handle is still open with a sparse staging file, its reads
-            // need `sparse_write` to fill the holes from CAS. Clearing it
-            // would make subsequent reads return zeros from the sparse
-            // staging file.
+            // Keep `sparse_write` (still-open handles need it for
+            // `fill_sparse_holes`) but reset its `dirty_ranges`. The no-op
+            // means the on-disk staging matches `original_hash`, so nothing
+            // is dirty wrt that hash anymore. If we left the old ranges
+            // here and the staging later got recreated as a sparse hole
+            // (e.g. release + reopen → fresh staging), reads would see
+            // those positions as "covered by dirty range" → skip CAS fill
+            // → return zeros from the hole.
+            if let Some(sw) = self.sparse_write.as_mut() {
+                Arc::make_mut(sw).dirty_ranges.clear();
+            }
         }
         // mtime/ctime are bumped unconditionally — same as apply_commit. A
         // no-op flush still ran an open/dirty/flush cycle, and observers that
@@ -883,12 +887,11 @@ impl InodeTable {
             // matches xet_hash. An in-flight download observes this under
             // its post-check and won't re-flag the cache.
             entry.staging_is_current = false;
-            // Sparse state references the OLD hash. If we keep it, a
-            // subsequent open-for-write would reuse the stale state and
-            // `range_upload` would compose the new content against the
-            // wrong base. Clear it so the next open re-installs against
-            // the current remote hash via the drift-checked path.
-            entry.sparse_write = None;
+            // Do NOT clear `sparse_write` here. Any handle still open against
+            // the old snapshot relies on it for `fill_sparse_holes` to serve
+            // reads from the old CAS hash. The next open's drift check
+            // (`open_advanced_write`) refreshes `sparse_write` against the
+            // current xet_hash when the snapshot doesn't match.
             true
         } else {
             false
