@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use nfsserve::nfs::{
-    fattr3, fileid3, filename3, ftype3, nfspath3, nfsstat3, nfsstring, nfstime3, sattr3, set_atime, set_gid3,
+    fattr3, fileid3, filename3, ftype3, nfs_fh3, nfspath3, nfsstat3, nfsstring, nfstime3, sattr3, set_atime, set_gid3,
     set_mode3, set_mtime, set_size3, set_uid3, specdata3,
 };
 use nfsserve::tcp::{NFSTcp, NFSTcpListener};
@@ -22,14 +22,34 @@ pub struct NFSAdapter {
     virtual_fs: Arc<VirtualFs>,
     handle_pool: Arc<Mutex<HandlePool>>,
     read_only: bool,
+    /// Stable generation number embedded in every NFS filehandle this adapter
+    /// hands out. Derived from the mount source identifier (FNV-1a hash of
+    /// `bucket/<id>` or `<type>/<repo>/<rev>`) so it survives process
+    /// restarts. See `id_to_fh` for the why.
+    fh_gen: u64,
+}
+
+/// FNV-1a 64-bit. Deterministic across processes and platforms (`std`'s
+/// `DefaultHasher` is randomized per-process, which defeats the whole point
+/// here). Quality is fine for what we use it for: an opaque tag attached to
+/// every filehandle.
+fn fnv1a_64(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for &b in bytes {
+        hash ^= u64::from(b);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
 }
 
 impl NFSAdapter {
     pub fn new(virtual_fs: Arc<VirtualFs>, read_only: bool) -> Self {
+        let fh_gen = fnv1a_64(virtual_fs.source_identifier().as_bytes());
         Self {
             virtual_fs,
             handle_pool: Arc::new(Mutex::new(HandlePool::new())),
             read_only,
+            fh_gen,
         }
     }
 
@@ -145,6 +165,60 @@ impl NFSFileSystem for NFSAdapter {
         } else {
             VFSCapabilities::ReadWrite
         }
+    }
+
+    /// Mint an NFS filehandle with a source-derived generation number.
+    ///
+    /// The default `nfsserve` implementation embeds `SystemTime::now()` at
+    /// server startup, which means every restart invalidates every handle the
+    /// client previously cached. That's a problem on macOS (and to a lesser
+    /// extent Linux): the kernel NFS client keeps filehandles alive across
+    /// `umount` + remount on the same mountpoint as an attribute-cache
+    /// optimization. When the server comes back with a fresh generation
+    /// number, those cached handles get NFS3ERR_STALE on the next operation —
+    /// and at least the macOS client *silently discards pending writes* on
+    /// the stale handle (the WRITE RPC is buffered, then dropped without an
+    /// error reaching userspace).
+    ///
+    /// Reproducer on macOS:
+    ///   1. `hf-mount-nfs bucket X/y /tmp/m` → write a file → `umount /tmp/m`
+    ///   2. Restart `hf-mount-nfs` on the same `/tmp/m`, mount again
+    ///   3. `dd of=/tmp/m/existing-file ...` reports success, but no WRITE RPC
+    ///      ever reaches the server; an explicit `fsync(2)` returns ESTALE.
+    ///
+    /// Fix: derive the generation number from the *mount source*
+    /// (`bucket/<id>` or `<type>/<repo>/<rev>`) rather than the start time.
+    /// The same mount target hands out the same generation across restarts,
+    /// so cached client handles stay valid. Different sources produce
+    /// different generations, so a handle from `bucket A` is correctly
+    /// rejected when later mounting `bucket B`.
+    ///
+    /// Trade-off: inode numbers within a source are not guaranteed stable
+    /// across restarts (hf-mount allocates them in tree-listing order). If
+    /// the listing changes between mounts, a client cached handle may map to
+    /// a *different* file than it expected. The risk is bounded — clients
+    /// re-LOOKUP on cache miss — but it's a slight reduction in safety
+    /// compared to upstream's strict "every handle expires on restart"
+    /// stance. We accept it because silent write loss is worse.
+    fn id_to_fh(&self, id: fileid3) -> nfs_fh3 {
+        let mut data = Vec::with_capacity(16);
+        data.extend_from_slice(&self.fh_gen.to_le_bytes());
+        data.extend_from_slice(&id.to_le_bytes());
+        nfs_fh3 { data }
+    }
+
+    fn fh_to_id(&self, fh: &nfs_fh3) -> Result<fileid3, nfsstat3> {
+        if fh.data.len() != 16 {
+            return Err(nfsstat3::NFS3ERR_BADHANDLE);
+        }
+        let gen_bytes = u64::from_le_bytes(fh.data[0..8].try_into().expect("checked len above"));
+        if gen_bytes != self.fh_gen {
+            // Different source (or pre-fix server build): handle isn't ours.
+            return Err(nfsstat3::NFS3ERR_BADHANDLE);
+        }
+        Ok(u64::from_le_bytes(
+            fh.data[8..16].try_into().expect("checked len above"),
+        ))
     }
 
     async fn lookup(&self, dirid: fileid3, filename: &filename3) -> Result<fileid3, nfsstat3> {
@@ -1025,6 +1099,101 @@ mod tests {
         // overflow entry 999 is MRU, so oldest unpinned entries are evicted)
         assert!(result.evicted.len() >= 2, "pool should shrink after overflow");
         assert!(pool.handles.len() <= HANDLE_POOL_CAPACITY + 1);
+    }
+
+    // ── filehandle stability across server restarts ─────────────────────
+
+    /// FNV-1a is deterministic — same input, same output. The whole point of
+    /// using it over `std::hash::DefaultHasher` is that `DefaultHasher`
+    /// randomizes per-process, which would defeat the cross-restart fix.
+    #[test]
+    fn fnv1a_is_deterministic_for_same_input() {
+        assert_eq!(
+            fnv1a_64(b"bucket/XciD/hf-mount-test"),
+            fnv1a_64(b"bucket/XciD/hf-mount-test")
+        );
+        assert_eq!(fnv1a_64(b""), fnv1a_64(b""));
+        // Known-good vector for FNV-1a 64 of the empty string (the basis).
+        // Locks the implementation against accidental algorithm changes.
+        assert_eq!(fnv1a_64(b""), 0xcbf29ce484222325);
+    }
+
+    #[test]
+    fn fnv1a_distinguishes_sources() {
+        let a = fnv1a_64(b"bucket/XciD/hf-mount-test");
+        let b = fnv1a_64(b"bucket/XciD/other-bucket");
+        let c = fnv1a_64(b"model/gpt2/main");
+        assert_ne!(a, b);
+        assert_ne!(a, c);
+        assert_ne!(b, c);
+    }
+
+    /// Build the same NFS filehandle layout `id_to_fh` produces, manually.
+    /// This isolates the byte-layout/round-trip logic from the need to
+    /// construct a full `NFSAdapter` (which would require a real
+    /// `VirtualFs`).
+    fn build_fh(generation: u64, id: fileid3) -> nfs_fh3 {
+        let mut data = Vec::with_capacity(16);
+        data.extend_from_slice(&generation.to_le_bytes());
+        data.extend_from_slice(&id.to_le_bytes());
+        nfs_fh3 { data }
+    }
+
+    fn parse_fh(adapter_gen: u64, fh: &nfs_fh3) -> Result<fileid3, nfsstat3> {
+        if fh.data.len() != 16 {
+            return Err(nfsstat3::NFS3ERR_BADHANDLE);
+        }
+        let g = u64::from_le_bytes(fh.data[0..8].try_into().unwrap());
+        if g != adapter_gen {
+            return Err(nfsstat3::NFS3ERR_BADHANDLE);
+        }
+        Ok(u64::from_le_bytes(fh.data[8..16].try_into().unwrap()))
+    }
+
+    /// Two adapters built for the *same* mount source must accept each
+    /// other's filehandles. This is the property that makes
+    /// `umount + kill nfs server + restart nfs server + remount` not
+    /// silently drop writes on the kernel NFS client (specifically: macOS,
+    /// which caches filehandles across umount of the same mount point).
+    ///
+    /// Regression: pre-fix, `nfsserve`'s default `id_to_fh` embeds
+    /// `SystemTime::now()` at server startup, so the gen differs every
+    /// restart and the kernel's cached handles end up STALE.
+    #[test]
+    fn filehandle_survives_simulated_server_restart() {
+        let source = "bucket/XciD/hf-mount-test";
+        // Server lifetime #1: mint a handle for fileid 42.
+        let gen_run_1 = fnv1a_64(source.as_bytes());
+        let h_run_1 = build_fh(gen_run_1, 42);
+
+        // Server lifetime #2: same source → same gen.
+        let gen_run_2 = fnv1a_64(source.as_bytes());
+        assert_eq!(gen_run_1, gen_run_2);
+
+        // The handle minted by run #1 round-trips against run #2.
+        assert_eq!(parse_fh(gen_run_2, &h_run_1).expect("handle must round-trip"), 42);
+    }
+
+    /// Cross-source handles must still be rejected — a handle minted by
+    /// bucket A must not silently decode as a valid id when later mounted on
+    /// bucket B (otherwise stale client cache could leak across unrelated
+    /// mounts).
+    #[test]
+    fn filehandle_rejected_when_source_differs() {
+        let gen_a = fnv1a_64(b"bucket/XciD/hf-mount-test");
+        let gen_b = fnv1a_64(b"bucket/XciD/other-bucket");
+        let h_from_a = build_fh(gen_a, 42);
+        assert!(matches!(parse_fh(gen_b, &h_from_a), Err(nfsstat3::NFS3ERR_BADHANDLE)));
+    }
+
+    /// Malformed handles (wrong length) are rejected.
+    #[test]
+    fn filehandle_rejects_wrong_length() {
+        let generation = fnv1a_64(b"bucket/x/y");
+        let short = nfs_fh3 { data: vec![0u8; 8] };
+        let long = nfs_fh3 { data: vec![0u8; 32] };
+        assert!(matches!(parse_fh(generation, &short), Err(nfsstat3::NFS3ERR_BADHANDLE)));
+        assert!(matches!(parse_fh(generation, &long), Err(nfsstat3::NFS3ERR_BADHANDLE)));
     }
 
     #[test]

@@ -1436,6 +1436,14 @@ impl VirtualFs {
         }
     }
 
+    /// Stable identifier for the mount source ("bucket/<id>" or "<type>/<repo>/<rev>").
+    /// Used by the NFS adapter to derive a generation number that survives
+    /// process restarts (so cached client filehandles don't go STALE across
+    /// `umount`+remount on the same mount point — see nfs.rs).
+    pub fn source_identifier(&self) -> String {
+        self.hub_client.source().to_string()
+    }
+
     pub fn default_uid(&self) -> u32 {
         self.uid
     }
