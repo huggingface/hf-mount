@@ -902,6 +902,174 @@ fn nfstime_to_system_time(t: nfstime3) -> SystemTime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_mocks::{MockHub, MockXet, TestOpts, make_test_vfs};
+
+    /// Regression: a WRITE that arrives after a prior READ has populated the
+    /// pool with a Lazy/read-only handle must NOT surface as `NFS3ERR_STALE`.
+    /// Pre-fix, `nfs.rs::write()` peeked the read-only handle, called
+    /// `virtual_fs.write()` which returned EBADF, and `errno_to_nfs` mapped
+    /// that to STALE — at which point macOS NFS silently discards the write.
+    ///
+    /// The fix: on EBADF, evict the read-only handle and re-open writable,
+    /// then retry. This test exercises that exact sequence.
+    #[test]
+    fn write_after_read_upgrades_handle_instead_of_returning_stale() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let hub = MockHub::new();
+        hub.add_file("file.txt", 11, Some("orig_hash"), None);
+        let xet = MockXet::new();
+        xet.add_file("orig_hash", b"hello world");
+
+        let vfs = make_test_vfs(
+            hub.clone(),
+            xet.clone(),
+            TestOpts {
+                advanced_writes: true,
+                ..Default::default()
+            },
+            &rt,
+        );
+
+        // NFS adapter under test (read-write, like a real bucket mount).
+        let adapter = NFSAdapter::new(vfs.clone(), false);
+
+        rt.block_on(async {
+            // Resolve the ino so we don't hard-code it.
+            let name = nfsstring(b"file.txt".to_vec());
+            let ino = adapter.lookup(1, &name).await.expect("lookup");
+
+            // Step 1: a READ populates the pool with a read-only (Lazy) handle.
+            let (_buf, _eof) = adapter.read(ino, 0, 11).await.expect("read");
+            let pooled_fh_after_read = adapter
+                .handle_pool
+                .lock()
+                .expect("poisoned")
+                .peek(ino)
+                .expect("pool entry");
+
+            // Step 2: the critical operation — WRITE on the same inode.
+            // Pre-fix: this returned Err(NFS3ERR_STALE). Post-fix: it must
+            // upgrade the handle and succeed.
+            let attr = adapter
+                .write(ino, 6, b"RUST!")
+                .await
+                .expect("write must not return STALE");
+
+            // The new attributes reflect the write.
+            assert_eq!(attr.size, 11, "file size should be unchanged (in-place edit)");
+
+            // The pool's handle must have been swapped for a writable one
+            // (the slow path inserts a fresh handle after the upgrade).
+            let pooled_fh_after_write = adapter
+                .handle_pool
+                .lock()
+                .expect("poisoned")
+                .peek(ino)
+                .expect("pool entry");
+            assert_ne!(
+                pooled_fh_after_read, pooled_fh_after_write,
+                "pool handle must be different after the upgrade (old Lazy → new writable)"
+            );
+        });
+    }
+
+    /// A second WRITE on the same ino reuses the now-writable pool handle
+    /// (fast path: no further open/release dance).
+    #[test]
+    fn second_write_reuses_writable_handle() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let hub = MockHub::new();
+        hub.add_file("file.txt", 11, Some("orig_hash"), None);
+        let xet = MockXet::new();
+        xet.add_file("orig_hash", b"hello world");
+
+        let vfs = make_test_vfs(
+            hub.clone(),
+            xet.clone(),
+            TestOpts {
+                advanced_writes: true,
+                ..Default::default()
+            },
+            &rt,
+        );
+        let adapter = NFSAdapter::new(vfs.clone(), false);
+
+        rt.block_on(async {
+            let name = nfsstring(b"file.txt".to_vec());
+            let ino = adapter.lookup(1, &name).await.expect("lookup");
+
+            // First read + write triggers the upgrade.
+            adapter.read(ino, 0, 11).await.expect("read");
+            adapter.write(ino, 0, b"A").await.expect("first write");
+            let fh_after_first_write = adapter
+                .handle_pool
+                .lock()
+                .expect("poisoned")
+                .peek(ino)
+                .expect("pool entry");
+
+            // Second write should take the fast path (no new open).
+            adapter.write(ino, 1, b"B").await.expect("second write");
+            let fh_after_second_write = adapter
+                .handle_pool
+                .lock()
+                .expect("poisoned")
+                .peek(ino)
+                .expect("pool entry");
+
+            assert_eq!(
+                fh_after_first_write, fh_after_second_write,
+                "fast path must reuse the writable handle"
+            );
+        });
+    }
+
+    /// A WRITE on a file that was never opened goes through the slow path
+    /// directly (no fast-path EBADF). Verifies the slow path stands alone.
+    #[test]
+    fn write_without_prior_read_opens_writable_directly() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let hub = MockHub::new();
+        hub.add_file("file.txt", 11, Some("orig_hash"), None);
+        let xet = MockXet::new();
+        xet.add_file("orig_hash", b"hello world");
+
+        let vfs = make_test_vfs(
+            hub.clone(),
+            xet.clone(),
+            TestOpts {
+                advanced_writes: true,
+                ..Default::default()
+            },
+            &rt,
+        );
+        let adapter = NFSAdapter::new(vfs.clone(), false);
+
+        rt.block_on(async {
+            let name = nfsstring(b"file.txt".to_vec());
+            let ino = adapter.lookup(1, &name).await.expect("lookup");
+
+            // Pool is empty for this ino; write goes straight to slow path.
+            assert!(adapter.handle_pool.lock().unwrap().peek(ino).is_none());
+            adapter.write(ino, 0, b"X").await.expect("write");
+            assert!(
+                adapter.handle_pool.lock().unwrap().peek(ino).is_some(),
+                "slow path must have inserted a writable handle"
+            );
+        });
+    }
 
     #[test]
     fn handle_pool_basic() {
