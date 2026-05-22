@@ -274,19 +274,48 @@ impl NFSFileSystem for NFSAdapter {
     }
 
     async fn write(&self, id: fileid3, offset: u64, data: &[u8]) -> Result<fattr3, nfsstat3> {
-        // virtual_fs.write is synchronous pwrite — no yield point where the
-        // pool could evict, so peek without pinning.
-        let file_handle = self
-            .handle_pool
-            .lock()
-            .expect("handle_pool poisoned")
-            .peek(id)
-            .ok_or(nfsstat3::NFS3ERR_STALE)?;
-        // NFS always uses advanced_writes (staging files), so write() is a
-        // synchronous pwrite() — safe to call from async context.
-        self.virtual_fs
-            .write(id, file_handle, offset, data)
+        // Fast path: try the existing pool handle. `virtual_fs.write` is a
+        // synchronous `pwrite` with no yield point, so peeking without
+        // pinning is safe — the pool can't evict mid-call.
+        //
+        // The pool may hold a *read-only* handle for this inode from a prior
+        // READ RPC. macOS NFS readily issues READs during stat / `ls` to
+        // populate its attribute cache, well before any write. Writing to a
+        // Lazy/read-only handle returns EBADF, which `errno_to_nfs` maps to
+        // `NFS3ERR_STALE`. macOS treats STALE on WRITE as a hard failure and
+        // silently drops the pending writes from its buffer — `dd` reports
+        // success but the bytes never reach the server. Symptom seen in the
+        // wild: `fsync(2)` on the file returns ESTALE.
+        //
+        // Fix: on EBADF, evict the read-only handle and reopen writable
+        // (which materializes the staging file), then retry the write.
+        let existing = self.handle_pool.lock().expect("handle_pool poisoned").peek(id);
+        if let Some(fh) = existing {
+            match self.virtual_fs.write(id, fh, offset, data) {
+                Ok(_) => {
+                    self.virtual_fs.schedule_flush(id);
+                    return self
+                        .virtual_fs
+                        .getattr(id)
+                        .map(|a| vfs_attr_to_nfs(&a))
+                        .map_err(errno_to_nfs);
+                }
+                Err(libc::EBADF) => {
+                    // Handle was opened read-only. Upgrade to writable.
+                    self.evict_handle(id, fh).await;
+                }
+                Err(e) => return Err(errno_to_nfs(e)),
+            }
+        }
+
+        // Slow path: open a writable handle and retry the write.
+        let fh = self
+            .virtual_fs
+            .open(id, true, false, None)
+            .await
             .map_err(errno_to_nfs)?;
+        self.insert_handle(id, fh).await;
+        self.virtual_fs.write(id, fh, offset, data).map_err(errno_to_nfs)?;
         // NFS has no close/flush RPC, so schedule a debounced flush after
         // each write to ensure data eventually gets committed to the Hub.
         self.virtual_fs.schedule_flush(id);
