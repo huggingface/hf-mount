@@ -496,7 +496,6 @@ mod tests {
         ) -> Result<u64> {
             unimplemented!("not needed in these tests")
         }
-
     }
 
     fn hash_for(i: usize) -> MerkleHash {

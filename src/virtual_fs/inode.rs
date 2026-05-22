@@ -330,7 +330,13 @@ impl InodeEntry {
     pub fn apply_noop_commit(&mut self, dirty_generation: u64) {
         if self.clear_dirty_if(dirty_generation) {
             self.pending_deletes.clear();
-            self.sparse_write = None;
+            // Do NOT clear `sparse_write` here. A no-op flush means the
+            // upload returned the same hash as the snapshot — typical case:
+            // the user opened the file but never wrote, then released. If a
+            // handle is still open with a sparse staging file, its reads
+            // need `sparse_write` to fill the holes from CAS. Clearing it
+            // would make subsequent reads return zeros from the sparse
+            // staging file.
         }
         // mtime/ctime are bumped unconditionally — same as apply_commit. A
         // no-op flush still ran an open/dirty/flush cycle, and observers that
@@ -877,6 +883,12 @@ impl InodeTable {
             // matches xet_hash. An in-flight download observes this under
             // its post-check and won't re-flag the cache.
             entry.staging_is_current = false;
+            // Sparse state references the OLD hash. If we keep it, a
+            // subsequent open-for-write would reuse the stale state and
+            // `range_upload` would compose the new content against the
+            // wrong base. Clear it so the next open re-installs against
+            // the current remote hash via the drift-checked path.
+            entry.sparse_write = None;
             true
         } else {
             false

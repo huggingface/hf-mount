@@ -5585,7 +5585,15 @@ fn sparse_open_no_writes_no_op_flush() {
             );
             assert_eq!(entry.size, 10);
             assert!(!entry.is_dirty(), "no-op flush clears dirty");
-            assert!(entry.sparse_write.is_none(), "no-op flush clears sparse_write");
+            // `sparse_write` is intentionally PRESERVED across a no-op flush.
+            // Clearing it would make any still-open handle's reads return
+            // zeros from the sparse staging file (no `fill_sparse_holes`
+            // when sparse_write is None). It is cleared elsewhere when the
+            // remote actually moves (`update_remote_file`).
+            assert!(
+                entry.sparse_write.is_some(),
+                "no-op flush must preserve sparse_write for still-open handles"
+            );
         }
     });
 }

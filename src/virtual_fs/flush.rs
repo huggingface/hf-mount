@@ -17,6 +17,13 @@ enum FlushSignal {
     Dirty(u64),
     /// Wake the loop to drain pending remote deletes (no dirty inode attached).
     WakeDeletes,
+    /// Tell `flush_loop` to drop its self-referencing sender clone so the
+    /// channel can close once the outer `FlushManager::tx` is dropped. Sent
+    /// by `FlushManager::shutdown` just before it drops the outer tx —
+    /// without this, the clone `flush_loop` holds (for `requeue_siblings`)
+    /// keeps the channel alive forever and shutdown deadlocks waiting on
+    /// the loop's join handle.
+    Shutdown,
 }
 
 // ── FlushManager ──────────────────────────────────────────────────────
@@ -50,8 +57,10 @@ impl FlushManager {
         let bg_errors = errors.clone();
         let bg_deletes = pending_deletes.clone();
         let bg_hub = hub_client.clone();
+        let bg_tx = tx.clone();
         let handle = runtime.spawn(flush_loop(
             rx,
+            bg_tx,
             xet_sessions,
             staging,
             bg_hub,
@@ -131,6 +140,12 @@ impl FlushManager {
                 for ino in dirty_inos {
                     let _ = tx.send(FlushSignal::Dirty(ino));
                 }
+                // Tell flush_loop to drop its self-referencing sender so the
+                // channel can close after we drop ours below. flush_loop
+                // holds a clone of `tx` (for `requeue_siblings` on abort);
+                // without this signal, that clone would keep the channel
+                // alive forever and shutdown would deadlock.
+                let _ = tx.send(FlushSignal::Shutdown);
             }
             // Drop the sender to signal the flush loop to drain and exit
             self.tx.lock().expect("flush_tx poisoned").take();
@@ -165,8 +180,14 @@ fn run_blocking<F: FnOnce()>(f: F) {
 // ── Background tasks ──────────────────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]
+/// `signal_tx`: self-referencing sender — passed to `flush_batch` so it can
+/// re-enqueue still-dirty siblings when a batch aborts mid-upload. Without
+/// this, an abort leaves the surviving items dirty but invisible to the loop
+/// until some other code path enqueues them (which may never happen,
+/// stranding the bytes on disk and never committing them to the Hub).
 async fn flush_loop(
     mut rx: mpsc::UnboundedReceiver<FlushSignal>,
+    signal_tx: mpsc::UnboundedSender<FlushSignal>,
     xet_sessions: Arc<dyn XetOps>,
     staging: Arc<StagingCoordinator>,
     hub_client: Arc<dyn HubOps>,
@@ -176,9 +197,21 @@ async fn flush_loop(
     max_batch_window: Duration,
     pending_deletes: Arc<Mutex<Vec<String>>>,
 ) {
+    // Wrap the self-referencing sender in Option so we can drop it on
+    // `Shutdown`. Keeping it alive past shutdown would prevent the channel
+    // from closing and `rx.recv()` would block forever.
+    let mut signal_tx = Some(signal_tx);
     loop {
         // Wait for the first signal
         let first = match rx.recv().await {
+            Some(FlushSignal::Shutdown) => {
+                // Drop our sender clone so the channel can close after the
+                // outer FlushManager.tx is dropped. Continue draining any
+                // remaining signals already in the buffer (Dirty/WakeDeletes
+                // queued before Shutdown) — those still represent real work.
+                signal_tx = None;
+                continue;
+            }
             Some(sig) => sig,
             None => return, // channel closed, exit
         };
@@ -195,6 +228,12 @@ async fn flush_loop(
             }
             let timeout = debounce.min(remaining);
             match tokio::time::timeout(timeout, rx.recv()).await {
+                Ok(Some(FlushSignal::Shutdown)) => {
+                    // Same as the outer arm: drop our sender clone, continue
+                    // draining the rest of this debounce window so queued
+                    // dirty work still gets flushed before the loop exits.
+                    signal_tx = None;
+                }
                 Ok(Some(sig)) => signals.push(sig),
                 _ => break, // timeout (debounce expired) or channel closed
             }
@@ -203,12 +242,12 @@ async fn flush_loop(
         // Flush queued remote deletes alongside dirty writes.
         flush_pending_deletes(&pending_deletes, &*hub_client).await;
 
-        // Extract dirty inode IDs (WakeDeletes signals carry no inode).
+        // Extract dirty inode IDs (WakeDeletes/Shutdown carry no inode).
         let dirty_inos: Vec<u64> = signals
             .into_iter()
             .filter_map(|sig| match sig {
                 FlushSignal::Dirty(ino) => Some(ino),
-                FlushSignal::WakeDeletes => None,
+                FlushSignal::WakeDeletes | FlushSignal::Shutdown => None,
             })
             .collect();
 
@@ -221,6 +260,7 @@ async fn flush_loop(
                 &*hub_client,
                 &inodes,
                 &flush_errors,
+                signal_tx.as_ref(),
             )
             .await;
         }
@@ -274,6 +314,45 @@ fn abort_batch(items: &[FlushItem], flush_errors: &Mutex<HashMap<u64, String>>, 
     }
 }
 
+/// Re-enqueue dirty siblings after a batch abort.
+///
+/// `to_flush` is the entire batch that was being processed; `failed_inos`
+/// are the ones whose own upload genuinely failed (now in `flush_errors`).
+/// Everything else is still dirty in the inode table but has lost its
+/// queue signal — without re-enqueueing, those bytes would sit on disk
+/// indefinitely with nothing to wake the flush loop.
+///
+/// This includes BOTH items already uploaded earlier in the batch (which
+/// never got their Hub commit because we aborted before that step) and
+/// items not yet reached. Both still need a fresh flush cycle.
+fn requeue_siblings(
+    to_flush: &[FlushItem],
+    failed_inos: &[u64],
+    signal_tx: Option<&mpsc::UnboundedSender<FlushSignal>>,
+) {
+    let Some(tx) = signal_tx else {
+        // Shutdown in progress — don't try to re-enqueue, the loop is exiting.
+        return;
+    };
+    let failed: HashSet<u64> = failed_inos.iter().copied().collect();
+    let mut requeued = 0;
+    for it in to_flush {
+        if failed.contains(&it.ino) {
+            continue;
+        }
+        if tx.send(FlushSignal::Dirty(it.ino)).is_err() {
+            // Channel closed (rare — outer FlushManager.tx was dropped
+            // without a Shutdown signal). The siblings stay visible as
+            // dirty in the inode table but won't be flushed this run.
+            return;
+        }
+        requeued += 1;
+    }
+    if requeued > 0 {
+        warn!("Re-enqueued {} sibling(s) after batch abort", requeued);
+    }
+}
+
 /// Length of the contiguous run of non-sparse FlushItems starting at `start`,
 /// capped to `max` items. `start` must point to a non-sparse item — sparse
 /// items are dispatched one-by-one through `range_upload` and never get
@@ -305,6 +384,9 @@ struct FlushItem {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// `signal_tx`: `None` after `Shutdown` was observed — siblings won't be
+/// re-enqueued because the loop is winding down anyway. They stay dirty on
+/// disk and are picked up by the next mount.
 async fn flush_batch(
     pending: Vec<u64>,
     xet_sessions: &dyn XetOps,
@@ -312,6 +394,7 @@ async fn flush_batch(
     hub_client: &dyn HubOps,
     inodes: &RwLock<InodeTable>,
     flush_errors: &Mutex<HashMap<u64, String>>,
+    signal_tx: Option<&mpsc::UnboundedSender<FlushSignal>>,
 ) {
     let staging_dir = staging.dir().expect("flush_batch requires staging directory");
     // Walk backwards so the last request per ino wins, then reverse in-place.
@@ -411,11 +494,13 @@ async fn flush_batch(
                     // retried on the next flush cycle (CAS dedup makes the
                     // re-upload cheap); marking them errored here would
                     // surface spurious EIO on files whose data is fine.
+                    let failed_ino = item.ino;
                     abort_batch(
                         std::slice::from_ref(item),
                         flush_errors,
                         format!("range_upload failed (ino={} path={}): {e}", item.ino, item.full_path),
                     );
+                    requeue_siblings(&to_flush, &[failed_ino], signal_tx);
                     return;
                 }
             }
@@ -439,9 +524,13 @@ async fn flush_batch(
             }
             Err(e) => {
                 // Only mark the chunk that actually failed; items in other
-                // chunks (already uploaded or not yet reached) stay dirty and
-                // retry on the next flush.
+                // chunks (already uploaded or not yet reached) stay dirty
+                // and need to be re-enqueued so a future flush cycle picks
+                // them up — otherwise they'd sit dirty forever with no
+                // signal to wake the flush loop.
+                let failed_inos: Vec<u64> = chunk.iter().map(|it| it.ino).collect();
                 abort_batch(chunk, flush_errors, format!("upload failed: {e}"));
+                requeue_siblings(&to_flush, &failed_inos, signal_tx);
                 return;
             }
         }
