@@ -274,19 +274,77 @@ impl NFSFileSystem for NFSAdapter {
     }
 
     async fn write(&self, id: fileid3, offset: u64, data: &[u8]) -> Result<fattr3, nfsstat3> {
-        // virtual_fs.write is synchronous pwrite — no yield point where the
-        // pool could evict, so peek without pinning.
-        let file_handle = self
-            .handle_pool
-            .lock()
-            .expect("handle_pool poisoned")
-            .peek(id)
-            .ok_or(nfsstat3::NFS3ERR_STALE)?;
-        // NFS always uses advanced_writes (staging files), so write() is a
-        // synchronous pwrite() — safe to call from async context.
-        self.virtual_fs
-            .write(id, file_handle, offset, data)
+        // Fast path: try the existing pool handle. `virtual_fs.write` is a
+        // synchronous `pwrite` with no yield point, so peeking without
+        // pinning is safe — the pool can't evict mid-call.
+        //
+        // The pool may hold a *read-only* handle for this inode from a prior
+        // READ RPC. macOS NFS readily issues READs during stat / `ls` to
+        // populate its attribute cache, well before any write. Writing to a
+        // Lazy/read-only handle returns EBADF, which `errno_to_nfs` maps to
+        // `NFS3ERR_STALE`. macOS treats STALE on WRITE as a hard failure and
+        // silently drops the pending writes from its buffer — `dd` reports
+        // success but the bytes never reach the server. Symptom seen in the
+        // wild: `fsync(2)` on the file returns ESTALE.
+        //
+        // Fix: on EBADF, evict the read-only handle and reopen writable
+        // (which materializes the staging file), then retry the write.
+        let existing = self.handle_pool.lock().expect("handle_pool poisoned").peek(id);
+        if let Some(fh) = existing {
+            match self.virtual_fs.write(id, fh, offset, data) {
+                Ok(_) => {
+                    self.virtual_fs.schedule_flush(id);
+                    return self
+                        .virtual_fs
+                        .getattr(id)
+                        .map(|a| vfs_attr_to_nfs(&a))
+                        .map_err(errno_to_nfs);
+                }
+                Err(libc::EBADF) => {
+                    // Handle was opened read-only. Evict + remove from pool so
+                    // a concurrent caller doesn't peek a freshly-released fh.
+                    // Mirrors the analogous EBADF retry in `read()` above.
+                    // Guard against removing a different fh: a successful
+                    // concurrent upgrader may have already replaced our entry.
+                    {
+                        let mut pool = self.handle_pool.lock().expect("handle_pool poisoned");
+                        if pool.peek(id) == Some(fh) {
+                            pool.remove(id);
+                        }
+                    }
+                    self.evict_handle(id, fh).await;
+                }
+                Err(e) => return Err(errno_to_nfs(e)),
+            }
+        }
+
+        // Slow path: open a writable handle, run the pwrite, THEN publish the
+        // handle to the pool. Two concurrent writers can both reach this
+        // branch and open distinct writable handles (open is serialized by
+        // VirtualFs's per-inode staging lock, so the calls don't overlap, but
+        // they DO produce two distinct fh). If we inserted before the pwrite,
+        // the second writer's `insert_handle` would release the first
+        // writer's freshly-opened fh as `replaced` — and the first writer's
+        // subsequent pwrite would hit EBADF on a closed fh, mapping back to
+        // NFS3ERR_STALE (silent data loss, the very symptom this code path
+        // exists to avoid). By writing before publishing, the fh stays
+        // private to this task until its pwrite completes; nothing else can
+        // see it, nothing else can release it.
+        let fh = self
+            .virtual_fs
+            .open(id, true, false, None)
+            .await
             .map_err(errno_to_nfs)?;
+        if let Err(e) = self.virtual_fs.write(id, fh, offset, data) {
+            // Write failed — release the fh we opened so we don't leak it.
+            let _ = self.virtual_fs.release(fh).await;
+            return Err(errno_to_nfs(e));
+        }
+        // Publish only on success. Any concurrent writer that reaches this
+        // point will release its own fh via the same Err path or replace
+        // ours via insert_handle's eviction, but by then our pwrite has
+        // committed to the staging file.
+        self.insert_handle(id, fh).await;
         // NFS has no close/flush RPC, so schedule a debounced flush after
         // each write to ensure data eventually gets committed to the Hub.
         self.virtual_fs.schedule_flush(id);
@@ -873,6 +931,174 @@ fn nfstime_to_system_time(t: nfstime3) -> SystemTime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_mocks::{MockHub, MockXet, TestOpts, make_test_vfs};
+
+    /// Regression: a WRITE that arrives after a prior READ has populated the
+    /// pool with a Lazy/read-only handle must NOT surface as `NFS3ERR_STALE`.
+    /// Pre-fix, `nfs.rs::write()` peeked the read-only handle, called
+    /// `virtual_fs.write()` which returned EBADF, and `errno_to_nfs` mapped
+    /// that to STALE — at which point macOS NFS silently discards the write.
+    ///
+    /// The fix: on EBADF, evict the read-only handle and re-open writable,
+    /// then retry. This test exercises that exact sequence.
+    #[test]
+    fn write_after_read_upgrades_handle_instead_of_returning_stale() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let hub = MockHub::new();
+        hub.add_file("file.txt", 11, Some("orig_hash"), None);
+        let xet = MockXet::new();
+        xet.add_file("orig_hash", b"hello world");
+
+        let vfs = make_test_vfs(
+            hub.clone(),
+            xet.clone(),
+            TestOpts {
+                advanced_writes: true,
+                ..Default::default()
+            },
+            &rt,
+        );
+
+        // NFS adapter under test (read-write, like a real bucket mount).
+        let adapter = NFSAdapter::new(vfs.clone(), false);
+
+        rt.block_on(async {
+            // Resolve the ino so we don't hard-code it.
+            let name = nfsstring(b"file.txt".to_vec());
+            let ino = adapter.lookup(1, &name).await.expect("lookup");
+
+            // Step 1: a READ populates the pool with a read-only (Lazy) handle.
+            let (_buf, _eof) = adapter.read(ino, 0, 11).await.expect("read");
+            let pooled_fh_after_read = adapter
+                .handle_pool
+                .lock()
+                .expect("poisoned")
+                .peek(ino)
+                .expect("pool entry");
+
+            // Step 2: the critical operation — WRITE on the same inode.
+            // Pre-fix: this returned Err(NFS3ERR_STALE). Post-fix: it must
+            // upgrade the handle and succeed.
+            let attr = adapter
+                .write(ino, 6, b"RUST!")
+                .await
+                .expect("write must not return STALE");
+
+            // The new attributes reflect the write.
+            assert_eq!(attr.size, 11, "file size should be unchanged (in-place edit)");
+
+            // The pool's handle must have been swapped for a writable one
+            // (the slow path inserts a fresh handle after the upgrade).
+            let pooled_fh_after_write = adapter
+                .handle_pool
+                .lock()
+                .expect("poisoned")
+                .peek(ino)
+                .expect("pool entry");
+            assert_ne!(
+                pooled_fh_after_read, pooled_fh_after_write,
+                "pool handle must be different after the upgrade (old Lazy → new writable)"
+            );
+        });
+    }
+
+    /// A second WRITE on the same ino reuses the now-writable pool handle
+    /// (fast path: no further open/release dance).
+    #[test]
+    fn second_write_reuses_writable_handle() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let hub = MockHub::new();
+        hub.add_file("file.txt", 11, Some("orig_hash"), None);
+        let xet = MockXet::new();
+        xet.add_file("orig_hash", b"hello world");
+
+        let vfs = make_test_vfs(
+            hub.clone(),
+            xet.clone(),
+            TestOpts {
+                advanced_writes: true,
+                ..Default::default()
+            },
+            &rt,
+        );
+        let adapter = NFSAdapter::new(vfs.clone(), false);
+
+        rt.block_on(async {
+            let name = nfsstring(b"file.txt".to_vec());
+            let ino = adapter.lookup(1, &name).await.expect("lookup");
+
+            // First read + write triggers the upgrade.
+            adapter.read(ino, 0, 11).await.expect("read");
+            adapter.write(ino, 0, b"A").await.expect("first write");
+            let fh_after_first_write = adapter
+                .handle_pool
+                .lock()
+                .expect("poisoned")
+                .peek(ino)
+                .expect("pool entry");
+
+            // Second write should take the fast path (no new open).
+            adapter.write(ino, 1, b"B").await.expect("second write");
+            let fh_after_second_write = adapter
+                .handle_pool
+                .lock()
+                .expect("poisoned")
+                .peek(ino)
+                .expect("pool entry");
+
+            assert_eq!(
+                fh_after_first_write, fh_after_second_write,
+                "fast path must reuse the writable handle"
+            );
+        });
+    }
+
+    /// A WRITE on a file that was never opened goes through the slow path
+    /// directly (no fast-path EBADF). Verifies the slow path stands alone.
+    #[test]
+    fn write_without_prior_read_opens_writable_directly() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let hub = MockHub::new();
+        hub.add_file("file.txt", 11, Some("orig_hash"), None);
+        let xet = MockXet::new();
+        xet.add_file("orig_hash", b"hello world");
+
+        let vfs = make_test_vfs(
+            hub.clone(),
+            xet.clone(),
+            TestOpts {
+                advanced_writes: true,
+                ..Default::default()
+            },
+            &rt,
+        );
+        let adapter = NFSAdapter::new(vfs.clone(), false);
+
+        rt.block_on(async {
+            let name = nfsstring(b"file.txt".to_vec());
+            let ino = adapter.lookup(1, &name).await.expect("lookup");
+
+            // Pool is empty for this ino; write goes straight to slow path.
+            assert!(adapter.handle_pool.lock().unwrap().peek(ino).is_none());
+            adapter.write(ino, 0, b"X").await.expect("write");
+            assert!(
+                adapter.handle_pool.lock().unwrap().peek(ino).is_some(),
+                "slow path must have inserted a writable handle"
+            );
+        });
+    }
 
     #[test]
     fn handle_pool_basic() {
