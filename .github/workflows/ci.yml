@@ -121,6 +121,10 @@ jobs:
         timeout-minutes: 10
         run: cargo test --release --test fsx -- --test-threads=1 --nocapture
 
+      - name: fsx paranoid (CAS round-trip per mutation)
+        timeout-minutes: 15
+        run: cargo test --release --test fsx_paranoid -- --test-threads=1 --nocapture
+
   xfstests:
     name: xfstests (filesystem exerciser)
     runs-on:
