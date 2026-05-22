@@ -1787,14 +1787,23 @@ impl VirtualFs {
             } else if will_install_sparse && entry.sparse_write.is_none() {
                 // Install sparse tracking against the snapshot hash. Covers two
                 // cases under the same drift guard:
-                //  * created_sparse_staging: staging is a hole sized to snapshot;
-                //    reads fill from CAS via `fill_sparse_holes`.
-                //  * reused staging: on-disk file matches the snapshot hash
-                //    fully (staging_is_current path); reads serve from staging
-                //    and fill_sparse_holes is a no-op for non-dirty regions.
+                //  * fresh sparse staging (can_reuse_staging=false): staging is
+                //    a hole sized to snapshot; reads must fill from CAS via
+                //    `fill_sparse_holes`.
+                //  * reused staging (can_reuse_staging=true with staging_is_current
+                //    snapshotted true): on-disk file already holds the full
+                //    original content for the snapshot hash. Mark it via
+                //    `new_with_full_staging` so `fill_sparse_holes` is a no-op
+                //    and reads serve directly from staging without an extra
+                //    CAS round-trip.
                 // Once set_dirty has fired, poll skips this inode so the snapshot
                 // remains valid for the lifetime of the open.
-                entry.sparse_write = Some(Arc::new(inode::SparseWriteState::new(xet_hash.to_string(), size)));
+                let sw = if can_reuse_staging {
+                    inode::SparseWriteState::new_with_full_staging(xet_hash.to_string(), size)
+                } else {
+                    inode::SparseWriteState::new(xet_hash.to_string(), size)
+                };
+                entry.sparse_write = Some(Arc::new(sw));
             }
         }
 
@@ -2129,6 +2138,15 @@ impl VirtualFs {
         let read_end = offset + buffer.len() as u64;
         let orig_end = sparse_write_state.effective_original_size.min(read_end);
         if offset >= orig_end {
+            return Ok(());
+        }
+
+        // Reused-staging open: the on-disk file holds the full original content
+        // for the snapshot hash, so reads outside dirty ranges are already served
+        // correctly by the prior pread. Skip CAS to avoid an unnecessary round-
+        // trip — track_write keeps overlaying user bytes onto staging, so the
+        // invariant still holds for dirty regions too.
+        if sparse_write_state.staging_holds_full_original {
             return Ok(());
         }
 

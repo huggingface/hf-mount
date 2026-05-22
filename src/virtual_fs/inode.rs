@@ -173,6 +173,15 @@ pub struct SparseWriteState {
     pub effective_original_size: u64,
     /// Sorted, non-overlapping dirty byte ranges (start, end), in current-file coordinates.
     pub dirty_ranges: Vec<(u64, u64)>,
+    /// When true, the on-disk staging file holds the full original content in
+    /// [0, effective_original_size) — set for opens that reuse a current
+    /// staging cache (no fresh sparse hole was created). Reads can serve
+    /// directly from staging without consulting CAS; `fill_sparse_holes`
+    /// short-circuits to a no-op. Stays valid for the lifetime of the open
+    /// because dirty writes overlay onto the existing bytes (track_write
+    /// updates both staging and the dirty range list) and the snapshot hash
+    /// is pinned once dirty is set.
+    pub staging_holds_full_original: bool,
 }
 
 impl SparseWriteState {
@@ -182,6 +191,16 @@ impl SparseWriteState {
             original_size,
             effective_original_size: original_size,
             dirty_ranges: Vec::new(),
+            staging_holds_full_original: false,
+        }
+    }
+
+    /// Variant of `new` for reused-staging opens: the staging file already
+    /// holds the full original content, so reads bypass CAS.
+    pub fn new_with_full_staging(original_hash: String, original_size: u64) -> Self {
+        Self {
+            staging_holds_full_original: true,
+            ..Self::new(original_hash, original_size)
         }
     }
 
@@ -2695,6 +2714,32 @@ mod tests {
         let a2 = mk_file(&mut table, "a.txt");
         assert_child_index_consistent(&table);
         assert_eq!(table.lookup_child(ROOT_INODE, "a.txt").map(|e| e.inode), Some(a2));
+    }
+
+    // ── SparseWriteState constructors ───────────────────────────────
+
+    #[test]
+    fn sparse_new_defaults_to_empty_holes() {
+        let sw = SparseWriteState::new("h".into(), 100);
+        assert!(
+            !sw.staging_holds_full_original,
+            "fresh sparse open: staging is a hole, must consult CAS on reads"
+        );
+        assert_eq!(sw.original_size, 100);
+        assert_eq!(sw.effective_original_size, 100);
+        assert!(sw.dirty_ranges.is_empty());
+    }
+
+    #[test]
+    fn sparse_new_with_full_staging_marks_flag() {
+        let sw = SparseWriteState::new_with_full_staging("h".into(), 100);
+        assert!(
+            sw.staging_holds_full_original,
+            "reused-staging open: fill_sparse_holes must short-circuit"
+        );
+        assert_eq!(sw.original_size, 100);
+        assert_eq!(sw.effective_original_size, 100);
+        assert!(sw.dirty_ranges.is_empty());
     }
 
     // ── SparseWriteState::track_write ───────────────────────────────
