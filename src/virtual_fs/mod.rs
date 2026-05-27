@@ -2462,11 +2462,56 @@ impl VirtualFs {
 
                     if let Some(entry) = inodes.get_mut(handle_ino) {
                         // Track the dirty range for sparse-staging flushes.
-                        // open_advanced_write installs sparse_write up front (under
-                        // the same drift guard) whenever sparse semantics apply, so
-                        // we never reach here with a None sparse_write on a file
-                        // that has a CAS-backed original — no risky keying-to-
-                        // current-hash fallback is needed.
+                        //
+                        // `open_advanced_write` installs `sparse_write` up front under
+                        // the open's drift guard, but NFSv3 has no CLOSE RPC, so the
+                        // server-side handle pool may keep a writable fh alive across
+                        // logical opens. A flush between the two opens clears
+                        // `sparse_write` (apply_commit on a regular-upload commit
+                        // sets it to None); reusing the pool fh skips
+                        // `open_advanced_write` entirely, so the write lands here with
+                        // a None `sparse_write` even though the inode now has a
+                        // CAS-backed original. Without recording a dirty range, a
+                        // later `setattr(size)` would create a fresh empty
+                        // `SparseWriteState` and `range_upload` would compose the
+                        // commit from CAS original only — silently dropping these
+                        // bytes. Lazily install `sparse_write` here so `track_write`
+                        // records the patch.
+                        // `!entry.is_dirty()` is critical: if an earlier write
+                        // through this same reused fh didn't install sparse_write
+                        // (e.g. the previous `entry.size == 0` snapshot skipped
+                        // the install but extended staging and bumped entry.size),
+                        // installing now would key the SparseWriteState to the
+                        // post-extension `entry.size` against the pre-extension
+                        // CAS hash — `range_upload` would then read an
+                        // `original_size` slice from a CAS object that is
+                        // smaller, dropping the prior write's bytes from the
+                        // composition. When the inode is already dirty, the
+                        // safe path is to leave sparse_write None so flush
+                        // falls through to the regular full-staging upload.
+                        if entry.sparse_write.is_none()
+                            && !entry.is_dirty()
+                            && let Some(hash) = entry.xet_hash.clone()
+                            && entry.size > 0
+                            && !self.overlay()
+                        {
+                            // `sparse_write=None && !is_dirty()` is only produced
+                            // by `apply_commit(was_sparse_upload=false)` (regular
+                            // upload), which also sets `staging_is_current=true`.
+                            // Every other path that clears `staging_is_current`
+                            // (apply_commit with was_sparse=true,
+                            // update_remote_file) leaves sparse_write=Some. So
+                            // reaching this branch with staging_is_current=false
+                            // means a future regression has dropped sparse_write
+                            // out from under us — assert in dev to catch it.
+                            debug_assert!(
+                                entry.staging_is_current,
+                                "lazy sparse_write install reached with staging_is_current=false; \
+                                 a code path cleared sparse_write without restoring it"
+                            );
+                            let sw = inode::SparseWriteState::new_with_full_staging(hash, entry.size);
+                            entry.sparse_write = Some(Arc::new(sw));
+                        }
                         if let Some(sw) = entry.sparse_write.as_mut() {
                             Arc::make_mut(sw).track_write(offset, tracked_len);
                         }

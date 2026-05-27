@@ -5972,3 +5972,190 @@ fn repro_abort_batch_marks_already_uploaded_items() {
         );
     });
 }
+
+/// Regression for PR #41 data-loss bug: NFSv3 has no CLOSE RPC, so the server-side
+/// handle pool keeps a writable fh alive across logical opens. After a flush that
+/// clears `sparse_write` (regular-upload commit), the next logical open through the
+/// reused fh skips `open_advanced_write` entirely. Pre-fix, the write path's
+/// `track_write` was gated on `sparse_write.is_some()` so the second write left no
+/// dirty range. A subsequent `setattr(size)` would then create a fresh
+/// `SparseWriteState` via the "Clean file" branch with empty `dirty_ranges`, and
+/// `range_upload` would compose the new CAS file from original + truncate-tail only,
+/// silently dropping the staging patch.
+///
+/// Fix: lazily install `sparse_write` in `write()` when the inode is CAS-backed but
+/// has no `sparse_write` (i.e. a flush cleared it between opens). The test reuses a
+/// single fh across the create → flush → patch → truncate cycle and asserts the
+/// committed CAS file contains the patch.
+#[test]
+fn write_after_flush_reuses_handle_and_preserves_patch_through_truncate() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_advanced(&hub, &xet);
+
+    rt.block_on(async {
+        // Phase A: create + initial write + flush. This mirrors the
+        // `echo "..." > file` (or first `open('wb')`) step that uploads the
+        // baseline 200-byte file. After flush, `xet_hash=Some`, `sparse_write=None`,
+        // `staging_is_current=true`.
+        let (attr, fh) = vfs
+            .create(ROOT_INODE, "file.bin", 0o644, 1000, 1000, Some(42))
+            .await
+            .unwrap();
+        let ino = attr.ino;
+        let initial: Vec<u8> = (0..200).map(|i| (i * 7 + 13) as u8).collect();
+        write_blocking(&vfs, ino, fh, 0, &initial).await.unwrap();
+        vfs.fsync(ino, fh, None).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        // Sanity: post-flush state matches the bug's preconditions.
+        {
+            let inodes = vfs.inode_table.read().unwrap();
+            let entry = inodes.get(ino).unwrap();
+            assert!(entry.xet_hash.is_some(), "file is now CAS-backed");
+            assert!(
+                entry.sparse_write.is_none(),
+                "regular flush cleared sparse_write (the preconditions for the bug)"
+            );
+            assert!(entry.staging_is_current, "staging still matches CAS content");
+            assert!(!entry.is_dirty(), "flush completed");
+        }
+
+        // Phase B: reuse the same fh (NFS pool reuse equivalent) and patch
+        // bytes [50..120). Pre-fix this write returned Ok but skipped
+        // `track_write`. Post-fix the lazy-install path runs first.
+        write_blocking(&vfs, ino, fh, 50, &[b'X'; 70]).await.unwrap();
+
+        // The fix's invariant: sparse_write is now installed, and the dirty
+        // range covers exactly the second write.
+        {
+            let inodes = vfs.inode_table.read().unwrap();
+            let entry = inodes.get(ino).unwrap();
+            let sw = entry
+                .sparse_write
+                .as_ref()
+                .expect("write() must lazily install sparse_write on a CAS-backed inode");
+            assert_eq!(sw.original_size, 200);
+            assert!(
+                sw.staging_holds_full_original,
+                "staging held the full original content at write time"
+            );
+            assert_eq!(sw.dirty_ranges, vec![(50, 120)], "write tracked as dirty");
+        }
+
+        // Phase C: shrink to 80 — this is the setattr that pre-fix would
+        // misroute into the "Clean file" branch with empty dirty_ranges.
+        vfs.setattr(ino, Some(80), None, None, None, None, None).await.unwrap();
+
+        // After clip_to_size(80), the dirty range [50..120) is capped to [50..80).
+        {
+            let inodes = vfs.inode_table.read().unwrap();
+            let sw = inodes.get(ino).unwrap().sparse_write.clone().unwrap();
+            assert_eq!(sw.dirty_ranges, vec![(50, 80)], "dirty range clipped to truncate");
+            assert_eq!(sw.effective_original_size, 80);
+            assert_eq!(sw.original_size, 200);
+        }
+
+        // Phase D: drive the flush and verify the new CAS file contains the
+        // X bytes — not just the truncated CAS original.
+        vfs.fsync(ino, fh, None).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        let new_hash = {
+            let inodes = vfs.inode_table.read().unwrap();
+            inodes.get(ino).unwrap().xet_hash.clone().expect("new hash committed")
+        };
+        let new_content = xet.get_file(&new_hash).expect("composed CAS file present");
+        assert_eq!(new_content.len(), 80, "committed size after truncate");
+        assert_eq!(&new_content[..50], &initial[..50], "prefix = original CAS bytes");
+        assert_eq!(
+            &new_content[50..],
+            &vec![b'X'; 30][..],
+            "tail = patched bytes (the bug dropped these)"
+        );
+
+        vfs.release(fh).await.unwrap();
+    });
+}
+
+/// Regression for the empty-CAS-file edge of the lazy-install path. Pre-fix the
+/// gate condition was `entry.size > 0` only, which lets two sequential writes
+/// through a reused fh land in a mis-keyed state: the first write is skipped by
+/// the gate (size=0) but extends staging and bumps entry.size; the second write
+/// then passes the gate and installs `new_with_full_staging(empty_hash, size=10)`
+/// — but `empty_hash` actually maps to a 0-byte CAS object, not 10 bytes. The
+/// next flush feeds that lying `original_size` to `range_upload`, which composes
+/// the new file by overlaying staging onto the (empty) original at the dirty
+/// ranges only. Bytes that the first write put into staging at [0..10) are NOT
+/// in any dirty range, so the composition produces zeros + W2 bytes — silently
+/// dropping W1.
+///
+/// The fix adds `!entry.is_dirty()` to the gate so a write following a
+/// non-installing first write defers to the regular (full-staging) upload path
+/// instead of building an incoherent sparse state.
+#[test]
+fn empty_cas_file_reused_handle_writes_preserve_both_writes() {
+    let hub = MockHub::new();
+    hub.add_file("empty.txt", 0, Some("empty_hash"), None);
+    let xet = MockXet::new();
+    xet.add_file("empty_hash", b"");
+    let (rt, vfs) = vfs_advanced(&hub, &xet);
+
+    rt.block_on(async {
+        let attr = vfs.lookup(ROOT_INODE, "empty.txt").await.unwrap();
+        let ino = attr.ino;
+        // Open for write. `has_xet = !xet_hash.is_empty() && size > 0` is false
+        // because size==0, so open_advanced_write does NOT install sparse_write
+        // — the inode enters the write path with sparse_write=None.
+        let fh = vfs.open(ino, true, false, None).await.unwrap();
+
+        // W1: write 10 bytes at offset 0. Pre-fix and post-fix the lazy-install
+        // gate fails on `entry.size > 0` (size still 0 here); the write extends
+        // staging to 10 bytes and bumps entry.size, but does NOT install
+        // sparse_write.
+        write_blocking(&vfs, ino, fh, 0, b"AAAAAAAAAA").await.unwrap();
+        {
+            let inodes = vfs.inode_table.read().unwrap();
+            let entry = inodes.get(ino).unwrap();
+            assert!(entry.sparse_write.is_none(), "W1 must not install sparse_write");
+            assert_eq!(entry.size, 10);
+            assert!(entry.is_dirty(), "W1 set_dirty fires");
+        }
+
+        // W2: write 10 bytes at offset 10 (no flush between W1 and W2). Pre-fix,
+        // entry.size>0 now and the install fires with a lying original_size.
+        // Post-fix, the `!is_dirty()` guard keeps sparse_write at None so the
+        // flush falls through the regular full-staging upload path.
+        write_blocking(&vfs, ino, fh, 10, b"BBBBBBBBBB").await.unwrap();
+        {
+            let inodes = vfs.inode_table.read().unwrap();
+            let entry = inodes.get(ino).unwrap();
+            assert!(
+                entry.sparse_write.is_none(),
+                "W2 must NOT lazily install sparse_write while inode is dirty from W1 — \
+                 doing so produces a SparseWriteState keyed to the post-W1 size against \
+                 the pre-W1 CAS hash (empty_hash), and range_upload silently drops W1 bytes."
+            );
+            assert_eq!(entry.size, 20);
+        }
+
+        // Flush. With sparse_write=None, flush goes through the regular upload
+        // path (upload_files of the full staging file), so the CAS object
+        // contains BOTH writes.
+        vfs.fsync(ino, fh, None).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        let new_hash = {
+            let inodes = vfs.inode_table.read().unwrap();
+            inodes.get(ino).unwrap().xet_hash.clone().expect("upload committed")
+        };
+        assert_ne!(new_hash, "empty_hash", "fresh content must produce fresh hash");
+        let new_content = xet.get_file(&new_hash).expect("CAS file present");
+        assert_eq!(
+            new_content, b"AAAAAAAAAABBBBBBBBBB",
+            "both writes preserved (pre-fix this returned 10 zeros + W2 only, dropping W1)"
+        );
+
+        vfs.release(fh).await.unwrap();
+    });
+}
