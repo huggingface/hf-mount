@@ -221,14 +221,23 @@ impl super::VirtualFs {
             let mut inode_table = inodes.write().expect("inodes poisoned");
 
             for update in &updates {
-                inode_table.update_remote_file(
+                // Gate the kernel-cache invalidation on whether the update
+                // actually applied. `update_remote_file` returns false when
+                // the inode is dirty or has open handles — invalidating
+                // anyway would close the pooled NFS handle that was the
+                // very reason we deferred the update, leaving sparse_write
+                // stale (per inode.rs:906) on the next cycle that finally
+                // accepts the update. See finding C4.
+                let applied = inode_table.update_remote_file(
                     update.ino,
                     update.hash.clone(),
                     update.etag.clone(),
                     update.size,
                     update.mtime,
                 );
-                inos_to_invalidate.push(update.ino);
+                if applied {
+                    inos_to_invalidate.push(update.ino);
+                }
             }
 
             for ino in &deletions {

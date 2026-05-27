@@ -53,6 +53,12 @@ pub struct EvictionState {
     /// with `open_handles > 0` — a racing read/write would silently lose
     /// data if the inode disappeared under it.
     pub open_handles: AtomicU32,
+    /// Subset of `open_handles` that were opened for write. Used by
+    /// `update_remote_file` to gate hash rotation: read-only handles do
+    /// not need the inode's snapshot to stay stable (their reads go
+    /// through prefetch handles bound to the open-time hash), so they
+    /// should not freeze poll-driven metadata refreshes (finding B6/E7).
+    pub open_write_handles: AtomicU32,
 }
 
 impl Clone for EvictionState {
@@ -62,6 +68,7 @@ impl Clone for EvictionState {
             last_touched: AtomicU64::new(self.last_touched.load(Ordering::Relaxed)),
             evict_pending: AtomicBool::new(self.evict_pending.load(Ordering::Relaxed)),
             open_handles: AtomicU32::new(self.open_handles.load(Ordering::Relaxed)),
+            open_write_handles: AtomicU32::new(self.open_write_handles.load(Ordering::Relaxed)),
         }
     }
 }
@@ -305,8 +312,16 @@ impl InodeEntry {
     }
 
     /// Mark the inode as dirty, incrementing the generation counter.
+    ///
+    /// `wrapping_add` (not saturating): once `dirty_generation` reaches
+    /// `u64::MAX`, saturating would pin the counter and let a stale flush
+    /// snapshot equal a concurrent writer's post-race value, falsely passing
+    /// `clear_dirty_if`. Wrapping spreads the collision space across all u64
+    /// values — `dirty_generation == 0` is reserved by `clear_dirty_if` for
+    /// "not dirty", so we skip 0 on wrap to keep the dirty bit meaningful.
     pub fn set_dirty(&mut self) {
-        self.dirty_generation = self.dirty_generation.saturating_add(1);
+        let next = self.dirty_generation.wrapping_add(1);
+        self.dirty_generation = if next == 0 { 1 } else { next };
     }
 
     /// Clear the dirty flag, but only if the generation matches the snapshot
@@ -348,15 +363,16 @@ impl InodeEntry {
                 sw.dirty_ranges.clear();
                 sw.staging_holds_full_original = false;
             }
+            // Bump mtime/ctime ONLY when clear_dirty_if succeeded — observers
+            // (build systems, rsync) interpret a fresh mtime as "this version
+            // is durably committed." On a generation mismatch, a concurrent
+            // writer raced past the snapshot and the inode is still dirty;
+            // advertising the touch would lie about durability (finding C5).
+            let now = SystemTime::now();
+            self.mtime = now;
+            self.ctime = now;
+            self.last_revalidated = Some(Instant::now());
         }
-        // mtime/ctime are bumped unconditionally — same as apply_commit. A
-        // no-op flush still ran an open/dirty/flush cycle, and observers that
-        // poll mtime (build systems, rsync-style sync tools) need to see the
-        // touch even when the content hash is unchanged.
-        let now = SystemTime::now();
-        self.mtime = now;
-        self.ctime = now;
-        self.last_revalidated = Some(Instant::now());
     }
 
     /// Apply a successful commit: update hash, size, timestamps, and
@@ -398,13 +414,18 @@ impl InodeEntry {
             }
             self.size = size;
             self.pending_deletes.clear();
+            // Bump mtime/ctime/last_revalidated ONLY when clear_dirty_if
+            // succeeded — on a generation mismatch the concurrent writer's
+            // bytes are still in staging and the inode stays dirty, so we
+            // must not advertise the touch as durably committed (finding
+            // C5/E2). Mark as recently validated so subsequent lookups skip
+            // HEAD revalidation for the duration of metadata_ttl (we just
+            // committed this exact hash).
+            let now = SystemTime::now();
+            self.mtime = now;
+            self.ctime = now;
+            self.last_revalidated = Some(Instant::now());
         }
-        let now = SystemTime::now();
-        self.mtime = now;
-        self.ctime = now;
-        // Mark as recently validated so subsequent lookups skip HEAD revalidation
-        // for the duration of metadata_ttl (we just committed this exact hash).
-        self.last_revalidated = Some(Instant::now());
     }
 }
 
@@ -512,17 +533,27 @@ impl InodeTable {
     /// Bump the per-inode open-handle refcount. Called on every `open` /
     /// `create` to pin the entry against eviction for as long as a FUSE
     /// file handle references it.
-    pub(crate) fn bump_open_handles(&self, ino: u64) {
+    ///
+    /// `writable=true` also bumps the writable-handle sub-count, which
+    /// `update_remote_file` uses to gate hash rotation: read-only handles
+    /// do not need the inode snapshot to stay stable across polls.
+    pub(crate) fn bump_open_handles(&self, ino: u64, writable: bool) {
         if let Some(entry) = self.inodes.get(&ino) {
             entry.eviction.open_handles.fetch_add(1, Ordering::Relaxed);
+            if writable {
+                entry.eviction.open_write_handles.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 
     /// Drop the per-inode open-handle refcount. Called on `release` once
     /// the handle has been removed from `VirtualFs::open_files`.
-    pub(crate) fn drop_open_handles(&self, ino: u64) {
+    pub(crate) fn drop_open_handles(&self, ino: u64, writable: bool) {
         if let Some(entry) = self.inodes.get(&ino) {
             entry.eviction.open_handles.fetch_sub(1, Ordering::Relaxed);
+            if writable {
+                entry.eviction.open_write_handles.fetch_sub(1, Ordering::Relaxed);
+            }
         }
     }
 
@@ -531,6 +562,15 @@ impl InodeTable {
         self.inodes
             .get(&ino)
             .is_some_and(|e| e.eviction.open_handles.load(Ordering::Relaxed) > 0)
+    }
+
+    /// Is there at least one live WRITABLE FUSE file handle on this inode?
+    /// Used by `update_remote_file` to gate hash rotation — read-only
+    /// handles are exempt (finding B6/E7).
+    pub(crate) fn has_open_write_handles(&self, ino: u64) -> bool {
+        self.inodes
+            .get(&ino)
+            .is_some_and(|e| e.eviction.open_write_handles.load(Ordering::Relaxed) > 0)
     }
 
     pub fn len(&self) -> usize {
@@ -890,9 +930,15 @@ impl InodeTable {
         new_size: u64,
         new_mtime: SystemTime,
     ) -> bool {
-        let has_handles = self.has_open_handles(ino);
+        // Read-only handles do NOT block hash rotation: their reads either
+        // go through Lazy prefetch buffers bound to the open-time hash, or
+        // through LocalFd which we now defensively gate fill_sparse_holes
+        // on `sparse_write.original_hash == entry.xet_hash` (finding C2).
+        // Pre-fix this checked `has_open_handles` and froze inodes under any
+        // long-lived NFS-pool read handle (finding B6/E7).
+        let has_write_handles = self.has_open_write_handles(ino);
         if let Some(entry) = self.inodes.get_mut(&ino) {
-            if entry.is_dirty() || has_handles {
+            if entry.is_dirty() || has_write_handles {
                 return false;
             }
             entry.xet_hash = new_hash;
@@ -903,11 +949,14 @@ impl InodeTable {
             // matches xet_hash. An in-flight download observes this under
             // its post-check and won't re-flag the cache.
             entry.staging_is_current = false;
-            // Do NOT clear `sparse_write` here. Any handle still open against
-            // the old snapshot relies on it for `fill_sparse_holes` to serve
-            // reads from the old CAS hash. The next open's drift check
-            // (`open_advanced_write`) refreshes `sparse_write` against the
-            // current xet_hash when the snapshot doesn't match.
+            // Clear `sparse_write` since the guard above already proved
+            // has_handles=false — no open handle relies on the old snapshot.
+            // Leaving sparse_write keyed to the OLD hash would have any
+            // subsequent setattr or read use it against the new xet_hash,
+            // composing/overlaying against the wrong CAS object (findings
+            // C1, C2). The next open's drift check installs a fresh
+            // sparse_write against the now-current hash.
+            entry.sparse_write = None;
             true
         } else {
             false
@@ -1355,7 +1404,7 @@ mod tests {
     }
 
     #[test]
-    fn set_dirty_saturates() {
+    fn set_dirty_wraps_around_skipping_zero() {
         let mut table = InodeTable::new(false);
         let ino = table.insert(
             ROOT_INODE,
@@ -1372,7 +1421,10 @@ mod tests {
         let entry = table.get_mut(ino).unwrap();
         entry.dirty_generation = u64::MAX;
         entry.set_dirty();
-        assert_eq!(entry.dirty_generation, u64::MAX); // saturated, not wrapped to 0
+        // Wraps to 1 (skipping 0, which is reserved for "not dirty"). A
+        // saturating implementation would pin at MAX and let a stale flush
+        // snapshot equal a concurrent writer's post-race value.
+        assert_eq!(entry.dirty_generation, 1);
         assert!(entry.is_dirty());
     }
 
@@ -2686,10 +2738,22 @@ mod tests {
         let busy = mk_file(&mut table, "busy.txt");
 
         assert!(!table.has_open_handles(busy));
-        table.bump_open_handles(busy);
+        assert!(!table.has_open_write_handles(busy));
+
+        // Read-only handle: bumps total but not write count.
+        table.bump_open_handles(busy, false);
         assert!(table.has_open_handles(busy));
-        table.drop_open_handles(busy);
+        assert!(!table.has_open_write_handles(busy));
+        table.drop_open_handles(busy, false);
         assert!(!table.has_open_handles(busy));
+
+        // Write handle: bumps both.
+        table.bump_open_handles(busy, true);
+        assert!(table.has_open_handles(busy));
+        assert!(table.has_open_write_handles(busy));
+        table.drop_open_handles(busy, true);
+        assert!(!table.has_open_handles(busy));
+        assert!(!table.has_open_write_handles(busy));
     }
 
     // ── child_index invariants ─────────────────────────────────────

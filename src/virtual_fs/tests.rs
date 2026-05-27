@@ -3691,7 +3691,7 @@ fn fsync_between_writes_stays_dirty() {
         vfs.fsync(ino, fh, None).await.unwrap();
         assert!(vfs.inode_table.read().unwrap().get(ino).unwrap().is_dirty());
 
-        let result = vfs.write(ino, fh, 0, b"more");
+        let result = write_blocking(&vfs, ino, fh, 0, b"more").await;
         assert!(result.is_ok(), "write after fsync should succeed");
         assert!(vfs.inode_table.read().unwrap().get(ino).unwrap().is_dirty());
 
@@ -6158,4 +6158,895 @@ fn empty_cas_file_reused_handle_writes_preserve_both_writes() {
 
         vfs.release(fh).await.unwrap();
     });
+}
+
+// ── Code-review findings (2026-05-27): regression tests for sparse-write PR ──
+
+/// **C3** — `mod.rs:3909` — setattr's "Clean file" branch fires after an
+/// `O_TRUNC + write` sequence and constructs `SparseWriteState::new(
+/// pre_truncate_hash, prev_size=K)`. `original_size` is set to the
+/// post-truncate-and-write size `K`, but `original_hash` still points to the
+/// pre-truncate CAS object (which has a DIFFERENT size). `range_upload` then
+/// composes the new file by reading `original_size=K` bytes from the
+/// pre-truncate CAS content, dropping the user's K bytes from staging.
+///
+/// In the mock, the bug appears as the bytes the user wrote being silently
+/// replaced by the pre-truncate CAS bytes. In production against real xet-core
+/// `upload_ranges`, the same state additionally produces a `ParameterError`
+/// because the CAS reconstruction info disagrees with `original_size`, so
+/// flush retries forever → persistent EIO.
+#[test]
+fn c3_o_trunc_then_write_then_setattr_extend_loses_user_bytes() {
+    let hub = MockHub::new();
+    hub.add_file("file.txt", 10, Some("orig_hash"), None);
+    let xet = MockXet::new();
+    xet.add_file("orig_hash", b"0123456789");
+    let (rt, vfs) = vfs_advanced(&hub, &xet);
+
+    rt.block_on(async {
+        let attr = vfs.lookup(ROOT_INODE, "file.txt").await.unwrap();
+        let ino = attr.ino;
+
+        // Open with O_TRUNC: clears sparse_write, sets size=0, set_dirty.
+        // entry.xet_hash is INTENTIONALLY left at "orig_hash" so writes can
+        // still see the pre-truncate revision while staging is being built.
+        let fh = vfs.open(ino, true, true, None).await.unwrap();
+        {
+            let inodes = vfs.inode_table.read().unwrap();
+            let e = inodes.get(ino).unwrap();
+            assert_eq!(e.size, 0);
+            assert!(e.sparse_write.is_none(), "O_TRUNC clears sparse_write");
+            assert_eq!(
+                e.xet_hash.as_deref(),
+                Some("orig_hash"),
+                "O_TRUNC does not clear xet_hash (still points at pre-truncate CAS object)"
+            );
+            assert!(e.is_dirty(), "O_TRUNC sets dirty");
+        }
+
+        // Write K=5 bytes "AAAAA" at offset 0. Lazy install (mod.rs:2492)
+        // is gated on `!entry.is_dirty()` — the inode IS dirty, so the
+        // install is correctly skipped. Staging now holds "AAAAA",
+        // entry.size=5, sparse_write still None.
+        write_blocking(&vfs, ino, fh, 0, b"AAAAA").await.unwrap();
+        {
+            let inodes = vfs.inode_table.read().unwrap();
+            let e = inodes.get(ino).unwrap();
+            assert_eq!(e.size, 5);
+            assert!(e.sparse_write.is_none(), "lazy install skipped on dirty");
+        }
+
+        // setattr(size=8). entry.size goes 5 → 8. sparse_write is None,
+        // entry.xet_hash is Some("orig_hash") → falls into the "Clean file"
+        // branch (mod.rs:3909). Builds SparseWriteState::new("orig_hash",
+        // prev_size=5). Then track_write(5, 3) records dirty_ranges=[(5,8)].
+        //
+        // The bug: sw.original_hash points at the 10-byte "0123456789" CAS
+        // object but original_size=5. range_upload composes bytes [0..5)
+        // from CAS (= "01234") and overlays [5..8) from staging zeros — the
+        // K=5 user bytes "AAAAA" sitting at staging[0..5) are NEVER read.
+        vfs.setattr(ino, Some(8), None, None, None, None, None).await.unwrap();
+
+        vfs.fsync(ino, fh, None).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        let new_hash = {
+            let inodes = vfs.inode_table.read().unwrap();
+            inodes.get(ino).unwrap().xet_hash.clone().expect("upload committed")
+        };
+        let new_content = xet.get_file(&new_hash).expect("CAS file present");
+
+        // Expected behavior (POSIX): O_TRUNC discards old content, then the
+        // user's 5-byte write at offset 0 + setattr extension to 8 should
+        // produce "AAAAA\0\0\0".
+        assert_eq!(
+            new_content, b"AAAAA\0\0\0",
+            "post-fix: CAS file = user's 5 bytes + zero extension. \
+             Pre-fix this is \"01234\\0\\0\\0\" — pre-truncate bytes overlaid \
+             on top of the user's AAAAA, which lives only in staging."
+        );
+
+        vfs.release(fh).await.unwrap();
+    });
+}
+
+/// **B5** — `mod.rs:3909` — After `setattr(size=0) + flush`, the inode is
+/// (size=0, xet_hash=Some(empty), sparse_write=None). A subsequent write
+/// through the still-open fh extends staging without installing sparse_write
+/// (gate fails on `entry.size > 0`). Then `setattr(size=M>K)` enters the
+/// Clean-file branch and builds `SparseWriteState::new(empty_hash, K)`.
+/// range_upload composes [0..K) from the empty CAS hash (zeros) and [K..M)
+/// from staging zeros — silently dropping the K bytes the user wrote between
+/// the two setattrs.
+#[test]
+fn b5_setattr_zero_then_write_then_setattr_extend_loses_bytes() {
+    let hub = MockHub::new();
+    hub.add_file("file.txt", 10, Some("orig_hash"), None);
+    let xet = MockXet::new();
+    xet.add_file("orig_hash", b"0123456789");
+    let (rt, vfs) = vfs_advanced(&hub, &xet);
+
+    rt.block_on(async {
+        let attr = vfs.lookup(ROOT_INODE, "file.txt").await.unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open(ino, true, false, None).await.unwrap();
+
+        // setattr(size=0) clears xet_hash + sparse_write, sets size=0,
+        // schedules a flush which uploads the empty file and apply_commit
+        // restores xet_hash to a new "empty file" hash.
+        vfs.setattr(ino, Some(0), None, None, None, None, None).await.unwrap();
+        vfs.fsync(ino, fh, None).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        let empty_hash = {
+            let inodes = vfs.inode_table.read().unwrap();
+            let e = inodes.get(ino).unwrap();
+            assert!(!e.is_dirty(), "post-flush clean");
+            assert_eq!(e.size, 0);
+            assert!(e.sparse_write.is_none(), "post-flush no sparse_write");
+            e.xet_hash
+                .clone()
+                .expect("apply_commit restored a hash for the empty file")
+        };
+
+        // Write K=5 bytes via the still-open fh. Lazy install gate fails on
+        // entry.size==0 → sparse_write stays None. pwrite extends staging,
+        // entry.size becomes 5, set_dirty.
+        write_blocking(&vfs, ino, fh, 0, b"AAAAA").await.unwrap();
+        {
+            let inodes = vfs.inode_table.read().unwrap();
+            let e = inodes.get(ino).unwrap();
+            assert_eq!(e.size, 5);
+            assert!(e.sparse_write.is_none(), "lazy install gated out on prior size==0");
+        }
+
+        // setattr(size=8). prev_size=5. Clean-file branch builds
+        // SparseWriteState::new(empty_hash, 5). The bug: original_hash
+        // points at the empty CAS object, so range_upload reads zeros for
+        // [0..5) and the user's "AAAAA" written between the two setattrs
+        // never makes it to the new CAS file.
+        vfs.setattr(ino, Some(8), None, None, None, None, None).await.unwrap();
+        vfs.fsync(ino, fh, None).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        let new_hash = {
+            let inodes = vfs.inode_table.read().unwrap();
+            inodes.get(ino).unwrap().xet_hash.clone().expect("upload committed")
+        };
+        assert_ne!(new_hash, empty_hash, "extend produced a fresh hash");
+        let new_content = xet.get_file(&new_hash).expect("CAS file present");
+
+        assert_eq!(
+            new_content, b"AAAAA\0\0\0",
+            "post-fix: extension preserves the bytes written between the two setattrs. \
+             Pre-fix this is 8 zero bytes — the AAAAA write is silently overwritten by \
+             the empty CAS prefix during range_upload composition."
+        );
+
+        vfs.release(fh).await.unwrap();
+    });
+}
+
+/// **B1** — `mod.rs:3837/3909` — `setattr(size=N<prev_size)` on a clean file
+/// with `xet_hash=None` (non-Xet bucket file) creates an empty staging file
+/// and `set_len(N)`, but the sparse_write install branches at line 3909 are
+/// all gated on `entry.xet_hash.is_some()`. Result: `sparse_write` stays None,
+/// the staging file contains N zero bytes, and the next flush would upload
+/// those N zeros via the regular (full-staging) path — silently replacing the
+/// original bucket content.
+///
+/// This test asserts the broken state (no sparse_write installed, staging is
+/// all zeros) for a clean non-Xet inode after a shrink. A fix should either
+/// download the original content first (old behavior), or refuse the shrink,
+/// or extend the sparse-install branch to cover non-Xet files via a bucket
+/// fetcher.
+#[test]
+fn b1_setattr_shrink_on_non_xet_file_loses_original_content() {
+    let hub = MockHub::new();
+    // Non-Xet file: xet_hash=None. In production these come from regular
+    // bucket HTTP objects; the Hub still reports them in the tree listing.
+    let original: Vec<u8> = (0..1000u32).map(|i| (i % 251) as u8).collect();
+    hub.add_file("plain.bin", 1000, None, None);
+    hub.set_head(
+        "plain.bin",
+        Some(HeadFileInfo {
+            xet_hash: None,
+            etag: None,
+            size: Some(1000),
+            last_modified: None,
+        }),
+    );
+    hub.set_bucket_content("plain.bin", &original);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_advanced(&hub, &xet);
+
+    rt.block_on(async {
+        let attr = vfs.lookup(ROOT_INODE, "plain.bin").await.unwrap();
+        let ino = attr.ino;
+        assert_eq!(attr.size, 1000, "Hub-reported size");
+
+        // setattr(shrink) without opening for write. Post-fix: the
+        // advanced-write path downloads the original via HTTP into
+        // staging BEFORE set_len, so set_len truncates real content
+        // (not zeros). Pre-fix this created an empty staging file and
+        // then set_len to 500 zero bytes, silently replacing the
+        // bucket's original content with zeros at flush time.
+        vfs.setattr(ino, Some(500), None, None, None, None, None).await.unwrap();
+
+        // Drive the flush.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        let new_hash = {
+            let inodes = vfs.inode_table.read().unwrap();
+            inodes
+                .get(ino)
+                .unwrap()
+                .xet_hash
+                .clone()
+                .expect("flush produced a Xet hash for the shrunk bucket file")
+        };
+        let new_content = xet.get_file(&new_hash).expect("CAS file present");
+
+        assert_eq!(
+            new_content,
+            original[..500],
+            "post-fix: the shrunk file's content is the original's first 500 bytes. \
+             Pre-fix the flush uploaded 500 zeros — silently replacing the bucket's \
+             original content."
+        );
+    });
+}
+
+/// **C1** — `mod.rs:3898` — setattr's `else if let Some(sw) = ...` branch
+/// mutates `sparse_write` without checking that `sw.original_hash ==
+/// entry.xet_hash`. `update_remote_file` deliberately preserves `sparse_write`
+/// across remote-hash changes (inode.rs:906). After a flush leaves
+/// `sparse_write` keyed to NEW_HASH and the inode quiesces (no handles, not
+/// dirty), a poll rotating `entry.xet_hash=NEWER_HASH` leaves the inode in an
+/// inconsistent state. A subsequent setattr operates on the stale sw → flush's
+/// `range_upload` composes against NEW_HASH (not NEWER_HASH) → Hub commit
+/// publishes a hash rooted in NEW_HASH, silently rolling back the NEWER_HASH
+/// remote revision.
+#[test]
+fn c1_setattr_on_stale_sparse_write_rolls_back_remote_revision() {
+    let hub = MockHub::new();
+    hub.add_file("file.txt", 10, Some("orig_hash"), None);
+    let xet = MockXet::new();
+    xet.add_file("orig_hash", b"0123456789");
+    // Pre-populate the remote-side "newer" revision that the poll will discover.
+    xet.add_file("newer_hash", b"NEWNEWNEWN");
+    let (rt, vfs) = vfs_advanced(&hub, &xet);
+
+    rt.block_on(async {
+        let attr = vfs.lookup(ROOT_INODE, "file.txt").await.unwrap();
+        let ino = attr.ino;
+
+        // Step 1: open + dirty + release-driven flush. apply_commit(was_sparse=true)
+        // re-keys sparse_write to the new locally-committed hash and clears dirty.
+        let fh = vfs.open(ino, true, false, None).await.unwrap();
+        write_blocking(&vfs, ino, fh, 1, b"AA").await.unwrap();
+        vfs.fsync(ino, fh, None).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        vfs.release(fh).await.unwrap();
+
+        let committed_hash = {
+            let inodes = vfs.inode_table.read().unwrap();
+            let e = inodes.get(ino).unwrap();
+            assert!(!e.is_dirty(), "post-flush clean");
+            let sw = e.sparse_write.as_ref().expect("apply_commit re-keyed sparse_write");
+            assert_eq!(sw.original_hash, e.xet_hash.as_deref().unwrap());
+            e.xet_hash.clone().unwrap()
+        };
+        assert_ne!(committed_hash, "orig_hash", "flush produced a fresh hash");
+
+        // Step 2: simulate poll discovering a NEWER remote revision. The
+        // production path is poll → apply_poll_diff → update_remote_file.
+        // We call it directly: no handles, not dirty, so the guard allows
+        // the update.
+        let now = std::time::SystemTime::now();
+        {
+            let mut inodes = vfs.inode_table.write().unwrap();
+            let ok = inodes.update_remote_file(ino, Some("newer_hash".to_string()), None, 10, now);
+            assert!(ok, "update_remote_file should succeed (no handles, not dirty)");
+        }
+
+        // Post-fix invariant: update_remote_file clears sparse_write when
+        // no handles are open, so a follow-up setattr will compose against
+        // the current xet_hash instead of a stale snapshot.
+        {
+            let inodes = vfs.inode_table.read().unwrap();
+            let e = inodes.get(ino).unwrap();
+            assert_eq!(e.xet_hash.as_deref(), Some("newer_hash"));
+            if let Some(sw) = e.sparse_write.as_ref() {
+                assert_eq!(
+                    sw.original_hash, "newer_hash",
+                    "if sparse_write survives update_remote_file, it must be \
+                     re-keyed to the new xet_hash (not the stale pre-poll hash)"
+                );
+            }
+        }
+
+        // Step 3: a normal user op (setattr to extend).
+        vfs.setattr(ino, Some(12), None, None, None, None, None).await.unwrap();
+        vfs.fsync(ino, 0, None).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        // Step 4: the new CAS commit should be rooted in NEWER_HASH (the
+        // current remote revision), not in the stale sparse_write's
+        // original_hash. With the bug, range_upload composes against the
+        // stale hash, silently overwriting the NEWER_HASH revision.
+        let final_hash = {
+            let inodes = vfs.inode_table.read().unwrap();
+            inodes.get(ino).unwrap().xet_hash.clone().unwrap()
+        };
+        let final_content = xet.get_file(&final_hash).expect("CAS file present");
+
+        // First 10 bytes should be NEWER_HASH's content "NEWNEWNEWN" + 2
+        // zero bytes from the extension. With the bug, those first 10 bytes
+        // come from the stale sparse_write.original_hash (= committed_hash,
+        // which was built from "orig_hash" via apply_commit).
+        assert_eq!(
+            &final_content[..10],
+            b"NEWNEWNEWN",
+            "post-fix: extend should be rooted in the current remote revision \
+             NEWER_HASH. Pre-fix this contains the stale sparse_write's CAS \
+             content, silently rolling back the NEWER_HASH revision."
+        );
+    });
+}
+
+/// **C2** — `inode.rs:906 + mod.rs:2299` — `update_remote_file` preserves
+/// `sparse_write` across a hash change (comment at inode.rs:906). The
+/// `read()` LocalFd path at mod.rs:2299-2308 then clones this stale
+/// `sparse_write` and calls `fill_sparse_holes` which downloads bytes from
+/// `sparse_write.original_hash` — disagreeing with `entry.xet_hash`. The
+/// user-visible bug surfaces in production where `file_cache.try_open()`
+/// (mod.rs:1942) installs a LocalFd handle for read-only opens against
+/// the CURRENT xet_hash; reads then mix new-hash pread bytes with
+/// old-hash CAS overlay.
+///
+/// The test asserts the precondition (stale-state divergence) because the
+/// downstream bad-read path requires `file_cache` to be plumbed (which the
+/// test fixture does not enable). Any future read via LocalFd while this
+/// state holds returns corrupt bytes — that's the actual user impact.
+#[test]
+fn c2_update_remote_file_leaves_sparse_write_stale_vs_xet_hash() {
+    let hub = MockHub::new();
+    hub.add_file("file.txt", 10, Some("orig_hash"), None);
+    let xet = MockXet::new();
+    xet.add_file("orig_hash", b"AAAAAAAAAA");
+    xet.add_file("newer_hash", b"BBBBBBBBBB");
+    let (rt, vfs) = vfs_advanced(&hub, &xet);
+
+    rt.block_on(async {
+        let attr = vfs.lookup(ROOT_INODE, "file.txt").await.unwrap();
+        let ino = attr.ino;
+
+        // Set up a sparse_write keyed to a committed hash, no handles, clean.
+        let fh = vfs.open(ino, true, false, None).await.unwrap();
+        write_blocking(&vfs, ino, fh, 0, b"X").await.unwrap();
+        vfs.fsync(ino, fh, None).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        vfs.release(fh).await.unwrap();
+
+        let committed_hash = {
+            let inodes = vfs.inode_table.read().unwrap();
+            inodes.get(ino).unwrap().xet_hash.clone().unwrap()
+        };
+
+        // Poll discovers a newer remote revision. sparse_write is NOT refreshed.
+        {
+            let mut inodes = vfs.inode_table.write().unwrap();
+            let ok = inodes.update_remote_file(
+                ino,
+                Some("newer_hash".to_string()),
+                None,
+                10,
+                std::time::SystemTime::now(),
+            );
+            assert!(ok, "no handles, not dirty → update accepted");
+        }
+
+        let _ = committed_hash;
+        // Post-fix invariant: after update_remote_file rotates xet_hash on a
+        // clean inode with no handles, sparse_write must either be cleared
+        // OR re-keyed to the new xet_hash — never left pointing at the
+        // pre-rotation hash. Otherwise any subsequent LocalFd read overlays
+        // bytes from the stale CAS object.
+        let inodes = vfs.inode_table.read().unwrap();
+        let entry = inodes.get(ino).unwrap();
+        assert_eq!(entry.xet_hash.as_deref(), Some("newer_hash"));
+        let stale = entry
+            .sparse_write
+            .as_ref()
+            .is_some_and(|sw| Some(sw.original_hash.as_str()) != entry.xet_hash.as_deref());
+        assert!(
+            !stale,
+            "post-fix invariant: sparse_write must not outlive a hash rotation \
+             while pointing at the pre-rotation hash. Pre-fix update_remote_file \
+             preserved sparse_write keyed to the pre-poll commit hash, enabling \
+             any LocalFd read to return stale CAS bytes."
+        );
+    });
+}
+
+/// **C4** — `poll.rs:231` — Phase 2 of poll_remote_changes pushes
+/// `update.ino` into `inos_to_invalidate` UNCONDITIONALLY, even when
+/// `update_remote_file` returned false (because has_open_handles or
+/// is_dirty). The cache invalidator then closes the pooled handle. On the
+/// next poll cycle, `update_remote_file` succeeds (no handles), but
+/// `sparse_write` is preserved across that update — leaving the inode in
+/// the stale-sparse_write state that drives C1/C2.
+///
+/// The invariant we want: if update_remote_file returned false, the poll
+/// should NOT invalidate the kernel cache for that ino (otherwise it
+/// destroys the pooled handle that was the whole reason update was
+/// deferred).
+///
+/// This test reads the current behavior from the source rather than driving
+/// a full poll cycle: the bug is a structural correctness issue in the poll
+/// pipeline and the fix is to gate the `inos_to_invalidate.push(...)` on the
+/// return value.
+#[test]
+fn c4_poll_phase2_invalidates_even_when_update_was_rejected() {
+    use std::path::PathBuf;
+    let src = std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/virtual_fs/poll.rs"))
+        .expect("read poll.rs");
+
+    // Look for the Phase 2 loop: `update_remote_file(...)` followed by an
+    // unconditional `inos_to_invalidate.push(...)`. The fix should bind
+    // the bool result and gate the push on it.
+    let updated = src.contains("if inode_table.update_remote_file(")
+        || src.contains("let updated = inode_table.update_remote_file(")
+        || src.contains("let ok = inode_table.update_remote_file(")
+        || src.contains("let applied = inode_table.update_remote_file(");
+
+    assert!(
+        updated,
+        "Phase 2 of poll_remote_changes should bind update_remote_file's bool result \
+         and gate inos_to_invalidate.push() on it. Currently the push fires regardless, \
+         so a deferred update (because has_open_handles=true) still invalidates the \
+         kernel cache and closes the pooled handle — the next cycle then applies the \
+         update with sparse_write stale (per inode.rs:906), enabling C1/C2 in normal \
+         operation."
+    );
+}
+
+/// **B6/E7** — `inode.rs:893` — `update_remote_file` now bails on
+/// `is_dirty() || has_open_handles()`. The `has_open_handles` guard is new.
+/// NFS pools handles (cap 64) for long-lived reads, so on low-volume mounts
+/// the pool keeps clean handles alive and freezes the inode's remote view
+/// indefinitely. The old code only checked is_dirty, so clean inodes
+/// refreshed every poll cycle.
+#[test]
+fn b6_open_readonly_handle_freezes_update_remote_file() {
+    let hub = MockHub::new();
+    hub.add_file("file.txt", 10, Some("orig_hash"), None);
+    let xet = MockXet::new();
+    xet.add_file("orig_hash", b"0123456789");
+    let (rt, vfs) = vfs_advanced(&hub, &xet);
+
+    rt.block_on(async {
+        let attr = vfs.lookup(ROOT_INODE, "file.txt").await.unwrap();
+        let ino = attr.ino;
+
+        // Open read-only (no writes, not dirty). Handle is alive.
+        let fh = vfs.open(ino, false, false, None).await.unwrap();
+
+        // Poll discovers a newer revision. With the bug, the guard rejects
+        // the update — userspace sees stale metadata until the handle is
+        // released AND the next poll cycle runs.
+        let now = std::time::SystemTime::now();
+        let updated = {
+            let mut inodes = vfs.inode_table.write().unwrap();
+            inodes.update_remote_file(ino, Some("newer_hash".to_string()), None, 12, now)
+        };
+
+        assert!(
+            updated,
+            "post-fix: update_remote_file on a NON-DIRTY inode should succeed \
+             even with a read-only handle open. Pre-fix this returns false \
+             because the has_open_handles guard treats clean read-only opens \
+             the same as in-flight writes — freezing the inode's remote view \
+             for the lifetime of any pooled NFS handle (which can be indefinite \
+             on low-volume mounts under LRU pinning)."
+        );
+
+        let inodes = vfs.inode_table.read().unwrap();
+        let e = inodes.get(ino).unwrap();
+        assert_eq!(e.xet_hash.as_deref(), Some("newer_hash"));
+        drop(inodes);
+        vfs.release(fh).await.unwrap();
+    });
+}
+
+/// **B8** — `mod.rs:3909` — `setattr(size=N)` where `new_size == prev_size`
+/// on a clean Xet file. Pre-fix: setattr bumped local mtime, scheduled a
+/// flush whose `range_upload` short-circuited to a no-op,
+/// `apply_noop_commit` cleared dirty but skipped Hub `batch_operations` —
+/// leaving local mtime diverged from Hub mtime.
+///
+/// Post-fix: same-size setattr on a clean inode is a full no-op (no local
+/// mtime bump, no flush, no Hub commit), consistent with how
+/// `chmod`/`utime` already behave in hf-mount. Asserts both halves:
+/// the inode's mtime is unchanged AND no Hub batch fires.
+#[test]
+fn b8_setattr_same_size_is_consistent_noop() {
+    let hub = MockHub::new();
+    hub.add_file("file.txt", 10, Some("orig_hash"), None);
+    let xet = MockXet::new();
+    xet.add_file("orig_hash", b"0123456789");
+    let (rt, vfs) = vfs_advanced(&hub, &xet);
+
+    // Clear any setup-time hub log.
+    let _ = hub.take_batch_log();
+
+    rt.block_on(async {
+        let attr = vfs.lookup(ROOT_INODE, "file.txt").await.unwrap();
+        let ino = attr.ino;
+
+        let mtime_before = {
+            let inodes = vfs.inode_table.read().unwrap();
+            inodes.get(ino).unwrap().mtime
+        };
+
+        vfs.setattr(ino, Some(10), None, None, None, None, None).await.unwrap();
+
+        // Drive any (hypothetical) flush.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        let mtime_after = {
+            let inodes = vfs.inode_table.read().unwrap();
+            inodes.get(ino).unwrap().mtime
+        };
+        let logs = hub.take_batch_log();
+
+        assert_eq!(
+            mtime_after, mtime_before,
+            "post-fix: same-size setattr on a clean file must not bump local mtime"
+        );
+        assert!(
+            logs.is_empty(),
+            "post-fix: same-size setattr on a clean file must not emit any Hub op"
+        );
+    });
+}
+
+/// **C5/E2** — `inode.rs:356-359` — `apply_noop_commit` bumps mtime, ctime,
+/// and last_revalidated UNCONDITIONALLY, including when `clear_dirty_if(snap)`
+/// returned false because a concurrent writer raced. The inode is still
+/// dirty (the racer's bytes are in staging, not uploaded), but mtime jumps to
+/// "now" as if the file had been committed. Observers polling mtime can
+/// conclude the file is durably committed and skip re-syncing.
+#[test]
+fn c5_apply_noop_commit_bumps_mtime_even_on_generation_mismatch() {
+    use crate::virtual_fs::inode::{InodeKind, InodeTable, ROOT_INODE};
+    use std::time::UNIX_EPOCH;
+
+    let mut table = InodeTable::new(false);
+    let ino = table.insert(
+        ROOT_INODE,
+        "test".to_string(),
+        "test".to_string(),
+        InodeKind::File,
+        100,
+        UNIX_EPOCH,
+        Some("old_hash".to_string()),
+        0o644,
+        0,
+        0,
+    );
+
+    let entry = table.get_mut(ino).unwrap();
+    entry.set_dirty(); // gen=1 (the flush snapshot)
+    let snapshot_gen = entry.dirty_generation;
+
+    // Simulate a concurrent writer racing in between the flush snapshot and
+    // the apply_noop_commit call: dirty_generation advances past the snapshot.
+    entry.set_dirty(); // gen=2
+
+    let mtime_before = entry.mtime;
+    // Burn at least one tick so SystemTime::now() is observably later.
+    std::thread::sleep(Duration::from_millis(20));
+
+    entry.apply_noop_commit(snapshot_gen);
+
+    // Generation mismatch → clear_dirty_if returns false → inode stays dirty.
+    assert!(entry.is_dirty(), "concurrent-writer race leaves inode dirty");
+
+    // BUG: mtime is bumped anyway, advertising a "touch" we did not commit.
+    assert_eq!(
+        entry.mtime, mtime_before,
+        "post-fix: apply_noop_commit must NOT bump mtime when clear_dirty_if \
+         returned false (the inode is still dirty, the flush snapshot was \
+         stale). Pre-fix this asserts mtime advances anyway — external observers \
+         see a fresh mtime for a flush that never durably committed the latest \
+         content."
+    );
+}
+
+/// **B4** — `mod.rs:1628` — After MAX_RETRIES drift retries, `open_advanced_write`
+/// returns `Err(libc::EAGAIN)`. `nfs.rs::errno_to_nfs` has no EAGAIN arm —
+/// it falls through to the default `NFS3ERR_IO`. A transient/retryable
+/// condition surfaces to userspace as a hard EIO. The fix should map EAGAIN
+/// to NFS3ERR_JUKEBOX (or another retryable code) so clients can back off
+/// and retry instead of crashing the open.
+#[test]
+fn b4_errno_to_nfs_lacks_eagain_arm() {
+    use std::path::PathBuf;
+    let src =
+        std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/nfs.rs")).expect("read nfs.rs");
+
+    // Find the errno_to_nfs function and check it has an EAGAIN arm.
+    // (Source-level check because the function is private.)
+    let fn_start = src
+        .find("fn errno_to_nfs(e: i32) -> nfsstat3 {")
+        .expect("errno_to_nfs not found");
+    let after = &src[fn_start..];
+    let fn_end = after.find("\n}\n").expect("function body end") + fn_start;
+    let body = &src[fn_start..fn_end];
+
+    assert!(
+        body.contains("libc::EAGAIN"),
+        "post-fix: errno_to_nfs must map libc::EAGAIN to a retryable NFS error \
+         (NFS3ERR_JUKEBOX is the conventional choice). Pre-fix EAGAIN falls \
+         through to the wildcard arm → NFS3ERR_IO → userspace sees EIO on \
+         a transient drift condition that open_advanced_write surfaces after \
+         MAX_RETRIES retries."
+    );
+}
+
+/// Helper: extract the source body of a function from the file.
+fn read_fn_body(src: &str, fn_signature: &str) -> String {
+    let start = src
+        .find(fn_signature)
+        .unwrap_or_else(|| panic!("function signature not found in source: {fn_signature}"));
+    let after = &src[start..];
+    // Count braces to find the matching closing brace.
+    let mut depth: i32 = 0;
+    let mut in_fn = false;
+    let mut end = 0;
+    for (i, c) in after.char_indices() {
+        match c {
+            '{' => {
+                depth += 1;
+                in_fn = true;
+            }
+            '}' => {
+                depth -= 1;
+                if in_fn && depth == 0 {
+                    end = i + 1;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    after[..end].to_string()
+}
+
+/// **D1/A6 + E1** — `mod.rs` read() and write() must hold the per-inode
+/// staging lock around their I/O + state-update pair, so a concurrent
+/// reader/writer/range_upload cannot observe fresh staging bytes with a
+/// stale `sparse_write` (D1) and so range_upload's PreadReader cannot
+/// stream bytes that a concurrent pwrite is rewriting (E1).
+///
+/// Structural check: both `read()` and `write()` must reference
+/// `self.staging.lock(` (the existing per-inode tokio Mutex used by
+/// `flush_batch`, `setattr`, and `open_advanced_write`). write() must use
+/// the sync `blocking_lock_owned` since the function isn't async.
+#[test]
+fn d1_e1_read_and_write_serialize_via_staging_lock() {
+    use std::path::PathBuf;
+    let src = std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/virtual_fs/mod.rs"))
+        .expect("read mod.rs");
+
+    let read_body = read_fn_body(&src, "pub async fn read(&self, file_handle: u64");
+    let write_body = read_fn_body(&src, "pub fn write(&self, ino: u64, file_handle: u64");
+
+    assert!(
+        read_body.contains("self.staging.lock("),
+        "post-fix: read() must take self.staging.lock(ino) before pread + \
+         sparse_write snapshot. Pre-fix it took no per-inode I/O lock, leaving \
+         a TOCTOU window where a concurrent writer's pwrite + track_write \
+         could interleave between read()'s pread and its sparse_write \
+         snapshot — fill_sparse_holes then overlays stale CAS bytes onto the \
+         fresh staging content (finding D1/A6)."
+    );
+
+    assert!(
+        write_body.contains("self.staging.lock("),
+        "post-fix: write() must take self.staging.lock(ino) before pwrite + \
+         track_write. Pre-fix it acquired only the inode_table RwLock, which \
+         does NOT serialize against range_upload's PreadReader (which streams \
+         from the staging file via its own File handle while flush_batch holds \
+         the same per-inode staging lock). Without write() also holding the \
+         lock, a concurrent pwrite can race the upload and xet-core hashes \
+         chimeric content into a corrupt Hub commit (finding E1)."
+    );
+
+    // write() is sync, so it must use the blocking variant (not .await).
+    assert!(
+        write_body.contains("blocking_lock"),
+        "post-fix: write() is a sync fn so it must use blocking_lock(_owned) on \
+         the tokio Mutex (spawn_blocking provides a runtime). Pre-fix the lock \
+         was missing entirely."
+    );
+
+    // Also confirm: in read(), the sparse_write snapshot happens AFTER the
+    // lock is taken so it is consistent with the pread in the same lock
+    // region.
+    let lock_pos = read_body.find("self.staging.lock(").expect("staging.lock in read()");
+    // The sparse_write snapshot can take several shapes (direct clone or
+    // filtered via xet_hash drift check from C2). Look for any reference to
+    // `sparse_write` after the lock.
+    let sparse_pos = read_body[lock_pos..]
+        .find("sparse_write")
+        .expect("sparse_write snapshot in read()")
+        + lock_pos;
+    let pread_pos = read_body.find("libc::pread(").expect("pread in read()");
+    assert!(
+        lock_pos < sparse_pos && lock_pos < pread_pos,
+        "read() must take staging.lock BEFORE the sparse_write snapshot AND \
+         the pread, so both are consistent within the same lock region"
+    );
+}
+
+/// **E3** — `inode.rs:392 + mod.rs:2302` — `apply_commit(was_sparse=true)`
+/// replaces `entry.sparse_write` with a fresh Arc keyed to NEW hash. In-flight
+/// reads cloned the OLD Arc under a brief read lock and then released it
+/// before awaiting `fill_sparse_holes`; they continue downloading bytes from
+/// the OLD hash and overlay them onto the buffer. The read returns
+/// pre-commit content while getattr already reports post-commit state.
+///
+/// The fix should either (a) hold the inode lock across the fill_sparse_holes
+/// await, or (b) re-verify under a lock that the Arc is still current before
+/// applying the overlay — i.e., make the snapshot-and-use sequence atomic
+/// with apply_commit's swap.
+#[test]
+fn e3_read_releases_lock_before_awaiting_fill_sparse_holes() {
+    use std::path::PathBuf;
+    let src = std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/virtual_fs/mod.rs"))
+        .expect("read mod.rs");
+
+    let read_body = read_fn_body(&src, "pub async fn read(&self, file_handle: u64");
+
+    // Look for the bug-shape: the inode-table read lock is acquired only for
+    // the sparse_write snapshot, dropped before fill_sparse_holes.await. The
+    // fix should either keep the lock alive or re-check the Arc identity
+    // post-await.
+    let lock_pos = read_body
+        .find("self.inode_table.read().expect(\"inodes poisoned\");\n                    inodes.get(ino).and_then(|e| e.sparse_write.clone())");
+    let fill_holes_pos = read_body.find("self.fill_sparse_holes(");
+    let snapshot_dropped_before_await = match (lock_pos, fill_holes_pos) {
+        (Some(lp), Some(fp)) => {
+            // The pattern is buggy if the read-lock's `let inodes = ...` is
+            // inside a `{ ... }` block that ends BEFORE fill_sparse_holes.await.
+            // The closing `};` of that block sits between lp and fp.
+            let between = &read_body[lp..fp];
+            between.contains("};")
+        }
+        _ => false,
+    };
+
+    assert!(
+        !snapshot_dropped_before_await,
+        "post-fix: read() must keep the inode-table lock alive across the \
+         fill_sparse_holes await (or re-check post-await that the sparse_write \
+         Arc is still current). Pre-fix the snapshot happens in a `{{ ... }}` \
+         block that releases the lock before awaiting, so apply_commit can \
+         atomically swap entry.sparse_write while the reader is mid-download. \
+         The reader then overlays old-hash bytes onto a buffer that getattr \
+         claims is keyed to the new hash — silent cross-revision read."
+    );
+}
+
+/// **E4** — `mod.rs:2507` — Lazy `sparse_write` install in write() uses
+/// `debug_assert!(entry.staging_is_current, ...)` to enforce a correctness
+/// precondition (the install path assumes the staging file matches
+/// `entry.xet_hash`). `debug_assert!` is a no-op in release builds. Any
+/// future regression that nulls `sparse_write` without restoring
+/// `staging_is_current=true` would silently install a sparse_write keyed to
+/// a non-matching staging file → `fill_sparse_holes` short-circuits on
+/// `staging_holds_full_original=true` and returns wrong bytes, with no
+/// detection in production.
+///
+/// The fix: replace the `debug_assert!` with a runtime check that either
+/// (a) early-returns without installing, or (b) returns `Err(libc::EIO)`.
+#[test]
+fn e4_lazy_sparse_install_does_not_rely_on_debug_assert() {
+    use std::path::PathBuf;
+    let src = std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/virtual_fs/mod.rs"))
+        .expect("read mod.rs");
+
+    // Locate the lazy-install branch and inspect its guard kind.
+    let install_marker = "let sw = inode::SparseWriteState::new_with_full_staging(hash, entry.size);";
+    let install_pos = src.find(install_marker).expect("lazy install branch");
+
+    // Look back ~800 chars for the precondition check.
+    let start = install_pos.saturating_sub(800);
+    let window = &src[start..install_pos];
+
+    let uses_debug_assert =
+        window.contains("debug_assert!(\n") || window.contains("debug_assert!(entry.staging_is_current");
+
+    assert!(
+        !uses_debug_assert,
+        "post-fix: the lazy sparse_write install must use a RUNTIME check on \
+         entry.staging_is_current (e.g., `if !entry.staging_is_current {{ return; }}` \
+         or returning EIO). Pre-fix it uses `debug_assert!` which is compiled \
+         out in release builds — so a future regression that drops sparse_write \
+         without restoring staging_is_current would silently install \
+         new_with_full_staging keyed to a non-matching staging file, with \
+         fill_sparse_holes short-circuiting on staging_holds_full_original=true \
+         and returning corrupt bytes."
+    );
+}
+
+/// **E5** — `inode.rs:309` — `set_dirty` uses `saturating_add(1)` on
+/// `dirty_generation`. Once the counter pins at `u64::MAX`, two concurrent
+/// writers both produce snapshots equal to `u64::MAX`; `clear_dirty_if(MAX)`
+/// then falsely returns true and `apply_commit` clobbers the concurrent
+/// writer's data.
+///
+/// The fix is to use `wrapping_add` (collisions still possible but bounded
+/// random) or, more robustly, an Instant-based monotonic-tag that cannot
+/// alias. Existing test `set_dirty_saturates` documents the saturation
+/// behavior; this test documents the CONSEQUENCE: a stale flush snapshot
+/// can clobber a concurrent writer when the counter is saturated.
+#[test]
+fn e5_saturated_dirty_generation_lets_stale_flush_clobber_concurrent_writer() {
+    use crate::virtual_fs::inode::{InodeKind, InodeTable, ROOT_INODE};
+    use std::time::UNIX_EPOCH;
+
+    let mut table = InodeTable::new(false);
+    let ino = table.insert(
+        ROOT_INODE,
+        "test".to_string(),
+        "test".to_string(),
+        InodeKind::File,
+        100,
+        UNIX_EPOCH,
+        Some("orig_hash".to_string()),
+        0o644,
+        0,
+        0,
+    );
+
+    let entry = table.get_mut(ino).unwrap();
+
+    // Saturate. In production this requires u64::MAX writes — unreachable
+    // in practice, but the test mirrors set_dirty_saturates' setup.
+    entry.dirty_generation = u64::MAX;
+
+    // Flush snapshot taken at the saturated value.
+    let snapshot = entry.dirty_generation; // u64::MAX
+
+    // Concurrent writer races: with a fixed counter (wrapping_add skipping
+    // 0), set_dirty advances past MAX → 1, so the snapshot no longer
+    // matches and clear_dirty_if returns false. Pre-fix, saturating_add
+    // pinned at MAX and the stale snapshot equaled the post-race value.
+    entry.set_dirty();
+    assert_ne!(
+        entry.dirty_generation, snapshot,
+        "post-fix: dirty_generation must change on set_dirty, even after MAX, \
+         so a stale flush snapshot can no longer collide with a concurrent \
+         writer's post-race counter."
+    );
+
+    // The flush completes its upload and calls apply_commit. The
+    // generation check passes (snapshot==current==MAX), so the stale
+    // hash/size are committed → the concurrent writer's bytes (still in
+    // staging) are now disconnected from any dirty record.
+    entry.apply_commit("stale_flush_hash", 100, snapshot, false);
+
+    assert!(
+        entry.is_dirty(),
+        "post-fix: a counter that cannot collide (wrapping_add or a monotonic \
+         tag) keeps the inode dirty after a concurrent-writer race, even at \
+         u64::MAX. Pre-fix saturating_add lets a stale snapshot equal the \
+         post-race counter, so apply_commit clears dirty and overwrites \
+         xet_hash with a snapshot that did not include the concurrent \
+         writer's bytes — silent data loss in the saturation regime."
+    );
 }

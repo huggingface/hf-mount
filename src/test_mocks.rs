@@ -30,6 +30,11 @@ pub struct MockHub {
     list_tree_calls: AtomicU32,
     head_file_calls: AtomicU32,
     probe_revision_calls: AtomicU32,
+    /// Path → bytes for non-Xet bucket objects. `download_file_http` writes
+    /// these to the requested dest path so tests can exercise the HTTP path
+    /// with real content. Files without an entry get an empty body
+    /// (mirrors the existing behavior).
+    bucket_content: Mutex<HashMap<String, Vec<u8>>>,
     /// `Ok(rev)` returns the token; `Err((status, msg))` rebuilds an
     /// `Error::Hub` with that status so the poll loop's 401-branch still fires.
     revision: Mutex<std::result::Result<String, (Option<u16>, String)>>,
@@ -53,6 +58,7 @@ impl MockHub {
             list_tree_calls: AtomicU32::new(0),
             head_file_calls: AtomicU32::new(0),
             probe_revision_calls: AtomicU32::new(0),
+            bucket_content: Mutex::new(HashMap::new()),
             revision: Mutex::new(Ok("rev-0".to_string())),
         })
     }
@@ -75,8 +81,20 @@ impl MockHub {
             list_tree_calls: AtomicU32::new(0),
             head_file_calls: AtomicU32::new(0),
             probe_revision_calls: AtomicU32::new(0),
+            bucket_content: Mutex::new(HashMap::new()),
             revision: Mutex::new(Ok("rev-0".to_string())),
         })
+    }
+
+    /// Register HTTP-served content for a non-Xet bucket file. Tests use
+    /// this to give `download_file_http` something to serve when exercising
+    /// write paths on non-Xet files (e.g., setattr-shrink that downloads
+    /// the original before truncating).
+    pub fn set_bucket_content(&self, path: &str, content: &[u8]) {
+        self.bucket_content
+            .lock()
+            .unwrap()
+            .insert(path.to_string(), content.to_vec());
     }
 
     pub fn add_file(&self, path: &str, size: u64, xet_hash: Option<&str>, oid: Option<&str>) {
@@ -246,15 +264,21 @@ impl HubOps for MockHub {
         Ok(())
     }
 
-    async fn download_file_http(&self, _path: &str, dest: &Path) -> Result<()> {
+    async fn download_file_http(&self, path: &str, dest: &Path) -> Result<()> {
         if self.download_fail.swap(false, Ordering::SeqCst) {
             return Err(Error::hub("mock download failure"));
         }
-        // Create an empty file at dest so open_local_readonly can open it.
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent).ok();
         }
-        std::fs::write(dest, b"").map_err(Error::Io)?;
+        let content = self
+            .bucket_content
+            .lock()
+            .unwrap()
+            .get(path)
+            .cloned()
+            .unwrap_or_default();
+        std::fs::write(dest, &content).map_err(Error::Io)?;
         Ok(())
     }
 
