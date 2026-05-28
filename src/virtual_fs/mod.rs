@@ -3775,6 +3775,25 @@ impl VirtualFs {
                     return Err(libc::EPERM);
                 }
 
+                // Snapshot the pre-setattr inode state. Used to decide whether
+                // the setattr is the first modification of a clean CAS-backed
+                // file (sparse install path) vs. an extension/clip of an
+                // already-prepared sparse_write.
+                let (prev_size, prev_hash, prev_sparse) = {
+                    let inodes = self.inode_table.read().expect("inodes poisoned");
+                    let entry = inodes.get(ino).ok_or(libc::ENOENT)?;
+                    (entry.size, entry.xet_hash.clone(), entry.sparse_write.is_some())
+                };
+
+                // Sparse-install path: first modification of a clean
+                // CAS-backed file via setattr (no open happened, no
+                // sparse_write installed yet). Punch a sparse hole sized to
+                // `new_size` and install SparseWriteState — the original CAS
+                // bytes are pulled in lazily by reads, the new tail (if any)
+                // is tracked as dirty so range_upload knows to compose it.
+                let want_sparse_install =
+                    self.sparse_writes && !prev_sparse && !local_exists && prev_hash.is_some() && prev_size > 0;
+
                 // GC accounting (non-overlay only): snapshot staging bytes before
                 // any mutation so the size delta is applied correctly at the end.
                 let old_staging_size = self
@@ -3785,20 +3804,30 @@ impl VirtualFs {
                     .unwrap_or(0);
 
                 if !local_exists {
-                    if new_size > 0 {
+                    if want_sparse_install {
+                        // Sparse hole, no download.
                         let staging_path = self
                             .staging
                             .path(ino)
                             .expect("staging directory required for advanced writes");
-                        let (xet_hash, file_size) = {
-                            let inodes = self.inode_table.read().expect("inodes poisoned");
-                            let entry = inodes.get(ino).ok_or(libc::ENOENT)?;
-                            (entry.xet_hash.clone().unwrap_or_default(), entry.size)
-                        };
-                        if !xet_hash.is_empty() && file_size > 0 {
+                        let file = std::fs::File::create(&staging_path).map_err(|e| {
+                            error!("Failed to create sparse staging file for setattr: {}", e);
+                            libc::EIO
+                        })?;
+                        file.set_len(new_size).map_err(|e| {
+                            error!("Failed to set sparse staging file length: {}", e);
+                            libc::EIO
+                        })?;
+                    } else if new_size > 0 {
+                        let staging_path = self
+                            .staging
+                            .path(ino)
+                            .expect("staging directory required for advanced writes");
+                        let xet_hash = prev_hash.clone().unwrap_or_default();
+                        if !xet_hash.is_empty() && prev_size > 0 {
                             if let Err(e) = self
                                 .xet_sessions
-                                .download_to_file(&xet_hash, file_size, &staging_path)
+                                .download_to_file(&xet_hash, prev_size, &staging_path)
                                 .await
                             {
                                 error!("Failed to download file for truncate: {}", e);
@@ -3817,16 +3846,21 @@ impl VirtualFs {
                 // Apply the size change under the same write lock so write() cannot
                 // race between the local truncate and inode metadata update.
                 let mut inodes = self.inode_table.write().expect("inodes poisoned");
-                let size_result = if new_size == 0 {
-                    self.open_local_backing_file(ino, &full_path, true, true, true, true)
-                        .map(|_| ())
-                } else {
-                    self.open_local_backing_file(ino, &full_path, false, true, false, false)
-                        .and_then(|file| file.set_len(new_size))
-                };
-                if let Err(e) = size_result {
-                    error!("Failed to set local backing file length: {}", e);
-                    return Err(libc::EIO);
+                // Skip set_len for the sparse-install path: the staging file
+                // was just created at exactly `new_size` above.
+                let need_set_len = !want_sparse_install;
+                if need_set_len {
+                    let size_result = if new_size == 0 {
+                        self.open_local_backing_file(ino, &full_path, true, true, true, true)
+                            .map(|_| ())
+                    } else {
+                        self.open_local_backing_file(ino, &full_path, false, true, false, false)
+                            .and_then(|file| file.set_len(new_size))
+                    };
+                    if let Err(e) = size_result {
+                        error!("Failed to set local backing file length: {}", e);
+                        return Err(libc::EIO);
+                    }
                 }
                 if !self.overlay()
                     && let Some(sd) = self.staging.dir()
@@ -3840,6 +3874,27 @@ impl VirtualFs {
                     entry.set_dirty();
                     if new_size == 0 {
                         entry.xet_hash = None;
+                        entry.sparse_write = None;
+                    } else if want_sparse_install {
+                        // Install a fresh sparse_write keyed to the original
+                        // hash; track the size change so range_upload composes
+                        // the new tail (extension) or drops the cut tail
+                        // (shrink) at flush time.
+                        let hash = prev_hash.expect("guard checked prev_hash is_some");
+                        let mut sw = inode::SparseWriteState::new(hash, prev_size);
+                        if new_size > prev_size {
+                            sw.track_write(prev_size, new_size - prev_size);
+                        } else if new_size < prev_size {
+                            sw.clip_to_size(new_size);
+                        }
+                        entry.sparse_write = Some(Arc::new(sw));
+                    } else if let Some(sw_arc) = entry.sparse_write.as_mut() {
+                        let sw = Arc::make_mut(sw_arc);
+                        if new_size > prev_size {
+                            sw.track_write(prev_size, new_size - prev_size);
+                        } else if new_size < prev_size {
+                            sw.clip_to_size(new_size);
+                        }
                     }
                 }
                 drop(inodes);
