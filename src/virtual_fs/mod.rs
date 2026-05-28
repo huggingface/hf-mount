@@ -1671,6 +1671,17 @@ impl VirtualFs {
         }
 
         let can_reuse_staging = !truncate && (is_dirty || staging_is_current) && local_exists;
+        // Sparse staging applies only when a remote CAS hash exists to fill
+        // holes from. truncate skips it: the file is logically empty, no
+        // original content to preserve. Overlay skips it: overlay writes live
+        // entirely in user dir, no remote concept.
+        let has_remote_xet = !self.overlay() && !truncate && !xet_hash.is_empty() && size > 0;
+        let want_sparse = self.sparse_writes && has_remote_xet;
+        // Track whether we punched a fresh sparse hole vs reused staging vs
+        // downloaded the full content. The sparse_write install at the bottom
+        // uses this to pick `new` (fresh hole, empty coverage) vs `new_full`
+        // (staging already mirrors original, coverage covers everything).
+        let mut staging_holds_original = can_reuse_staging && staging_is_current;
 
         if !can_reuse_staging {
             // Clear the flag before touching disk so a partial failure (e.g.
@@ -1678,12 +1689,36 @@ impl VirtualFs {
             // reusable.
             if let Some(entry) = self.inode_table.write().expect("inodes poisoned").get_mut(ino) {
                 entry.staging_is_current = false;
+                // Drop any stale sparse_write — the staging file is about to
+                // be recreated. The new sparse_write (if any) is installed
+                // below against the just-prepared staging.
+                entry.sparse_write = None;
             }
             // GC accounting only matters for non-overlay (overlay files live
             // in user dir, so file_size returns 0 here on miss).
             let old_size = self.staging.dir().map(|sd| sd.file_size(ino)).unwrap_or(0);
-            let needs_download = !self.overlay() && !truncate && !xet_hash.is_empty() && size > 0;
-            let new_size = if needs_download {
+            // Sparse mode: punch a hole of `size` bytes via set_len, do NOT
+            // download. Reads in [0, size) outside the dirty regions fetch
+            // from CAS lazily via fill_sparse_holes and persist into staging
+            // as a cache. Flush composes the upload via range_upload.
+            let new_size = if want_sparse {
+                let staging_path = self
+                    .staging
+                    .path(ino)
+                    .expect("staging directory required for advanced writes");
+                let file = std::fs::File::create(&staging_path).map_err(|e| {
+                    error!("Failed to create sparse staging file: {}", e);
+                    libc::EIO
+                })?;
+                file.set_len(size).map_err(|e| {
+                    error!("Failed to set sparse staging file length: {}", e);
+                    libc::EIO
+                })?;
+                size
+            } else if has_remote_xet {
+                // Non-sparse mode: download the full CAS object into staging.
+                // Slower for large-file/small-edit workloads but avoids the
+                // sparse-staging lifecycle edge cases.
                 let staging_path = self
                     .staging
                     .path(ino)
@@ -1695,6 +1730,7 @@ impl VirtualFs {
                         error!("Failed to download file for write: {}", e);
                         libc::EIO
                     })?;
+                staging_holds_original = true;
                 size
             } else {
                 self.open_local_backing_file(ino, full_path, true, true, true, true)
@@ -1710,15 +1746,21 @@ impl VirtualFs {
                 sd.resize_bytes(old_size, new_size);
             }
             // Flag the cache as current only when the staging actually mirrors
-            // the remote. Cases to exclude:
+            // the remote. Cases included:
+            // - downloaded the full CAS object (staging IS the remote).
+            // - empty file (xet_hash empty, size == 0): File::create produced
+            //   an empty staging file that trivially matches.
+            // Cases excluded:
+            // - sparse staging: staging is a hole + dirty bytes, doesn't match
+            //   the CAS bytes. range_upload composes at flush time, but the
+            //   on-disk file itself is not a clean cache.
             // - truncated hashed file: empty staging, non-empty xet_hash.
-            // - non-Xet file with `size > 0` and no xet_hash: File::create
-            //   leaves empty staging, which does not match the remote.
             // - race with poll: `xet_hash` moved between `open()` reading the
-            //   inode and here, so the downloaded hash is now stale — detected
-            //   by the `entry.xet_hash == xet_hash` post-check.
+            //   inode and here. Detected by the `entry.xet_hash == xet_hash`
+            //   post-check.
             // Skip in overlay mode: there's no remote materialization concept.
-            let materializes_remote = !self.overlay() && (needs_download || (xet_hash.is_empty() && size == 0));
+            let materializes_remote =
+                !self.overlay() && !want_sparse && (has_remote_xet || (xet_hash.is_empty() && size == 0));
             if materializes_remote
                 && let Some(entry) = self.inode_table.write().expect("inodes poisoned").get_mut(ino)
                 && entry.xet_hash.as_deref().unwrap_or("") == xet_hash
@@ -1733,17 +1775,35 @@ impl VirtualFs {
                 libc::EIO
             })?;
 
-        // Re-check inode still exists before committing the open
+        // Re-check inode still exists before committing the open. Install
+        // sparse_write here under the same write lock that set_dirty takes,
+        // so poll can't observe a (dirty, no sparse_write) intermediate
+        // state and rotate xet_hash from under us.
         {
             let mut inodes = self.inode_table.write().expect("inodes poisoned");
             let entry = inodes.get_mut(ino).ok_or(libc::ENOENT)?;
             entry.set_dirty();
             if truncate {
                 entry.size = 0;
+                entry.sparse_write = None;
                 // POSIX: O_TRUNC must update mtime and ctime
                 let now = SystemTime::now();
                 entry.mtime = now;
                 entry.ctime = now;
+            } else if want_sparse {
+                // Key sparse_write to the snapshot xet_hash. If poll rotated
+                // entry.xet_hash since `open()` captured the snapshot, the
+                // post-check below detects the drift; we skip installing so
+                // the next write/setattr re-prepares against the current hash.
+                let snapshot_matches_current = entry.xet_hash.as_deref() == Some(xet_hash);
+                if snapshot_matches_current {
+                    let state = if staging_holds_original {
+                        inode::SparseWriteState::new_full(xet_hash.to_string(), size)
+                    } else {
+                        inode::SparseWriteState::new(xet_hash.to_string(), size)
+                    };
+                    entry.sparse_write = Some(Arc::new(state));
+                }
             }
         }
 
