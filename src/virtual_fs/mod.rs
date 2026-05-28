@@ -875,15 +875,22 @@ impl VirtualFs {
 
     /// Bump the per-inode open-handle refcount. Used by the FUSE adapter
     /// on `opendir` so a directory with an active readdir can't be evicted.
+    /// Directories are always read-only handles.
     #[cfg(feature = "fuse")]
     pub(crate) fn bump_open_handles(&self, ino: u64) {
-        self.inode_table.read().expect("inodes poisoned").bump_open_handles(ino);
+        self.inode_table
+            .read()
+            .expect("inodes poisoned")
+            .bump_open_handles(ino, false);
     }
 
     /// Counterpart to `bump_open_handles`, called from `releasedir`.
     #[cfg(feature = "fuse")]
     pub(crate) fn drop_open_handles(&self, ino: u64) {
-        self.inode_table.read().expect("inodes poisoned").drop_open_handles(ino);
+        self.inode_table
+            .read()
+            .expect("inodes poisoned")
+            .drop_open_handles(ino, false);
     }
 
     /// Check if any open file handle references the given inode.
@@ -1082,7 +1089,7 @@ impl VirtualFs {
         let file_handle = self.alloc_file_handle();
         {
             let inodes = self.inode_table.read().expect("inodes poisoned");
-            inodes.bump_open_handles(ino);
+            inodes.bump_open_handles(ino, writable);
             inodes.touch(ino);
         }
         self.open_files
@@ -1903,7 +1910,10 @@ impl VirtualFs {
             }
         }
 
-        self.inode_table.read().expect("inodes poisoned").bump_open_handles(ino);
+        self.inode_table
+            .read()
+            .expect("inodes poisoned")
+            .bump_open_handles(ino, true);
         self.open_files
             .write()
             .expect("open_files poisoned")
@@ -2032,7 +2042,11 @@ impl VirtualFs {
             self.direct_io,
         )));
         let file_handle = self.alloc_file_handle();
-        self.inode_table.read().expect("inodes poisoned").bump_open_handles(ino);
+        // Lazy handle is read-only (CAS prefetch buffer).
+        self.inode_table
+            .read()
+            .expect("inodes poisoned")
+            .bump_open_handles(ino, false);
         self.open_files
             .write()
             .expect("open_files poisoned")
@@ -2746,14 +2760,18 @@ impl VirtualFs {
             .expect("open_files poisoned")
             .remove(&file_handle);
 
-        let released_ino = match &removed {
-            Some(OpenFile::Local { ino, .. })
-            | Some(OpenFile::Lazy { ino, .. })
-            | Some(OpenFile::Streaming { ino, .. }) => Some(*ino),
+        let released = match &removed {
+            Some(OpenFile::Local { ino, writable, .. }) => Some((*ino, *writable)),
+            Some(OpenFile::Streaming { ino, .. }) => Some((*ino, true)),
+            Some(OpenFile::Lazy { ino, .. }) => Some((*ino, false)),
             _ => None,
         };
-        if let Some(ino) = released_ino {
-            self.inode_table.read().expect("inodes poisoned").drop_open_handles(ino);
+        let released_ino = released.map(|(ino, _)| ino);
+        if let Some((ino, writable)) = released {
+            self.inode_table
+                .read()
+                .expect("inodes poisoned")
+                .drop_open_handles(ino, writable);
         }
 
         let mut release_error: Option<i32> = None;
@@ -3070,7 +3088,7 @@ impl VirtualFs {
                     }
                     let file_handle = self.alloc_file_handle();
                     let inodes = self.inode_table.read().expect("inodes poisoned");
-                    inodes.bump_open_handles(ino);
+                    inodes.bump_open_handles(ino, true);
                     self.open_files.write().expect("open_files poisoned").insert(
                         file_handle,
                         OpenFile::Local {
@@ -3107,7 +3125,7 @@ impl VirtualFs {
             };
 
             let inodes = self.inode_table.read().expect("inodes poisoned");
-            inodes.bump_open_handles(ino);
+            inodes.bump_open_handles(ino, true);
             self.open_files
                 .write()
                 .expect("open_files poisoned")
@@ -3828,17 +3846,21 @@ impl VirtualFs {
         }
 
         // Dirty file rename: bump dirty_generation so an in-flight flush won't clear
-        // dirty state with the stale snapshot (path + sparse_write). Also record old
-        // path for deletion at flush time when the file has a remote presence.
+        // dirty state with the stale snapshot (path + sparse_write). Record the old
+        // path for deletion at flush time unconditionally — even for a brand-new
+        // dirty file with `xet_hash=None`, a concurrent flush that snapshotted
+        // before this rename can still publish AddFile{old_path} to the Hub before
+        // we re-enqueue. Without the delete, the re-enqueued flush commits
+        // AddFile{new_path} and the old path is leaked remotely (codex P2). Hub
+        // tolerates DeleteFile on a non-existent path as a no-op, so this is safe
+        // for files that never made it remote.
         let mut dirty_inos_to_reenqueue: Vec<u64> = Vec::new();
         if info.is_dirty
             && info.kind == InodeKind::File
             && let Some(entry) = inodes.get_mut(info.ino)
         {
             entry.set_dirty();
-            if info.xet_hash.is_some() {
-                entry.pending_deletes.push(info.old_path.clone());
-            }
+            entry.pending_deletes.push(info.old_path.clone());
             dirty_inos_to_reenqueue.push(info.ino);
         }
 
@@ -3921,25 +3943,22 @@ impl VirtualFs {
                 }
             };
 
-            // Same-size setattr on a clean file is a no-op: there is nothing
-            // to upload, and `chmod`/`utime` already keep metadata-only
-            // changes local (mod.rs:~3978). Bumping mtime + scheduling a
-            // flush would compose a no-op range_upload that skips the Hub
-            // commit anyway, leaving local mtime diverged from Hub mtime
-            // (finding B8). Treat it consistently with chmod: leave
-            // everything alone and return.
-            if new_size == prev_size_snapshot && !was_dirty_snapshot {
-                let inodes = self.inode_table.read().expect("inodes poisoned");
-                return match inodes.get(ino) {
-                    Some(entry) => Ok(self.make_vfs_attr(entry)),
-                    None => Err(libc::ENOENT),
-                };
-            }
+            // Same-size setattr on a clean file is a no-op for content: there
+            // is nothing to upload, and `chmod`/`utime` already keep metadata-
+            // only changes local. Skip the size work (no mtime bump, no
+            // flush) but FALL THROUGH to the metadata-only block below so a
+            // SETATTR carrying `size = current_size` together with mode /
+            // uid / atime / mtime still applies those (otherwise NFS clients
+            // that batch all attrs into one RPC see their other changes
+            // silently dropped — codex P3).
+            let size_is_noop = new_size == prev_size_snapshot && !was_dirty_snapshot;
             let _ = (prev_size_snapshot, was_dirty_snapshot);
 
-            if !self.advanced_writes {
-                // Simple mode: ftruncate via setattr is silently ignored.
-                // Real truncation goes through open(O_TRUNC) which is handled separately.
+            if size_is_noop || !self.advanced_writes {
+                // size_is_noop: skip size work as a finding-B8 no-op.
+                // !advanced_writes (simple mode): ftruncate via setattr is silently
+                // ignored. Real truncation goes through open(O_TRUNC) which is handled
+                // separately.
             } else {
                 // Advanced mode: truncation is applied to the staging file on disk
                 let staging_mutex = self.staging.lock(ino);

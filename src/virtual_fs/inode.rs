@@ -53,6 +53,16 @@ pub struct EvictionState {
     /// with `open_handles > 0` — a racing read/write would silently lose
     /// data if the inode disappeared under it.
     pub open_handles: AtomicU32,
+    /// Subset of `open_handles` that were opened for write. Used by
+    /// `update_remote_file` to gate hash rotation: a writable handle
+    /// counts on `sparse_write` matching the inode's `xet_hash` for its
+    /// next write (lazy install + range_upload composition). Letting poll
+    /// clear or re-key `sparse_write` while a writable handle is open
+    /// produces silent corruption (codex P1). Read-only handles are not
+    /// affected: Lazy prefetch buffers are bound to the open-time hash,
+    /// and LocalFd reads defensively gate `fill_sparse_holes` on the
+    /// hash match (finding C2).
+    pub open_write_handles: AtomicU32,
 }
 
 impl Clone for EvictionState {
@@ -62,6 +72,7 @@ impl Clone for EvictionState {
             last_touched: AtomicU64::new(self.last_touched.load(Ordering::Relaxed)),
             evict_pending: AtomicBool::new(self.evict_pending.load(Ordering::Relaxed)),
             open_handles: AtomicU32::new(self.open_handles.load(Ordering::Relaxed)),
+            open_write_handles: AtomicU32::new(self.open_write_handles.load(Ordering::Relaxed)),
         }
     }
 }
@@ -522,17 +533,23 @@ impl InodeTable {
     /// `writable=true` also bumps the writable-handle sub-count, which
     /// `update_remote_file` uses to gate hash rotation: read-only handles
     /// do not need the inode snapshot to stay stable across polls.
-    pub(crate) fn bump_open_handles(&self, ino: u64) {
+    pub(crate) fn bump_open_handles(&self, ino: u64, writable: bool) {
         if let Some(entry) = self.inodes.get(&ino) {
             entry.eviction.open_handles.fetch_add(1, Ordering::Relaxed);
+            if writable {
+                entry.eviction.open_write_handles.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 
     /// Drop the per-inode open-handle refcount. Called on `release` once
     /// the handle has been removed from `VirtualFs::open_files`.
-    pub(crate) fn drop_open_handles(&self, ino: u64) {
+    pub(crate) fn drop_open_handles(&self, ino: u64, writable: bool) {
         if let Some(entry) = self.inodes.get(&ino) {
             entry.eviction.open_handles.fetch_sub(1, Ordering::Relaxed);
+            if writable {
+                entry.eviction.open_write_handles.fetch_sub(1, Ordering::Relaxed);
+            }
         }
     }
 
@@ -541,6 +558,15 @@ impl InodeTable {
         self.inodes
             .get(&ino)
             .is_some_and(|e| e.eviction.open_handles.load(Ordering::Relaxed) > 0)
+    }
+
+    /// Is there at least one WRITABLE FUSE file handle on this inode?
+    /// Used by `update_remote_file` to defer hash rotation while a writer
+    /// still depends on the inode's snapshot (codex P1).
+    pub(crate) fn has_open_write_handles(&self, ino: u64) -> bool {
+        self.inodes
+            .get(&ino)
+            .is_some_and(|e| e.eviction.open_write_handles.load(Ordering::Relaxed) > 0)
     }
 
     pub fn len(&self) -> usize {
@@ -900,19 +926,21 @@ impl InodeTable {
         new_size: u64,
         new_mtime: SystemTime,
     ) -> bool {
-        // is_dirty already covers the in-flight-write case (every open-for-
-        // write path calls set_dirty before publishing the handle). Read-only
-        // handles do NOT need the inode's snapshot to stay stable: in-flight
-        // reads hold their own Arc snapshot (Lazy: prefetch buffer bound to
-        // the open-time hash; LocalFd: Arc<File> on the file_cache backing
-        // file). For LocalFd reads we additionally gate `fill_sparse_holes`
-        // on `sparse_write.original_hash == entry.xet_hash` (finding C2) so
-        // a stale sparse_write Arc cloned before this rotation simply skips
-        // the overlay. Pre-fix this also blocked on `has_open_handles`,
-        // freezing inodes under long-lived NFS-pool read handles (finding
-        // B6/E7).
+        // Refuse when a writable handle is open even if the inode is
+        // currently clean: a post-flush writable handle still relies on
+        // sparse_write matching entry.xet_hash for its next write (lazy
+        // install + range_upload composition); rotating xet_hash here
+        // would corrupt the next flush (codex P1).
+        //
+        // Read-only handles are NOT a blocker — Lazy prefetch buffers are
+        // bound to the open-time hash, and LocalFd reads gate
+        // fill_sparse_holes on the hash match (finding C2). So a long-
+        // lived NFS-pool READ handle does not freeze metadata refreshes
+        // for that inode (resolves the B6/E7 freeze without re-introducing
+        // the corruption it was originally guarding against).
+        let has_write_handles = self.has_open_write_handles(ino);
         if let Some(entry) = self.inodes.get_mut(&ino) {
-            if entry.is_dirty() {
+            if entry.is_dirty() || has_write_handles {
                 return false;
             }
             entry.xet_hash = new_hash;
@@ -2709,10 +2737,22 @@ mod tests {
         let busy = mk_file(&mut table, "busy.txt");
 
         assert!(!table.has_open_handles(busy));
-        table.bump_open_handles(busy);
+        assert!(!table.has_open_write_handles(busy));
+
+        // Read-only handle bumps total but not write count.
+        table.bump_open_handles(busy, false);
         assert!(table.has_open_handles(busy));
-        table.drop_open_handles(busy);
+        assert!(!table.has_open_write_handles(busy));
+        table.drop_open_handles(busy, false);
         assert!(!table.has_open_handles(busy));
+
+        // Write handle bumps both.
+        table.bump_open_handles(busy, true);
+        assert!(table.has_open_handles(busy));
+        assert!(table.has_open_write_handles(busy));
+        table.drop_open_handles(busy, true);
+        assert!(!table.has_open_handles(busy));
+        assert!(!table.has_open_write_handles(busy));
     }
 
     // ── child_index invariants ─────────────────────────────────────
