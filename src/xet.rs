@@ -1,18 +1,42 @@
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::task::{Context, Poll};
 
 use bytes::Bytes;
+use tokio::io::{AsyncRead, ReadBuf};
+use tracing::info;
 use xet_client::cas_client::Client;
 use xet_client::cas_types::FileRange;
 use xet_client::chunk_cache::ChunkCache;
 use xet_core_structures::merklehash::MerkleHash;
 use xet_data::file_reconstruction::{DownloadStream, FileReconstructor};
 use xet_data::processing::configurations::TranslatorConfig;
-use xet_data::processing::{FileDownloadSession, FileUploadSession, Sha256Policy, SingleFileCleaner, XetFileInfo};
+use xet_data::processing::{
+    DirtyInput, FileDownloadSession, FileUploadSession, Sha256Policy, SingleFileCleaner, XetFileInfo,
+};
 use xet_runtime::core::XetContext;
 
 use crate::error::{Error, Result};
+
+// ── RangeSnapshot ────────────────────────────────────────────────────
+
+/// A self-contained snapshot of one dirty range, ready to feed `range_upload`.
+///
+/// The caller (typically `flush_batch`) reads the bytes from the staging file
+/// while holding the per-inode I/O lock, then releases the lock and hands the
+/// snapshot to `range_upload`. `range_upload` itself never touches disk and
+/// never holds the I/O lock, so concurrent writes to staging can proceed
+/// during the upload without producing torn reads (codex review finding: the
+/// previous per-chunk lock acquisition could let a concurrent pwrite interleave
+/// between chunks, hashing chimeric content).
+pub struct RangeSnapshot {
+    /// Offset in the new file where these bytes live.
+    pub offset: u64,
+    /// Pre-read bytes from staging at this offset.
+    pub data: Bytes,
+}
 
 // ── Traits ───────────────────────────────────────────────────────────
 
@@ -31,6 +55,21 @@ pub trait XetOps: Send + Sync {
     /// Pre-warm the reconstruction cache for a file by fetching its full plan.
     /// Errors are silently ignored — this is best-effort.
     async fn warm_reconstruction_cache(&self, xet_hash: &str);
+
+    /// Compose a new CAS file from an existing reconstruction (`original_hash`)
+    /// plus a set of pre-snapshotted dirty ranges. Used for sparse-write flushes
+    /// so unmodified bytes never round-trip the network.
+    ///
+    /// `new_file_size` is the size of the resulting file. When it is less than
+    /// `original_size`, a synthetic delete is appended past the last dirty range
+    /// so the original tail is dropped.
+    async fn range_upload(
+        &self,
+        original_hash: &str,
+        original_size: u64,
+        new_file_size: u64,
+        dirty_snapshots: Vec<RangeSnapshot>,
+    ) -> Result<XetFileInfo>;
 }
 
 /// Append-only streaming writer trait (abstracts StreamingWriter for testing).
@@ -154,6 +193,122 @@ impl XetOps for XetSessions {
         if let Ok(hash) = MerkleHash::from_hex(xet_hash) {
             let _ = self.cas_client.get_reconstruction(&hash, None).await;
         }
+    }
+
+    async fn range_upload(
+        &self,
+        original_hash: &str,
+        original_size: u64,
+        new_file_size: u64,
+        dirty_snapshots: Vec<RangeSnapshot>,
+    ) -> Result<XetFileInfo> {
+        let config = self
+            .upload_config
+            .as_ref()
+            .ok_or_else(|| Error::hub("no upload config (read-only mode)"))?;
+
+        let original_merkle =
+            MerkleHash::from_hex(original_hash).map_err(|e| Error::Xet(format!("invalid original hash: {e}")))?;
+
+        // No-op: no dirty bytes and file size unchanged means the new content
+        // is bit-for-bit the original. Skip the upload round-trip.
+        if dirty_snapshots.is_empty() && new_file_size == original_size {
+            return Ok(XetFileInfo::new(original_hash.to_string(), original_size));
+        }
+
+        // Map each snapshotted range to a DirtyInput. `original_range` is the
+        // segment of the ORIGINAL file that this dirty input REPLACES — empty
+        // for inserts past EOF, partial for writes spanning EOF, full for
+        // overwrites within the original.
+        let dirty_count = dirty_snapshots.len();
+        let mut dirty_inputs: Vec<DirtyInput> = Vec::with_capacity(dirty_snapshots.len() + 1);
+        for snap in dirty_snapshots {
+            let start = snap.offset;
+            let new_length = snap.data.len() as u64;
+            let end = start + new_length;
+
+            let original_range = if end <= original_size {
+                start..end
+            } else if start >= original_size {
+                original_size..original_size
+            } else {
+                start..original_size
+            };
+
+            let reader: Pin<Box<dyn AsyncRead + Send>> = Box::pin(BytesReader::new(snap.data));
+            dirty_inputs.push(DirtyInput {
+                original_range,
+                reader,
+                new_length,
+            });
+        }
+
+        // Truncate-past-end: if the new file is shorter than the original AND
+        // the truncation point isn't already covered by a dirty input, append
+        // a synthetic empty input over the cut tail so upload_ranges drops
+        // those original bytes.
+        if new_file_size < original_size {
+            let last_covered = dirty_inputs.last().map(|d| d.original_range.end).unwrap_or(0);
+            let truncate_start = new_file_size.max(last_covered);
+            if truncate_start < original_size {
+                dirty_inputs.push(DirtyInput {
+                    original_range: truncate_start..original_size,
+                    reader: Box::pin(tokio::io::empty()),
+                    new_length: 0,
+                });
+            }
+        }
+
+        let result = xet_data::processing::upload_ranges(
+            config.clone(),
+            self.cas_client.clone(),
+            original_merkle,
+            original_size,
+            dirty_inputs,
+        )
+        .await
+        .map_err(|e| Error::Xet(e.to_string()))?;
+
+        info!(
+            "range_upload: hash={} size={:?} (original_size={}, {} dirty ranges)",
+            result.hash(),
+            result.file_size(),
+            original_size,
+            dirty_count
+        );
+
+        Ok(result)
+    }
+}
+
+// ── BytesReader ──────────────────────────────────────────────────────
+
+/// `AsyncRead` over an in-memory `Bytes` buffer. Used by `range_upload` to
+/// feed pre-snapshotted dirty bytes into xet-core without re-reading from
+/// staging. Yields all data without ever returning `Pending` — there is no
+/// I/O to await.
+struct BytesReader {
+    data: Bytes,
+    position: usize,
+}
+
+impl BytesReader {
+    fn new(data: Bytes) -> Self {
+        Self { data, position: 0 }
+    }
+}
+
+impl AsyncRead for BytesReader {
+    fn poll_read(self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let remaining = this.data.len() - this.position;
+        if remaining == 0 {
+            return Poll::Ready(Ok(()));
+        }
+        let take = remaining.min(buf.remaining());
+        buf.put_slice(&this.data[this.position..this.position + take]);
+        this.position += take;
+        Poll::Ready(Ok(()))
     }
 }
 

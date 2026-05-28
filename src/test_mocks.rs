@@ -12,7 +12,7 @@ use xet_data::processing::XetFileInfo;
 use crate::error::{Error, Result};
 use crate::hub_api::{BatchOp, HeadFileInfo, HubOps, SourceKind, TreeEntry};
 use crate::overlay::OverlayBacking;
-use crate::xet::{DownloadStreamOps, StagingDir, StreamingWriterOps, XetOps};
+use crate::xet::{DownloadStreamOps, RangeSnapshot, StagingDir, StreamingWriterOps, XetOps};
 
 // ── MockHub ───────────────────────────────────────────────────────────
 
@@ -459,6 +459,43 @@ impl XetOps for MockXet {
             end: bounded_end,
             chunk_size: 4096,
         }))
+    }
+
+    async fn range_upload(
+        &self,
+        original_hash: &str,
+        original_size: u64,
+        new_file_size: u64,
+        dirty_snapshots: Vec<RangeSnapshot>,
+    ) -> Result<XetFileInfo> {
+        if self.upload_fail.swap(false, Ordering::SeqCst) {
+            return Err(Error::Xet("mock range upload failure".into()));
+        }
+        // No-op: matches the real XetSessions short-circuit. Lets tests pin
+        // the "nothing changed → original hash preserved" invariant.
+        if dirty_snapshots.is_empty() && new_file_size == original_size {
+            return Ok(XetFileInfo::new(original_hash.to_string(), original_size));
+        }
+        // Build the new file by overlaying dirty bytes on top of the original
+        // content. Truncate / extend as needed to match new_file_size.
+        let original = {
+            let files = self.files.lock().unwrap();
+            files.get(original_hash).cloned().unwrap_or_default()
+        };
+        let new_size_usize = new_file_size as usize;
+        let mut composed = vec![0u8; new_size_usize];
+        let copy_len = original.len().min(new_size_usize);
+        composed[..copy_len].copy_from_slice(&original[..copy_len]);
+        for snap in dirty_snapshots {
+            let start = snap.offset as usize;
+            let end = (start + snap.data.len()).min(new_size_usize);
+            if start < new_size_usize {
+                composed[start..end].copy_from_slice(&snap.data[..end - start]);
+            }
+        }
+        let new_hash = self.next_hash_string();
+        self.files.lock().unwrap().insert(new_hash.clone(), composed);
+        Ok(XetFileInfo::new(new_hash, new_file_size))
     }
 }
 
