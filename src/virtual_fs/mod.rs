@@ -862,22 +862,15 @@ impl VirtualFs {
 
     /// Bump the per-inode open-handle refcount. Used by the FUSE adapter
     /// on `opendir` so a directory with an active readdir can't be evicted.
-    /// Directories are always read-only handles.
     #[cfg(feature = "fuse")]
     pub(crate) fn bump_open_handles(&self, ino: u64) {
-        self.inode_table
-            .read()
-            .expect("inodes poisoned")
-            .bump_open_handles(ino, false);
+        self.inode_table.read().expect("inodes poisoned").bump_open_handles(ino);
     }
 
     /// Counterpart to `bump_open_handles`, called from `releasedir`.
     #[cfg(feature = "fuse")]
     pub(crate) fn drop_open_handles(&self, ino: u64) {
-        self.inode_table
-            .read()
-            .expect("inodes poisoned")
-            .drop_open_handles(ino, false);
+        self.inode_table.read().expect("inodes poisoned").drop_open_handles(ino);
     }
 
     /// Check if any open file handle references the given inode.
@@ -1076,7 +1069,7 @@ impl VirtualFs {
         let file_handle = self.alloc_file_handle();
         {
             let inodes = self.inode_table.read().expect("inodes poisoned");
-            inodes.bump_open_handles(ino, writable);
+            inodes.bump_open_handles(ino);
             inodes.touch(ino);
         }
         self.open_files
@@ -1877,10 +1870,7 @@ impl VirtualFs {
             }
         }
 
-        self.inode_table
-            .read()
-            .expect("inodes poisoned")
-            .bump_open_handles(ino, true);
+        self.inode_table.read().expect("inodes poisoned").bump_open_handles(ino);
         self.open_files
             .write()
             .expect("open_files poisoned")
@@ -2009,10 +1999,7 @@ impl VirtualFs {
             self.direct_io,
         )));
         let file_handle = self.alloc_file_handle();
-        self.inode_table
-            .read()
-            .expect("inodes poisoned")
-            .bump_open_handles(ino, false);
+        self.inode_table.read().expect("inodes poisoned").bump_open_handles(ino);
         self.open_files
             .write()
             .expect("open_files poisoned")
@@ -2564,28 +2551,15 @@ impl VirtualFs {
                             // (apply_commit with was_sparse=true,
                             // update_remote_file) leaves sparse_write=Some. So
                             // reaching this branch with staging_is_current=false
-                            // means a code path cleared sparse_write without
-                            // restoring it — installing `new_with_full_staging`
-                            // would claim the staging file matches the CAS
-                            // hash, which is a lie, and fill_sparse_holes would
-                            // short-circuit to garbage bytes.
-                            //
-                            // Runtime check (not debug_assert): production
-                            // builds must skip the install rather than
-                            // silently corrupt reads. Leaving sparse_write
-                            // None falls through to the regular full-staging
-                            // upload path on flush, which is safe.
-                            if !entry.staging_is_current {
-                                error!(
-                                    "lazy sparse_write install skipped for ino={}: \
-                                     staging_is_current=false (a code path cleared \
-                                     sparse_write without restoring staging cache)",
-                                    handle_ino
-                                );
-                            } else {
-                                let sw = inode::SparseWriteState::new_with_full_staging(hash, entry.size);
-                                entry.sparse_write = Some(Arc::new(sw));
-                            }
+                            // means a future regression has dropped sparse_write
+                            // out from under us — assert in dev to catch it.
+                            debug_assert!(
+                                entry.staging_is_current,
+                                "lazy sparse_write install reached with staging_is_current=false; \
+                                 a code path cleared sparse_write without restoring it"
+                            );
+                            let sw = inode::SparseWriteState::new_with_full_staging(hash, entry.size);
+                            entry.sparse_write = Some(Arc::new(sw));
                         }
                         if let Some(sw) = entry.sparse_write.as_mut() {
                             Arc::make_mut(sw).track_write(offset, tracked_len);
@@ -2731,18 +2705,14 @@ impl VirtualFs {
             .expect("open_files poisoned")
             .remove(&file_handle);
 
-        let released = match &removed {
-            Some(OpenFile::Local { ino, writable, .. }) => Some((*ino, *writable)),
-            Some(OpenFile::Streaming { ino, .. }) => Some((*ino, true)),
-            Some(OpenFile::Lazy { ino, .. }) => Some((*ino, false)),
+        let released_ino = match &removed {
+            Some(OpenFile::Local { ino, .. })
+            | Some(OpenFile::Lazy { ino, .. })
+            | Some(OpenFile::Streaming { ino, .. }) => Some(*ino),
             _ => None,
         };
-        let released_ino = released.map(|(ino, _)| ino);
-        if let Some((ino, writable)) = released {
-            self.inode_table
-                .read()
-                .expect("inodes poisoned")
-                .drop_open_handles(ino, writable);
+        if let Some(ino) = released_ino {
+            self.inode_table.read().expect("inodes poisoned").drop_open_handles(ino);
         }
 
         let mut release_error: Option<i32> = None;
@@ -3059,7 +3029,7 @@ impl VirtualFs {
                     }
                     let file_handle = self.alloc_file_handle();
                     let inodes = self.inode_table.read().expect("inodes poisoned");
-                    inodes.bump_open_handles(ino, true);
+                    inodes.bump_open_handles(ino);
                     self.open_files.write().expect("open_files poisoned").insert(
                         file_handle,
                         OpenFile::Local {
@@ -3096,7 +3066,7 @@ impl VirtualFs {
             };
 
             let inodes = self.inode_table.read().expect("inodes poisoned");
-            inodes.bump_open_handles(ino, true);
+            inodes.bump_open_handles(ino);
             self.open_files
                 .write()
                 .expect("open_files poisoned")
