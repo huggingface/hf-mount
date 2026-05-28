@@ -43,12 +43,15 @@ pub trait XetOps: Send + Sync {
     /// Upload only the modified portion of a sparse file, composing the CAS reconstruction
     /// plan from existing segments (prefix/suffix) + newly uploaded segments (dirty range).
     /// `file_size` is the size of the staging file; the original file size is read from
-    /// `sparse_state`.
+    /// `sparse_state`. `io_lock` is the per-inode sync I/O lock taken briefly around
+    /// each `read_at` so concurrent `pwrite`s can't interleave with our reads
+    /// (otherwise xet-core would hash chimeric content — finding E1).
     async fn range_upload(
         &self,
         sparse_state: &SparseWriteState,
         staging_path: &Path,
         file_size: u64,
+        io_lock: Arc<std::sync::Mutex<()>>,
     ) -> Result<XetFileInfo>;
 }
 
@@ -180,6 +183,7 @@ impl XetOps for XetSessions {
         sparse_state: &SparseWriteState,
         staging_path: &Path,
         file_size: u64,
+        io_lock: Arc<std::sync::Mutex<()>>,
     ) -> Result<XetFileInfo> {
         let config = self
             .upload_config
@@ -220,6 +224,7 @@ impl XetOps for XetSessions {
 
             let reader: Pin<Box<dyn AsyncRead + Send>> = Box::pin(PreadReader {
                 file: staging_file.clone(),
+                io_lock: io_lock.clone(),
                 offset: start,
                 remaining: new_length,
             });
@@ -279,6 +284,11 @@ impl XetOps for XetSessions {
 /// range — small enough not to starve the runtime in practice.
 struct PreadReader {
     file: Arc<std::fs::File>,
+    /// Per-inode sync I/O lock taken briefly across each `read_at` so a
+    /// concurrent `pwrite` from another writable fh cannot interleave with
+    /// our reads. Without this, xet-core could hash chimeric content into
+    /// a corrupt Hub commit (finding E1).
+    io_lock: Arc<std::sync::Mutex<()>>,
     offset: u64,
     remaining: u64,
 }
@@ -294,6 +304,7 @@ impl AsyncRead for PreadReader {
             return Poll::Ready(Ok(()));
         }
         let slice = &mut buf.initialize_unfilled_to(want)[..want];
+        let _io_guard = this.io_lock.lock().expect("staging io_lock poisoned");
         match this.file.read_at(slice, this.offset) {
             Ok(0) => {
                 // Short read: staging file ended before `remaining` was met.

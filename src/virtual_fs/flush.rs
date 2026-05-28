@@ -477,7 +477,11 @@ async fn flush_batch(
     while i < to_flush.len() {
         let item = &to_flush[i];
         if let Some(sw) = &item.sparse_write {
-            match xet_sessions.range_upload(sw, &item.staging_path, item.file_size).await {
+            let io_lock = staging.io_lock(item.ino);
+            match xet_sessions
+                .range_upload(sw, &item.staging_path, item.file_size, io_lock)
+                .await
+            {
                 Ok(file_info) => {
                     debug!(
                         "flush: range_upload ino={} path={} hash={} size={}",

@@ -6825,16 +6825,18 @@ fn read_fn_body(src: &str, fn_signature: &str) -> String {
     after[..end].to_string()
 }
 
-/// **D1/A6 + E1** — `mod.rs` read() and write() must hold the per-inode
-/// staging lock around their I/O + state-update pair, so a concurrent
+/// **D1/A6 + E1** — `mod.rs` read() and write() must hold a per-inode I/O
+/// lock around their I/O + state-update pair, so a concurrent
 /// reader/writer/range_upload cannot observe fresh staging bytes with a
 /// stale `sparse_write` (D1) and so range_upload's PreadReader cannot
 /// stream bytes that a concurrent pwrite is rewriting (E1).
 ///
 /// Structural check: both `read()` and `write()` must reference
-/// `self.staging.lock(` (the existing per-inode tokio Mutex used by
-/// `flush_batch`, `setattr`, and `open_advanced_write`). write() must use
-/// the sync `blocking_lock_owned` since the function isn't async.
+/// `self.staging.io_lock(` (a sync `std::sync::Mutex` per inode used by
+/// pread / pwrite / range_upload's reads). Sync, not tokio: `write()` is
+/// called both from sync spawn_blocking tasks AND from async NFS handlers
+/// without spawn_blocking — a tokio Mutex's `blocking_lock` panics from
+/// the latter.
 #[test]
 fn d1_e1_read_and_write_serialize_via_staging_lock() {
     use std::path::PathBuf;
@@ -6845,8 +6847,8 @@ fn d1_e1_read_and_write_serialize_via_staging_lock() {
     let write_body = read_fn_body(&src, "pub fn write(&self, ino: u64, file_handle: u64");
 
     assert!(
-        read_body.contains("self.staging.lock("),
-        "post-fix: read() must take self.staging.lock(ino) before pread + \
+        read_body.contains("self.staging.io_lock("),
+        "post-fix: read() must take self.staging.io_lock(ino) before pread + \
          sparse_write snapshot. Pre-fix it took no per-inode I/O lock, leaving \
          a TOCTOU window where a concurrent writer's pwrite + track_write \
          could interleave between read()'s pread and its sparse_write \
@@ -6855,31 +6857,20 @@ fn d1_e1_read_and_write_serialize_via_staging_lock() {
     );
 
     assert!(
-        write_body.contains("self.staging.lock("),
-        "post-fix: write() must take self.staging.lock(ino) before pwrite + \
+        write_body.contains("self.staging.io_lock("),
+        "post-fix: write() must take self.staging.io_lock(ino) before pwrite + \
          track_write. Pre-fix it acquired only the inode_table RwLock, which \
-         does NOT serialize against range_upload's PreadReader (which streams \
-         from the staging file via its own File handle while flush_batch holds \
-         the same per-inode staging lock). Without write() also holding the \
-         lock, a concurrent pwrite can race the upload and xet-core hashes \
-         chimeric content into a corrupt Hub commit (finding E1)."
+         does NOT serialize against range_upload's PreadReader. Without \
+         write() also holding the lock, a concurrent pwrite can race the \
+         upload and xet-core hashes chimeric content into a corrupt Hub \
+         commit (finding E1)."
     );
 
-    // write() is sync, so it must use the blocking variant (not .await).
-    assert!(
-        write_body.contains("blocking_lock"),
-        "post-fix: write() is a sync fn so it must use blocking_lock(_owned) on \
-         the tokio Mutex (spawn_blocking provides a runtime). Pre-fix the lock \
-         was missing entirely."
-    );
-
-    // Also confirm: in read(), the sparse_write snapshot happens AFTER the
-    // lock is taken so it is consistent with the pread in the same lock
-    // region.
-    let lock_pos = read_body.find("self.staging.lock(").expect("staging.lock in read()");
-    // The sparse_write snapshot can take several shapes (direct clone or
-    // filtered via xet_hash drift check from C2). Look for any reference to
-    // `sparse_write` after the lock.
+    // Confirm read() takes the io_lock BEFORE both the sparse_write snapshot
+    // AND the pread, so both are consistent within the same lock region.
+    let lock_pos = read_body
+        .find("self.staging.io_lock(")
+        .expect("staging.io_lock in read()");
     let sparse_pos = read_body[lock_pos..]
         .find("sparse_write")
         .expect("sparse_write snapshot in read()")
@@ -6887,7 +6878,7 @@ fn d1_e1_read_and_write_serialize_via_staging_lock() {
     let pread_pos = read_body.find("libc::pread(").expect("pread in read()");
     assert!(
         lock_pos < sparse_pos && lock_pos < pread_pos,
-        "read() must take staging.lock BEFORE the sparse_write snapshot AND \
+        "read() must take io_lock BEFORE the sparse_write snapshot AND \
          the pread, so both are consistent within the same lock region"
     );
 }

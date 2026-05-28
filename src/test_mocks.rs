@@ -474,6 +474,7 @@ impl XetOps for MockXet {
         sparse_state: &SparseWriteState,
         staging_path: &std::path::Path,
         file_size: u64,
+        _io_lock: Arc<std::sync::Mutex<()>>,
     ) -> crate::error::Result<XetFileInfo> {
         if self.range_upload_fail.swap(false, Ordering::SeqCst) {
             return Err(crate::error::Error::Xet("mock range_upload failure".into()));

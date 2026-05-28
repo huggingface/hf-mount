@@ -2290,43 +2290,47 @@ impl VirtualFs {
                 // sparse_write snapshot, leaving the buffer holding fresh
                 // bytes that fill_sparse_holes then overwrites with stale
                 // CAS data (finding D1/A6).
-                let staging_mutex = self.staging.lock(ino);
-                let _staging_guard = staging_mutex.lock_owned().await;
-
-                // Snapshot sparse_write FIRST (under the I/O lock so it's
-                // consistent with the pread we're about to do).
+                // Serialize the (pread + sparse_write snapshot) pair against
+                // concurrent writers (which take the same per-inode sync
+                // I/O lock around pwrite + track_write) and against
+                // range_upload's PreadReader. The lock is dropped before
+                // awaiting fill_sparse_holes — the snapshot Arc captured
+                // under the lock is consistent with the pread'd bytes; any
+                // concurrent state change after this point is for the next
+                // read to observe.
                 //
                 // Only use `sparse_write` if its `original_hash` matches the
-                // inode's current `xet_hash`. `update_remote_file` preserves
-                // sparse_write across hash rotations (inode.rs:906) for the
-                // sake of still-open handles, but a fresh read on a clean
-                // inode that has since drifted would otherwise overlay
-                // bytes from the stale CAS object on top of pread results
-                // — silently returning content from two different revisions
-                // (finding C2).
+                // inode's current `xet_hash`. `update_remote_file` clears
+                // sparse_write when it applies (no handles open), but the
+                // hash check defends against any path that might leave a
+                // stale Arc lying around (finding C2).
+                let n;
                 let sparse_write = {
-                    let inodes = self.inode_table.read().expect("inodes poisoned");
-                    inodes.get(ino).and_then(|e| {
-                        e.sparse_write.as_ref().and_then(|sw| {
-                            if e.xet_hash.as_deref() == Some(&sw.original_hash) {
-                                Some(sw.clone())
-                            } else {
-                                None
-                            }
+                    let io_lock = self.staging.io_lock(ino);
+                    let _io_guard = io_lock.lock().expect("staging io_lock poisoned");
+                    let sparse_write_snapshot = {
+                        let inodes = self.inode_table.read().expect("inodes poisoned");
+                        inodes.get(ino).and_then(|e| {
+                            e.sparse_write.as_ref().and_then(|sw| {
+                                if e.xet_hash.as_deref() == Some(&sw.original_hash) {
+                                    Some(sw.clone())
+                                } else {
+                                    None
+                                }
+                            })
                         })
-                    })
-                };
-
-                // SAFETY: fd is valid (Arc<File> keeps it alive), buf is
-                // correctly sized. pread is thread-safe (atomic offset, no
-                // shared seek cursor).
-                let n = unsafe {
-                    libc::pread(
-                        file_descriptor,
-                        buf.as_mut_ptr() as *mut libc::c_void,
-                        size as usize,
-                        offset as i64,
-                    )
+                    };
+                    // SAFETY: fd is valid (Arc<File> keeps it alive), buf is
+                    // correctly sized. pread is thread-safe (atomic offset).
+                    n = unsafe {
+                        libc::pread(
+                            file_descriptor,
+                            buf.as_mut_ptr() as *mut libc::c_void,
+                            size as usize,
+                            offset as i64,
+                        )
+                    };
+                    sparse_write_snapshot
                 };
                 if n < 0 {
                     return Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO));
@@ -2335,7 +2339,8 @@ impl VirtualFs {
 
                 // Sparse staging: bytes in [0, original_size) outside dirty
                 // ranges are sparse holes (zeros). Fill them from CAS so
-                // reads see the original content.
+                // reads see the original content. Runs outside the I/O lock
+                // so a long CAS download doesn't block writers.
                 if let Some(ref sw) = sparse_write {
                     self.fill_sparse_holes(sw, &mut buf, offset).await?;
                 }
@@ -2465,20 +2470,22 @@ impl VirtualFs {
             WriteTarget::Local { file, ino: handle_ino } => {
                 let file_descriptor = file.as_raw_fd();
 
-                // Hold the per-inode staging lock across pwrite + track_write
-                // + entry.size update so a concurrent reader cannot observe
-                // the post-pwrite bytes with a sparse_write that does not
-                // yet include the new dirty range (finding D1/A6). Also
-                // serializes against range_upload's PreadReader (flush_batch
-                // already holds this lock for the upload), preventing the
-                // chimeric-content commit from finding E1.
+                // Hold the per-inode sync I/O lock across pwrite +
+                // track_write + entry.size update so a concurrent reader
+                // cannot observe the post-pwrite bytes with a sparse_write
+                // that does not yet include the new dirty range (finding
+                // D1/A6). Also serializes against range_upload's
+                // PreadReader (which takes the same lock per chunk),
+                // preventing the chimeric-content commit (finding E1).
                 //
-                // `blocking_lock_owned` blocks on the tokio Mutex from this
-                // sync context — write() is always invoked from a blocking
-                // task (FUSE/NFS adapter via spawn_blocking), so a running
-                // runtime is available for the lock's wakers.
-                let staging_mutex = self.staging.lock(handle_ino);
-                let _staging_guard = staging_mutex.blocking_lock_owned();
+                // Sync `std::sync::Mutex` (not the tokio staging Mutex):
+                // `write()` is called both from sync FUSE workers via
+                // spawn_blocking AND directly from async NFS handlers
+                // (nfs.rs::write). A tokio Mutex's `blocking_lock` panics
+                // from the second context. A sync mutex works everywhere
+                // because we hold it only across non-await syscalls.
+                let io_lock = self.staging.io_lock(handle_ino);
+                let _io_guard = io_lock.lock().expect("staging io_lock poisoned");
 
                 let n = unsafe {
                     libc::pwrite(

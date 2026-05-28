@@ -14,6 +14,13 @@ use super::inode::InodeTable;
 pub(crate) struct StagingCoordinator {
     dir: Option<StagingDir>,
     locks: Mutex<HashMap<u64, Arc<tokio::sync::Mutex<()>>>>,
+    /// Per-inode sync mutex used to serialize the tiny I/O critical sections
+    /// (`pread`+sparse_write snapshot, `pwrite`+`track_write`, range_upload's
+    /// per-chunk `read_at`). Sync (std::sync::Mutex) because callers include
+    /// both async tasks (read, range_upload) and sync code paths (write,
+    /// called from FUSE/NFS handlers without spawn_blocking). The critical
+    /// sections hold no `.await`, so a sync mutex is safe everywhere.
+    io_locks: Mutex<HashMap<u64, Arc<std::sync::Mutex<()>>>>,
 }
 
 impl StagingCoordinator {
@@ -21,7 +28,20 @@ impl StagingCoordinator {
         Self {
             dir,
             locks: Mutex::new(HashMap::new()),
+            io_locks: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Sync per-inode lock for serializing pread / pwrite / range_upload's
+    /// reads with each other and with sparse_write state updates. Held only
+    /// across non-await operations — never block an async runtime worker.
+    pub(crate) fn io_lock(&self, ino: u64) -> Arc<std::sync::Mutex<()>> {
+        self.io_locks
+            .lock()
+            .expect("staging io_locks poisoned")
+            .entry(ino)
+            .or_insert_with(|| Arc::new(std::sync::Mutex::new(())))
+            .clone()
     }
 
     pub(crate) fn dir(&self) -> Option<&StagingDir> {
