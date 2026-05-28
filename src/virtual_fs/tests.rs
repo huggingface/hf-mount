@@ -5510,6 +5510,11 @@ fn sparse_setattr_shrink_truncates_at_flush() {
 /// the second open would replace the state with a fresh one, dropping the
 /// dirty tracking — a subsequent flush would see no dirty ranges and commit
 /// a no-op even though the user's writes are still in staging.
+///
+/// `fh1` is held open across the second open so the inode stays dirty
+/// deterministically (no race with the background flush): the reopen path
+/// keys on `is_dirty || staging_is_current`, and a held writable handle
+/// keeps the inode dirty regardless of debounce timing.
 #[test]
 fn sparse_reopen_dirty_preserves_state() {
     let hub = MockHub::new();
@@ -5523,21 +5528,10 @@ fn sparse_reopen_dirty_preserves_state() {
         let ino = vfs.lookup(ROOT_INODE, "file.bin").await.unwrap().ino;
         let fh1 = vfs.open(ino, true, false, None).await.unwrap();
         write_blocking(&vfs, ino, fh1, 5, b"AAA").await.unwrap();
-        vfs.release(fh1).await.unwrap();
-        // DO NOT wait for flush — open again while still dirty.
-        // Verify the inode is dirty before the reopen so the test exercises
-        // the right path (if it cleared between release and reopen, the test
-        // would not be checking the bug).
-        let dirty_before = {
-            let inodes = vfs.inode_table.read().unwrap();
-            inodes.get(ino).unwrap().is_dirty()
-        };
-        if !dirty_before {
-            // Flush already fired; can't exercise the reopen path. Skip.
-            return;
-        }
 
+        // Reopen while fh1 is still held — the inode is dirty for certain.
         let fh2 = vfs.open(ino, true, false, None).await.unwrap();
+
         // Dirty state from the first open must survive the reopen.
         let dirty_ranges = {
             let inodes = vfs.inode_table.read().unwrap();
@@ -5554,7 +5548,50 @@ fn sparse_reopen_dirty_preserves_state() {
             vec![(5, 8)],
             "reopen must preserve dirty_ranges from the first open"
         );
+
+        // The user's bytes are still readable through the reopened handle.
+        let (data, _) = vfs.read(fh2, 5, 3).await.unwrap();
+        assert_eq!(&data[..], b"AAA");
+
         vfs.release(fh2).await.unwrap();
+        vfs.release(fh1).await.unwrap();
+    });
+}
+
+/// Hash-drift during a sparse open: if `entry.xet_hash` rotated (via poll)
+/// between `open()`'s snapshot and the install point in `open_advanced_write`,
+/// the prepared staging hole no longer matches the inode's reality. The open
+/// must fail with EIO before marking the inode dirty, rather than returning a
+/// writable handle with no (or stale) sparse_write — which would flush
+/// hole-zeros as real content.
+///
+/// Drives `open_advanced_write` directly with a stale snapshot hash so the
+/// drift branch is exercised deterministically (no need to race the poll loop).
+#[test]
+fn sparse_open_hash_drift_returns_eio() {
+    let hub = MockHub::new();
+    let content: Vec<u8> = (0u8..20).collect();
+    hub.add_file("file.bin", content.len() as u64, Some("current_hash"), None);
+    let xet = MockXet::new();
+    xet.add_file("current_hash", &content);
+    let (rt, vfs) = vfs_sparse(&hub, &xet);
+
+    rt.block_on(async {
+        let ino = vfs.lookup(ROOT_INODE, "file.bin").await.unwrap().ino;
+        // The inode's live hash is "current_hash". Call open_advanced_write
+        // with a STALE snapshot ("stale_hash") as if poll rotated the hash
+        // after open() captured the snapshot.
+        let result = vfs.open_advanced_write(ino, "file.bin", "stale_hash", 20, false).await;
+        assert_eq!(result, Err(libc::EIO), "stale snapshot hash must return EIO");
+
+        // The inode must NOT have been left dirty or with a stale sparse_write.
+        let inodes = vfs.inode_table.read().unwrap();
+        let entry = inodes.get(ino).unwrap();
+        assert!(!entry.is_dirty(), "drift open must not mark the inode dirty");
+        assert!(
+            entry.sparse_write.is_none(),
+            "drift open must not install a sparse_write"
+        );
     });
 }
 
