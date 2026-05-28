@@ -72,6 +72,13 @@ fn is_os_junk(name: &str) -> bool {
 pub struct VfsConfig {
     pub read_only: bool,
     pub advanced_writes: bool,
+    /// EXPERIMENTAL: when true, opens for write create a sparse staging file
+    /// (set_len, no CAS download) and reads fill holes on demand from CAS.
+    /// When false (default), opens download the full CAS object first — same
+    /// behavior as before the sparse-write feature. The off-by-default mode
+    /// avoids the lifecycle edge cases exposed by sparse staging (poll
+    /// drift, NFS pool reuse, in-flight reads under concurrent writers).
+    pub sparse_writes: bool,
     pub uid: u32,
     pub gid: u32,
     pub poll_interval_secs: u64,
@@ -124,6 +131,7 @@ pub struct VirtualFs {
     overlay_backing: Option<Arc<OverlayBacking>>,
     read_only: bool,
     advanced_writes: bool,
+    sparse_writes: bool,
     inode_table: Arc<RwLock<InodeTable>>,
     /// Maps file_handle → OpenFile (local fd or lazy remote reference).
     open_files: Arc<RwLock<HashMap<u64, OpenFile>>>,
@@ -249,6 +257,11 @@ impl VirtualFs {
             read_only: config.read_only,
             // Overlay implies advanced_writes (random writes via local backing file).
             advanced_writes: config.advanced_writes || overlay,
+            // Sparse writes are opt-in beta — they require advanced_writes
+            // (sparse staging lives in the advanced-write path) AND the
+            // explicit flag. Default off: production gets the well-tested
+            // download-then-write behavior.
+            sparse_writes: config.sparse_writes && (config.advanced_writes || overlay),
             inode_table: inodes,
             open_files,
             next_file_handle: AtomicU64::new(1),
@@ -1679,7 +1692,9 @@ impl VirtualFs {
             // GC accounting only matters for non-overlay (overlay files live
             // in user dir, so file_size returns 0 here on miss).
             let old_size = self.staging.dir().map(|sd| sd.file_size(ino)).unwrap_or(0);
-            let needs_sparse = !self.overlay() && !truncate && !xet_hash.is_empty() && size > 0;
+            let has_remote_xet = !self.overlay() && !truncate && !xet_hash.is_empty() && size > 0;
+            let needs_sparse = self.sparse_writes && has_remote_xet;
+            let needs_download = !self.sparse_writes && has_remote_xet;
             let new_size = if needs_sparse {
                 // Sparse staging: create the staging file as a hole of `size` bytes
                 // instead of downloading the original. Reads in [0, size) outside
@@ -1698,6 +1713,24 @@ impl VirtualFs {
                     error!("Failed to set sparse staging file length: {}", e);
                     libc::EIO
                 })?;
+                size
+            } else if needs_download {
+                // Non-sparse (default) write path: download the full CAS object
+                // into staging. Slower for large-file/small-edit workloads but
+                // avoids the sparse-staging lifecycle edge cases (handle pool
+                // reuse, drift retries, multi-handle reads). Mirrors the
+                // pre-sparse-feature behavior.
+                let staging_path = self
+                    .staging
+                    .path(ino)
+                    .expect("staging directory required for advanced writes");
+                self.xet_sessions
+                    .download_to_file(xet_hash, size, &staging_path)
+                    .await
+                    .map_err(|e| {
+                        error!("Failed to download file for write: {}", e);
+                        libc::EIO
+                    })?;
                 size
             } else {
                 self.open_local_backing_file(ino, full_path, true, true, true, true)
@@ -1757,7 +1790,7 @@ impl VirtualFs {
             //    fill_sparse_holes download bytes that have no relation to what
             //    the staging file actually contains.
             let has_xet = !xet_hash.is_empty() && size > 0;
-            let will_install_sparse = !truncate && !is_dirty && !self.overlay() && has_xet;
+            let will_install_sparse = self.sparse_writes && !truncate && !is_dirty && !self.overlay() && has_xet;
             if will_install_sparse {
                 let snapshot_hash = Some(xet_hash);
                 let drift_hash = entry.xet_hash.as_deref() != snapshot_hash;
@@ -2545,7 +2578,8 @@ impl VirtualFs {
                         // composition. When the inode is already dirty, the
                         // safe path is to leave sparse_write None so flush
                         // falls through to the regular full-staging upload.
-                        if entry.sparse_write.is_none()
+                        if self.sparse_writes
+                            && entry.sparse_write.is_none()
                             && !entry.is_dirty()
                             && let Some(hash) = entry.xet_hash.clone()
                             && entry.size > 0
@@ -3930,19 +3964,38 @@ impl VirtualFs {
                     .unwrap_or(0);
 
                 if !local_exists {
-                    // For Xet-backed files we leave staging sparse: reads fill
-                    // sparse holes on demand via fill_sparse_holes, and
-                    // range_upload composes the correct file at flush time.
-                    //
-                    // For NON-Xet (bucket) files there is no sparse path —
-                    // sparse_write requires an original_hash. The flush would
-                    // upload whatever bytes are in staging, so leaving it as
-                    // a sparse hole and applying set_len(new_size) would
-                    // upload zeros and silently replace the bucket content
-                    // (finding B1). Download the original via HTTP first
-                    // so set_len truncates real content.
-                    let need_http_download = xet_hash_snapshot.is_none() && new_size > 0;
-                    if need_http_download {
+                    // What to put in staging before set_len:
+                    //  * sparse_writes=true + Xet hash: leave staging as a
+                    //    set_len hole; reads fill from CAS via
+                    //    fill_sparse_holes and range_upload composes at flush.
+                    //  * sparse_writes=false + Xet hash: download the full
+                    //    CAS object first. Without this, set_len(N) on an
+                    //    empty file leaves N zero bytes which the regular
+                    //    upload path would commit as the new content
+                    //    (replacing the original with zeros).
+                    //  * Non-Xet (xet_hash=None) + size>0: bucket object.
+                    //    Download via HTTP — there is no sparse path for
+                    //    non-Xet (sparse_write requires an original_hash).
+                    //    Without this, B1 fires regardless of sparse_writes.
+                    let want_xet_download = !self.sparse_writes && xet_hash_snapshot.is_some() && new_size > 0;
+                    let want_http_download = xet_hash_snapshot.is_none() && new_size > 0;
+                    if want_xet_download {
+                        if let Some(sd) = self.staging.dir() {
+                            let dest = sd.path(ino);
+                            let hash = xet_hash_snapshot.as_deref().expect("guard checked");
+                            if let Err(e) = self
+                                .xet_sessions
+                                .download_to_file(hash, prev_size_snapshot, &dest)
+                                .await
+                            {
+                                error!("Failed to download Xet file for setattr ino={}: {}", ino, e);
+                                return Err(libc::EIO);
+                            }
+                        } else {
+                            error!("No staging dir for Xet download of ino={}", ino);
+                            return Err(libc::EIO);
+                        }
+                    } else if want_http_download {
                         if let Some(sd) = self.staging.dir() {
                             let dest = sd.path(ino);
                             if let Err(e) = self.hub_client.download_file_http(&full_path, &dest).await {
@@ -4026,7 +4079,10 @@ impl VirtualFs {
                             // [prev_size, new_size) is included in the upload windows.
                             sw.track_write(prev_size, new_size - prev_size);
                         }
-                    } else if !was_dirty && let Some(hash) = entry.xet_hash.clone() {
+                    } else if self.sparse_writes
+                        && !was_dirty
+                        && let Some(hash) = entry.xet_hash.clone()
+                    {
                         // Clean file (never opened for write): set up sparse_write so
                         // flush uses range_upload instead of regular upload (which
                         // would read zeros from the empty/extended staging file).
