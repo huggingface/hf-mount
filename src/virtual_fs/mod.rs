@@ -2437,20 +2437,28 @@ impl VirtualFs {
         match target {
             WriteTarget::Local { file, ino: handle_ino } => {
                 let file_descriptor = file.as_raw_fd();
-                let n = unsafe {
-                    libc::pwrite(
-                        file_descriptor,
-                        data.as_ptr() as *const libc::c_void,
-                        data.len(),
-                        offset as i64,
-                    )
-                };
-
-                if n < 0 {
-                    Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO))
-                } else {
-                    let written = n as u32;
-                    let new_end = offset + written as u64;
+                // pwrite + sparse_write track under the per-inode io_lock so a
+                // concurrent reader's (pread + snapshot) pair sees a consistent
+                // view: either before this write or after, never half-applied.
+                let n;
+                let new_end;
+                let written;
+                {
+                    let io_lock = self.staging.io_lock(handle_ino);
+                    let _io_guard = io_lock.lock().expect("staging io_lock poisoned");
+                    n = unsafe {
+                        libc::pwrite(
+                            file_descriptor,
+                            data.as_ptr() as *const libc::c_void,
+                            data.len(),
+                            offset as i64,
+                        )
+                    };
+                    if n < 0 {
+                        return Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO));
+                    }
+                    written = n as u32;
+                    new_end = offset + written as u64;
                     let mut inodes = self.inode_table.write().expect("inodes poisoned");
                     if let Some(entry) = inodes.get_mut(handle_ino) {
                         if new_end > entry.size {
@@ -2460,10 +2468,18 @@ impl VirtualFs {
                             entry.size = new_end;
                         }
                         entry.set_dirty();
+                        // Sparse mode: extend coverage AND dirty_ranges for the
+                        // written window. Always done under both the io_lock
+                        // (vs concurrent readers) and the inode write lock
+                        // (vs flush snapshotting sparse_write).
+                        if let Some(sw_arc) = entry.sparse_write.as_mut() {
+                            let sw = Arc::make_mut(sw_arc);
+                            sw.track_write(offset, written as u64);
+                        }
                     }
                     inodes.touch(handle_ino);
-                    Ok(written)
                 }
+                Ok(written)
             }
             WriteTarget::Streaming {
                 ino: handle_ino,
