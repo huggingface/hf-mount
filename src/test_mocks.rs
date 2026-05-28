@@ -559,6 +559,11 @@ impl DownloadStreamOps for MockDownloadStream {
 pub struct TestOpts {
     pub read_only: bool,
     pub advanced_writes: bool,
+    /// Enables sparse-write staging. The mock-driven test_vfs honors this
+    /// faithfully even when `advanced_writes` is false: the helper turns the
+    /// effective advanced_writes flag on so the underlying VfsConfig
+    /// derivation does not silently downgrade `sparse_writes` to false.
+    pub sparse_writes: bool,
     pub overlay: bool,
     pub serve_lookup_from_cache: bool,
     pub metadata_ttl: Duration,
@@ -571,6 +576,7 @@ impl Default for TestOpts {
         Self {
             read_only: false,
             advanced_writes: false,
+            sparse_writes: false,
             overlay: false,
             serve_lookup_from_cache: false,
             metadata_ttl: Duration::from_secs(1),
@@ -618,7 +624,12 @@ pub fn make_test_vfs(
     opts: TestOpts,
     runtime: &tokio::runtime::Runtime,
 ) -> Arc<crate::virtual_fs::VirtualFs> {
-    let effective_advanced_writes = opts.advanced_writes || opts.overlay;
+    // Sparse writes need a staging substrate (advanced or overlay). Force
+    // advanced_writes on when the test opted into sparse_writes so VfsConfig
+    // does not silently downgrade. Without this, tests using
+    // `TestOpts { sparse_writes: true, ..Default::default() }` would get the
+    // non-sparse path and the feature wouldn't actually be exercised.
+    let effective_advanced_writes = opts.advanced_writes || opts.overlay || opts.sparse_writes;
 
     let overlay_backing = if opts.overlay {
         let overlay_root = fresh_test_dir("hf_mount_overlay");
@@ -646,7 +657,8 @@ pub fn make_test_vfs(
         overlay_backing,
         crate::virtual_fs::VfsConfig {
             read_only: opts.read_only,
-            advanced_writes: opts.advanced_writes,
+            advanced_writes: effective_advanced_writes,
+            sparse_writes: opts.sparse_writes,
             uid: 1000,
             gid: 1000,
             poll_interval_secs: 0,
@@ -690,6 +702,7 @@ pub fn make_overlay_test_vfs_with_root(
         crate::virtual_fs::VfsConfig {
             read_only: false,
             advanced_writes: false,
+            sparse_writes: false,
             uid: 1000,
             gid: 1000,
             poll_interval_secs: 0,

@@ -72,6 +72,12 @@ fn is_os_junk(name: &str) -> bool {
 pub struct VfsConfig {
     pub read_only: bool,
     pub advanced_writes: bool,
+    /// Enables sparse-write staging: open-for-write punches a hole instead of
+    /// downloading the original CAS content, and flush composes the new file
+    /// via `range_upload` (CAS prefix/suffix + re-chunked dirty windows). Reads
+    /// outside the dirty regions fetch from CAS on demand and populate the
+    /// local staging file as a cache. Implies `advanced_writes`.
+    pub sparse_writes: bool,
     pub uid: u32,
     pub gid: u32,
     pub poll_interval_secs: u64,
@@ -124,6 +130,12 @@ pub struct VirtualFs {
     overlay_backing: Option<Arc<OverlayBacking>>,
     read_only: bool,
     advanced_writes: bool,
+    /// Sparse writes (open punches a hole, flush via range_upload).
+    /// Derived: requires advanced_writes or overlay — the staging dir is the
+    /// substrate for both. If `config.sparse_writes` is set without a backing
+    /// staging dir, this stays false.
+    #[allow(dead_code)] // wired by subsequent commits
+    sparse_writes: bool,
     inode_table: Arc<RwLock<InodeTable>>,
     /// Maps file_handle → OpenFile (local fd or lazy remote reference).
     open_files: Arc<RwLock<HashMap<u64, OpenFile>>>,
@@ -249,6 +261,11 @@ impl VirtualFs {
             read_only: config.read_only,
             // Overlay implies advanced_writes (random writes via local backing file).
             advanced_writes: config.advanced_writes || overlay,
+            // Sparse writes require a staging substrate (advanced_writes or
+            // overlay). Without one, downgrade silently rather than failing.
+            // Callers that need a hard guarantee should validate at the CLI
+            // layer (see setup.rs: `--sparse-writes` implies `--advanced-writes`).
+            sparse_writes: config.sparse_writes && (config.advanced_writes || overlay),
             inode_table: inodes,
             open_files,
             next_file_handle: AtomicU64::new(1),

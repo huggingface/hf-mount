@@ -526,6 +526,10 @@ pub fn build_with_runtime(
         VfsConfig {
             read_only,
             advanced_writes,
+            // Sparse writes wired through here, but the CLI flag is not
+            // exposed yet — off by default until the feature is fully
+            // validated. See VfsConfig docs.
+            sparse_writes: false,
             uid,
             gid,
             poll_interval_secs: options.poll_interval_secs,
