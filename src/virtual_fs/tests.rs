@@ -66,6 +66,24 @@ fn vfs_advanced(
     (rt, vfs)
 }
 
+/// Build a VFS with sparse writes enabled (implies advanced_writes via TestOpts).
+fn vfs_sparse(
+    hub: &std::sync::Arc<MockHub>,
+    xet: &std::sync::Arc<MockXet>,
+) -> (tokio::runtime::Runtime, std::sync::Arc<VirtualFs>) {
+    let rt = new_runtime();
+    let vfs = make_test_vfs(
+        hub.clone(),
+        xet.clone(),
+        TestOpts {
+            sparse_writes: true,
+            ..Default::default()
+        },
+        &rt,
+    );
+    (rt, vfs)
+}
+
 /// Build a read-only VFS.
 fn vfs_readonly(
     hub: &std::sync::Arc<MockHub>,
@@ -5239,5 +5257,257 @@ fn overlay_rmdir_remote_dir_eperm() {
         // rmdir should also fail: clean remote directory
         let err = t.vfs.rmdir(ROOT_INODE, "subdir").await.unwrap_err();
         assert_eq!(err, libc::EPERM);
+    });
+}
+
+// ── Sparse writes ──────────────────────────────────────────────────────
+//
+// Invariant tests for the sparse-write path. The goal here is to nail down
+// observable behaviors (read, write, flush composition), not implementation
+// details. The state machine itself (coverage map, dirty tracking) is unit-
+// tested in inode.rs.
+
+/// Poll until `ino` is clean (flushed). Bounded retry; panics on timeout.
+async fn wait_for_clean(vfs: &Arc<VirtualFs>, ino: u64) {
+    for _ in 0..200 {
+        {
+            let inodes = vfs.inode_table.read().unwrap();
+            if let Some(entry) = inodes.get(ino)
+                && !entry.is_dirty()
+            {
+                return;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("wait_for_clean: ino={} did not become clean within 4s", ino);
+}
+
+/// Look up the MockXet content for a hash. Helper used by sparse flush tests.
+fn xet_content(xet: &Arc<MockXet>, hash: &str) -> Option<Vec<u8>> {
+    xet.files.lock().unwrap().get(hash).cloned()
+}
+
+/// Open in sparse mode does not download the full file. Reads outside the
+/// dirty window hit CAS lazily via fill_sparse_holes.
+#[test]
+fn sparse_open_skips_download() {
+    let hub = MockHub::new();
+    hub.add_file("big.bin", 100, Some("hbig"), None);
+    let xet = MockXet::new();
+    xet.add_file("hbig", &(0u8..100).collect::<Vec<u8>>());
+    let (rt, vfs) = vfs_sparse(&hub, &xet);
+
+    rt.block_on(async {
+        let ino = vfs.lookup(ROOT_INODE, "big.bin").await.unwrap().ino;
+        let downloads_before = xet.download_to_file_calls.load(std::sync::atomic::Ordering::SeqCst);
+        let fh = vfs.open(ino, true, false, None).await.unwrap();
+        let downloads_after = xet.download_to_file_calls.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            downloads_before, downloads_after,
+            "sparse open must not call download_to_file"
+        );
+        vfs.release(fh).await.unwrap();
+    });
+}
+
+/// Sparse read fills holes from CAS and returns the original bytes.
+#[test]
+fn sparse_read_returns_cas_bytes() {
+    let hub = MockHub::new();
+    let content: Vec<u8> = (0u8..50).collect();
+    hub.add_file("file.bin", content.len() as u64, Some("h1"), None);
+    let xet = MockXet::new();
+    xet.add_file("h1", &content);
+    let (rt, vfs) = vfs_sparse(&hub, &xet);
+
+    rt.block_on(async {
+        let ino = vfs.lookup(ROOT_INODE, "file.bin").await.unwrap().ino;
+        let fh = vfs.open(ino, true, false, None).await.unwrap();
+        let (data, _) = vfs.read(fh, 10, 20).await.unwrap();
+        assert_eq!(&data[..], &content[10..30]);
+        vfs.release(fh).await.unwrap();
+    });
+}
+
+/// Second read of the same region hits the staging cache (no additional CAS
+/// stream call) because fill_sparse_holes persisted the bytes on the first read.
+#[test]
+fn sparse_read_caches_into_staging() {
+    let hub = MockHub::new();
+    let content: Vec<u8> = (0u8..50).collect();
+    hub.add_file("file.bin", content.len() as u64, Some("h1"), None);
+    let xet = MockXet::new();
+    xet.add_file("h1", &content);
+    let (rt, vfs) = vfs_sparse(&hub, &xet);
+
+    rt.block_on(async {
+        let ino = vfs.lookup(ROOT_INODE, "file.bin").await.unwrap().ino;
+        let fh = vfs.open(ino, true, false, None).await.unwrap();
+        // First read populates the cache.
+        let _ = vfs.read(fh, 0, 30).await.unwrap();
+        let calls_after_first = xet.stream_calls.lock().unwrap().len();
+        // Second read of the same region should not stream from CAS again.
+        let (data2, _) = vfs.read(fh, 0, 30).await.unwrap();
+        let calls_after_second = xet.stream_calls.lock().unwrap().len();
+        assert_eq!(
+            calls_after_first, calls_after_second,
+            "second read should hit the staging cache, not CAS"
+        );
+        assert_eq!(&data2[..], &content[..30]);
+        vfs.release(fh).await.unwrap();
+    });
+}
+
+/// Reads outside the cached window still go to CAS. The cache fills lazily.
+#[test]
+fn sparse_read_uncached_region_hits_cas() {
+    let hub = MockHub::new();
+    let content: Vec<u8> = (0u8..100).collect();
+    hub.add_file("file.bin", content.len() as u64, Some("h1"), None);
+    let xet = MockXet::new();
+    xet.add_file("h1", &content);
+    let (rt, vfs) = vfs_sparse(&hub, &xet);
+
+    rt.block_on(async {
+        let ino = vfs.lookup(ROOT_INODE, "file.bin").await.unwrap().ino;
+        let fh = vfs.open(ino, true, false, None).await.unwrap();
+        // Cache [0, 20)
+        let _ = vfs.read(fh, 0, 20).await.unwrap();
+        let calls_a = xet.stream_calls.lock().unwrap().len();
+        // Read [60, 80) — uncached, should stream.
+        let (data, _) = vfs.read(fh, 60, 20).await.unwrap();
+        let calls_b = xet.stream_calls.lock().unwrap().len();
+        assert!(calls_b > calls_a, "uncached read should call CAS");
+        assert_eq!(&data[..], &content[60..80]);
+        vfs.release(fh).await.unwrap();
+    });
+}
+
+/// Write at an offset overlays staging and marks the range dirty. Subsequent
+/// read returns the user's bytes (overlaid on holes filled from CAS).
+#[test]
+fn sparse_write_overlays_on_original() {
+    let hub = MockHub::new();
+    let content: Vec<u8> = (0u8..20).collect();
+    hub.add_file("file.bin", content.len() as u64, Some("h1"), None);
+    let xet = MockXet::new();
+    xet.add_file("h1", &content);
+    let (rt, vfs) = vfs_sparse(&hub, &xet);
+
+    rt.block_on(async {
+        let ino = vfs.lookup(ROOT_INODE, "file.bin").await.unwrap().ino;
+        let fh = vfs.open(ino, true, false, None).await.unwrap();
+        // Overwrite bytes [5, 10)
+        write_blocking(&vfs, ino, fh, 5, &[0xff; 5]).await.unwrap();
+        let (data, _) = vfs.read(fh, 0, 20).await.unwrap();
+        let mut expected = content.clone();
+        expected[5..10].copy_from_slice(&[0xff; 5]);
+        assert_eq!(&data[..], &expected[..]);
+        vfs.release(fh).await.unwrap();
+    });
+}
+
+/// Flush after a sparse write commits a CAS file with the user's modifications
+/// applied on top of the original. The new hash differs from the original.
+#[test]
+fn sparse_flush_commits_composed_file() {
+    let hub = MockHub::new();
+    let content: Vec<u8> = (0u8..20).collect();
+    hub.add_file("file.bin", content.len() as u64, Some("h1"), None);
+    let xet = MockXet::new();
+    xet.add_file("h1", &content);
+    let (rt, vfs) = vfs_sparse(&hub, &xet);
+
+    rt.block_on(async {
+        let ino = vfs.lookup(ROOT_INODE, "file.bin").await.unwrap().ino;
+        let fh = vfs.open(ino, true, false, None).await.unwrap();
+        write_blocking(&vfs, ino, fh, 10, b"HELLO").await.unwrap();
+        vfs.release(fh).await.unwrap();
+        // Wait for async flush
+        wait_for_clean(&vfs, ino).await;
+        // Verify the new hash exists in MockXet with the expected composed content
+        let mut expected = content.clone();
+        expected[10..15].copy_from_slice(b"HELLO");
+        let new_hash = {
+            let inodes = vfs.inode_table.read().unwrap();
+            inodes.get(ino).unwrap().xet_hash.clone().unwrap()
+        };
+        assert_ne!(new_hash, "h1", "flush should produce a new hash");
+        assert_eq!(xet_content(&xet, &new_hash), Some(expected));
+    });
+}
+
+/// Sparse write past EOF extends the file; the gap [old_size, new_offset) is
+/// tracked as dirty so range_upload composes the extension correctly.
+#[test]
+fn sparse_write_past_eof_extends() {
+    let hub = MockHub::new();
+    let content: Vec<u8> = (0u8..10).collect();
+    hub.add_file("file.bin", 10, Some("h1"), None);
+    let xet = MockXet::new();
+    xet.add_file("h1", &content);
+    let (rt, vfs) = vfs_sparse(&hub, &xet);
+
+    rt.block_on(async {
+        let ino = vfs.lookup(ROOT_INODE, "file.bin").await.unwrap().ino;
+        let fh = vfs.open(ino, true, false, None).await.unwrap();
+        // Write at offset 15 (5 bytes past EOF=10)
+        write_blocking(&vfs, ino, fh, 15, b"XYZ").await.unwrap();
+        let (data, _) = vfs.read(fh, 0, 30).await.unwrap();
+        let mut expected = content.clone();
+        expected.resize(18, 0); // zeros in [10..15), then "XYZ"
+        expected[15..18].copy_from_slice(b"XYZ");
+        assert_eq!(&data[..], &expected[..]);
+        vfs.release(fh).await.unwrap();
+    });
+}
+
+/// Setattr shrink trims coverage and dirty_ranges past the new size; the
+/// flushed CAS file matches the truncated original.
+#[test]
+fn sparse_setattr_shrink_truncates_at_flush() {
+    let hub = MockHub::new();
+    let content: Vec<u8> = (0u8..50).collect();
+    hub.add_file("file.bin", content.len() as u64, Some("h1"), None);
+    let xet = MockXet::new();
+    xet.add_file("h1", &content);
+    let (rt, vfs) = vfs_sparse(&hub, &xet);
+
+    rt.block_on(async {
+        let ino = vfs.lookup(ROOT_INODE, "file.bin").await.unwrap().ino;
+        vfs.setattr(ino, Some(20), None, None, None, None, None).await.unwrap();
+        wait_for_clean(&vfs, ino).await;
+        let new_hash = {
+            let inodes = vfs.inode_table.read().unwrap();
+            inodes.get(ino).unwrap().xet_hash.clone().unwrap()
+        };
+        assert_eq!(xet_content(&xet, &new_hash), Some(content[..20].to_vec()));
+    });
+}
+
+/// No-op flush (open then release with no writes) keeps the original hash
+/// and preserves the staging cache populated by reads.
+#[test]
+fn sparse_noop_flush_preserves_hash_and_cache() {
+    let hub = MockHub::new();
+    let content: Vec<u8> = (0u8..30).collect();
+    hub.add_file("file.bin", content.len() as u64, Some("h1"), None);
+    let xet = MockXet::new();
+    xet.add_file("h1", &content);
+    let (rt, vfs) = vfs_sparse(&hub, &xet);
+
+    rt.block_on(async {
+        let ino = vfs.lookup(ROOT_INODE, "file.bin").await.unwrap().ino;
+        let fh = vfs.open(ino, true, false, None).await.unwrap();
+        // Read populates the cache but doesn't dirty anything.
+        let _ = vfs.read(fh, 0, 30).await.unwrap();
+        vfs.release(fh).await.unwrap();
+        wait_for_clean(&vfs, ino).await;
+        let final_hash = {
+            let inodes = vfs.inode_table.read().unwrap();
+            inodes.get(ino).unwrap().xet_hash.clone().unwrap()
+        };
+        assert_eq!(final_hash, "h1", "no-op flush must keep the original hash");
     });
 }
