@@ -2109,6 +2109,141 @@ impl VirtualFs {
         Err(libc::EIO)
     }
 
+    /// Fetch the holes in `[offset, offset + buf.len())` from CAS, overlay them
+    /// into `buf`, and persist them into the staging file as a cache.
+    ///
+    /// `sparse_snapshot` describes which bytes were holes at the moment of the
+    /// pread that filled `buf`; only those positions get overlaid. The
+    /// staging-side cache write is gated by re-checking the live coverage
+    /// under `io_lock` per hole, so we never overwrite bytes a concurrent
+    /// writer may have just landed at the same offset.
+    ///
+    /// Bounded by `original_size`: bytes past the original CAS size aren't
+    /// in CAS, so they stay as whatever pread returned (zeros from the hole
+    /// or the user's own extension if a write covered them).
+    async fn fill_sparse_holes(
+        &self,
+        ino: u64,
+        staging_file: &Arc<File>,
+        sparse_snapshot: &Arc<inode::SparseWriteState>,
+        offset: u64,
+        buf: &mut BytesMut,
+    ) -> VirtualFsResult<()> {
+        let buf_len = buf.len() as u64;
+        if buf_len == 0 {
+            return Ok(());
+        }
+        // Read window in file coordinates. Clamp to the original CAS size —
+        // bytes past it are not in CAS.
+        let window_end = offset.saturating_add(buf_len).min(sparse_snapshot.original_size);
+        if window_end <= offset {
+            return Ok(());
+        }
+        let holes = sparse_snapshot.holes_in(offset, window_end - offset);
+        if holes.is_empty() {
+            return Ok(());
+        }
+
+        let file_info = XetFileInfo::new(sparse_snapshot.original_hash.clone(), sparse_snapshot.original_size);
+        let staging_fd = staging_file.as_raw_fd();
+
+        for (hole_start, hole_end) in holes {
+            let hole_len = (hole_end - hole_start) as usize;
+            let mut chunk = Vec::with_capacity(hole_len);
+            let mut stream = self
+                .xet_sessions
+                .download_stream_boxed(&file_info, hole_start, Some(hole_end))
+                .map_err(|e| {
+                    error!(
+                        "sparse read: open CAS stream {}..{} failed: {}",
+                        hole_start, hole_end, e
+                    );
+                    libc::EIO
+                })?;
+            while let Some(bytes) = stream.next().await.map_err(|e| {
+                error!("sparse read: CAS stream error at {}..{}: {}", hole_start, hole_end, e);
+                libc::EIO
+            })? {
+                chunk.extend_from_slice(&bytes);
+                if chunk.len() >= hole_len {
+                    break;
+                }
+            }
+            if chunk.len() < hole_len {
+                error!(
+                    "sparse read: CAS stream short ({} of {} bytes) for {}..{}",
+                    chunk.len(),
+                    hole_len,
+                    hole_start,
+                    hole_end,
+                );
+                return Err(libc::EIO);
+            }
+            chunk.truncate(hole_len);
+
+            // Overlay into buf: zeros at the hole positions become the
+            // CAS bytes. This is the user-visible read result.
+            let buf_lo = (hole_start - offset) as usize;
+            let buf_hi = buf_lo + hole_len;
+            buf[buf_lo..buf_hi].copy_from_slice(&chunk);
+
+            // Cache the bytes into staging — but only at offsets that are
+            // STILL holes under the current coverage. A concurrent writer
+            // may have filled this range since the snapshot; pwriting our
+            // CAS bytes there would clobber the user's data.
+            let io_lock = self.staging.io_lock(ino);
+            let _io_guard = io_lock.lock().expect("staging io_lock poisoned");
+            let mut inodes = self.inode_table.write().expect("inodes poisoned");
+            let Some(entry) = inodes.get_mut(ino) else {
+                // Inode vanished mid-fill; the buf overlay is still valid for
+                // the caller, just skip the cache update.
+                continue;
+            };
+            // Sparse_write may have been cleared (poll, commit) — bail
+            // gracefully.
+            let Some(sw_arc) = entry.sparse_write.as_mut() else {
+                continue;
+            };
+            // Re-key check: if the hash rotated, the snapshot bytes don't
+            // describe this inode any more.
+            if sw_arc.original_hash != sparse_snapshot.original_hash {
+                continue;
+            }
+            let sw = Arc::make_mut(sw_arc);
+            // Per-sub-range check: only pwrite into sections that are still
+            // holes in the live coverage.
+            for (sub_start, sub_end) in sw.holes_in(hole_start, hole_end - hole_start) {
+                let sub_off_in_chunk = (sub_start - hole_start) as usize;
+                let sub_len = (sub_end - sub_start) as usize;
+                let slice = &chunk[sub_off_in_chunk..sub_off_in_chunk + sub_len];
+                // SAFETY: fd is valid (Arc<File> keeps it alive), slice is
+                // correctly sized. pwrite is thread-safe.
+                let n = unsafe {
+                    libc::pwrite(
+                        staging_fd,
+                        slice.as_ptr() as *const libc::c_void,
+                        sub_len,
+                        sub_start as i64,
+                    )
+                };
+                if n < 0 {
+                    let err = std::io::Error::last_os_error();
+                    warn!(
+                        "sparse read: pwrite cache update failed at {}..{}: {}",
+                        sub_start, sub_end, err
+                    );
+                    // Don't fail the read — the user's buf is already
+                    // correct; we just lose the cache for this range.
+                    continue;
+                }
+                if (n as u64) == sub_len as u64 {
+                    sw.track_read_fill(sub_start, sub_len as u64);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Read data from an open file. Returns `(data, eof)`.
     pub async fn read(&self, file_handle: u64, offset: u64, size: u32) -> VirtualFsResult<(Bytes, bool)> {
         debug!("read: fh={}, offset={}, size={}", file_handle, offset, size);
@@ -2118,7 +2253,10 @@ impl VirtualFs {
         let read_target = {
             let files = self.open_files.read().expect("open_files poisoned");
             match files.get(&file_handle) {
-                Some(OpenFile::Local { file, .. }) => ReadTarget::LocalFd(file.clone()),
+                Some(OpenFile::Local { file, ino, .. }) => ReadTarget::LocalFd {
+                    file: file.clone(),
+                    ino: *ino,
+                },
                 Some(OpenFile::Lazy { prefetch, .. }) => ReadTarget::Remote {
                     prefetch: prefetch.clone(),
                 },
@@ -2129,26 +2267,54 @@ impl VirtualFs {
         };
 
         match read_target {
-            ReadTarget::LocalFd(file) => {
+            ReadTarget::LocalFd { file, ino } => {
                 let file_descriptor = file.as_raw_fd();
                 let mut buf = BytesMut::zeroed(size as usize);
-                // SAFETY: fd is valid (Arc<File> keeps it alive), buf is correctly sized.
-                // pread is thread-safe (atomic offset, no shared seek cursor).
-                let n = unsafe {
-                    libc::pread(
-                        file_descriptor,
-                        buf.as_mut_ptr() as *mut libc::c_void,
-                        size as usize,
-                        offset as i64,
-                    )
-                };
-                if n < 0 {
-                    Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO))
-                } else {
-                    buf.truncate(n as usize);
-                    let eof = (n as u32) < size;
-                    Ok((buf.freeze(), eof))
+                // Snapshot sparse_write under the io_lock together with the
+                // pread, so the snapshot describes exactly what staging held
+                // at the moment buf was filled. A concurrent pwrite cannot
+                // land between snapshot and pread because both happen under
+                // the same lock. Only valid for inodes that have a
+                // sparse_write installed (otherwise staging is the source of
+                // truth and pread is sufficient on its own).
+                let sparse_snapshot;
+                let n;
+                {
+                    let io_lock = self.staging.io_lock(ino);
+                    let _io_guard = io_lock.lock().expect("staging io_lock poisoned");
+                    sparse_snapshot = self
+                        .inode_table
+                        .read()
+                        .expect("inodes poisoned")
+                        .get(ino)
+                        .and_then(|e| e.sparse_write.clone());
+                    // SAFETY: fd is valid (Arc<File> keeps it alive), buf is
+                    // correctly sized. pread is thread-safe (atomic offset).
+                    n = unsafe {
+                        libc::pread(
+                            file_descriptor,
+                            buf.as_mut_ptr() as *mut libc::c_void,
+                            size as usize,
+                            offset as i64,
+                        )
+                    };
                 }
+                if n < 0 {
+                    return Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO));
+                }
+                buf.truncate(n as usize);
+
+                // Sparse staging: bytes pread'd from a hole are zeros. Fill
+                // them from CAS, overlay into buf, and persist into staging
+                // (as a cache for subsequent reads of the same range).
+                if let Some(sw) = sparse_snapshot
+                    && n > 0
+                {
+                    self.fill_sparse_holes(ino, &file, &sw, offset, &mut buf).await?;
+                }
+
+                let eof = (n as u32) < size;
+                Ok((buf.freeze(), eof))
             }
             ReadTarget::Remote { prefetch } => {
                 let mut prefetch_state = prefetch.lock().await;
@@ -3923,7 +4089,8 @@ async fn streaming_worker(
 /// What to do in read() after releasing the open_files lock.
 enum ReadTarget {
     /// Hold an Arc<File> so the FD stays alive even if release() runs concurrently.
-    LocalFd(Arc<File>),
+    /// `ino` is needed to look up `sparse_write` for the sparse-hole fill path.
+    LocalFd { file: Arc<File>, ino: u64 },
     Remote {
         prefetch: Arc<tokio::sync::Mutex<PrefetchState>>,
     },
