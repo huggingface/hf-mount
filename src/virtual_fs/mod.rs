@@ -1782,6 +1782,23 @@ impl VirtualFs {
         {
             let mut inodes = self.inode_table.write().expect("inodes poisoned");
             let entry = inodes.get_mut(ino).ok_or(libc::ENOENT)?;
+            // Drift check BEFORE set_dirty: if poll rotated entry.xet_hash
+            // between `open()`'s snapshot and here, the staging we just
+            // prepared (sparse hole sized to old `size`, or downloaded old
+            // hash) no longer matches the inode's reality. Setting dirty
+            // and proceeding would leave a dirty inode with no sparse_write
+            // (or a stale one), which the flush would upload as
+            // hole-zeros via the regular path — silent corruption.
+            // Surface as EIO so the caller retries; we have not yet set
+            // dirty, so nothing rolls back beyond the punched staging
+            // file (which will be replaced by the next open).
+            if want_sparse && entry.xet_hash.as_deref() != Some(xet_hash) {
+                debug!(
+                    "open_advanced_write: ino={} xet_hash drifted between snapshot and install (snap={:?}, now={:?}), retrying",
+                    ino, xet_hash, entry.xet_hash
+                );
+                return Err(libc::EIO);
+            }
             entry.set_dirty();
             if truncate {
                 entry.size = 0;
@@ -1791,12 +1808,19 @@ impl VirtualFs {
                 entry.mtime = now;
                 entry.ctime = now;
             } else if want_sparse {
-                // Key sparse_write to the snapshot xet_hash. If poll rotated
-                // entry.xet_hash since `open()` captured the snapshot, the
-                // post-check below detects the drift; we skip installing so
-                // the next write/setattr re-prepares against the current hash.
-                let snapshot_matches_current = entry.xet_hash.as_deref() == Some(xet_hash);
-                if snapshot_matches_current {
+                // Preserve an existing sparse_write when it's already keyed
+                // to the same hash: the reopen happens after writes to the
+                // first open that left dirty_ranges/coverage populated, and
+                // those represent the user's in-flight modifications.
+                // Replacing the state with a fresh one would drop the dirty
+                // tracking, make subsequent reads refill user-written bytes
+                // from CAS, and trigger a no-op flush — silently losing the
+                // user's pending writes.
+                let existing_matches = entry
+                    .sparse_write
+                    .as_ref()
+                    .is_some_and(|sw| sw.original_hash == xet_hash);
+                if !existing_matches {
                     let state = if staging_holds_original {
                         inode::SparseWriteState::new_full(xet_hash.to_string(), size)
                     } else {
@@ -2461,6 +2485,14 @@ impl VirtualFs {
                     new_end = offset + written as u64;
                     let mut inodes = self.inode_table.write().expect("inodes poisoned");
                     if let Some(entry) = inodes.get_mut(handle_ino) {
+                        // Snapshot the previous size BEFORE bumping it: the
+                        // sparse path needs to include the zero-filled gap
+                        // [prev_size, offset) in dirty_ranges when the write
+                        // starts past EOF. Otherwise range_upload would only
+                        // see [offset, new_end) and the resulting CAS file
+                        // would be missing those zeros — a write at offset
+                        // 15 to a 10-byte file would commit a 13-byte file.
+                        let prev_size = entry.size;
                         if new_end > entry.size {
                             if let Some(sd) = self.staging.dir() {
                                 sd.resize_bytes(entry.size, new_end);
@@ -2469,12 +2501,19 @@ impl VirtualFs {
                         }
                         entry.set_dirty();
                         // Sparse mode: extend coverage AND dirty_ranges for the
-                        // written window. Always done under both the io_lock
-                        // (vs concurrent readers) and the inode write lock
-                        // (vs flush snapshotting sparse_write).
+                        // written window plus any zero gap from the old EOF.
+                        // Done under both io_lock (vs concurrent readers) and
+                        // the inode write lock (vs flush snapshotting
+                        // sparse_write).
                         if let Some(sw_arc) = entry.sparse_write.as_mut() {
                             let sw = Arc::make_mut(sw_arc);
-                            sw.track_write(offset, written as u64);
+                            // Effective write start: include the zero gap
+                            // between the previous EOF and `offset` so
+                            // range_upload composes those zeros into the
+                            // new CAS file.
+                            let effective_start = offset.min(prev_size);
+                            let effective_len = new_end - effective_start;
+                            sw.track_write(effective_start, effective_len);
                         }
                     }
                     inodes.touch(handle_ino);

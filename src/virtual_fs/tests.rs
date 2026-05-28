@@ -5439,7 +5439,11 @@ fn sparse_flush_commits_composed_file() {
 }
 
 /// Sparse write past EOF extends the file; the gap [old_size, new_offset) is
-/// tracked as dirty so range_upload composes the extension correctly.
+/// tracked as dirty so range_upload composes the extension correctly. Without
+/// the gap tracking, the real xet-core upload_ranges would commit a truncated
+/// file (10 + 3 = 13 bytes instead of 18); MockXet zero-pads to new_file_size
+/// so the user-facing read happens to match, but the dirty_ranges check
+/// guards against the mock masking the bug.
 #[test]
 fn sparse_write_past_eof_extends() {
     let hub = MockHub::new();
@@ -5459,6 +5463,21 @@ fn sparse_write_past_eof_extends() {
         expected.resize(18, 0); // zeros in [10..15), then "XYZ"
         expected[15..18].copy_from_slice(b"XYZ");
         assert_eq!(&data[..], &expected[..]);
+
+        // Dirty range must cover the whole extension [prev_size, new_end) =
+        // [10, 18), not just [15, 18). Otherwise range_upload omits the
+        // zero gap and commits a truncated file.
+        {
+            let inodes = vfs.inode_table.read().unwrap();
+            let entry = inodes.get(ino).unwrap();
+            let sw = entry.sparse_write.as_ref().expect("sparse_write must be set");
+            assert_eq!(
+                sw.dirty_ranges,
+                vec![(10, 18)],
+                "past-EOF write must track the zero-gap from old EOF"
+            );
+        }
+
         vfs.release(fh).await.unwrap();
     });
 }
@@ -5483,6 +5502,59 @@ fn sparse_setattr_shrink_truncates_at_flush() {
             inodes.get(ino).unwrap().xet_hash.clone().unwrap()
         };
         assert_eq!(xet_content(&xet, &new_hash), Some(content[..20].to_vec()));
+    });
+}
+
+/// Reopening a dirty sparse inode before its flush completes must preserve
+/// the existing sparse_write state (coverage + dirty_ranges). Without this,
+/// the second open would replace the state with a fresh one, dropping the
+/// dirty tracking — a subsequent flush would see no dirty ranges and commit
+/// a no-op even though the user's writes are still in staging.
+#[test]
+fn sparse_reopen_dirty_preserves_state() {
+    let hub = MockHub::new();
+    let content: Vec<u8> = (0u8..20).collect();
+    hub.add_file("file.bin", content.len() as u64, Some("h1"), None);
+    let xet = MockXet::new();
+    xet.add_file("h1", &content);
+    let (rt, vfs) = vfs_sparse(&hub, &xet);
+
+    rt.block_on(async {
+        let ino = vfs.lookup(ROOT_INODE, "file.bin").await.unwrap().ino;
+        let fh1 = vfs.open(ino, true, false, None).await.unwrap();
+        write_blocking(&vfs, ino, fh1, 5, b"AAA").await.unwrap();
+        vfs.release(fh1).await.unwrap();
+        // DO NOT wait for flush — open again while still dirty.
+        // Verify the inode is dirty before the reopen so the test exercises
+        // the right path (if it cleared between release and reopen, the test
+        // would not be checking the bug).
+        let dirty_before = {
+            let inodes = vfs.inode_table.read().unwrap();
+            inodes.get(ino).unwrap().is_dirty()
+        };
+        if !dirty_before {
+            // Flush already fired; can't exercise the reopen path. Skip.
+            return;
+        }
+
+        let fh2 = vfs.open(ino, true, false, None).await.unwrap();
+        // Dirty state from the first open must survive the reopen.
+        let dirty_ranges = {
+            let inodes = vfs.inode_table.read().unwrap();
+            let entry = inodes.get(ino).unwrap();
+            entry
+                .sparse_write
+                .as_ref()
+                .expect("sparse_write must persist")
+                .dirty_ranges
+                .clone()
+        };
+        assert_eq!(
+            dirty_ranges,
+            vec![(5, 8)],
+            "reopen must preserve dirty_ranges from the first open"
+        );
+        vfs.release(fh2).await.unwrap();
     });
 }
 
