@@ -951,6 +951,14 @@ impl InodeTable {
             // matches xet_hash. An in-flight download observes this under
             // its post-check and won't re-flag the cache.
             entry.staging_is_current = false;
+            // Sparse-write state stays keyed to its `original_hash`, NOT
+            // the just-rotated `entry.xet_hash`. Readers via fill_sparse_holes
+            // continue to see the old revision (their frame of reference),
+            // writers continue to track against the old base. The next open
+            // recomputes a fresh sparse_write against the new hash. This
+            // mirrors the equivalent race in the non-sparse path (where a
+            // writer's flush silently overwrites poll-discovered updates) —
+            // not made worse by the sparse path.
             true
         } else {
             false
