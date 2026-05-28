@@ -7,10 +7,13 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use crate::hub_api::{BatchOp, HubOps};
-use crate::xet::XetOps;
+use crate::xet::{RangeSnapshot, XetOps};
+use bytes::Bytes;
 
-use super::inode::InodeTable;
+use super::inode::{InodeTable, SparseWriteState};
 use super::staging::StagingCoordinator;
+use std::os::unix::fs::FileExt;
+use xet_data::processing::XetFileInfo;
 
 enum FlushSignal {
     /// Flush a dirty inode.
@@ -270,6 +273,56 @@ struct FlushItem {
     /// Hash from the last successful commit, used to skip redundant Hub commits
     /// when the CAS upload produces the same hash (content unchanged).
     prev_xet_hash: Option<String>,
+    /// Current file size at snapshot time. Captured under the inode read
+    /// lock together with the sparse_write Arc, so range_upload composes a
+    /// file of the right shape even if a concurrent setattr races later.
+    file_size: u64,
+    /// Sparse-write snapshot. When Some, the flush composes a new CAS file
+    /// from this state's dirty ranges via range_upload (no re-upload of the
+    /// unchanged prefix/suffix). When None, the flush takes the regular path
+    /// and uploads the entire staging file via upload_files.
+    sparse_snapshot: Option<Arc<SparseWriteState>>,
+}
+
+/// Read each dirty range of `sparse` from the staging file at `staging_path`,
+/// producing a Vec of `RangeSnapshot` ready for `range_upload`. Each range is
+/// read under the per-inode io_lock so a concurrent pwrite cannot interleave
+/// with our reads.
+fn snapshot_dirty_bytes(
+    staging: &StagingCoordinator,
+    ino: u64,
+    staging_path: &std::path::Path,
+    sparse: &SparseWriteState,
+) -> std::io::Result<Vec<RangeSnapshot>> {
+    if sparse.dirty_ranges.is_empty() {
+        return Ok(Vec::new());
+    }
+    let file = std::fs::File::open(staging_path)?;
+    let io_lock = staging.io_lock(ino);
+    let _io_guard = io_lock.lock().expect("staging io_lock poisoned");
+    let mut snapshots = Vec::with_capacity(sparse.dirty_ranges.len());
+    for &(start, end) in &sparse.dirty_ranges {
+        let len = (end - start) as usize;
+        let mut buf = vec![0u8; len];
+        let mut read_total = 0;
+        while read_total < len {
+            let n = file.read_at(&mut buf[read_total..], start + read_total as u64)?;
+            if n == 0 {
+                // Short read: the staging file is shorter than dirty_ranges
+                // claim. This can happen if setattr-shrink truncated under
+                // us and clip_to_size hasn't run yet; treat as EOF and pad
+                // with whatever zeros we read so far.
+                buf.truncate(read_total);
+                break;
+            }
+            read_total += n;
+        }
+        snapshots.push(RangeSnapshot {
+            offset: start,
+            data: Bytes::from(buf),
+        });
+    }
+    Ok(snapshots)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -334,6 +387,8 @@ async fn flush_batch(
                     pending_deletes: entry.pending_deletes.clone(),
                     dirty_generation: entry.dirty_generation,
                     prev_xet_hash: entry.xet_hash.clone(),
+                    file_size: entry.size,
+                    sparse_snapshot: entry.sparse_write.clone(),
                 })
             })
             .collect()
@@ -350,11 +405,65 @@ async fn flush_batch(
     // Upload in chunks to bound FD usage (xet-core opens all staging files per
     // upload session), but accumulate all batch ops for a single Hub commit to
     // preserve the global adds-before-deletes ordering required by the Hub API.
+    //
+    // Sparse items take the per-item range_upload path: dirty bytes are
+    // snapshotted under the per-inode io_lock, then composed against the
+    // existing CAS reconstruction without re-uploading the unchanged prefix/
+    // suffix. Regular items go through the batched upload_files path.
     const UPLOAD_CHUNK_SIZE: usize = 500;
-    let mut upload_results = Vec::with_capacity(to_flush.len());
+    let mut upload_results: Vec<Option<XetFileInfo>> = vec![None; to_flush.len()];
 
-    for (chunk_idx, chunk) in to_flush.chunks(UPLOAD_CHUNK_SIZE).enumerate() {
-        let staging_paths: Vec<&std::path::Path> = chunk.iter().map(|item| item.staging_path.as_path()).collect();
+    // Pass A: per-item range_upload for sparse items.
+    for (idx, item) in to_flush.iter().enumerate() {
+        let Some(sw) = item.sparse_snapshot.as_ref() else {
+            continue;
+        };
+        // Snapshot dirty bytes under io_lock so a concurrent pwrite cannot
+        // interleave with our reads and produce chimeric content downstream.
+        let snapshots_result = snapshot_dirty_bytes(staging, item.ino, &item.staging_path, sw);
+        let snapshots = match snapshots_result {
+            Ok(s) => s,
+            Err(e) => {
+                error!(
+                    "sparse flush: snapshot failed for ino={} path={}: {}",
+                    item.ino, item.full_path, e
+                );
+                flush_errors
+                    .lock()
+                    .expect("flush_errors poisoned")
+                    .insert(item.ino, format!("snapshot failed: {e}"));
+                return;
+            }
+        };
+        match xet_sessions
+            .range_upload(&sw.original_hash, sw.original_size, item.file_size, snapshots)
+            .await
+        {
+            Ok(info) => upload_results[idx] = Some(info),
+            Err(e) => {
+                error!(
+                    "sparse flush: range_upload failed for ino={} path={}: {}",
+                    item.ino, item.full_path, e
+                );
+                let msg = format!("range_upload failed: {e}");
+                let mut errs = flush_errors.lock().expect("flush_errors poisoned");
+                for item in &to_flush {
+                    errs.insert(item.ino, msg.clone());
+                }
+                return;
+            }
+        }
+    }
+
+    // Pass B: batched upload_files for non-sparse items.
+    let regular_indices: Vec<usize> = to_flush
+        .iter()
+        .enumerate()
+        .filter(|(_, it)| it.sparse_snapshot.is_none())
+        .map(|(i, _)| i)
+        .collect();
+    for chunk in regular_indices.chunks(UPLOAD_CHUNK_SIZE) {
+        let staging_paths: Vec<&std::path::Path> = chunk.iter().map(|&i| to_flush[i].staging_path.as_path()).collect();
         match xet_sessions.upload_files(&staging_paths).await {
             Ok(results) => {
                 assert_eq!(
@@ -364,12 +473,12 @@ async fn flush_batch(
                     results.len(),
                     chunk.len()
                 );
-                upload_results.extend(results);
+                for (slot_idx, info) in chunk.iter().zip(results.into_iter()) {
+                    upload_results[*slot_idx] = Some(info);
+                }
             }
             Err(e) => {
-                // Abort the entire batch: committing partial results could apply
-                // deletes without the corresponding adds from this failed chunk.
-                error!("Batch upload failed (chunk {}), aborting flush: {}", chunk_idx, e);
+                error!("Batch upload failed, aborting flush: {}", e);
                 let msg = format!("upload failed: {e}");
                 let mut errs = flush_errors.lock().expect("flush_errors poisoned");
                 for item in &to_flush {
@@ -379,6 +488,14 @@ async fn flush_batch(
             }
         }
     }
+
+    // Bail if a slot stayed unfilled — would indicate a logic bug in the
+    // partition above. Don't proceed with potentially-misaligned indices.
+    if upload_results.iter().any(|r| r.is_none()) {
+        error!("flush_batch: internal error: not all items uploaded");
+        return;
+    }
+    let upload_results: Vec<XetFileInfo> = upload_results.into_iter().map(|r| r.expect("checked above")).collect();
 
     // Uploads are done — drop the staging locks so unlink/truncate and the
     // gc() calls below (which acquire the same per-inode locks) can proceed.
@@ -430,15 +547,13 @@ async fn flush_batch(
     // Clear dirty on unchanged files without waiting for the Hub round-trip.
     {
         let mut inode_table = inodes.write().expect("inodes poisoned");
-        for (i, (item, file_info)) in to_flush.iter().zip(upload_results.iter()).enumerate() {
+        for (i, item) in to_flush.iter().enumerate() {
             if unchanged[i]
                 && let Some(entry) = inode_table.get_mut(item.ino)
             {
-                entry.apply_commit(
-                    file_info.hash(),
-                    file_info.file_size().expect("upload returned XetFileInfo without size"),
-                    item.dirty_generation,
-                );
+                // Same hash + no pending_deletes: nothing changed remotely.
+                // Coverage and sparse_write stay intact.
+                entry.apply_noop_commit(item.dirty_generation);
             }
         }
     }
@@ -473,11 +588,19 @@ async fn flush_batch(
             if !unchanged[i]
                 && let Some(entry) = inode_table.get_mut(item.ino)
             {
-                entry.apply_commit(
-                    file_info.hash(),
-                    file_info.file_size().expect("upload returned XetFileInfo without size"),
-                    item.dirty_generation,
-                );
+                let size = file_info.file_size().expect("upload returned XetFileInfo without size");
+                if item.sparse_snapshot.is_some() {
+                    // Sparse upload via range_upload: re-key the inode's
+                    // sparse_write to the new hash, clear dirty_ranges,
+                    // preserve coverage (the new CAS file was composed from
+                    // those staging bytes, so staging still matches at
+                    // those offsets).
+                    entry.apply_commit_sparse(file_info.hash(), size, item.dirty_generation);
+                } else {
+                    // Non-sparse upload via upload_files: staging IS the
+                    // committed content, drop sparse_write.
+                    entry.apply_commit(file_info.hash(), size, item.dirty_generation);
+                }
             }
         }
     }
