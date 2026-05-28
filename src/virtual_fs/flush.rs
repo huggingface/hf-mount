@@ -473,7 +473,7 @@ async fn flush_batch(
                     results.len(),
                     chunk.len()
                 );
-                for (slot_idx, info) in chunk.iter().zip(results.into_iter()) {
+                for (slot_idx, info) in chunk.iter().zip(results) {
                     upload_results[*slot_idx] = Some(info);
                 }
             }
