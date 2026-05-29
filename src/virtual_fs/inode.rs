@@ -249,6 +249,18 @@ impl SparseWriteState {
         clip_ranges(&mut self.dirty_ranges, new_size);
     }
 
+    /// Apply a `setattr` size change from `prev_size` to `new_size`: a grow
+    /// tracks the new tail `[prev_size, new_size)` as dirty (so range_upload
+    /// composes the zero-fill); a shrink clips coverage and dirty_ranges down
+    /// to `new_size`. Unchanged size is a no-op.
+    pub fn resize_to(&mut self, prev_size: u64, new_size: u64) {
+        if new_size > prev_size {
+            self.track_write(prev_size, new_size - prev_size);
+        } else if new_size < prev_size {
+            self.clip_to_size(new_size);
+        }
+    }
+
     /// Return the sub-ranges of `[offset, offset+len)` that are NOT in
     /// `coverage` — i.e. holes that a read must fill from CAS.
     pub fn holes_in(&self, offset: u64, len: u64) -> Vec<(u64, u64)> {
@@ -393,12 +405,7 @@ impl InodeEntry {
             self.pending_deletes.clear();
             self.sparse_write = None;
         }
-        let now = SystemTime::now();
-        self.mtime = now;
-        self.ctime = now;
-        // Mark as recently validated so subsequent lookups skip HEAD revalidation
-        // for the duration of metadata_ttl (we just committed this exact hash).
-        self.last_revalidated = Some(Instant::now());
+        self.touch_commit_clocks();
     }
 
     /// Apply a successful `range_upload` commit. Re-keys `sparse_write` to the
@@ -430,10 +437,7 @@ impl InodeEntry {
                 sw.clip_to_size(size);
             }
         }
-        let now = SystemTime::now();
-        self.mtime = now;
-        self.ctime = now;
-        self.last_revalidated = Some(Instant::now());
+        self.touch_commit_clocks();
     }
 
     /// Apply a no-op commit (range_upload returned the original hash
@@ -449,6 +453,13 @@ impl InodeEntry {
                 sw.dirty_ranges.clear();
             }
         }
+        self.touch_commit_clocks();
+    }
+
+    /// Bump mtime/ctime to now and mark the inode as freshly revalidated.
+    /// Called at the end of every commit-apply so subsequent lookups skip HEAD
+    /// revalidation for metadata_ttl (we just committed this exact state).
+    fn touch_commit_clocks(&mut self) {
         let now = SystemTime::now();
         self.mtime = now;
         self.ctime = now;

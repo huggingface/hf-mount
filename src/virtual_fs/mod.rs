@@ -1698,11 +1698,6 @@ impl VirtualFs {
         // entirely in user dir, no remote concept.
         let has_remote_xet = !self.overlay() && !truncate && !xet_hash.is_empty() && size > 0;
         let want_sparse = self.sparse_writes && has_remote_xet;
-        // Track whether we punched a fresh sparse hole vs reused staging vs
-        // downloaded the full content. The sparse_write install at the bottom
-        // uses this to pick `new` (fresh hole, empty coverage) vs `new_full`
-        // (staging already mirrors original, coverage covers everything).
-        let mut staging_holds_original = can_reuse_staging && staging_is_current;
 
         if !can_reuse_staging {
             // Clear the flag before touching disk so a partial failure (e.g.
@@ -1751,7 +1746,6 @@ impl VirtualFs {
                         error!("Failed to download file for write: {}", e);
                         libc::EIO
                     })?;
-                staging_holds_original = true;
                 size
             } else {
                 self.open_local_backing_file(ino, full_path, true, true, true, true)
@@ -1855,9 +1849,11 @@ impl VirtualFs {
                         // empty, so empty coverage is correct — reads fill holes
                         // from CAS lazily.
                         entry.sparse_write = Some(Arc::new(inode::SparseWriteState::new(xet_hash.to_string(), size)));
-                    } else if staging_holds_original {
-                        // Reused a clean cache that mirrors the original in full:
-                        // every byte is present, so coverage spans the file.
+                    } else if staging_is_current {
+                        // Reused a clean cache that mirrors the original in full
+                        // (can_reuse_staging holds here, so this is exactly
+                        // can_reuse_staging && staging_is_current): every byte is
+                        // present, so coverage spans the file.
                         entry.sparse_write =
                             Some(Arc::new(inode::SparseWriteState::new_full(xet_hash.to_string(), size)));
                     } else {
@@ -2585,8 +2581,14 @@ impl VirtualFs {
                 let new_end;
                 let written;
                 {
-                    let io_lock = self.staging.io_lock(handle_ino);
-                    let _io_guard = io_lock.lock().expect("staging io_lock poisoned");
+                    // The io_lock only serializes pwrite + sparse track_write
+                    // against a sparse reader's (pread + coverage snapshot) pair.
+                    // On a non-sparse mount no reader takes it (see the read
+                    // fast-path), so skip it here too and keep the write path
+                    // lock-free; the inode write lock still guards the size/dirty
+                    // update.
+                    let io_lock = self.sparse_writes.then(|| self.staging.io_lock(handle_ino));
+                    let _io_guard = io_lock.as_ref().map(|l| l.lock().expect("staging io_lock poisoned"));
                     n = unsafe {
                         libc::pwrite(
                             file_descriptor,
@@ -4041,19 +4043,10 @@ impl VirtualFs {
                         // (shrink) at flush time.
                         let hash = prev_hash.expect("guard checked prev_hash is_some");
                         let mut sw = inode::SparseWriteState::new(hash, prev_size);
-                        if new_size > prev_size {
-                            sw.track_write(prev_size, new_size - prev_size);
-                        } else if new_size < prev_size {
-                            sw.clip_to_size(new_size);
-                        }
+                        sw.resize_to(prev_size, new_size);
                         entry.sparse_write = Some(Arc::new(sw));
                     } else if let Some(sw_arc) = entry.sparse_write.as_mut() {
-                        let sw = Arc::make_mut(sw_arc);
-                        if new_size > prev_size {
-                            sw.track_write(prev_size, new_size - prev_size);
-                        } else if new_size < prev_size {
-                            sw.clip_to_size(new_size);
-                        }
+                        Arc::make_mut(sw_arc).resize_to(prev_size, new_size);
                     }
                 }
                 drop(inodes);

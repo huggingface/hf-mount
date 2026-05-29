@@ -40,7 +40,6 @@ impl StagingCoordinator {
     /// Sync per-inode lock for serializing pread / pwrite / range_upload's
     /// per-chunk reads. Held only across non-await operations — never block
     /// an async runtime worker.
-    #[allow(dead_code)]
     pub(crate) fn io_lock(&self, ino: u64) -> Arc<std::sync::Mutex<()>> {
         self.io_locks
             .lock()
