@@ -135,7 +135,6 @@ pub struct VirtualFs {
     /// Derived: requires advanced_writes or overlay — the staging dir is the
     /// substrate for both. If `config.sparse_writes` is set without a backing
     /// staging dir, this stays false.
-    #[allow(dead_code)] // wired by subsequent commits
     sparse_writes: bool,
     inode_table: Arc<RwLock<InodeTable>>,
     /// Maps file_handle → OpenFile (local fd or lazy remote reference).
@@ -4007,16 +4006,44 @@ impl VirtualFs {
                 // Apply the size change under the same write lock so write() cannot
                 // race between the local truncate and inode metadata update.
                 let mut inodes = self.inode_table.write().expect("inodes poisoned");
+                // Current revision under the write lock. Poll can rotate
+                // xet_hash/size on a clean inode between the pre-lock snapshot
+                // and here (InodeTable::update_remote_file leaves any
+                // sparse_write keyed to the OLD hash). `sparse_drifted` flags a
+                // retained sparse_write whose original_hash no longer matches
+                // the live xet_hash (a rotated hash, or a revision that is no
+                // longer xet-backed at all, i.e. xet_hash is None). The staging
+                // tail (sized from the stale snapshot) must then be rebuilt
+                // against the current revision.
+                let (cur_hash, cur_size, sparse_drifted) = match inodes.get(ino) {
+                    Some(entry) => {
+                        let drifted = entry
+                            .sparse_write
+                            .as_ref()
+                            .is_some_and(|sparse| entry.xet_hash.as_deref() != Some(sparse.original_hash.as_str()));
+                        (entry.xet_hash.clone(), entry.size, drifted)
+                    }
+                    None => (None, 0, false),
+                };
                 // Skip set_len for the sparse-install path: the staging file
                 // was just created at exactly `new_size` above.
-                let need_set_len = !want_sparse_install;
-                if need_set_len {
+                if !want_sparse_install {
                     let size_result = if new_size == 0 {
                         self.open_local_backing_file(ino, &full_path, true, true, true, true)
                             .map(|_| ())
                     } else {
                         self.open_local_backing_file(ino, &full_path, false, true, false, false)
-                            .and_then(|file| file.set_len(new_size))
+                            .and_then(|file| {
+                                // On drift the staging was sized from the stale
+                                // pre-rotation snapshot. Truncate to the current
+                                // revision size before extending so a grow
+                                // zero-fills the extension (POSIX), instead of
+                                // committing stale tail bytes of the old revision.
+                                if sparse_drifted && new_size > cur_size {
+                                    file.set_len(cur_size)?;
+                                }
+                                file.set_len(new_size)
+                            })
                     };
                     if let Err(e) = size_result {
                         error!("Failed to set local backing file length: {}", e);
@@ -4037,16 +4064,39 @@ impl VirtualFs {
                         entry.xet_hash = None;
                         entry.sparse_write = None;
                     } else if want_sparse_install {
-                        // Install a fresh sparse_write keyed to the original
+                        // Install a fresh sparse_write keyed to the current
                         // hash; track the size change so range_upload composes
                         // the new tail (extension) or drops the cut tail
-                        // (shrink) at flush time.
-                        let hash = prev_hash.expect("guard checked prev_hash is_some");
-                        let mut sw = inode::SparseWriteState::new(hash, prev_size);
-                        sw.resize_to(prev_size, new_size);
+                        // (shrink) at flush time. The staging hole punched above
+                        // is content-free, so any base revision is valid.
+                        let hash = cur_hash.or(prev_hash).expect("guard checked xet_hash is_some");
+                        let mut sw = inode::SparseWriteState::new(hash, cur_size);
+                        sw.resize_to(cur_size, new_size);
                         entry.sparse_write = Some(Arc::new(sw));
                     } else if let Some(sw_arc) = entry.sparse_write.as_mut() {
-                        Arc::make_mut(sw_arc).resize_to(prev_size, new_size);
+                        match cur_hash {
+                            // Drifted to a NEW xet revision (poll rotated the
+                            // hash on the clean inode, leaving the state pinned
+                            // to the old one). Reusing it would make range_upload
+                            // compose against the wrong base and silently
+                            // overwrite the remote update. Rebuild against the
+                            // current revision (the staging tail was re-zeroed
+                            // above); empty coverage makes reads refill from the
+                            // current CAS object. Mirrors the drift handling in
+                            // open_advanced_write.
+                            Some(ref hash) if hash.as_str() != sw_arc.original_hash.as_str() => {
+                                let mut sw = inode::SparseWriteState::new(hash.clone(), cur_size);
+                                sw.resize_to(cur_size, new_size);
+                                *sw_arc = Arc::new(sw);
+                            }
+                            // Either still keyed to the current revision, or the
+                            // current revision is no longer xet-backed (cur_hash
+                            // is None) so there is no base to re-key to. Keep the
+                            // state's existing hash (last-writer-wins, the same
+                            // accepted race as the non-sparse path) and resize in
+                            // place; the grow tail was zeroed above when drifted.
+                            _ => Arc::make_mut(sw_arc).resize_to(cur_size, new_size),
+                        }
                     }
                 }
                 drop(inodes);

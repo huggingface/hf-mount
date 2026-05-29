@@ -5505,6 +5505,186 @@ fn sparse_setattr_shrink_truncates_at_flush() {
     });
 }
 
+/// Regression: a clean sparse inode whose `xet_hash` is rotated by poll
+/// (InodeTable::update_remote_file) keeps its `sparse_write` keyed to the OLD
+/// hash. A later setattr must NOT reuse that stale state — doing so makes
+/// range_upload compose against the superseded revision and silently overwrite
+/// the poll-discovered remote update. The truncate must compose against the
+/// current (rotated) revision instead.
+#[test]
+fn sparse_setattr_after_hash_drift_uses_current_revision() {
+    let hub = MockHub::new();
+    let original: Vec<u8> = (0u8..50).collect();
+    hub.add_file("file.bin", original.len() as u64, Some("h1"), None);
+    let xet = MockXet::new();
+    xet.add_file("h1", &original);
+    // The revision the remote rotates to while the inode is clean.
+    let rotated: Vec<u8> = (100u8..150).collect();
+    xet.add_file("h2", &rotated);
+    let (rt, vfs) = vfs_sparse(&hub, &xet);
+
+    rt.block_on(async {
+        let ino = vfs.lookup(ROOT_INODE, "file.bin").await.unwrap().ino;
+
+        // Sparse open + write + flush leaves the inode CLEAN with a retained
+        // sparse_write keyed to the composed hash (the post-apply_commit_sparse
+        // state).
+        let fh = vfs.open(ino, true, false, None).await.unwrap();
+        write_blocking(&vfs, ino, fh, 10, b"HELLO").await.unwrap();
+        vfs.release(fh).await.unwrap();
+        wait_for_clean(&vfs, ino).await;
+        let committed_hash = {
+            let inodes = vfs.inode_table.read().unwrap();
+            inodes.get(ino).unwrap().xet_hash.clone().unwrap()
+        };
+        assert_ne!(committed_hash, "h1");
+
+        // Poll discovers a newer remote revision and rotates xet_hash on the
+        // clean inode. The retained sparse_write stays keyed to the now-stale
+        // committed_hash.
+        {
+            let mut inodes = vfs.inode_table.write().unwrap();
+            assert!(
+                inodes.update_remote_file(ino, Some("h2".to_string()), None, 50, SystemTime::now()),
+                "poll must rotate the clean inode"
+            );
+        }
+
+        // Truncate to 30. The flush must compose against h2 (current), not the
+        // stale committed hash.
+        vfs.setattr(ino, Some(30), None, None, None, None, None).await.unwrap();
+        wait_for_clean(&vfs, ino).await;
+
+        let new_hash = {
+            let inodes = vfs.inode_table.read().unwrap();
+            inodes.get(ino).unwrap().xet_hash.clone().unwrap()
+        };
+        assert_eq!(
+            xet_content(&xet, &new_hash),
+            Some(rotated[..30].to_vec()),
+            "truncate after hash drift must compose against the rotated remote (h2), \
+             not the stale committed revision"
+        );
+    });
+}
+
+/// Regression: when poll rotates a clean sparse inode to a SMALLER revision
+/// and a later setattr grows the file past the new (smaller) size, the grow
+/// tail must be POSIX zero-extension, not stale tail bytes left in the staging
+/// file from the larger pre-rotation revision. The drift rebuild re-zeros the
+/// staging tail (truncate to cur_size before extending) so range_upload
+/// composes zeros over [cur_size, new_size).
+#[test]
+fn sparse_setattr_grow_after_shrinking_drift_zero_fills_tail() {
+    let hub = MockHub::new();
+    let original: Vec<u8> = (0u8..100).collect();
+    hub.add_file("file.bin", original.len() as u64, Some("h1"), None);
+    let xet = MockXet::new();
+    xet.add_file("h1", &original);
+    // Rotated remote revision is SMALLER (50 bytes) than the original (100).
+    let rotated: Vec<u8> = (200u8..250).collect();
+    xet.add_file("h2", &rotated);
+    let (rt, vfs) = vfs_sparse(&hub, &xet);
+
+    rt.block_on(async {
+        let ino = vfs.lookup(ROOT_INODE, "file.bin").await.unwrap().ino;
+
+        // Sparse open + write + flush: clean inode, retained sparse_write, and
+        // a 100-byte staging file persists (no GC pressure in tests).
+        let fh = vfs.open(ino, true, false, None).await.unwrap();
+        write_blocking(&vfs, ino, fh, 60, b"XXXXX").await.unwrap();
+        vfs.release(fh).await.unwrap();
+        wait_for_clean(&vfs, ino).await;
+
+        // Poll rotates the clean inode to the smaller h2 (50 bytes). The
+        // retained sparse_write stays keyed to the now-stale committed hash.
+        {
+            let mut inodes = vfs.inode_table.write().unwrap();
+            assert!(
+                inodes.update_remote_file(ino, Some("h2".to_string()), None, 50, SystemTime::now()),
+                "poll must rotate the clean inode"
+            );
+        }
+
+        // Grow to 75 (25 bytes past the current 50-byte revision).
+        vfs.setattr(ino, Some(75), None, None, None, None, None).await.unwrap();
+        wait_for_clean(&vfs, ino).await;
+
+        let new_hash = {
+            let inodes = vfs.inode_table.read().unwrap();
+            inodes.get(ino).unwrap().xet_hash.clone().unwrap()
+        };
+        // Expect h2 (50 bytes) followed by 25 zero bytes — NOT stale bytes from
+        // the 100-byte pre-rotation staging file.
+        let mut expected = rotated.clone();
+        expected.resize(75, 0);
+        assert_eq!(
+            xet_content(&xet, &new_hash),
+            Some(expected),
+            "grow after shrinking drift must zero-fill the extension, not commit stale tail bytes"
+        );
+    });
+}
+
+/// Regression: when poll rotates a clean sparse inode to a revision that is no
+/// longer xet-backed (xet_hash None) and smaller, a later grow must not commit
+/// stale tail bytes. The sparse state has no current hash to re-key to, so it
+/// keeps composing against its existing hash (last-writer-wins) but the grow
+/// tail is still zero-filled per POSIX.
+#[test]
+fn sparse_setattr_grow_after_drift_to_non_xet_zero_fills_tail() {
+    let hub = MockHub::new();
+    let original: Vec<u8> = (0u8..100).collect();
+    hub.add_file("file.bin", original.len() as u64, Some("h1"), None);
+    let xet = MockXet::new();
+    xet.add_file("h1", &original);
+    let (rt, vfs) = vfs_sparse(&hub, &xet);
+
+    rt.block_on(async {
+        let ino = vfs.lookup(ROOT_INODE, "file.bin").await.unwrap().ino;
+
+        // Sparse open + no-op flush leaves a clean inode keyed to h1/100 with a
+        // 100-byte staging file persisted.
+        let fh = vfs.open(ino, true, false, None).await.unwrap();
+        write_blocking(&vfs, ino, fh, 70, b"YYYYY").await.unwrap();
+        vfs.release(fh).await.unwrap();
+        wait_for_clean(&vfs, ino).await;
+        let committed_hash = {
+            let inodes = vfs.inode_table.read().unwrap();
+            inodes.get(ino).unwrap().xet_hash.clone().unwrap()
+        };
+
+        // Poll rotates the clean inode to a non-xet, smaller revision: hash None,
+        // size 50. The retained sparse_write stays keyed to committed_hash.
+        {
+            let mut inodes = vfs.inode_table.write().unwrap();
+            assert!(
+                inodes.update_remote_file(ino, None, Some("etag".to_string()), 50, SystemTime::now()),
+                "poll must rotate the clean inode"
+            );
+        }
+
+        // Grow to 75.
+        vfs.setattr(ino, Some(75), None, None, None, None, None).await.unwrap();
+        wait_for_clean(&vfs, ino).await;
+
+        let new_hash = {
+            let inodes = vfs.inode_table.read().unwrap();
+            inodes.get(ino).unwrap().xet_hash.clone().unwrap()
+        };
+        // The user's stale view of [0,50) is committed_hash[..50]; [50,75) must
+        // be POSIX zeros, never the committed_hash tail bytes (which include the
+        // "YYYYY" written at offset 70).
+        let mut expected = xet_content(&xet, &committed_hash).unwrap()[..50].to_vec();
+        expected.resize(75, 0);
+        assert_eq!(
+            xet_content(&xet, &new_hash),
+            Some(expected),
+            "grow after drift to a non-xet revision must zero-fill the extension"
+        );
+    });
+}
+
 /// Reopening a dirty sparse inode before its flush completes must preserve
 /// the existing sparse_write state (coverage + dirty_ranges). Without this,
 /// the second open would replace the state with a fresh one, dropping the
