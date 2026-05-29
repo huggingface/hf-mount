@@ -37,7 +37,20 @@ async fn test_fsx_paranoid_cas_roundtrip() {
         // range_upload composition bugs, and range_upload is only exercised
         // on the sparse path. Without this flag the test runs the legacy
         // download-then-upload path and never invokes range_upload.
-        &["--advanced-writes", "--sparse-writes", "--flush-debounce-ms", "100"],
+        //
+        // --direct-io is required for the round-trip to actually validate CAS:
+        // without it the kernel page cache (FOPEN_KEEP_CACHE) can serve the
+        // read-back from the just-written pages, so a range_upload that
+        // corrupted the committed CAS object would still match `reference`.
+        // direct-io forces every read through the FUSE handler, which on the
+        // now-clean inode reads from the committed CAS revision.
+        &[
+            "--advanced-writes",
+            "--sparse-writes",
+            "--direct-io",
+            "--flush-debounce-ms",
+            "100",
+        ],
     );
 
     let num_ops = std::env::var("FSX_PARANOID_OPS")

@@ -1068,13 +1068,24 @@ impl VirtualFs {
         Ok((file_handle, channel))
     }
 
-    /// Open a local file as read-only and return the file handle.
+    /// Open a local file for a read FUSE handle and return the file handle.
     /// `staging_backed` must be true only when `path` is the per-inode sparse
     /// staging file (a dirty file that may carry CAS-fillable holes), and false
     /// for complete local files (e.g. the HTTP non-Xet download cache) so the
     /// read path keeps its lock-free fast path for them.
     fn open_local_readonly(&self, ino: u64, path: &PathBuf, staging_backed: bool) -> VirtualFsResult<u64> {
-        match File::open(path) {
+        // Staging-backed reads cache fetched holes back into staging via
+        // fill_sparse_holes' write_at, so the underlying fd needs write
+        // permission even though this is a read FUSE handle. Without it every
+        // hole write fails with EBADF, defeating the staging cache (re-fetch +
+        // warning on each read). Complete cache files are never written here,
+        // so keep them read-only.
+        let opened = if staging_backed {
+            OpenOptions::new().read(true).write(true).open(path)
+        } else {
+            File::open(path)
+        };
+        match opened {
             Ok(file) => self.install_local_handle(ino, Arc::new(file), false, staging_backed),
             Err(e) => {
                 error!("Failed to open file {:?}: {}", path, e);

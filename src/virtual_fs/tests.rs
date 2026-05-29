@@ -5685,6 +5685,50 @@ fn sparse_setattr_grow_after_drift_to_non_xet_zero_fills_tail() {
     });
 }
 
+/// A read-only open of a DIRTY sparse file must still cache CAS hole-fills
+/// into staging. The read handle's fd is opened writable for exactly this
+/// reason; with a read-only fd the fill_sparse_holes write_at fails with EBADF
+/// and every read of the same hole re-fetches from CAS.
+#[test]
+fn sparse_readonly_handle_on_dirty_file_caches_holes() {
+    let hub = MockHub::new();
+    let content: Vec<u8> = (0u8..50).collect();
+    hub.add_file("file.bin", content.len() as u64, Some("h1"), None);
+    let xet = MockXet::new();
+    xet.add_file("h1", &content);
+    let (rt, vfs) = vfs_sparse(&hub, &xet);
+
+    rt.block_on(async {
+        let ino = vfs.lookup(ROOT_INODE, "file.bin").await.unwrap().ino;
+
+        // Writable open makes the file dirty with a sparse staging file.
+        let fh_w = vfs.open(ino, true, false, None).await.unwrap();
+        write_blocking(&vfs, ino, fh_w, 5, b"AAAAA").await.unwrap();
+
+        // Read-only open of the now-dirty file routes through open_readonly ->
+        // open_local_readonly(staging_backed=true). Hold fh_w so the inode
+        // stays dirty (no race with the background flush).
+        let fh_r = vfs.open(ino, false, false, None).await.unwrap();
+
+        // First read of an uncovered hole streams from CAS and caches it.
+        let _ = vfs.read(fh_r, 20, 10).await.unwrap();
+        let calls_after_first = xet.stream_calls.lock().unwrap().len();
+
+        // Second read of the same hole must hit the staging cache: the fill
+        // write_at succeeded (writable fd) and recorded coverage.
+        let (data, _) = vfs.read(fh_r, 20, 10).await.unwrap();
+        let calls_after_second = xet.stream_calls.lock().unwrap().len();
+        assert_eq!(
+            calls_after_first, calls_after_second,
+            "read-only handle on a dirty sparse file must cache hole-fills, not re-fetch CAS"
+        );
+        assert_eq!(&data[..], &content[20..30]);
+
+        vfs.release(fh_r).await.unwrap();
+        vfs.release(fh_w).await.unwrap();
+    });
+}
+
 /// Reopening a dirty sparse inode before its flush completes must preserve
 /// the existing sparse_write state (coverage + dirty_ranges). Without this,
 /// the second open would replace the state with a fresh one, dropping the
