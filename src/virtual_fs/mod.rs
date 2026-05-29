@@ -1070,11 +1070,13 @@ impl VirtualFs {
     }
 
     /// Open a local file as read-only and return the file handle.
-    fn open_local_readonly(&self, ino: u64, path: &PathBuf) -> VirtualFsResult<u64> {
+    /// `staging_backed` must be true only when `path` is the per-inode sparse
+    /// staging file (a dirty file that may carry CAS-fillable holes), and false
+    /// for complete local files (e.g. the HTTP non-Xet download cache) so the
+    /// read path keeps its lock-free fast path for them.
+    fn open_local_readonly(&self, ino: u64, path: &PathBuf, staging_backed: bool) -> VirtualFsResult<u64> {
         match File::open(path) {
-            // Dirty-staging read: the staging file may carry sparse holes, so
-            // mark it staging-backed for the read-path hole fill.
-            Ok(file) => self.install_local_handle(ino, Arc::new(file), false, true),
+            Ok(file) => self.install_local_handle(ino, Arc::new(file), false, staging_backed),
             Err(e) => {
                 error!("Failed to open file {:?}: {}", path, e);
                 Err(libc::EIO)
@@ -1762,14 +1764,15 @@ impl VirtualFs {
             if !self.overlay()
                 && let Some(sd) = self.staging.dir()
             {
-                // A freshly punched sparse hole occupies ~0 blocks despite its
-                // logical size, so charge actual disk usage — otherwise opening
-                // a small edit on a huge CAS file would charge its full logical
-                // size to the GC budget and evict other cached staging files,
-                // defeating the point of sparse writes. Materialized bytes are
-                // accounted lazily as reads fill holes (see fill_sparse_holes).
-                let accounted_new = if want_sparse { sd.disk_usage(ino) } else { new_size };
-                sd.resize_bytes(old_size, accounted_new);
+                // NOTE: a sparse hole is charged at its full logical size here,
+                // not its (near-zero) on-disk block count. That is conservative
+                // (a large sparse open can pressure the GC budget before its
+                // bytes materialize), but it keeps the accounting symmetric with
+                // try_remove / write / setattr, which all use the logical size:
+                // charging actual disk usage at only one of those sites skews
+                // the global bytes_used counter and breaks the budget. Making it
+                // truly block-based is a separate, whole-model change.
+                sd.resize_bytes(old_size, new_size);
             }
             // Flag the cache as current only when the staging actually mirrors
             // the remote. Cases included:
@@ -1961,8 +1964,9 @@ impl VirtualFs {
             _ => fe,
         };
         match (fe.is_dirty, &staging_path) {
-            // Advanced write in progress — read from local staging file.
-            (true, Some(path)) if path.exists() => self.open_local_readonly(ino, path),
+            // Advanced write in progress — read from local staging file (which
+            // may be a sparse staging file with CAS-fillable holes).
+            (true, Some(path)) if path.exists() => self.open_local_readonly(ino, path, true),
 
             // Dirty file but staging file is missing — should not happen.
             (true, Some(_)) => {
@@ -2030,7 +2034,8 @@ impl VirtualFs {
                             libc::EIO
                         })?;
                 }
-                self.open_local_readonly(ino, &dest)
+                // Complete HTTP-cached file (non-Xet), never a sparse hole.
+                self.open_local_readonly(ino, &dest, false)
             }
 
             // Empty file (size=0, no hash).
@@ -2304,15 +2309,10 @@ impl VirtualFs {
         // io_lock is held (no concurrent writer), but no await and no global
         // inode lock across these syscalls.
         let mut filled: Vec<(u64, u64)> = Vec::with_capacity(still_holes.len());
-        let mut cached_total: u64 = 0;
         for (file_off, src, len) in still_holes {
             match staging_file.write_at(&data[src..src + len], file_off) {
-                Ok(n) => {
-                    if n > 0 {
-                        filled.push((file_off, n as u64));
-                        cached_total += n as u64;
-                    }
-                }
+                Ok(n) if n > 0 => filled.push((file_off, n as u64)),
+                Ok(_) => {}
                 Err(e) => {
                     // Don't fail the read — buf is already correct; we just lose
                     // the staging cache for this range (e.g. a read-only fd).
@@ -2329,6 +2329,12 @@ impl VirtualFs {
         // Record the newly cached ranges as coverage (brief write lock, no
         // syscalls under it). Re-check the hash in case a commit re-keyed
         // sparse_write while we were writing.
+        //
+        // NOTE: the materialized bytes are not separately charged to the GC
+        // budget here — the staging file was already charged at its full
+        // logical size when the hole was punched (see open_advanced_write), so
+        // filling holes adds no new logical bytes. This keeps the accounting
+        // symmetric with try_remove.
         if !filled.is_empty() {
             let mut inodes = self.inode_table.write().expect("inodes poisoned");
             if let Some(entry) = inodes.get_mut(ino)
@@ -2340,14 +2346,6 @@ impl VirtualFs {
                     sw.track_read_fill(off, len);
                 }
             }
-        }
-
-        // Account the materialized bytes against the GC budget: the sparse hole
-        // was charged ~0 at open, and now occupies real blocks on disk.
-        if cached_total > 0
-            && let Some(sd) = self.staging.dir()
-        {
-            sd.resize_bytes(0, cached_total);
         }
 
         Ok(())
@@ -3097,7 +3095,9 @@ impl VirtualFs {
                             ino,
                             file: Arc::new(file),
                             writable: true,
-                            staging_backed: true,
+                            // A freshly created file has no CAS hash, so it never
+                            // carries a sparse_write — keep the read fast path.
+                            staging_backed: false,
                         },
                     );
 

@@ -1,4 +1,3 @@
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -364,6 +363,33 @@ mod range_upload_tests {
     fn no_change_yields_empty_plan() {
         assert!(plan_original_ranges(&[], 100, 100).is_empty());
     }
+
+    #[test]
+    fn multiple_snapshots_preserve_order_one_entry_each() {
+        // Two disjoint in-place overwrites on a 50-byte file: one plan entry
+        // per snapshot, in order, no truncate tail. This pins the by-index
+        // reader-pairing range_upload relies on (data entries before the tail).
+        assert_eq!(
+            plan_original_ranges(&[(0, 10), (30, 5)], 50, 50),
+            vec![(0..10, 10), (30..35, 5)]
+        );
+    }
+
+    #[test]
+    fn multiple_snapshots_with_past_eof_then_shrink() {
+        // An in-file overwrite plus a past-EOF insert, on a file that also
+        // shrinks below the original tail: 2 data entries (order preserved) +
+        // a synthetic truncate tail after the last dirty original_range.
+        // original=40, write [0,10) in place, write [50,55) past EOF, new=55.
+        assert_eq!(
+            plan_original_ranges(&[(0, 10), (50, 5)], 40, 55),
+            vec![(0..10, 10), (40..40, 5)]
+        );
+        // Same dirty inputs but the file shrinks to 35 (< original 40): the
+        // truncate tail drops [last_covered, original) where last_covered is
+        // the max original_range end across entries.
+        assert_eq!(plan_original_ranges(&[(0, 10)], 40, 35), vec![(0..10, 10), (35..40, 0)]);
+    }
 }
 
 // ── DownloadStreamWrapper ─────────────────────────────────────────────
@@ -441,18 +467,6 @@ impl StagingDir {
     /// Size of the on-disk staging file for `inode`, or 0 if it doesn't exist.
     pub fn file_size(&self, inode: u64) -> u64 {
         std::fs::metadata(self.path(inode)).map(|m| m.len()).unwrap_or(0)
-    }
-
-    /// Actual on-disk usage of the staging file for `inode` (allocated blocks ×
-    /// 512), or 0 if it doesn't exist. Unlike `file_size` (logical length),
-    /// this reflects what a sparse file truly occupies: a freshly punched hole
-    /// (`set_len` with no data written) reports ~0 here, so sparse opens charge
-    /// ~0 against the GC budget instead of the full logical size. Bytes are
-    /// then accounted as they materialize (CAS read-fill, writes).
-    pub fn disk_usage(&self, inode: u64) -> u64 {
-        std::fs::metadata(self.path(inode))
-            .map(|m| m.blocks() * 512)
-            .unwrap_or(0)
     }
 
     /// Remove the staging file for `inode`, ignoring NotFound.
