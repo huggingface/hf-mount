@@ -251,7 +251,11 @@ pub fn init_tracing(daemon: bool) {
     // Disable ANSI colors when daemonizing (output goes to a log file)
     // or when stderr is not a terminal.
     let ansi = !daemon && std::io::stderr().is_terminal();
-    tracing_subscriber::fmt().with_env_filter(filter).with_ansi(ansi).init();
+    if std::env::var("RUST_LOG_FORMAT").as_deref() == Ok("json") {
+        tracing_subscriber::fmt().json().with_env_filter(filter).init();
+    } else {
+        tracing_subscriber::fmt().with_env_filter(filter).with_ansi(ansi).init();
+    }
 
     // Tune xet-core for interactive FUSE reads (not batch downloads).
     for (k, v) in [
