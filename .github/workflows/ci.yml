@@ -23,7 +23,7 @@ jobs:
     runs-on:
       group: hf-mount-ci-pub
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Configure internal registries
         run: curl -sSL https://registries.huggingface.tech/setup.sh | bash
@@ -35,7 +35,7 @@ jobs:
           toolchain: nightly-2026-04-22
           components: rustfmt
 
-      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: dtolnay/rust-toolchain@1.100.0
         with:
           components: clippy
 
@@ -73,12 +73,12 @@ jobs:
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
       HF_ENDPOINT: https://huggingface.co
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Configure internal registries
         run: curl -sSL https://registries.huggingface.tech/setup.sh | bash
 
-      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: dtolnay/rust-toolchain@1.100.0
 
       - uses: Swatinem/rust-cache@v2
 
@@ -105,10 +105,10 @@ jobs:
     env:
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Configure internal registries
         run: curl -sSL https://registries.huggingface.tech/setup.sh | bash
-      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: dtolnay/rust-toolchain@1.100.0
       - uses: Swatinem/rust-cache@v2
       - name: Install system deps
         run: |
@@ -129,10 +129,10 @@ jobs:
     env:
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Configure internal registries
         run: curl -sSL https://registries.huggingface.tech/setup.sh | bash
-      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: dtolnay/rust-toolchain@1.100.0
       - uses: Swatinem/rust-cache@v2
       - name: Install system deps
         run: |
@@ -154,12 +154,12 @@ jobs:
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
       HF_ENDPOINT: https://huggingface.co
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Configure internal registries
         run: curl -sSL https://registries.huggingface.tech/setup.sh | bash
 
-      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: dtolnay/rust-toolchain@1.100.0
 
       - uses: Swatinem/rust-cache@v2
 
@@ -223,12 +223,12 @@ jobs:
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
       HF_ENDPOINT: https://huggingface.co
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Configure internal registries
         run: curl -sSL https://registries.huggingface.tech/setup.sh | bash
 
-      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: dtolnay/rust-toolchain@1.100.0
 
       - uses: Swatinem/rust-cache@v2
 
