@@ -258,15 +258,6 @@ impl SparseWriteState {
         let end = offset.saturating_add(len);
         subtract_ranges(offset, end, &self.coverage)
     }
-
-    /// True if `[0, size)` is fully covered (no holes). Used by callers
-    /// that want to skip the CAS fill entirely when staging is complete.
-    pub fn is_fully_covered(&self, size: u64) -> bool {
-        if size == 0 {
-            return true;
-        }
-        matches!(self.coverage.as_slice(), [(s, e)] if *s == 0 && *e >= size)
-    }
 }
 
 /// Merge `[new_start, new_end)` into a sorted, non-overlapping range vec.
@@ -2866,7 +2857,7 @@ mod tests {
     #[test]
     fn sparse_state_new_full_covers_everything() {
         let sw = SparseWriteState::new_full("h".into(), 1000);
-        assert!(sw.is_fully_covered(1000));
+        assert_eq!(sw.coverage, vec![(0, 1000)]);
         assert!(sw.holes_in(0, 1000).is_empty());
         assert!(sw.dirty_ranges.is_empty());
     }
@@ -2874,6 +2865,10 @@ mod tests {
     #[test]
     fn sparse_state_new_full_empty_size_is_covered() {
         let sw = SparseWriteState::new_full("h".into(), 0);
-        assert!(sw.is_fully_covered(0));
+        // An empty file has no coverage ranges and nothing dirty; reads are
+        // bounded by original_size == 0 so there is never a hole to fill.
+        assert!(sw.coverage.is_empty());
+        assert!(sw.dirty_ranges.is_empty());
+        assert!(sw.holes_in(0, 0).is_empty());
     }
 }

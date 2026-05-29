@@ -5620,3 +5620,58 @@ fn sparse_noop_flush_preserves_hash_and_cache() {
         assert_eq!(final_hash, "h1", "no-op flush must keep the original hash");
     });
 }
+
+/// Regression: O_TRUNC clears sparse_write but keeps xet_hash; a write then
+/// lands while sparse_write is None (so it tracks nothing); a reopen WITHOUT
+/// O_TRUNC (before the debounced flush) must NOT install an empty-coverage
+/// SparseWriteState over the dirty staging. If it did, reads would overlay the
+/// ORIGINAL CAS bytes over the user's write and the flush would no-op back to
+/// the original hash, silently losing the write entirely.
+#[test]
+fn sparse_otrunc_then_write_then_reopen_keeps_user_data() {
+    let hub = MockHub::new();
+    let content: Vec<u8> = (0u8..20).collect();
+    hub.add_file("file.bin", content.len() as u64, Some("h1"), None);
+    let xet = MockXet::new();
+    xet.add_file("h1", &content);
+    let (rt, vfs) = vfs_sparse(&hub, &xet);
+
+    rt.block_on(async {
+        let ino = vfs.lookup(ROOT_INODE, "file.bin").await.unwrap().ino;
+
+        // 1. open(O_TRUNC): logically empties the file, clears sparse_write,
+        //    but keeps xet_hash = "h1".
+        let fh1 = vfs.open(ino, true, true, None).await.unwrap();
+        // 2. write fresh bytes while sparse_write is None (untracked).
+        write_blocking(&vfs, ino, fh1, 0, b"NEWDATA").await.unwrap();
+
+        // 3. reopen WITHOUT O_TRUNC, before the flush fires (fh1 held open keeps
+        //    the inode dirty deterministically).
+        let fh2 = vfs.open(ino, true, false, None).await.unwrap();
+
+        // 4. a read through the reopened handle must return the user's bytes,
+        //    not the resurrected original CAS content.
+        let (data, _) = vfs.read(fh2, 0, 7).await.unwrap();
+        assert_eq!(
+            &data[..],
+            b"NEWDATA",
+            "reopen must not overlay original CAS bytes over the write"
+        );
+
+        vfs.release(fh2).await.unwrap();
+        vfs.release(fh1).await.unwrap();
+
+        // 5. the flush must commit the user's content, not no-op back to h1.
+        wait_for_clean(&vfs, ino).await;
+        let new_hash = {
+            let inodes = vfs.inode_table.read().unwrap();
+            inodes.get(ino).unwrap().xet_hash.clone().unwrap()
+        };
+        assert_ne!(new_hash, "h1", "flush must not preserve the original hash");
+        assert_eq!(
+            xet_content(&xet, &new_hash),
+            Some(b"NEWDATA".to_vec()),
+            "committed CAS content must be exactly the user's write"
+        );
+    });
+}

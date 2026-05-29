@@ -1,11 +1,11 @@
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::task::{Context, Poll};
 
 use bytes::Bytes;
-use tokio::io::{AsyncRead, ReadBuf};
+use tokio::io::AsyncRead;
 use tracing::info;
 use xet_client::cas_client::Client;
 use xet_client::cas_types::FileRange;
@@ -216,47 +216,35 @@ impl XetOps for XetSessions {
             return Ok(XetFileInfo::new(original_hash.to_string(), original_size));
         }
 
-        // Map each snapshotted range to a DirtyInput. `original_range` is the
-        // segment of the ORIGINAL file that this dirty input REPLACES — empty
-        // for inserts past EOF, partial for writes spanning EOF, full for
-        // overwrites within the original.
+        // Plan the `original_range` each dirty input REPLACES (empty for inserts
+        // past EOF, partial for writes spanning EOF, full for overwrites within
+        // the original), plus any synthetic truncate-tail delete. Pure and
+        // unit-tested in `plan_original_ranges` so the composition mapping has
+        // coverage independent of a live CAS (the mock XetOps bypasses it).
         let dirty_count = dirty_snapshots.len();
-        let mut dirty_inputs: Vec<DirtyInput> = Vec::with_capacity(dirty_snapshots.len() + 1);
-        for snap in dirty_snapshots {
-            let start = snap.offset;
-            let new_length = snap.data.len() as u64;
-            let end = start + new_length;
+        let meta: Vec<(u64, u64)> = dirty_snapshots
+            .iter()
+            .map(|s| (s.offset, s.data.len() as u64))
+            .collect();
+        let plan = plan_original_ranges(&meta, original_size, new_file_size);
 
-            let original_range = if end <= original_size {
-                start..end
-            } else if start >= original_size {
-                original_size..original_size
+        // Pair plan entries with their readers by index: the first `meta.len()`
+        // entries are data-bearing (one per snapshot, same order); a trailing
+        // entry (if any) is the synthetic truncate tail with an empty reader.
+        let mut snaps = dirty_snapshots.into_iter();
+        let mut dirty_inputs: Vec<DirtyInput> = Vec::with_capacity(plan.len());
+        for (idx, (original_range, new_length)) in plan.into_iter().enumerate() {
+            let reader: Pin<Box<dyn AsyncRead + Send>> = if idx < meta.len() {
+                let snap = snaps.next().expect("one snapshot per data plan entry");
+                Box::pin(std::io::Cursor::new(snap.data))
             } else {
-                start..original_size
+                Box::pin(tokio::io::empty())
             };
-
-            let reader: Pin<Box<dyn AsyncRead + Send>> = Box::pin(BytesReader::new(snap.data));
             dirty_inputs.push(DirtyInput {
                 original_range,
                 reader,
                 new_length,
             });
-        }
-
-        // Truncate-past-end: if the new file is shorter than the original AND
-        // the truncation point isn't already covered by a dirty input, append
-        // a synthetic empty input over the cut tail so upload_ranges drops
-        // those original bytes.
-        if new_file_size < original_size {
-            let last_covered = dirty_inputs.last().map(|d| d.original_range.end).unwrap_or(0);
-            let truncate_start = new_file_size.max(last_covered);
-            if truncate_start < original_size {
-                dirty_inputs.push(DirtyInput {
-                    original_range: truncate_start..original_size,
-                    reader: Box::pin(tokio::io::empty()),
-                    new_length: 0,
-                });
-            }
         }
 
         let result = xet_data::processing::upload_ranges(
@@ -281,34 +269,100 @@ impl XetOps for XetSessions {
     }
 }
 
-// ── BytesReader ──────────────────────────────────────────────────────
+// ── range_upload composition planning ────────────────────────────────
 
-/// `AsyncRead` over an in-memory `Bytes` buffer. Used by `range_upload` to
-/// feed pre-snapshotted dirty bytes into xet-core without re-reading from
-/// staging. Yields all data without ever returning `Pending` — there is no
-/// I/O to await.
-struct BytesReader {
-    data: Bytes,
-    position: usize,
-}
-
-impl BytesReader {
-    fn new(data: Bytes) -> Self {
-        Self { data, position: 0 }
+/// For each dirty snapshot `(offset, new_length)`, compute the `original_range`
+/// of the ORIGINAL file that the snapshot REPLACES, plus an optional synthetic
+/// truncate-tail delete when the new file is shorter than the original.
+///
+/// Returns one entry per snapshot (same order) followed by at most one extra
+/// `(range, 0)` truncate entry, so callers can pair the first `snapshots.len()`
+/// entries with their readers by index. Mapping rules per snapshot spanning
+/// `[start, start+new_length)`:
+/// - fully within the original (`end <= original_size`): replaces `start..end`;
+/// - fully past EOF (`start >= original_size`): inserts (replaces an empty
+///   `original_size..original_size`);
+/// - spanning EOF: replaces `start..original_size` and extends.
+///
+/// Pure function: the composition mapping is unit-tested here, independent of a
+/// live CAS (the mock `XetOps::range_upload` bypasses this logic entirely).
+fn plan_original_ranges(
+    snapshots: &[(u64, u64)],
+    original_size: u64,
+    new_file_size: u64,
+) -> Vec<(std::ops::Range<u64>, u64)> {
+    let mut plan: Vec<(std::ops::Range<u64>, u64)> = Vec::with_capacity(snapshots.len() + 1);
+    for &(start, new_length) in snapshots {
+        let end = start + new_length;
+        let original_range = if end <= original_size {
+            start..end
+        } else if start >= original_size {
+            original_size..original_size
+        } else {
+            start..original_size
+        };
+        plan.push((original_range, new_length));
     }
+
+    // Truncate-past-end: if the new file is shorter than the original AND the
+    // truncation point isn't already covered by a dirty input, append a
+    // synthetic empty input over the cut tail so upload_ranges drops those
+    // original bytes.
+    if new_file_size < original_size {
+        let last_covered = plan.last().map(|(r, _)| r.end).unwrap_or(0);
+        let truncate_start = new_file_size.max(last_covered);
+        if truncate_start < original_size {
+            plan.push((truncate_start..original_size, 0));
+        }
+    }
+    plan
 }
 
-impl AsyncRead for BytesReader {
-    fn poll_read(self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
-        let this = self.get_mut();
-        let remaining = this.data.len() - this.position;
-        if remaining == 0 {
-            return Poll::Ready(Ok(()));
-        }
-        let take = remaining.min(buf.remaining());
-        buf.put_slice(&this.data[this.position..this.position + take]);
-        this.position += take;
-        Poll::Ready(Ok(()))
+#[cfg(test)]
+mod range_upload_tests {
+    use super::plan_original_ranges;
+
+    #[test]
+    fn in_place_overwrite_maps_to_same_range() {
+        // Overwrite [10,20) of a 100-byte file: replaces exactly [10,20).
+        assert_eq!(plan_original_ranges(&[(10, 10)], 100, 100), vec![(10..20, 10)]);
+    }
+
+    #[test]
+    fn write_past_eof_is_an_insert() {
+        // Write 5 bytes at offset 30 of a 20-byte file: inserts past EOF.
+        assert_eq!(plan_original_ranges(&[(30, 5)], 20, 35), vec![(20..20, 5)]);
+    }
+
+    #[test]
+    fn write_spanning_eof_replaces_tail_and_extends() {
+        // Write [15,25) of a 20-byte file: replaces [15,20), extends to 25.
+        assert_eq!(plan_original_ranges(&[(15, 10)], 20, 25), vec![(15..20, 10)]);
+    }
+
+    #[test]
+    fn pure_shrink_appends_truncate_tail() {
+        // No dirty bytes, shrink 50 -> 20: one synthetic delete of [20,50).
+        assert_eq!(plan_original_ranges(&[], 50, 20), vec![(20..50, 0)]);
+    }
+
+    #[test]
+    fn shrink_with_dirty_prefix_truncates_after_last_dirty() {
+        // Overwrite [0,10) and shrink 50 -> 20: keep the overwrite, drop [20,50).
+        assert_eq!(plan_original_ranges(&[(0, 10)], 50, 20), vec![(0..10, 10), (20..50, 0)]);
+    }
+
+    #[test]
+    fn shrink_below_a_dirty_range_does_not_double_count_tail() {
+        // Dirty [0,30) but file shrinks to 25: the dirty input already covers
+        // past new_file_size, so truncate_start = max(25, 30) = 30 == nothing
+        // extra to drop beyond the dirty range's original_range end.
+        assert_eq!(plan_original_ranges(&[(0, 30)], 50, 25), vec![(0..30, 30), (30..50, 0)]);
+    }
+
+    #[test]
+    fn no_change_yields_empty_plan() {
+        assert!(plan_original_ranges(&[], 100, 100).is_empty());
     }
 }
 
@@ -387,6 +441,18 @@ impl StagingDir {
     /// Size of the on-disk staging file for `inode`, or 0 if it doesn't exist.
     pub fn file_size(&self, inode: u64) -> u64 {
         std::fs::metadata(self.path(inode)).map(|m| m.len()).unwrap_or(0)
+    }
+
+    /// Actual on-disk usage of the staging file for `inode` (allocated blocks ×
+    /// 512), or 0 if it doesn't exist. Unlike `file_size` (logical length),
+    /// this reflects what a sparse file truly occupies: a freshly punched hole
+    /// (`set_len` with no data written) reports ~0 here, so sparse opens charge
+    /// ~0 against the GC budget instead of the full logical size. Bytes are
+    /// then accounted as they materialize (CAS read-fill, writes).
+    pub fn disk_usage(&self, inode: u64) -> u64 {
+        std::fs::metadata(self.path(inode))
+            .map(|m| m.blocks() * 512)
+            .unwrap_or(0)
     }
 
     /// Remove the staging file for `inode`, ignoring NotFound.

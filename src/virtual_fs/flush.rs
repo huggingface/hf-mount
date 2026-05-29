@@ -304,19 +304,14 @@ fn snapshot_dirty_bytes(
     for &(start, end) in &sparse.dirty_ranges {
         let len = (end - start) as usize;
         let mut buf = vec![0u8; len];
-        let mut read_total = 0;
-        while read_total < len {
-            let n = file.read_at(&mut buf[read_total..], start + read_total as u64)?;
-            if n == 0 {
-                // Short read: the staging file is shorter than dirty_ranges
-                // claim. This can happen if setattr-shrink truncated under
-                // us and clip_to_size hasn't run yet; treat as EOF and pad
-                // with whatever zeros we read so far.
-                buf.truncate(read_total);
-                break;
-            }
-            read_total += n;
-        }
+        // The staging file MUST hold every byte the dirty range claims: the
+        // flush holds `staging.lock(ino)` across this snapshot (see flush_batch),
+        // and `setattr`-shrink takes the same lock before truncating, so it
+        // cannot shrink staging underneath us. A short read therefore signals a
+        // real invariant violation, not a benign race; surface it as an error
+        // (the dirty_generation guard makes the next flush retry) instead of
+        // silently composing a wrong-length file from a truncated buffer.
+        file.read_exact_at(&mut buf, start)?;
         snapshots.push(RangeSnapshot {
             offset: start,
             data: Bytes::from(buf),
