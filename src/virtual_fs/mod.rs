@@ -1603,11 +1603,14 @@ impl VirtualFs {
 
     /// Remove any on-disk staging file for `ino`. Safe to call for inodes that
     /// never had a staging file — NotFound is ignored. Keeps `StagingDir`'s
-    /// byte budget accurate via `try_remove`.
+    /// byte budget accurate via `try_remove`. Also drops the per-inode lock
+    /// map entries so long-running mounts don't accumulate dead Arc<Mutex>
+    /// entries for inodes that have been evicted.
     fn drop_staging(&self, ino: u64) {
         if let Some(sd) = self.staging.dir() {
             sd.try_remove(ino);
         }
+        self.staging.forget_locks(ino);
     }
 
     pub async fn readdir(&self, ino: u64) -> VirtualFsResult<Vec<VirtualFsDirEntry>> {

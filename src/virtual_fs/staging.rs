@@ -78,6 +78,25 @@ impl StagingCoordinator {
         let lock = self.lock(ino);
         let _guard = lock.lock().await;
         dir.try_remove(ino);
+        drop(_guard);
+        self.forget_locks(ino);
+    }
+
+    /// Drop the per-inode lock map entries for an inode that is permanently
+    /// gone (evicted via FUSE forget, unlinked, rename-replaced). Without
+    /// this, `locks` and `io_locks` grow monotonically — every inode ever
+    /// touched by read/write/setattr/flush installs a permanent entry, and
+    /// long-running mounts with high inode churn accumulate dead Arc<Mutex>
+    /// entries unbounded.
+    ///
+    /// Safe even if another task is mid-call holding the Arc<Mutex>: removal
+    /// from the HashMap only drops THIS reference; the other task continues
+    /// against its already-cloned Arc. A new caller after removal allocates
+    /// a fresh Arc<Mutex>, which is correct in practice because the inode is
+    /// gone — no legitimate caller should be operating on it anymore.
+    pub(crate) fn forget_locks(&self, ino: u64) {
+        self.locks.lock().expect("staging locks poisoned").remove(&ino);
+        self.io_locks.lock().expect("staging io_locks poisoned").remove(&ino);
     }
 
     /// Reclaim a single clean inode's staging file when usage exceeds the
