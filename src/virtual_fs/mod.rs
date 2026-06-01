@@ -1741,14 +1741,27 @@ impl VirtualFs {
                     .staging
                     .path(ino)
                     .expect("staging directory required for advanced writes");
-                let file = std::fs::File::create(&staging_path).map_err(|e| {
-                    error!("Failed to create sparse staging file: {}", e);
-                    libc::EIO
-                })?;
-                file.set_len(size).map_err(|e| {
-                    error!("Failed to set sparse staging file length: {}", e);
-                    libc::EIO
-                })?;
+                // Hold io_lock(ino) across File::create + set_len: File::create
+                // is O_TRUNC and shrinks the shared on-disk inode to 0 BEFORE
+                // set_len extends it back to `size`. A concurrent reader on
+                // the prior staging file (its Arc<File> still alive from a
+                // previous open) whose pread lands in that window would read
+                // 0 bytes and deliver a phantom EOF to FUSE. io_lock
+                // serializes us against any read()/setattr/fill_sparse_holes
+                // critical section that touches the staging file. Both
+                // syscalls are sync, so the lock is never held across await.
+                let io_lock = self.staging.io_lock(ino);
+                {
+                    let _io_guard = io_lock.lock().expect("staging io_lock poisoned");
+                    let file = std::fs::File::create(&staging_path).map_err(|e| {
+                        error!("Failed to create sparse staging file: {}", e);
+                        libc::EIO
+                    })?;
+                    file.set_len(size).map_err(|e| {
+                        error!("Failed to set sparse staging file length: {}", e);
+                        libc::EIO
+                    })?;
+                }
                 size
             } else if has_remote_xet {
                 // Non-sparse mode: download the full CAS object into staging.
