@@ -110,11 +110,12 @@ pub struct VfsConfig {
 ///   StreamingChannel.commit_hook (Mutex)
 ///     → pending_commits          (Mutex)
 ///
-/// `io_lock` is held by read() (pread + sparse snapshot), write() (pwrite +
-/// sparse track), setattr's size-change branch (set_len + entry.size update),
-/// and fill_sparse_holes' still_holes recheck + write_at. It serializes the
+/// `io_lock` is held by read() (sparse pread + sparse snapshot), write()
+/// (pwrite + entry.size update, plus sparse_write track when present),
+/// setattr's size-change branch (set_len + entry.size update), and
+/// fill_sparse_holes' still_holes recheck + write_at. It serializes the
 /// staging file's I/O against concurrent readers/writers/truncates so the
-/// sparse-coverage view stays consistent with the on-disk bytes.
+/// on-disk bytes, entry.size, and sparse-coverage view stay consistent.
 ///
 /// General discipline: locks are held briefly and never across await points
 /// (except the per-inode tokio::sync::Mutex from StagingCoordinator). Most
@@ -2606,9 +2607,10 @@ impl VirtualFs {
         match target {
             WriteTarget::Local { file, ino: handle_ino } => {
                 let file_descriptor = file.as_raw_fd();
-                // pwrite + sparse_write track under the per-inode io_lock so a
-                // concurrent reader's (pread + snapshot) pair sees a consistent
-                // view: either before this write or after, never half-applied.
+                // pwrite + entry.size update (and sparse_write track when
+                // present) under the per-inode io_lock so concurrent readers,
+                // writers, and setattr-shrinks see a consistent view: either
+                // before this write or after, never half-applied.
                 let n;
                 let new_end;
                 let written;
@@ -2620,9 +2622,10 @@ impl VirtualFs {
                     // a concurrent setattr-shrink can truncate the staging
                     // file between our pwrite and our entry.size update,
                     // leaving inode.size larger than the on-disk staging
-                    // length. The sparse read fast-path still skips io_lock
-                    // for its own pread (no shared state to protect), so
-                    // taking the lock here is harmless for it.
+                    // length. The non-sparse / non-staging read fast-path
+                    // (FileCache hit, HTTP cache) doesn't take io_lock, but
+                    // those reads never touch the staging file, so taking
+                    // the lock here is harmless for them.
                     let io_lock = self.staging.io_lock(handle_ino);
                     let _io_guard = io_lock.lock().expect("staging io_lock poisoned");
                     n = unsafe {
