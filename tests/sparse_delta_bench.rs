@@ -227,7 +227,20 @@ async fn run_bench(label: &str, extra_mount_args: &[&str]) {
     // start measuring per-step costs.
     std::thread::sleep(Duration::from_millis(1500));
     let seed_total = t_seed.elapsed();
-    eprintln!("  initial commit total: {:.2}s", seed_total.as_secs_f64());
+    let meta_after_seed = std::fs::metadata(&test_file).expect("stat after seed");
+    eprintln!(
+        "  initial commit total: {:.2}s; mount-side file size after seed: {} bytes (expected {})",
+        seed_total.as_secs_f64(),
+        meta_after_seed.len(),
+        file_size,
+    );
+    if meta_after_seed.len() != file_size {
+        eprintln!(
+            "  ! WARN: mount-side file size {} != bench-side written {}, divergence will propagate to sparse_write.original_size",
+            meta_after_seed.len(),
+            file_size,
+        );
+    }
 
     // Phase 2: N delta-equivalent steps
     let mut rng = Rng::new(0xDEAD_BEEF_C0FFEE);

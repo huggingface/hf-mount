@@ -435,6 +435,12 @@ async fn flush_batch(
                 continue;
             }
         };
+        let snap_count = snapshots.len();
+        let snap_bytes: u64 = snapshots.iter().map(|s| s.data.len() as u64).sum();
+        debug!(
+            "sparse flush: ino={} range_upload original_hash={} original_size={} new_file_size={} snapshots={} snap_bytes={}",
+            item.ino, sw.original_hash, sw.original_size, item.file_size, snap_count, snap_bytes
+        );
         match xet_sessions
             .range_upload(&sw.original_hash, sw.original_size, item.file_size, snapshots)
             .await
@@ -442,8 +448,9 @@ async fn flush_batch(
             Ok(info) => upload_results[idx] = Some(info),
             Err(e) => {
                 error!(
-                    "sparse flush: range_upload failed for ino={} path={}: {}",
-                    item.ino, item.full_path, e
+                    "sparse flush: range_upload failed for ino={} path={}: {} (sw.original_hash={} sw.original_size={} item.file_size={} snapshots={} snap_bytes={})",
+                    item.ino, item.full_path, e,
+                    sw.original_hash, sw.original_size, item.file_size, snap_count, snap_bytes,
                 );
                 flush_errors
                     .lock()
