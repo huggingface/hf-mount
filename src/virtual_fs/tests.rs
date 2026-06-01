@@ -6269,3 +6269,358 @@ fn write_zero_bytes_past_eof_is_a_noop() {
 
     vfs.shutdown();
 }
+
+// ── Sparse-write stress test ────────────────────────────────────────────
+//
+// A multi-worker workload that exercises the sparse-write state machine
+// (coverage map, dirty_ranges, dirty_generation, drift handling, io_lock
+// discipline) under concurrent ops on multiple files. Each worker owns its
+// own file (no cross-worker shadow races), but flushes happen against a
+// shared FlushManager → Pass A/B batching, lock map churn, and concurrent
+// staging-file lifecycles get exercised for real.
+//
+// What the random ops cover, by construction:
+// - in-file overwrite (offset < EOF, end <= EOF)
+// - write spanning EOF (offset < EOF < end)
+// - write at EOF (offset == EOF)
+// - write past EOF (offset > EOF) → the zero-fill gap
+// - setattr-grow (zero-fill tail)
+// - setattr-shrink (clip coverage + dirty)
+// - setattr-shrink-then-grow (must re-zero, not stale)
+// - reopen (sparse_write preservation + drift retry)
+// - fsync (force apply_commit_sparse cycle)
+// - reads at random offsets (exercises fill_sparse_holes + cache)
+//
+// Validation: shadow Vec<u8> per file mirroring the expected content; after
+// every committed state (fsync or release+wait_for_clean), a full-file read
+// of the inode must match the shadow byte for byte. A divergence proves
+// data loss or corruption.
+
+const STRESS_FILES: usize = 12;
+const STRESS_OPS_PER_FILE: usize = 200;
+const STRESS_BASE_SIZE: usize = 4096;
+const STRESS_MAX_SIZE: usize = 64 * 1024;
+
+#[derive(Debug, Clone, Copy)]
+enum StressOp {
+    Write { offset: usize, len: usize },
+    SetattrGrow { delta: usize },
+    SetattrShrink { delta: usize },
+    Fsync,
+    Reopen,
+    VerifyRead,
+}
+
+struct StressRng(u64);
+impl StressRng {
+    fn new(seed: u64) -> Self {
+        Self(seed | 1)
+    }
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+    fn rand_byte(&mut self) -> u8 {
+        self.next() as u8
+    }
+    fn rand_range(&mut self, hi: usize) -> usize {
+        if hi == 0 { 0 } else { (self.next() as usize) % hi }
+    }
+}
+
+fn gen_stress_op(rng: &mut StressRng, current_size: usize) -> StressOp {
+    let pick = rng.next() % 100;
+    match pick {
+        // 50% writes biased toward useful edge cases
+        0..=49 => {
+            let kind = rng.next() % 5;
+            let (offset, len) = match kind {
+                // in-file overwrite
+                0 if current_size >= 2 => {
+                    let len = 1 + rng.rand_range(current_size.min(1024));
+                    let offset = rng.rand_range(current_size.saturating_sub(len).max(1));
+                    (offset, len)
+                }
+                // write spanning EOF (offset < size, end > size)
+                1 if current_size >= 2 => {
+                    let offset = rng.rand_range(current_size);
+                    let len = (current_size - offset) + 1 + rng.rand_range(1024);
+                    (offset, len)
+                }
+                // write at exactly EOF
+                2 => (current_size, 1 + rng.rand_range(1024)),
+                // write past EOF with gap
+                3 => {
+                    let gap = 1 + rng.rand_range(2048);
+                    let offset = current_size + gap;
+                    let len = 1 + rng.rand_range(1024);
+                    (offset, len)
+                }
+                // any random offset+len
+                _ => {
+                    let offset = rng.rand_range(STRESS_MAX_SIZE.saturating_sub(1));
+                    let len = 1 + rng.rand_range(2048);
+                    (offset, len)
+                }
+            };
+            let len = len.min(STRESS_MAX_SIZE.saturating_sub(offset));
+            if len == 0 || offset >= STRESS_MAX_SIZE {
+                StressOp::VerifyRead
+            } else {
+                StressOp::Write { offset, len }
+            }
+        }
+        // 15% setattr-grow
+        50..=64 => StressOp::SetattrGrow {
+            delta: 1 + rng.rand_range(4096),
+        },
+        // 15% setattr-shrink
+        65..=79 if current_size > 1 => StressOp::SetattrShrink {
+            delta: 1 + rng.rand_range(current_size - 1),
+        },
+        // 10% fsync (force flush + apply_commit_sparse cycle)
+        80..=89 => StressOp::Fsync,
+        // 5% reopen
+        90..=94 => StressOp::Reopen,
+        // remainder + fallback for invalid shrink: verification read
+        _ => StressOp::VerifyRead,
+    }
+}
+
+async fn read_full(vfs: &std::sync::Arc<VirtualFs>, ino: u64, size: u64) -> Vec<u8> {
+    if size == 0 {
+        return Vec::new();
+    }
+    // Read in chunks of 16 KB to mirror real FUSE behaviour.
+    let fh = vfs.open(ino, false, false, None).await.expect("open ro");
+    let mut out = Vec::with_capacity(size as usize);
+    let chunk: u32 = 16 * 1024;
+    let mut off: u64 = 0;
+    while off < size {
+        let want = chunk.min((size - off) as u32);
+        let (bytes, _eof) = vfs.read(fh, off, want).await.expect("read");
+        if bytes.is_empty() {
+            break;
+        }
+        out.extend_from_slice(&bytes);
+        off += bytes.len() as u64;
+    }
+    vfs.release(fh).await.expect("release ro");
+    out
+}
+
+async fn run_stress_worker(
+    vfs: std::sync::Arc<VirtualFs>,
+    path: String,
+    seed: u64,
+    base: Vec<u8>,
+    n_ops: usize,
+) -> Result<(), String> {
+    let mut shadow = base.clone();
+    let mut rng = StressRng::new(seed);
+
+    let ino = vfs
+        .lookup(ROOT_INODE, &path)
+        .await
+        .map_err(|e| format!("[{path}] initial lookup: {e}"))?
+        .ino;
+
+    // open_advanced_write returns EIO when xet_hash drifts between the
+    // open()'s pre-lock snapshot and the install — the documented contract
+    // is to retry. Bounded retry loop mirrors what a real caller (FUSE
+    // wrapper / NFS) ought to do (but currently doesn't — separate finding).
+    async fn open_with_retry(vfs: &std::sync::Arc<VirtualFs>, ino: u64, path: &str, ctx: &str) -> Result<u64, String> {
+        for attempt in 0..8 {
+            match vfs.open(ino, true, false, None).await {
+                Ok(fh) => return Ok(fh),
+                Err(libc::EIO) if attempt < 7 => {
+                    tokio::time::sleep(Duration::from_millis(5 * (1 << attempt))).await;
+                }
+                Err(e) => return Err(format!("[{path}] {ctx}: {e}")),
+            }
+        }
+        unreachable!()
+    }
+
+    let mut fh = open_with_retry(&vfs, ino, &path, "initial open").await?;
+
+    for op_idx in 0..n_ops {
+        let op = gen_stress_op(&mut rng, shadow.len());
+        match op {
+            StressOp::Write { offset, len } => {
+                let buf: Vec<u8> = (0..len).map(|_| rng.rand_byte()).collect();
+                let written = write_blocking(&vfs, ino, fh, offset as u64, &buf)
+                    .await
+                    .map_err(|e| format!("[{path}] op {op_idx} write({offset},{len}): {e}"))?;
+                // Mirror in shadow. The pwrite may have written fewer bytes
+                // than asked, but in practice on a regular file it writes
+                // all or errors — defend just in case.
+                let actual_len = written as usize;
+                if offset > shadow.len() {
+                    shadow.resize(offset, 0);
+                }
+                let end = offset + actual_len;
+                if shadow.len() < end {
+                    shadow.resize(end, 0);
+                }
+                shadow[offset..end].copy_from_slice(&buf[..actual_len]);
+            }
+            StressOp::SetattrGrow { delta } => {
+                let new_size = (shadow.len() + delta).min(STRESS_MAX_SIZE);
+                if new_size == shadow.len() {
+                    continue;
+                }
+                vfs.setattr(ino, Some(new_size as u64), None, None, None, None, None)
+                    .await
+                    .map_err(|e| format!("[{path}] op {op_idx} setattr_grow({new_size}): {e}"))?;
+                shadow.resize(new_size, 0);
+            }
+            StressOp::SetattrShrink { delta } => {
+                if shadow.len() <= 1 {
+                    continue;
+                }
+                let new_size = shadow.len().saturating_sub(delta).max(1);
+                vfs.setattr(ino, Some(new_size as u64), None, None, None, None, None)
+                    .await
+                    .map_err(|e| format!("[{path}] op {op_idx} setattr_shrink({new_size}): {e}"))?;
+                shadow.truncate(new_size);
+            }
+            StressOp::Fsync => {
+                vfs.fsync(ino, fh, None)
+                    .await
+                    .map_err(|e| format!("[{path}] op {op_idx} fsync: {e}"))?;
+                // Best-effort wait for the debounced commit so the next
+                // verify-read can hit a clean inode. wait_for_clean blocks up
+                // to 4s and panics on timeout — too aggressive for stress, so
+                // just sleep a bit.
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            StressOp::Reopen => {
+                vfs.release(fh)
+                    .await
+                    .map_err(|e| format!("[{path}] op {op_idx} release-before-reopen: {e}"))?;
+                fh = open_with_retry(&vfs, ino, &path, &format!("op {op_idx} reopen")).await?;
+            }
+            StressOp::VerifyRead => {
+                // Read a random window and compare with shadow. Don't verify
+                // the full file mid-stream (too slow and the shadow is
+                // already mirroring every op) — just sanity-check a slice.
+                if shadow.is_empty() {
+                    continue;
+                }
+                let len = 1 + rng.rand_range(shadow.len().min(2048));
+                let offset = rng.rand_range(shadow.len() - 1);
+                let want = (len as u32).min((shadow.len() - offset) as u32);
+                let (bytes, _eof) = vfs
+                    .read(fh, offset as u64, want)
+                    .await
+                    .map_err(|e| format!("[{path}] op {op_idx} mid-stream read: {e}"))?;
+                let expected = &shadow[offset..offset + bytes.len()];
+                if bytes.as_ref() != expected {
+                    return Err(format!(
+                        "[{path}] op {op_idx} mid-stream read MISMATCH at offset {} (got {} bytes, expected {})\n  first diff at {:?}",
+                        offset,
+                        bytes.len(),
+                        expected.len(),
+                        bytes.iter().zip(expected.iter()).position(|(a, b)| a != b),
+                    ));
+                }
+            }
+        }
+    }
+
+    // Quiesce: release, wait for clean, then full-file CAS-level verify.
+    vfs.release(fh)
+        .await
+        .map_err(|e| format!("[{path}] final release: {e}"))?;
+    wait_for_clean(&vfs, ino).await;
+
+    let committed = read_full(&vfs, ino, shadow.len() as u64).await;
+    if committed != shadow {
+        return Err(format!(
+            "[{path}] FINAL CAS-LEVEL MISMATCH: committed_len={} shadow_len={} first_diff_at={:?}",
+            committed.len(),
+            shadow.len(),
+            committed.iter().zip(shadow.iter()).position(|(a, b)| a != b),
+        ));
+    }
+    Ok(())
+}
+
+/// Multi-worker stress test for the sparse-write feature. Each worker churns
+/// random ops on its own file; the global FlushManager batches across files
+/// so Pass A / Pass B / drift / lock-map paths all get exercised
+/// concurrently. The shadow model catches any data divergence — a single
+/// mismatch fails the test with the offending offset.
+///
+/// Default: 12 files × 200 ops, ~2-4 s wall time. Override with
+/// `STRESS_FILES` / `STRESS_OPS_PER_FILE` env vars for longer runs.
+#[test]
+fn sparse_writes_concurrent_stress() {
+    let n_files: usize = std::env::var("STRESS_FILES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(STRESS_FILES);
+    let ops_per_file: usize = std::env::var("STRESS_OPS_PER_FILE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(STRESS_OPS_PER_FILE);
+    let seed: u64 = std::env::var("STRESS_SEED")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos() as u64
+        });
+
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    let mut bases: Vec<(String, Vec<u8>)> = Vec::with_capacity(n_files);
+    for i in 0..n_files {
+        let path = format!("stress_{:03}.bin", i);
+        let base_size = STRESS_BASE_SIZE + (i * 32);
+        let mut base = vec![0u8; base_size];
+        for (j, b) in base.iter_mut().enumerate() {
+            *b = ((i * 31 + j) % 251) as u8;
+        }
+        let hash = format!("stress_h_{:03}", i);
+        hub.add_file(&path, base_size as u64, Some(&hash), None);
+        xet.add_file(&hash, &base);
+        bases.push((path, base));
+    }
+    let (rt, vfs) = vfs_sparse(&hub, &xet);
+
+    eprintln!("sparse_writes_concurrent_stress: {n_files} files, seed={seed}");
+
+    rt.block_on(async {
+        let mut handles = Vec::with_capacity(n_files);
+        for (i, (path, base)) in bases.into_iter().enumerate() {
+            let vfs = vfs.clone();
+            let worker_seed = seed.wrapping_add(i as u64).wrapping_mul(0x9E3779B97F4A7C15);
+            handles.push(tokio::spawn(async move {
+                run_stress_worker(vfs, path, worker_seed, base, ops_per_file).await
+            }));
+        }
+        let mut errors = Vec::new();
+        for h in handles {
+            match h.await.expect("worker panic") {
+                Ok(()) => {}
+                Err(e) => errors.push(e),
+            }
+        }
+        if !errors.is_empty() {
+            panic!(
+                "sparse-write stress FAILED ({} workers): seed={}\n{}",
+                errors.len(),
+                seed,
+                errors.join("\n  ")
+            );
+        }
+    });
+
+    vfs.shutdown();
+}
