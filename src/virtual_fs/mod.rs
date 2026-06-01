@@ -2295,14 +2295,15 @@ impl VirtualFs {
         let _io_guard = io_lock.lock().expect("staging io_lock poisoned");
 
         // Still-hole sub-ranges as (file_offset, offset_into_data, len).
-        // Clamp every hole to the LIVE inode size: a concurrent setattr-shrink
-        // (which takes staging.lock + inode_table.write(), not io_lock) may
-        // have clipped entry.size below the snapshot's original_size between
-        // pread and here. Without the clamp, write_at past the new EOF
-        // re-extends the staging file with stale CAS bytes and records
-        // coverage there — a subsequent setattr-grow would expose those
-        // bytes instead of the POSIX-mandated zeros, and a future read at
-        // offsets past entry.size could observe non-zero stale content.
+        // Clamp every hole to the LIVE inode size: setattr's size branch now
+        // takes io_lock around its set_len + entry.size update, so a shrink
+        // cannot interleave with this critical section. But the SNAPSHOT
+        // (taken under io_lock earlier in read()) may have been captured
+        // before a shrink that completed during the CAS stream await window,
+        // so we still need to re-read entry.size here and clip to it before
+        // caching. Without the clamp a write_at past the new EOF would
+        // re-extend staging with stale CAS bytes and a setattr-grow back
+        // through the region would expose them instead of POSIX zeros.
         let still_holes: Vec<(u64, usize, usize)> = {
             let inodes = self.inode_table.read().expect("inodes poisoned");
             let Some(entry) = inodes.get(ino) else {
@@ -2612,14 +2613,18 @@ impl VirtualFs {
                 let new_end;
                 let written;
                 {
-                    // The io_lock only serializes pwrite + sparse track_write
-                    // against a sparse reader's (pread + coverage snapshot) pair.
-                    // On a non-sparse mount no reader takes it (see the read
-                    // fast-path), so skip it here too and keep the write path
-                    // lock-free; the inode write lock still guards the size/dirty
-                    // update.
-                    let io_lock = self.sparse_writes.then(|| self.staging.io_lock(handle_ino));
-                    let _io_guard = io_lock.as_ref().map(|l| l.lock().expect("staging io_lock poisoned"));
+                    // io_lock serializes this pwrite + entry.size update
+                    // against (a) sparse readers' pread + coverage snapshot
+                    // pair, and (b) setattr's set_len + entry.size update.
+                    // Without io_lock on the non-sparse advanced-writes path,
+                    // a concurrent setattr-shrink can truncate the staging
+                    // file between our pwrite and our entry.size update,
+                    // leaving inode.size larger than the on-disk staging
+                    // length. The sparse read fast-path still skips io_lock
+                    // for its own pread (no shared state to protect), so
+                    // taking the lock here is harmless for it.
+                    let io_lock = self.staging.io_lock(handle_ino);
+                    let _io_guard = io_lock.lock().expect("staging io_lock poisoned");
                     n = unsafe {
                         libc::pwrite(
                             file_descriptor,
