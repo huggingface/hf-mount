@@ -4042,14 +4042,23 @@ impl VirtualFs {
                 // CAS base to key against. Returning EIO after we've already
                 // bumped entry.size/mtime/set_dirty would leave the inode
                 // dirty with no sparse_write and no scheduled flush. Surface
-                // the race here so the caller retries against the rotated
-                // state; the punched staging file is harmlessly replaced on
-                // the next open.
+                // the race so the caller retries against the rotated state.
+                //
+                // Drop the punched staging file before returning: it was
+                // created just above (lines 3977-3991) at the sparse-install
+                // size, and leaving it behind makes local_backing_exists true
+                // for the next setattr — which would skip want_sparse_install
+                // and full-upload the stale placeholder if the inode rotates
+                // back to xet-backed. The budget was not charged yet (the
+                // resize_bytes happens below this point).
                 if want_sparse_install && cur_hash.is_none() {
                     debug!(
                         "setattr: ino={} rotated to non-xet between snapshot and install, retrying",
                         ino
                     );
+                    if let Some(sd) = self.staging.dir() {
+                        sd.try_remove(ino);
+                    }
                     return Err(libc::EIO);
                 }
                 // Skip set_len for the sparse-install path: the staging file
