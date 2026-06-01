@@ -408,7 +408,13 @@ async fn flush_batch(
     const UPLOAD_CHUNK_SIZE: usize = 500;
     let mut upload_results: Vec<Option<XetFileInfo>> = vec![None; to_flush.len()];
 
-    // Pass A: per-item range_upload for sparse items.
+    // Pass A: per-item range_upload for sparse items. A failure on one sparse
+    // item is recorded per-inode and the loop continues — independent sparse
+    // items are not head-of-line-blocked by a sibling's sticky failure (e.g. a
+    // deterministic CAS rejection on one item starving the rest of the batch).
+    // The failing item leaves its slot in `upload_results` as None: downstream
+    // commit-apply skips it, clear_dirty_if is never invoked, the next flush
+    // retries it.
     for (idx, item) in to_flush.iter().enumerate() {
         let Some(sw) = item.sparse_snapshot.as_ref() else {
             continue;
@@ -427,7 +433,7 @@ async fn flush_batch(
                     .lock()
                     .expect("flush_errors poisoned")
                     .insert(item.ino, format!("snapshot failed: {e}"));
-                return;
+                continue;
             }
         };
         match xet_sessions
@@ -440,12 +446,10 @@ async fn flush_batch(
                     "sparse flush: range_upload failed for ino={} path={}: {}",
                     item.ino, item.full_path, e
                 );
-                let msg = format!("range_upload failed: {e}");
-                let mut errs = flush_errors.lock().expect("flush_errors poisoned");
-                for item in &to_flush {
-                    errs.insert(item.ino, msg.clone());
-                }
-                return;
+                flush_errors
+                    .lock()
+                    .expect("flush_errors poisoned")
+                    .insert(item.ino, format!("range_upload failed: {e}"));
             }
         }
     }
@@ -476,27 +480,22 @@ async fn flush_batch(
                 error!("Batch upload failed, aborting flush: {}", e);
                 let msg = format!("upload failed: {e}");
                 let mut errs = flush_errors.lock().expect("flush_errors poisoned");
-                for item in &to_flush {
-                    errs.insert(item.ino, msg.clone());
+                // Only mark items that went through this upload_files batch —
+                // sparse items in Pass A and items in other regular chunks
+                // either already errored or are independently in flight.
+                for &i in chunk {
+                    errs.insert(to_flush[i].ino, msg.clone());
                 }
                 return;
             }
         }
     }
 
-    // Bail if a slot stayed unfilled — would indicate a logic bug in the
-    // partition above. Don't proceed with potentially-misaligned indices.
-    if upload_results.iter().any(|r| r.is_none()) {
-        error!("flush_batch: internal error: not all items uploaded");
-        return;
-    }
-    let upload_results: Vec<XetFileInfo> = upload_results.into_iter().map(|r| r.expect("checked above")).collect();
-
     // Uploads are done — drop the staging locks so unlink/truncate and the
     // gc() calls below (which acquire the same per-inode locks) can proceed.
     drop(_staging_guards);
 
-    if upload_results.is_empty() {
+    if upload_results.iter().all(|r| r.is_none()) {
         return;
     }
 
@@ -510,7 +509,12 @@ async fn flush_batch(
     let mut delete_ops = Vec::new();
     let mut unchanged = vec![false; to_flush.len()];
 
-    for (i, (item, file_info)) in to_flush.iter().zip(upload_results.iter()).enumerate() {
+    for (i, (item, file_info_opt)) in to_flush.iter().zip(upload_results.iter()).enumerate() {
+        // Skip items whose upload failed in Pass A (sparse range_upload error).
+        // They stay dirty and are retried on the next flush.
+        let Some(file_info) = file_info_opt else {
+            continue;
+        };
         if item.pending_deletes.is_empty() && item.prev_xet_hash.as_deref() == Some(file_info.hash()) {
             debug!(
                 "flush_batch: unchanged ino={} path={} (hash {})",
@@ -579,7 +583,10 @@ async fn flush_batch(
 
     {
         let mut inode_table = inodes.write().expect("inodes poisoned");
-        for (i, (item, file_info)) in to_flush.iter().zip(upload_results.iter()).enumerate() {
+        for (i, (item, file_info_opt)) in to_flush.iter().zip(upload_results.iter()).enumerate() {
+            let Some(file_info) = file_info_opt else {
+                continue; // Pass A failure — leave dirty for retry.
+            };
             if !unchanged[i]
                 && let Some(entry) = inode_table.get_mut(item.ino)
             {

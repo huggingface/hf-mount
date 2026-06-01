@@ -4075,12 +4075,29 @@ impl VirtualFs {
                         entry.xet_hash = None;
                         entry.sparse_write = None;
                     } else if want_sparse_install {
-                        // Install a fresh sparse_write keyed to the current
-                        // hash; track the size change so range_upload composes
-                        // the new tail (extension) or drops the cut tail
-                        // (shrink) at flush time. The staging hole punched above
-                        // is content-free, so any base revision is valid.
-                        let hash = cur_hash.or(prev_hash).expect("guard checked xet_hash is_some");
+                        // Install a fresh sparse_write keyed to the CURRENT
+                        // hash + size; track the size change so range_upload
+                        // composes the new tail (extension) or drops the cut
+                        // tail (shrink) at flush time. The staging hole punched
+                        // above is content-free, so any base revision is valid.
+                        //
+                        // If poll rotated the inode to a non-xet revision
+                        // between the pre-lock snapshot and here (cur_hash is
+                        // None), there is no CAS base for range_upload to
+                        // compose against — falling back to prev_hash would
+                        // key the state to a hash whose CAS size != cur_size,
+                        // and range_upload would feed plan_original_ranges
+                        // mismatched (hash, size) → malformed commit. Surface
+                        // as EIO so the caller retries against the rotated
+                        // (now non-xet) state; the punched staging file is
+                        // harmlessly replaced on the next open.
+                        let Some(hash) = cur_hash else {
+                            debug!(
+                                "setattr: ino={} rotated to non-xet between snapshot and install, retrying",
+                                ino
+                            );
+                            return Err(libc::EIO);
+                        };
                         let mut sw = inode::SparseWriteState::new(hash, cur_size);
                         sw.resize_to(cur_size, new_size);
                         entry.sparse_write = Some(Arc::new(sw));

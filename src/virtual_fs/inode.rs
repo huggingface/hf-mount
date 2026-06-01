@@ -442,15 +442,25 @@ impl InodeEntry {
 
     /// Apply a no-op commit (range_upload returned the original hash
     /// unchanged, or the flush detected nothing to do). Clears dirty +
-    /// pending_deletes if the generation matches, but leaves `sparse_write`
-    /// and `staging_is_current` untouched: staging hasn't changed, so the
-    /// coverage cache is still valid for the unchanged hash.
+    /// pending_deletes if the generation matches. `sparse_write` keeps its
+    /// coverage (the unchanged hash means staging still matches at covered
+    /// offsets) but dirty_ranges are cleared since they were just rehashed
+    /// back to the original.
+    ///
+    /// `staging_is_current` is promoted to true ONLY when sparse_write is
+    /// None: on the non-sparse path the upload hashed the whole staging
+    /// file and returned the same hash, so staging IS the committed content
+    /// — a valid cache for the next open. On the sparse path, staging is
+    /// still a partial mirror (covered + dirty bytes match, holes do not),
+    /// so the flag must stay false.
     pub fn apply_noop_commit(&mut self, dirty_generation: u64) {
         if self.clear_dirty_if(dirty_generation) {
             self.pending_deletes.clear();
             if let Some(sw) = self.sparse_write.as_mut() {
                 let sw = Arc::make_mut(sw);
                 sw.dirty_ranges.clear();
+            } else {
+                self.staging_is_current = true;
             }
         }
         self.touch_commit_clocks();
@@ -1342,6 +1352,72 @@ mod tests {
         );
         assert_eq!(entry.size, 100, "size should not be clobbered by stale flush");
         assert_eq!(entry.pending_deletes.len(), 1, "pending_deletes should be preserved");
+    }
+
+    /// Non-sparse no-op flush (upload_files rehashed staging back to the
+    /// previous hash): staging IS the committed content, so the cache flag must
+    /// flip to true — otherwise the next open discards the staging and forces a
+    /// full re-download even though it matches the committed bytes.
+    #[test]
+    fn apply_noop_commit_promotes_staging_is_current_when_non_sparse() {
+        let mut table = InodeTable::new(false);
+        let ino = table.insert(
+            ROOT_INODE,
+            "test".to_string(),
+            "test".to_string(),
+            InodeKind::File,
+            10,
+            UNIX_EPOCH,
+            Some("h1".to_string()),
+            0o644,
+            0,
+            0,
+        );
+        let entry = table.get_mut(ino).unwrap();
+        entry.set_dirty();
+        entry.staging_is_current = false;
+        let snap = entry.dirty_generation;
+
+        entry.apply_noop_commit(snap);
+
+        assert!(!entry.is_dirty(), "noop must clear dirty");
+        assert!(
+            entry.staging_is_current,
+            "non-sparse noop: staging matches the committed hash, flag must be true"
+        );
+    }
+
+    /// Sparse no-op flush: staging is still a partial mirror (covered + dirty
+    /// match the hash, holes do not), so the cache flag must stay false even
+    /// though the hash is unchanged.
+    #[test]
+    fn apply_noop_commit_keeps_staging_is_current_false_when_sparse() {
+        let mut table = InodeTable::new(false);
+        let ino = table.insert(
+            ROOT_INODE,
+            "test".to_string(),
+            "test".to_string(),
+            InodeKind::File,
+            10,
+            UNIX_EPOCH,
+            Some("h1".to_string()),
+            0o644,
+            0,
+            0,
+        );
+        let entry = table.get_mut(ino).unwrap();
+        entry.set_dirty();
+        entry.staging_is_current = false;
+        entry.sparse_write = Some(Arc::new(SparseWriteState::new("h1".to_string(), 10)));
+        let snap = entry.dirty_generation;
+
+        entry.apply_noop_commit(snap);
+
+        assert!(!entry.is_dirty(), "noop must clear dirty");
+        assert!(
+            !entry.staging_is_current,
+            "sparse noop: staging has unmaterialized holes, flag must remain false"
+        );
     }
 
     #[test]
