@@ -282,6 +282,10 @@ pub struct MockXet {
     pub next_hash: AtomicU64,
     writer_create_fail: AtomicBool,
     upload_fail: AtomicBool,
+    /// Force only the next `upload_files` (Pass B) call to fail, without
+    /// affecting `range_upload` (Pass A). Used to assert that a Pass B
+    /// failure doesn't pollute Pass A successes in the same flush batch.
+    upload_files_fail: AtomicBool,
     download_fail: AtomicBool,
     writer_fail_after: AtomicU64,
     /// Number of range download calls that should fail before succeeding.
@@ -313,6 +317,7 @@ impl MockXet {
             next_hash: AtomicU64::new(1),
             writer_create_fail: AtomicBool::new(false),
             upload_fail: AtomicBool::new(false),
+            upload_files_fail: AtomicBool::new(false),
             download_fail: AtomicBool::new(false),
             writer_fail_after: AtomicU64::new(u64::MAX),
             range_fail_count: AtomicU32::new(0),
@@ -346,6 +351,14 @@ impl MockXet {
 
     pub fn fail_upload(&self) {
         self.upload_fail.store(true, Ordering::SeqCst);
+    }
+
+    /// Force ONLY the next `upload_files` (batched Pass B) call to fail.
+    /// `range_upload` (Pass A) is unaffected. Used to verify that a Pass B
+    /// abort doesn't misattribute its error to sparse items that already
+    /// succeeded in Pass A.
+    pub fn fail_next_upload_files(&self) {
+        self.upload_files_fail.store(true, Ordering::SeqCst);
     }
 
     pub fn fail_writer_after(&self, bytes: u64) {
@@ -407,7 +420,7 @@ impl XetOps for MockXet {
             gate.release.notified().await;
             self.uploads_inflight.fetch_sub(1, Ordering::SeqCst);
         }
-        if self.upload_fail.swap(false, Ordering::SeqCst) {
+        if self.upload_fail.swap(false, Ordering::SeqCst) || self.upload_files_fail.swap(false, Ordering::SeqCst) {
             return Err(Error::Xet("mock upload failure".into()));
         }
         let mut results = Vec::new();

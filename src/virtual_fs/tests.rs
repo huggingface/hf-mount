@@ -6228,3 +6228,185 @@ fn sparse_setattr_after_drift_to_larger_non_xet_tracks_gap() {
         assert_eq!(xet_content(&xet, &new_hash), Some(expected));
     });
 }
+
+/// Regression for the Pass B over-marking bug: when a Pass B (`upload_files`)
+/// failure aborts the batch, sparse items whose Pass A `range_upload` already
+/// succeeded used to be flagged with the Pass B error in `flush_errors`. A
+/// follow-up fsync on the sparse item would return EIO claiming "upload
+/// failed" even though its CAS xorb had been uploaded cleanly. After the fix,
+/// only items without an upload_result entry (Pass A failures + items the
+/// early return skipped) are marked.
+#[test]
+fn flush_pass_b_failure_preserves_pass_a_sparse_success() {
+    let hub = MockHub::new();
+    let original: Vec<u8> = (0u8..40).collect();
+    hub.add_file("sparse.bin", original.len() as u64, Some("h_sparse"), None);
+    let xet = MockXet::new();
+    xet.add_file("h_sparse", &original);
+    let (rt, vfs) = vfs_sparse(&hub, &xet);
+
+    rt.block_on(async {
+        // ino_sparse: existing remote file → Pass A (range_upload succeeds).
+        let ino_sparse = vfs.lookup(ROOT_INODE, "sparse.bin").await.unwrap().ino;
+        let fh_sparse = vfs.open(ino_sparse, true, false, None).await.unwrap();
+        write_blocking(&vfs, ino_sparse, fh_sparse, 5, b"ZZZZ").await.unwrap();
+
+        // ino_regular: newly created → Pass B (upload_files fails).
+        let (attr_regular, fh_regular) = vfs
+            .create(ROOT_INODE, "fresh.bin", 0o644, 1000, 1000, None)
+            .await
+            .unwrap();
+        let ino_regular = attr_regular.ino;
+        write_blocking(&vfs, ino_regular, fh_regular, 0, b"hello world")
+            .await
+            .unwrap();
+
+        // Fail ONLY Pass B (upload_files) — Pass A's range_upload still succeeds.
+        xet.fail_next_upload_files();
+
+        vfs.release(fh_sparse).await.unwrap();
+        vfs.release(fh_regular).await.unwrap();
+
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        let fm = vfs.flush_manager.as_ref().unwrap();
+        // ino_sparse uploaded cleanly in Pass A; its CAS xorb is durable. It
+        // stayed dirty because the batch's Hub commit was aborted, and the
+        // next flush will retry the commit, but fsync must NOT surface a
+        // misleading "upload failed" for it.
+        let err_sparse = fm.check_error(ino_sparse);
+        assert!(
+            err_sparse.is_none(),
+            "sparse Pass A success must not inherit the Pass B failure, got {err_sparse:?}"
+        );
+        // ino_regular is the one that actually failed in Pass B; its error
+        // must surface so fsync returns EIO for the caller.
+        let err_regular = fm.check_error(ino_regular);
+        assert!(
+            err_regular.as_deref().is_some_and(|m| m.contains("upload failed")),
+            "regular Pass B failure must be surfaced, got {err_regular:?}"
+        );
+    });
+
+    vfs.shutdown();
+}
+
+/// Regression for `touch_commit_clocks` being stamped on a dirty_generation
+/// mismatch: a concurrent writer that bumps the generation between flush
+/// snapshot and `apply_commit_sparse` used to still see `last_revalidated =
+/// now` written, which lets a subsequent `lookup()` skip HEAD revalidation
+/// for metadata_ttl seconds even though nothing was committed for this
+/// generation. Mtime/ctime were also overwritten to "now" while the inode
+/// was still dirty with the racing writer's bytes.
+///
+/// After the fix, all three clock fields (mtime, ctime, last_revalidated)
+/// stay untouched on a generation mismatch — only the racing-writer-newer
+/// content remains dirty and revalidation is not silenced.
+#[test]
+fn apply_commit_sparse_mismatch_does_not_stamp_clocks() {
+    use std::time::Instant;
+    let hub = MockHub::new();
+    let original: Vec<u8> = (0u8..20).collect();
+    hub.add_file("file.bin", 20, Some("h1"), None);
+    let xet = MockXet::new();
+    xet.add_file("h1", &original);
+    let (rt, vfs) = vfs_sparse(&hub, &xet);
+
+    rt.block_on(async {
+        let ino = vfs.lookup(ROOT_INODE, "file.bin").await.unwrap().ino;
+        let fh = vfs.open(ino, true, false, None).await.unwrap();
+        write_blocking(&vfs, ino, fh, 0, b"AAA").await.unwrap();
+
+        // Snapshot the pre-commit clocks BEFORE simulating the mismatch so we
+        // can assert nothing moved on the rejected path.
+        let (mtime_before, ctime_before, lastrev_before, gen_before) = {
+            let inodes = vfs.inode_table.read().unwrap();
+            let entry = inodes.get(ino).unwrap();
+            (entry.mtime, entry.ctime, entry.last_revalidated, entry.dirty_generation)
+        };
+
+        // Tiny sleep so any wrongly-bumped `Instant::now()` would differ from
+        // the snapshot (otherwise the assert is flaky on fast machines).
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // Simulate a generation mismatch: invoke apply_commit_sparse with a
+        // generation that is NOT the current one. This mirrors the race where
+        // the flusher snapshotted gen=N but a concurrent pwrite bumped to N+1
+        // before commit. clear_dirty_if returns false → no fields applied.
+        {
+            let mut inodes = vfs.inode_table.write().unwrap();
+            let entry = inodes.get_mut(ino).unwrap();
+            let stale_gen = gen_before.wrapping_sub(1); // any value != gen_before
+            entry.apply_commit_sparse("hX", 50, stale_gen);
+        }
+
+        let (mtime_after, ctime_after, lastrev_after) = {
+            let inodes = vfs.inode_table.read().unwrap();
+            let entry = inodes.get(ino).unwrap();
+            (entry.mtime, entry.ctime, entry.last_revalidated)
+        };
+
+        assert_eq!(mtime_before, mtime_after, "mtime must not bump on generation mismatch");
+        assert_eq!(ctime_before, ctime_after, "ctime must not bump on generation mismatch");
+        assert_eq!(
+            lastrev_before, lastrev_after,
+            "last_revalidated must not be stamped on a rejected commit, otherwise lookup skips HEAD revalidation while the inode is still dirty"
+        );
+
+        // Sanity: the inode should still be dirty (the racing writer's content
+        // hasn't been committed). Clean up so the test doesn't hang on the
+        // background flush retrying.
+        assert!(vfs.inode_table.read().unwrap().get(ino).unwrap().is_dirty());
+        let _ = Instant::now();
+
+        vfs.release(fh).await.unwrap();
+    });
+
+    vfs.shutdown();
+}
+
+/// Regression for the zero-byte pwrite-past-EOF stuck-dirty bug: a write
+/// with `data.len() == 0` (reachable via custom FUSE clients, NFS re-exports,
+/// or test harnesses that bypass the kernel's VFS short-circuit) must NOT
+/// extend entry.size, mark the inode dirty, or track sparse coverage. Before
+/// the fix, the code unconditionally computed `new_end = offset + 0` and
+/// bumped entry.size past the on-disk staging length; snapshot_dirty_bytes
+/// then hit UnexpectedEof on every flush retry and the inode stayed
+/// permanently dirty with fsync returning EIO forever.
+#[test]
+fn write_zero_bytes_past_eof_is_a_noop() {
+    let hub = MockHub::new();
+    let original: Vec<u8> = (0u8..10).collect();
+    hub.add_file("file.bin", 10, Some("h1"), None);
+    let xet = MockXet::new();
+    xet.add_file("h1", &original);
+    let (rt, vfs) = vfs_sparse(&hub, &xet);
+
+    rt.block_on(async {
+        let ino = vfs.lookup(ROOT_INODE, "file.bin").await.unwrap().ino;
+        let fh = vfs.open(ino, true, false, None).await.unwrap();
+        assert_eq!(vfs.inode_table.read().unwrap().get(ino).unwrap().size, 10);
+
+        // Zero-byte write past EOF (offset > size). Before the fix, the code
+        // bumped entry.size to offset (50) while the on-disk staging stayed
+        // at 10 bytes; the next flush snapshot_dirty_bytes would then hit
+        // UnexpectedEof and the inode would be stuck dirty forever. The fix
+        // gates the size bump + dirty + sparse-track on `written > 0`.
+        let written = write_blocking(&vfs, ino, fh, 50, b"").await.unwrap();
+        assert_eq!(written, 0, "pwrite of empty slice returns 0");
+
+        let size_after = vfs.inode_table.read().unwrap().get(ino).unwrap().size;
+        assert_eq!(size_after, 10, "zero-byte write past EOF must not extend size");
+
+        // The actual cure: a subsequent flush of any concurrent dirty work
+        // must succeed (no UnexpectedEof from snapshot_dirty_bytes). Issue a
+        // real one-byte write to dirty the inode legitimately, then verify
+        // it commits cleanly — the zero-byte write didn't poison the staging
+        // file invariant.
+        write_blocking(&vfs, ino, fh, 0, b"X").await.unwrap();
+        vfs.release(fh).await.unwrap();
+        wait_for_clean(&vfs, ino).await;
+    });
+
+    vfs.shutdown();
+}
