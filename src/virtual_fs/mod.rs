@@ -4170,26 +4170,16 @@ impl VirtualFs {
                             sw.resize_to(cur_size, new_size);
                             *sw_arc = Arc::new(sw);
                         } else {
-                            // Still keyed to the current revision. Resize in
-                            // place. If the live size grew past sw.original_size
-                            // (drift: the remote revision is larger than the CAS
-                            // base we're still keyed to), the staging file's
-                            // tail bytes in [original_size, min(cur_size,
-                            // new_size)) are zero-fill from set_len, not part of
-                            // the original CAS reconstruction. They must be
-                            // tracked as dirty or range_upload will compose only
-                            // [0, original_size) from the old base and produce a
-                            // file whose middle (between original CAS EOF and
-                            // the truncation point) is silently dropped. Track
-                            // the gap up to min(cur_size, new_size) — anything
-                            // past new_size is clipped by the resize below.
-                            let original_size = sw_arc.original_size;
-                            let sw = Arc::make_mut(sw_arc);
-                            let gap_end = cur_size.min(new_size);
-                            if gap_end > original_size {
-                                sw.track_write(original_size, gap_end - original_size);
-                            }
-                            sw.resize_to(cur_size, new_size);
+                            // Hash unchanged: sparse_write is still keyed to the
+                            // current revision. Any bytes past sw.original_size
+                            // were produced by user writes (write() already
+                            // tracked them as dirty under both io_lock and the
+                            // inode write lock) — Xet hashes are content-
+                            // addressable so cur_size > sw.original_size can
+                            // only come from local writes, not from a poll
+                            // rotation that kept the same hash. Just propagate
+                            // the setattr size change to the coverage map.
+                            Arc::make_mut(sw_arc).resize_to(cur_size, new_size);
                         }
                     }
                 }
