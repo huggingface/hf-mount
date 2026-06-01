@@ -5899,3 +5899,250 @@ fn sparse_otrunc_then_write_then_reopen_keeps_user_data() {
         );
     });
 }
+
+// ── Flush batch failure isolation ──────────────────────────────────────
+//
+// flush_batch processes sparse items in Pass A (per-item range_upload) and
+// non-sparse items in Pass B (batched upload_files). A failure in one item
+// must not pollute or block sibling items: the failing inode stays dirty and
+// retries on the next flush, every other inode commits independently.
+
+/// Regression for the Pass A fan-out bug: when a sparse range_upload failed,
+/// the error was attributed to *every* item in to_flush — including non-sparse
+/// items that Pass B had not even attempted yet. After the fix only the failing
+/// sparse inode is marked errored; the non-sparse sibling commits cleanly.
+#[test]
+fn flush_pass_a_failure_does_not_pollute_non_sparse_sibling() {
+    let hub = MockHub::new();
+    let original: Vec<u8> = (0u8..40).collect();
+    hub.add_file("sparse.bin", original.len() as u64, Some("h_sparse"), None);
+    let xet = MockXet::new();
+    xet.add_file("h_sparse", &original);
+    let (rt, vfs) = vfs_sparse(&hub, &xet);
+
+    rt.block_on(async {
+        // ino1: existing remote file → sparse path (Pass A).
+        let ino1 = vfs.lookup(ROOT_INODE, "sparse.bin").await.unwrap().ino;
+        let fh1 = vfs.open(ino1, true, false, None).await.unwrap();
+        write_blocking(&vfs, ino1, fh1, 5, b"ZZZZ").await.unwrap();
+
+        // ino2: freshly created file with no remote hash → non-sparse (Pass B).
+        let (attr2, fh2) = vfs
+            .create(ROOT_INODE, "fresh.bin", 0o644, 1000, 1000, None)
+            .await
+            .unwrap();
+        let ino2 = attr2.ino;
+        write_blocking(&vfs, ino2, fh2, 0, b"hello world").await.unwrap();
+
+        // Arm the one-shot failure: the next sparse range_upload (Pass A on
+        // ino1) fails; the upload_files in Pass B for ino2 succeeds because
+        // fail_upload has already been consumed.
+        xet.fail_upload();
+
+        vfs.release(fh1).await.unwrap();
+        vfs.release(fh2).await.unwrap();
+
+        // Give the debounce + retries time to settle. ino2 commits on the
+        // first batch; ino1 stays dirty (will retry on subsequent flushes).
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        let fm = vfs.flush_manager.as_ref().unwrap();
+        // ino1 must carry the range_upload failure.
+        let err1 = fm.check_error(ino1);
+        assert!(
+            err1.as_deref().is_some_and(|m| m.contains("range_upload failed")),
+            "ino1 should be marked range_upload failed, got {err1:?}"
+        );
+        // ino2 must NOT be falsely marked. Before the fix it inherited the
+        // sparse failure even though Pass B uploaded its content cleanly.
+        assert!(
+            fm.check_error(ino2).is_none(),
+            "ino2 went through a successful upload_files and must not carry the sibling's error"
+        );
+        // And ino2 must actually be clean (committed).
+        assert!(
+            !vfs.inode_table.read().unwrap().get(ino2).unwrap().is_dirty(),
+            "ino2 must be clean after a successful Pass B commit, regardless of Pass A's failure"
+        );
+    });
+
+    vfs.shutdown();
+}
+
+/// Regression for head-of-line blocking in Pass A: a failed sparse upload used
+/// to abort the entire pass with an early return, starving independent sparse
+/// items behind it. After the fix Pass A continues; each sparse item has its
+/// own success/failure outcome.
+#[test]
+fn flush_pass_a_failure_does_not_block_independent_sparse_items() {
+    let hub = MockHub::new();
+    let content_a: Vec<u8> = (0u8..30).collect();
+    let content_b: Vec<u8> = (50u8..90).collect();
+    hub.add_file("a.bin", content_a.len() as u64, Some("h_a"), None);
+    hub.add_file("b.bin", content_b.len() as u64, Some("h_b"), None);
+    let xet = MockXet::new();
+    xet.add_file("h_a", &content_a);
+    xet.add_file("h_b", &content_b);
+    let (rt, vfs) = vfs_sparse(&hub, &xet);
+
+    rt.block_on(async {
+        let ino_a = vfs.lookup(ROOT_INODE, "a.bin").await.unwrap().ino;
+        let ino_b = vfs.lookup(ROOT_INODE, "b.bin").await.unwrap().ino;
+
+        let fh_a = vfs.open(ino_a, true, false, None).await.unwrap();
+        write_blocking(&vfs, ino_a, fh_a, 0, b"AAAA").await.unwrap();
+        let fh_b = vfs.open(ino_b, true, false, None).await.unwrap();
+        write_blocking(&vfs, ino_b, fh_b, 0, b"BBBB").await.unwrap();
+
+        // Only the first range_upload in the Pass A loop fails.
+        xet.fail_upload();
+        vfs.release(fh_a).await.unwrap();
+        vfs.release(fh_b).await.unwrap();
+
+        // Wait for the batch to settle (the failed inode does not retry within
+        // this window — the failure is sticky for one debounce cycle).
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        // Exactly one of {a, b} must be clean (the one whose range_upload
+        // succeeded) and the other must still be dirty. Before the fix neither
+        // would be clean because the early return killed Pass A entirely.
+        let (a_dirty, b_dirty) = {
+            let inodes = vfs.inode_table.read().unwrap();
+            (
+                inodes.get(ino_a).unwrap().is_dirty(),
+                inodes.get(ino_b).unwrap().is_dirty(),
+            )
+        };
+        assert!(
+            a_dirty ^ b_dirty,
+            "exactly one sibling must commit; got a_dirty={a_dirty} b_dirty={b_dirty}"
+        );
+    });
+
+    vfs.shutdown();
+}
+
+// ── Sparse smoke / edge cases ───────────────────────────────────────────
+
+/// Write that lands EXACTLY at EOF (no zero gap, no overlap) extends the file
+/// by the write length. Coverage/dirty must merge with any pre-EOF coverage
+/// instead of leaving a phantom seam at the boundary.
+#[test]
+fn sparse_write_at_eof_boundary_extends_cleanly() {
+    let hub = MockHub::new();
+    let content: Vec<u8> = (0u8..10).collect();
+    hub.add_file("file.bin", 10, Some("h1"), None);
+    let xet = MockXet::new();
+    xet.add_file("h1", &content);
+    let (rt, vfs) = vfs_sparse(&hub, &xet);
+
+    rt.block_on(async {
+        let ino = vfs.lookup(ROOT_INODE, "file.bin").await.unwrap().ino;
+        let fh = vfs.open(ino, true, false, None).await.unwrap();
+        // Write at offset 10 (current EOF), 5 bytes. No gap, no overlap.
+        write_blocking(&vfs, ino, fh, 10, b"EDGE!").await.unwrap();
+
+        // Reading across the boundary must stitch CAS bytes [0..10) and the
+        // user's bytes [10..15) into one continuous response.
+        let (data, _) = vfs.read(fh, 7, 8).await.unwrap();
+        assert_eq!(&data[..], b"\x07\x08\x09EDGE!", "read across the EOF seam");
+
+        // Dirty range covers exactly the extension — no spurious zero-gap.
+        {
+            let inodes = vfs.inode_table.read().unwrap();
+            let sw = inodes.get(ino).unwrap().sparse_write.as_ref().unwrap().clone();
+            assert_eq!(sw.dirty_ranges, vec![(10, 15)]);
+        }
+
+        vfs.release(fh).await.unwrap();
+        wait_for_clean(&vfs, ino).await;
+        let new_hash = vfs
+            .inode_table
+            .read()
+            .unwrap()
+            .get(ino)
+            .unwrap()
+            .xet_hash
+            .clone()
+            .unwrap();
+        let mut expected = content.clone();
+        expected.extend_from_slice(b"EDGE!");
+        assert_eq!(xet_content(&xet, &new_hash), Some(expected));
+    });
+}
+
+/// Setattr-shrink to a size INSIDE an existing dirty range must clip the dirty
+/// range, not drop it entirely. The flushed CAS file then contains the head of
+/// the user's write, truncated at the new size.
+#[test]
+fn sparse_setattr_shrink_inside_dirty_range_keeps_clipped_writes() {
+    let hub = MockHub::new();
+    let original: Vec<u8> = (0u8..100).collect();
+    hub.add_file("file.bin", original.len() as u64, Some("h1"), None);
+    let xet = MockXet::new();
+    xet.add_file("h1", &original);
+    let (rt, vfs) = vfs_sparse(&hub, &xet);
+
+    rt.block_on(async {
+        let ino = vfs.lookup(ROOT_INODE, "file.bin").await.unwrap().ino;
+        let fh = vfs.open(ino, true, false, None).await.unwrap();
+        // Write [40, 70) = 30 bytes of 'X'.
+        write_blocking(&vfs, ino, fh, 40, &[b'X'; 30]).await.unwrap();
+        vfs.release(fh).await.unwrap();
+
+        // Shrink to 55 — slices through the middle of the dirty range. The
+        // committed file must be original[..40] + 'X' * 15.
+        vfs.setattr(ino, Some(55), None, None, None, None, None).await.unwrap();
+        wait_for_clean(&vfs, ino).await;
+
+        let new_hash = vfs
+            .inode_table
+            .read()
+            .unwrap()
+            .get(ino)
+            .unwrap()
+            .xet_hash
+            .clone()
+            .unwrap();
+        let mut expected = original[..40].to_vec();
+        expected.extend(std::iter::repeat_n(b'X', 15));
+        assert_eq!(
+            xet_content(&xet, &new_hash),
+            Some(expected),
+            "shrink cutting through a dirty range must keep the clipped prefix"
+        );
+    });
+}
+
+/// Zero-length write to a sparse file is a no-op: must not mark dirty, must not
+/// add to coverage or dirty_ranges, must not extend the file. Defensive smoke
+/// test — kernel typically filters these but FUSE/NFS handlers don't always.
+#[test]
+fn sparse_zero_length_write_is_a_noop() {
+    let hub = MockHub::new();
+    let content: Vec<u8> = (0u8..20).collect();
+    hub.add_file("file.bin", 20, Some("h1"), None);
+    let xet = MockXet::new();
+    xet.add_file("h1", &content);
+    let (rt, vfs) = vfs_sparse(&hub, &xet);
+
+    rt.block_on(async {
+        let ino = vfs.lookup(ROOT_INODE, "file.bin").await.unwrap().ino;
+        let fh = vfs.open(ino, true, false, None).await.unwrap();
+        let n = write_blocking(&vfs, ino, fh, 5, b"").await.unwrap();
+        assert_eq!(n, 0);
+
+        let inodes = vfs.inode_table.read().unwrap();
+        let entry = inodes.get(ino).unwrap();
+        // pwrite of zero bytes still bumps mtime/dirty per POSIX, but the
+        // tracked dirty range must be empty (no zero-length entries leaking).
+        if let Some(sw) = entry.sparse_write.as_ref() {
+            assert!(
+                sw.dirty_ranges.is_empty(),
+                "zero-length write must not create a dirty range, got {:?}",
+                sw.dirty_ranges
+            );
+        }
+        assert_eq!(entry.size, 20, "zero-length write must not change size");
+    });
+}
