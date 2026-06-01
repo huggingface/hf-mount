@@ -404,8 +404,8 @@ impl InodeEntry {
             self.size = size;
             self.pending_deletes.clear();
             self.sparse_write = None;
+            self.touch_commit_clocks();
         }
-        self.touch_commit_clocks();
     }
 
     /// Apply a successful `range_upload` commit. Re-keys `sparse_write` to the
@@ -436,8 +436,8 @@ impl InodeEntry {
                 // CAS bytes at the same offsets, by construction.
                 sw.clip_to_size(size);
             }
+            self.touch_commit_clocks();
         }
-        self.touch_commit_clocks();
     }
 
     /// Apply a no-op commit (range_upload returned the original hash
@@ -462,13 +462,17 @@ impl InodeEntry {
             } else {
                 self.staging_is_current = true;
             }
+            self.touch_commit_clocks();
         }
-        self.touch_commit_clocks();
     }
 
     /// Bump mtime/ctime to now and mark the inode as freshly revalidated.
     /// Called at the end of every commit-apply so subsequent lookups skip HEAD
     /// revalidation for metadata_ttl (we just committed this exact state).
+    /// Must only be called inside the `clear_dirty_if` branch — on a
+    /// generation mismatch nothing was committed, so stamping
+    /// `last_revalidated` would let lookups serve stale state from the
+    /// metadata_ttl cache while the inode is still dirty with newer content.
     fn touch_commit_clocks(&mut self) {
         let now = SystemTime::now();
         self.mtime = now;
