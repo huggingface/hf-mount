@@ -2657,40 +2657,51 @@ impl VirtualFs {
                     }
                     written = n as u32;
                     new_end = offset + written as u64;
-                    let mut inodes = self.inode_table.write().expect("inodes poisoned");
-                    if let Some(entry) = inodes.get_mut(handle_ino) {
-                        // Snapshot the previous size BEFORE bumping it: the
-                        // sparse path needs to include the zero-filled gap
-                        // [prev_size, offset) in dirty_ranges when the write
-                        // starts past EOF. Otherwise range_upload would only
-                        // see [offset, new_end) and the resulting CAS file
-                        // would be missing those zeros — a write at offset
-                        // 15 to a 10-byte file would commit a 13-byte file.
-                        let prev_size = entry.size;
-                        if new_end > entry.size {
-                            if let Some(sd) = self.staging.dir() {
-                                sd.resize_bytes(entry.size, new_end);
+                    // A zero-byte write must not extend size, mark dirty, or
+                    // track sparse coverage: pwrite didn't grow the staging
+                    // file, so bumping entry.size past offset would leave
+                    // staging shorter than entry.size and the next flush
+                    // snapshot_dirty_bytes hits UnexpectedEof, stranding the
+                    // inode permanently dirty. Reachable via zero-length
+                    // FUSE writes past EOF (custom clients, NFS re-export,
+                    // test harnesses) since the kernel VFS short-circuit
+                    // doesn't always fire before FUSE.
+                    if written > 0 {
+                        let mut inodes = self.inode_table.write().expect("inodes poisoned");
+                        if let Some(entry) = inodes.get_mut(handle_ino) {
+                            // Snapshot the previous size BEFORE bumping it: the
+                            // sparse path needs to include the zero-filled gap
+                            // [prev_size, offset) in dirty_ranges when the write
+                            // starts past EOF. Otherwise range_upload would only
+                            // see [offset, new_end) and the resulting CAS file
+                            // would be missing those zeros — a write at offset
+                            // 15 to a 10-byte file would commit a 13-byte file.
+                            let prev_size = entry.size;
+                            if new_end > entry.size {
+                                if let Some(sd) = self.staging.dir() {
+                                    sd.resize_bytes(entry.size, new_end);
+                                }
+                                entry.size = new_end;
                             }
-                            entry.size = new_end;
+                            entry.set_dirty();
+                            // Sparse mode: extend coverage AND dirty_ranges for the
+                            // written window plus any zero gap from the old EOF.
+                            // Done under both io_lock (vs concurrent readers) and
+                            // the inode write lock (vs flush snapshotting
+                            // sparse_write).
+                            if let Some(sw_arc) = entry.sparse_write.as_mut() {
+                                let sw = Arc::make_mut(sw_arc);
+                                // Effective write start: include the zero gap
+                                // between the previous EOF and `offset` so
+                                // range_upload composes those zeros into the
+                                // new CAS file.
+                                let effective_start = offset.min(prev_size);
+                                let effective_len = new_end - effective_start;
+                                sw.track_write(effective_start, effective_len);
+                            }
                         }
-                        entry.set_dirty();
-                        // Sparse mode: extend coverage AND dirty_ranges for the
-                        // written window plus any zero gap from the old EOF.
-                        // Done under both io_lock (vs concurrent readers) and
-                        // the inode write lock (vs flush snapshotting
-                        // sparse_write).
-                        if let Some(sw_arc) = entry.sparse_write.as_mut() {
-                            let sw = Arc::make_mut(sw_arc);
-                            // Effective write start: include the zero gap
-                            // between the previous EOF and `offset` so
-                            // range_upload composes those zeros into the
-                            // new CAS file.
-                            let effective_start = offset.min(prev_size);
-                            let effective_len = new_end - effective_start;
-                            sw.track_write(effective_start, effective_len);
-                        }
+                        inodes.touch(handle_ino);
                     }
-                    inodes.touch(handle_ino);
                 }
                 Ok(written)
             }
