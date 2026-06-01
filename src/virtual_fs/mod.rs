@@ -2684,20 +2684,15 @@ impl VirtualFs {
                                 entry.size = new_end;
                             }
                             entry.set_dirty();
-                            // Sparse mode: extend coverage AND dirty_ranges for the
-                            // written window plus any zero gap from the old EOF.
-                            // Done under both io_lock (vs concurrent readers) and
-                            // the inode write lock (vs flush snapshotting
+                            // Sparse mode: extend coverage AND dirty_ranges
+                            // for the written window. `track_write` handles
+                            // the zero-fill gap [prev_size, offset) when the
+                            // write lands past the previous EOF. Done under
+                            // both io_lock (vs concurrent readers) and the
+                            // inode write lock (vs flush snapshotting
                             // sparse_write).
                             if let Some(sw_arc) = entry.sparse_write.as_mut() {
-                                let sw = Arc::make_mut(sw_arc);
-                                // Effective write start: include the zero gap
-                                // between the previous EOF and `offset` so
-                                // range_upload composes those zeros into the
-                                // new CAS file.
-                                let effective_start = offset.min(prev_size);
-                                let effective_len = new_end - effective_start;
-                                sw.track_write(effective_start, effective_len);
+                                Arc::make_mut(sw_arc).track_write(offset, written as u64, prev_size);
                             }
                         }
                         inodes.touch(handle_ino);
@@ -4144,41 +4139,28 @@ impl VirtualFs {
                     if new_size == 0 {
                         entry.xet_hash = None;
                         entry.sparse_write = None;
-                    } else if want_sparse_install {
-                        // Install a fresh sparse_write keyed to the CURRENT
-                        // hash + size; track the size change so range_upload
-                        // composes the new tail (extension) or drops the cut
-                        // tail (shrink) at flush time. The staging hole punched
-                        // above is content-free, so any base revision is valid.
-                        let hash = cur_hash.expect("Xet → non-Xet rotation is unreachable on writable inodes");
-                        let mut sw = inode::SparseWriteState::new(hash, cur_size);
-                        sw.resize_to(cur_size, new_size);
-                        entry.sparse_write = Some(Arc::new(sw));
-                    } else if let Some(sw_arc) = entry.sparse_write.as_mut() {
-                        let hash = cur_hash.expect("Xet → non-Xet rotation is unreachable on writable inodes");
-                        if hash.as_str() != sw_arc.original_hash.as_str() {
-                            // Drifted to a NEW xet revision (poll rotated the
-                            // hash on the clean inode, leaving the state pinned
-                            // to the old one). Reusing it would make range_upload
-                            // compose against the wrong base and silently
-                            // overwrite the remote update. Rebuild against the
-                            // current revision (the staging tail was re-zeroed
-                            // above); empty coverage makes reads refill from the
-                            // current CAS object. Mirrors the drift handling in
-                            // open_advanced_write.
-                            let mut sw = inode::SparseWriteState::new(hash, cur_size);
-                            sw.resize_to(cur_size, new_size);
-                            *sw_arc = Arc::new(sw);
-                        } else {
-                            // Hash unchanged: sparse_write is still keyed to the
-                            // current revision. Any bytes past sw.original_size
-                            // were produced by user writes (write() already
-                            // tracked them as dirty under both io_lock and the
-                            // inode write lock) — Xet hashes are content-
-                            // addressable so cur_size > sw.original_size can
-                            // only come from local writes, not from a poll
-                            // rotation that kept the same hash. Just propagate
-                            // the setattr size change to the coverage map.
+                    } else {
+                        // Rebuild sparse_write against the current revision
+                        // when: (a) we just punched a sparse-install hole, or
+                        // (b) sparse_write is keyed to a stale hash (poll
+                        // rotated to a NEW xet revision while we held no
+                        // write lock — its compose base would silently
+                        // overwrite the remote update). Otherwise propagate
+                        // the setattr size change in place; any bytes past
+                        // sw.original_size are already in dirty_ranges (Xet
+                        // hashes are content-addressable so size can't grow
+                        // without a hash rotation, and write() under io_lock
+                        // already tracked any user-side extension).
+                        let needs_rebuild = want_sparse_install
+                            || entry
+                                .sparse_write
+                                .as_ref()
+                                .is_some_and(|sw| Some(sw.original_hash.as_str()) != cur_hash.as_deref());
+                        if needs_rebuild {
+                            let hash = cur_hash.expect("Xet → non-Xet rotation is unreachable on writable inodes");
+                            entry.sparse_write =
+                                Some(Arc::new(inode::SparseWriteState::new_resized(hash, cur_size, new_size)));
+                        } else if let Some(sw_arc) = entry.sparse_write.as_mut() {
                             Arc::make_mut(sw_arc).resize_to(cur_size, new_size);
                         }
                     }

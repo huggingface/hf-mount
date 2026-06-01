@@ -208,26 +208,28 @@ impl SparseWriteState {
     /// that downloaded the entire CAS file into staging — reads short-circuit
     /// because staging already holds every byte.
     pub fn new_full(original_hash: String, original_size: u64) -> Self {
+        let coverage = if original_size > 0 {
+            vec![(0, original_size)]
+        } else {
+            Vec::new()
+        };
         Self {
-            coverage: if original_size > 0 {
-                vec![(0, original_size)]
-            } else {
-                Vec::new()
-            },
-            ..Self::new(original_hash, original_size)
+            original_hash,
+            original_size,
+            coverage,
+            dirty_ranges: Vec::new(),
         }
     }
 
-    /// Record a user write at `[offset, offset+len)`: adds the range to both
-    /// `coverage` and `dirty_ranges`, merging overlapping/adjacent entries.
-    /// Idempotent if the range is already tracked.
-    pub fn track_write(&mut self, offset: u64, len: u64) {
-        if len == 0 {
-            return;
-        }
-        let end = offset.saturating_add(len);
-        merge_range(&mut self.coverage, offset, end);
-        merge_range(&mut self.dirty_ranges, offset, end);
+    /// Build a fresh state keyed to `original_hash`/`original_size` and project
+    /// a size change to `new_size`: empty coverage (reads refill from CAS),
+    /// dirty_ranges populated if `new_size > original_size` (so range_upload
+    /// composes the zero-fill tail). Used by setattr's sparse-install and
+    /// drift-rebuild paths.
+    pub fn new_resized(original_hash: String, original_size: u64, new_size: u64) -> Self {
+        let mut sw = Self::new(original_hash, original_size);
+        sw.resize_to(original_size, new_size);
+        sw
     }
 
     /// Record bytes just fetched from CAS into staging at `[offset, offset+len)`.
@@ -239,6 +241,22 @@ impl SparseWriteState {
         }
         let end = offset.saturating_add(len);
         merge_range(&mut self.coverage, offset, end);
+    }
+
+    /// Record a user write at `[offset, offset+len)`: adds the range to both
+    /// `coverage` and `dirty_ranges`. A write that lands past the previous EOF
+    /// (`offset > prev_eof`) also dirties the zero-fill gap `[prev_eof,
+    /// offset)` so `range_upload` composes those zeros into the new CAS file
+    /// — without it a write at offset 15 to a 10-byte file would commit a
+    /// 13-byte file. Idempotent if the range is already tracked.
+    pub fn track_write(&mut self, offset: u64, len: u64, prev_eof: u64) {
+        if len == 0 {
+            return;
+        }
+        let start = offset.min(prev_eof);
+        let end = offset.saturating_add(len);
+        self.track_read_fill(start, end - start);
+        merge_range(&mut self.dirty_ranges, start, end);
     }
 
     /// Clip both coverage and dirty_ranges to `[0, new_size)`. Called after
@@ -255,7 +273,10 @@ impl SparseWriteState {
     /// to `new_size`. Unchanged size is a no-op.
     pub fn resize_to(&mut self, prev_size: u64, new_size: u64) {
         if new_size > prev_size {
-            self.track_write(prev_size, new_size - prev_size);
+            // prev_size == prev_eof on this path (setattr), so the gap
+            // computation in track_write collapses to start = prev_size and
+            // end = new_size — exactly the new tail.
+            self.track_write(prev_size, new_size - prev_size, prev_size);
         } else if new_size < prev_size {
             self.clip_to_size(new_size);
         }
@@ -2904,9 +2925,21 @@ mod tests {
     #[test]
     fn sparse_state_track_write_extends_both_coverage_and_dirty() {
         let mut sw = SparseWriteState::new("h".into(), 100);
-        sw.track_write(10, 20);
+        // prev_eof = offset → no zero-gap, plain in-window write.
+        sw.track_write(10, 20, 10);
         assert_eq!(sw.coverage, vec![(10, 30)]);
         assert_eq!(sw.dirty_ranges, vec![(10, 30)]);
+    }
+
+    #[test]
+    fn sparse_state_track_write_past_eof_dirties_gap() {
+        // Write 5 bytes at offset 15 on a 10-byte file: prev_eof=10, the gap
+        // [10, 15) must also be tracked dirty so range_upload composes those
+        // zeros instead of producing a 13-byte file.
+        let mut sw = SparseWriteState::new("h".into(), 10);
+        sw.track_write(15, 5, 10);
+        assert_eq!(sw.coverage, vec![(10, 20)]);
+        assert_eq!(sw.dirty_ranges, vec![(10, 20)]);
     }
 
     #[test]
@@ -2921,7 +2954,7 @@ mod tests {
     fn sparse_state_write_after_read_marks_dirty_subset() {
         let mut sw = SparseWriteState::new("h".into(), 100);
         sw.track_read_fill(0, 100);
-        sw.track_write(20, 30);
+        sw.track_write(20, 30, 100);
         assert_eq!(sw.coverage, vec![(0, 100)]);
         assert_eq!(sw.dirty_ranges, vec![(20, 50)]);
     }
@@ -2929,7 +2962,7 @@ mod tests {
     #[test]
     fn sparse_state_clip_trims_both() {
         let mut sw = SparseWriteState::new("h".into(), 100);
-        sw.track_write(0, 100);
+        sw.track_write(0, 100, 0);
         sw.clip_to_size(40);
         assert_eq!(sw.coverage, vec![(0, 40)]);
         assert_eq!(sw.dirty_ranges, vec![(0, 40)]);
@@ -2939,7 +2972,7 @@ mod tests {
     fn sparse_state_holes_in_window() {
         let mut sw = SparseWriteState::new("h".into(), 100);
         sw.track_read_fill(20, 20); // covers [20, 40)
-        sw.track_write(60, 10); // covers [60, 70)
+        sw.track_write(60, 10, 60); // covers [60, 70)
         assert_eq!(sw.holes_in(0, 80), vec![(0, 20), (40, 60), (70, 80)]);
         assert!(sw.holes_in(20, 20).is_empty()); // entirely covered
         assert_eq!(sw.holes_in(0, 10), vec![(0, 10)]); // entirely hole
