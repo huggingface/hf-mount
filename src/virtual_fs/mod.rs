@@ -2692,6 +2692,12 @@ impl VirtualFs {
                     }
                     written = n as u32;
                     new_end = offset + written as u64;
+                    // DEBUG: trace every write hitting the staging path so we
+                    // can see if the kernel is sending unexpected ops past EOF.
+                    debug!(
+                        "write: ino={} offset={} len={} written={} new_end={}",
+                        handle_ino, offset, data.len(), written, new_end
+                    );
                     // A zero-byte write must not extend size, mark dirty, or
                     // track sparse coverage: pwrite didn't grow the staging
                     // file, so bumping entry.size past offset would leave
