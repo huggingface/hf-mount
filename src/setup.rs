@@ -104,6 +104,15 @@ pub struct MountOptions {
     #[arg(long, default_value_t = false)]
     pub advanced_writes: bool,
 
+    /// EXPERIMENTAL (beta). Skip the full CAS download when opening for write
+    /// and only upload modified byte ranges via `range_upload`. Much faster
+    /// for large files with small edits, but exercises more lifecycle paths
+    /// (handle pool reuse, drift retries, multi-handle reads/writes) than the
+    /// download-then-upload mode. Off by default — opt in if you understand
+    /// the trade-off. Implies --advanced-writes.
+    #[arg(long, default_value_t = false)]
+    pub sparse_writes: bool,
+
     /// Interval in seconds for polling remote changes (0 to disable).
     #[arg(long, default_value_t = 30)]
     pub poll_interval_secs: u64,
@@ -230,6 +239,7 @@ pub struct MountSetup {
     pub mount_point: PathBuf,
     pub read_only: bool,
     pub advanced_writes: bool,
+    pub sparse_writes: bool,
     pub direct_io: bool,
     pub metadata_ttl: std::time::Duration,
     pub max_threads: usize,
@@ -432,6 +442,18 @@ pub fn build_with_runtime(
     let xet_sessions = XetSessions::new(xet_ctx, download_session, upload_config, cached_client, xorb_cache);
 
     let advanced_writes = options.advanced_writes || options.overlay || (is_nfs && !read_only);
+    // Sparse writes are an experimental optimization on top of advanced writes.
+    // They imply advanced_writes (the advanced_writes path is where the sparse
+    // staging lives), but advanced_writes does NOT imply sparse_writes — the
+    // safe default is to download-then-write, which is well-tested and avoids
+    // the lifecycle edge cases that sparse staging exposes.
+    let sparse_writes = options.sparse_writes && advanced_writes;
+    if options.sparse_writes && !advanced_writes {
+        warn!("--sparse-writes ignored: requires --advanced-writes (or NFS read-write, or --overlay)");
+    }
+    if sparse_writes {
+        warn!("--sparse-writes is EXPERIMENTAL. Disable with `--sparse-writes=false` if you see issues.");
+    }
 
     // Overlay: open a pre-mount fd to the mount point directory. The fd is
     // held by OverlayBacking so overlay-local filesystem ops can stay rooted
@@ -530,6 +552,7 @@ pub fn build_with_runtime(
         VfsConfig {
             read_only,
             advanced_writes,
+            sparse_writes,
             uid,
             gid,
             poll_interval_secs: options.poll_interval_secs,
@@ -556,6 +579,7 @@ pub fn build_with_runtime(
         mount_point,
         read_only,
         advanced_writes,
+        sparse_writes,
         direct_io: options.direct_io,
         metadata_ttl,
         max_threads: options.max_threads,

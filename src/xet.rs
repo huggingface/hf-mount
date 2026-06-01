@@ -1,18 +1,26 @@
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::task::{Context, Poll};
 
 use bytes::Bytes;
+use tokio::io::{AsyncRead, ReadBuf};
+use tracing::info;
 use xet_client::cas_client::Client;
 use xet_client::cas_types::FileRange;
 use xet_client::chunk_cache::ChunkCache;
 use xet_core_structures::merklehash::MerkleHash;
 use xet_data::file_reconstruction::{DownloadStream, FileReconstructor};
 use xet_data::processing::configurations::TranslatorConfig;
-use xet_data::processing::{FileDownloadSession, FileUploadSession, Sha256Policy, SingleFileCleaner, XetFileInfo};
+use xet_data::processing::{
+    DirtyInput, FileDownloadSession, FileUploadSession, Sha256Policy, SingleFileCleaner, XetFileInfo,
+};
 use xet_runtime::core::XetContext;
 
 use crate::error::{Error, Result};
+use crate::virtual_fs::inode::SparseWriteState;
 
 // ── Traits ───────────────────────────────────────────────────────────
 
@@ -31,6 +39,20 @@ pub trait XetOps: Send + Sync {
     /// Pre-warm the reconstruction cache for a file by fetching its full plan.
     /// Errors are silently ignored — this is best-effort.
     async fn warm_reconstruction_cache(&self, xet_hash: &str);
+
+    /// Upload only the modified portion of a sparse file, composing the CAS reconstruction
+    /// plan from existing segments (prefix/suffix) + newly uploaded segments (dirty range).
+    /// `file_size` is the size of the staging file; the original file size is read from
+    /// `sparse_state`. `io_lock` is the per-inode sync I/O lock taken briefly around
+    /// each `read_at` so concurrent `pwrite`s can't interleave with our reads
+    /// (otherwise xet-core would hash chimeric content — finding E1).
+    async fn range_upload(
+        &self,
+        sparse_state: &SparseWriteState,
+        staging_path: &Path,
+        file_size: u64,
+        io_lock: Arc<std::sync::Mutex<()>>,
+    ) -> Result<XetFileInfo>;
 }
 
 /// Append-only streaming writer trait (abstracts StreamingWriter for testing).
@@ -153,6 +175,150 @@ impl XetOps for XetSessions {
     async fn warm_reconstruction_cache(&self, xet_hash: &str) {
         if let Ok(hash) = MerkleHash::from_hex(xet_hash) {
             let _ = self.cas_client.get_reconstruction(&hash, None).await;
+        }
+    }
+
+    async fn range_upload(
+        &self,
+        sparse_state: &SparseWriteState,
+        staging_path: &Path,
+        file_size: u64,
+        io_lock: Arc<std::sync::Mutex<()>>,
+    ) -> Result<XetFileInfo> {
+        let config = self
+            .upload_config
+            .as_ref()
+            .ok_or_else(|| Error::hub("no upload config (read-only mode)"))?;
+
+        let original_hash = MerkleHash::from_hex(&sparse_state.original_hash)
+            .map_err(|e| Error::Xet(format!("invalid original hash: {e}")))?;
+
+        // No-op: nothing dirty and size matches → original hash is unchanged.
+        if sparse_state.dirty_ranges.is_empty() && file_size == sparse_state.original_size {
+            return Ok(XetFileInfo::new(
+                sparse_state.original_hash.clone(),
+                sparse_state.original_size,
+            ));
+        }
+
+        // Open the staging file once and share it across all per-range readers.
+        // Each PreadReader holds an Arc<File> and tracks its own (offset, remaining),
+        // using pread(2) so independent positions don't fight a shared file cursor —
+        // avoids N open(2) syscalls for an N-fragment file.
+        let staging_file = Arc::new(std::fs::File::open(staging_path).map_err(Error::Io)?);
+
+        // Build DirtyInput list in original-file coordinates. Each dirty range
+        // (start, end) is expressed in current-file coordinates; track_write
+        // snaps writes past `effective_original_size` back to it, so
+        // `start <= effective_original_size <= original_size` always holds.
+        let mut dirty_inputs: Vec<DirtyInput> = Vec::with_capacity(sparse_state.dirty_ranges.len() + 1);
+        for &(start, end) in &sparse_state.dirty_ranges {
+            let new_length = end - start;
+            let original_range = if end <= sparse_state.original_size {
+                start..end
+            } else if start >= sparse_state.original_size {
+                sparse_state.original_size..sparse_state.original_size
+            } else {
+                start..sparse_state.original_size
+            };
+
+            let reader: Pin<Box<dyn AsyncRead + Send>> = Box::pin(PreadReader {
+                file: staging_file.clone(),
+                io_lock: io_lock.clone(),
+                offset: start,
+                remaining: new_length,
+            });
+            dirty_inputs.push(DirtyInput {
+                original_range,
+                reader,
+                new_length,
+            });
+        }
+
+        // Truncate-past-end: if file_size < original_size and the truncated tail is not
+        // already covered by a dirty input, append a synthetic delete to drop the bytes
+        // beyond file_size from the original file.
+        if file_size < sparse_state.original_size {
+            let last_covered = dirty_inputs.last().map(|d| d.original_range.end).unwrap_or(0);
+            let truncate_start = file_size.max(last_covered);
+            if truncate_start < sparse_state.original_size {
+                dirty_inputs.push(DirtyInput {
+                    original_range: truncate_start..sparse_state.original_size,
+                    reader: Box::pin(tokio::io::empty()),
+                    new_length: 0,
+                });
+            }
+        }
+
+        let result = xet_data::processing::upload_ranges(
+            config.clone(),
+            self.cas_client.clone(),
+            original_hash,
+            sparse_state.original_size,
+            dirty_inputs,
+        )
+        .await
+        .map_err(|e| Error::Xet(e.to_string()))?;
+
+        info!(
+            "range_upload: hash={} size={:?} (original_size={}, {} dirty ranges)",
+            result.hash(),
+            result.file_size(),
+            sparse_state.original_size,
+            sparse_state.dirty_ranges.len()
+        );
+
+        Ok(result)
+    }
+}
+
+// ── PreadReader ──────────────────────────────────────────────────────
+
+/// `AsyncRead` over a positional window of a shared `std::fs::File`, using
+/// `pread(2)` so multiple readers can target distinct regions of the same file
+/// without contending on a shared cursor. Used by `range_upload` to feed
+/// `xet-core` per-range readers from a single open FD on the staging file.
+///
+/// `pread` is synchronous, but staging files live on local SSD and `xet-core`
+/// reads in bounded chunks, so the per-poll latency stays in the microseconds
+/// range — small enough not to starve the runtime in practice.
+struct PreadReader {
+    file: Arc<std::fs::File>,
+    /// Per-inode sync I/O lock taken briefly across each `read_at` so a
+    /// concurrent `pwrite` from another writable fh cannot interleave with
+    /// our reads. Without this, xet-core could hash chimeric content into
+    /// a corrupt Hub commit (finding E1).
+    io_lock: Arc<std::sync::Mutex<()>>,
+    offset: u64,
+    remaining: u64,
+}
+
+impl AsyncRead for PreadReader {
+    fn poll_read(self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        if this.remaining == 0 {
+            return Poll::Ready(Ok(()));
+        }
+        let want = buf.remaining().min(this.remaining as usize);
+        if want == 0 {
+            return Poll::Ready(Ok(()));
+        }
+        let slice = &mut buf.initialize_unfilled_to(want)[..want];
+        let _io_guard = this.io_lock.lock().expect("staging io_lock poisoned");
+        match this.file.read_at(slice, this.offset) {
+            Ok(0) => {
+                // Short read: staging file ended before `remaining` was met.
+                // Surface as a clean EOF so `xet-core` can decide how to react.
+                this.remaining = 0;
+                Poll::Ready(Ok(()))
+            }
+            Ok(n) => {
+                buf.advance(n);
+                this.offset += n as u64;
+                this.remaining -= n as u64;
+                Poll::Ready(Ok(()))
+            }
+            Err(e) => Poll::Ready(Err(e)),
         }
     }
 }

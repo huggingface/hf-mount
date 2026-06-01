@@ -53,6 +53,16 @@ pub struct EvictionState {
     /// with `open_handles > 0` — a racing read/write would silently lose
     /// data if the inode disappeared under it.
     pub open_handles: AtomicU32,
+    /// Subset of `open_handles` that were opened for write. Used by
+    /// `update_remote_file` to gate hash rotation: a writable handle
+    /// counts on `sparse_write` matching the inode's `xet_hash` for its
+    /// next write (lazy install + range_upload composition). Letting poll
+    /// clear or re-key `sparse_write` while a writable handle is open
+    /// produces silent corruption (codex P1). Read-only handles are not
+    /// affected: Lazy prefetch buffers are bound to the open-time hash,
+    /// and LocalFd reads defensively gate `fill_sparse_holes` on the
+    /// hash match (finding C2).
+    pub open_write_handles: AtomicU32,
 }
 
 impl Clone for EvictionState {
@@ -62,6 +72,7 @@ impl Clone for EvictionState {
             last_touched: AtomicU64::new(self.last_touched.load(Ordering::Relaxed)),
             evict_pending: AtomicBool::new(self.evict_pending.load(Ordering::Relaxed)),
             open_handles: AtomicU32::new(self.open_handles.load(Ordering::Relaxed)),
+            open_write_handles: AtomicU32::new(self.open_write_handles.load(Ordering::Relaxed)),
         }
     }
 }
@@ -145,6 +156,120 @@ pub struct InodeEntry {
     pub last_revalidated: Option<Instant>,
     /// Eviction bookkeeping (kernel refcount, LRU recency, pending flag, pinning).
     pub eviction: EvictionState,
+    /// Tracks the original file state and dirty byte ranges when the file is opened
+    /// for write without downloading the full original content (sparse staging).
+    /// At flush time, only the dirty windows need to be re-uploaded via `upload_ranges`.
+    /// `None` means either a new file or the full file was downloaded. Race protection
+    /// (concurrent writes during flush) reuses `dirty_generation` — see `apply_commit`.
+    pub sparse_write: Option<Arc<SparseWriteState>>,
+}
+
+/// Tracks which regions of a sparse staging file have been modified.
+/// The staging file is sparse: bytes in [0, original_size) are a hole (zeros)
+/// unless a dirty range overlaps them, in which case they are lazily downloaded
+/// from CAS. At flush time, only the modified regions need re-chunking/uploading.
+#[derive(Debug, Clone)]
+pub struct SparseWriteState {
+    /// Hash of the original file in CAS.
+    pub original_hash: String,
+    /// Size of the original file in CAS. Immutable after construction; passed to
+    /// `upload_ranges`, which validates it against the reconstruction info for
+    /// `original_hash`. A truncate-shrink does NOT change this — see
+    /// `effective_original_size` instead.
+    pub original_size: u64,
+    /// Effective live region of the original CAS file. Equals `original_size`
+    /// initially, then capped by truncate-shrinks. Used by `track_write` (to
+    /// know where the live "fillable" region ends) and `fill_sparse_holes` (to
+    /// stop reading CAS bytes past a truncate boundary). Always <= original_size.
+    pub effective_original_size: u64,
+    /// Sorted, non-overlapping dirty byte ranges (start, end), in current-file coordinates.
+    pub dirty_ranges: Vec<(u64, u64)>,
+    /// When true, the on-disk staging file holds the full original content in
+    /// [0, effective_original_size) — set for opens that reuse a current
+    /// staging cache (no fresh sparse hole was created). Reads can serve
+    /// directly from staging without consulting CAS; `fill_sparse_holes`
+    /// short-circuits to a no-op. Stays valid for the lifetime of the open
+    /// because dirty writes overlay onto the existing bytes (track_write
+    /// updates both staging and the dirty range list) and the snapshot hash
+    /// is pinned once dirty is set.
+    pub staging_holds_full_original: bool,
+}
+
+impl SparseWriteState {
+    pub fn new(original_hash: String, original_size: u64) -> Self {
+        Self {
+            original_hash,
+            original_size,
+            effective_original_size: original_size,
+            dirty_ranges: Vec::new(),
+            staging_holds_full_original: false,
+        }
+    }
+
+    /// Variant of `new` for reused-staging opens: the staging file already
+    /// holds the full original content, so reads bypass CAS.
+    pub fn new_with_full_staging(original_hash: String, original_size: u64) -> Self {
+        Self {
+            staging_holds_full_original: true,
+            ..Self::new(original_hash, original_size)
+        }
+    }
+
+    /// Record a write at [offset, offset+len). Merges overlapping/adjacent ranges.
+    /// Uses binary search to find the affected region in O(log n + k) where k is
+    /// the number of ranges merged (typically 0-1 for sequential writes).
+    pub fn track_write(&mut self, offset: u64, len: u64) {
+        if len == 0 {
+            return;
+        }
+        // If writing past the live region, extend the range back to its end.
+        // The gap [effective_original_size, offset) is zeros in the sparse staging
+        // file (either never-touched holes, or zeroed by a prior truncate) and must
+        // be included in dirty_inputs so upload_ranges doesn't miss them.
+        let mut new_start = if offset > self.effective_original_size {
+            self.effective_original_size
+        } else {
+            offset
+        };
+        let mut new_end = offset + len;
+
+        // Binary search: first range whose end >= new_start (could overlap on the left)
+        let first = self.dirty_ranges.partition_point(|&(_, e)| e < new_start);
+        // Binary search: first range whose start > new_end (past the overlap zone)
+        let last = self.dirty_ranges[first..].partition_point(|&(s, _)| s <= new_end) + first;
+
+        // Merge all overlapping ranges [first..last) into the new range
+        if first < last {
+            new_start = new_start.min(self.dirty_ranges[first].0);
+            new_end = new_end.max(self.dirty_ranges[last - 1].1);
+        }
+
+        // Replace the overlapping slice with the single merged range
+        self.dirty_ranges.splice(first..last, [(new_start, new_end)]);
+    }
+
+    /// Remove dirty ranges past `new_size`, cap overlapping ones, and drop any
+    /// range that becomes empty after clipping (defense — `track_write` never
+    /// produces zero-length ranges, but keeping the invariant `s < e` here means
+    /// downstream consumers don't have to worry about it).
+    fn trim_dirty_ranges(&mut self, new_size: u64) {
+        self.dirty_ranges.retain_mut(|&mut (ref s, ref mut e)| {
+            if *s >= new_size {
+                return false;
+            }
+            *e = (*e).min(new_size);
+            *s < *e
+        });
+    }
+
+    /// Clip the sparse state to a new (smaller) file size after a truncate-shrink.
+    /// Removes dirty ranges past `new_size` and lowers `effective_original_size`
+    /// so subsequent writes past the new EOF zero-fill the gap correctly.
+    /// `original_size` is left untouched — it is the immutable CAS object size.
+    pub fn clip_to_size(&mut self, new_size: u64) {
+        self.effective_original_size = self.effective_original_size.min(new_size);
+        self.trim_dirty_ranges(new_size);
+    }
 }
 
 impl InodeEntry {
@@ -207,26 +332,96 @@ impl InodeEntry {
         }
     }
 
+    /// Clear dirty state after a no-op flush (the upload returned the same hash
+    /// the snapshot pointed at — no Hub commit needed). Used when the open made
+    /// no actual modifications. We must NOT roll `xet_hash`/`size` back to the
+    /// snapshot here, because `poll_remote_changes` may have legitimately
+    /// updated them to a newer remote revision during the open window; doing so
+    /// would silently revert the inode to the snapshot.
+    pub fn apply_noop_commit(&mut self, dirty_generation: u64) {
+        if self.clear_dirty_if(dirty_generation) {
+            self.pending_deletes.clear();
+            // Keep `sparse_write` (still-open handles need it for
+            // `fill_sparse_holes`) but reset the parts that describe staging
+            // contents:
+            //  * `dirty_ranges`: the no-op means staging matches
+            //    `original_hash`, so nothing is dirty wrt that hash. Stale
+            //    ranges would mark zero positions as "covered by dirty"
+            //    on a subsequent reopen with fresh sparse staging → reads
+            //    return zeros from the hole.
+            //  * `staging_holds_full_original`: the on-disk staging file may
+            //    be GC'd or recreated as a hole later. Leaving this true
+            //    would make `fill_sparse_holes` short-circuit and return
+            //    those zeros. Pessimistic but correct: subsequent reads
+            //    fetch from CAS again.
+            if let Some(sw) = self.sparse_write.as_mut() {
+                let sw = Arc::make_mut(sw);
+                sw.dirty_ranges.clear();
+                sw.staging_holds_full_original = false;
+            }
+            // Bump mtime/ctime ONLY when clear_dirty_if succeeded — observers
+            // (build systems, rsync) interpret a fresh mtime as "this version
+            // is durably committed." On a generation mismatch, a concurrent
+            // writer raced past the snapshot and the inode is still dirty;
+            // advertising the touch would lie about durability (finding C5).
+            let now = SystemTime::now();
+            self.mtime = now;
+            self.ctime = now;
+            self.last_revalidated = Some(Instant::now());
+        }
+    }
+
     /// Apply a successful commit: update hash, size, timestamps, and
     /// conditionally clear dirty + pending_deletes if the generation matches.
-    pub fn apply_commit(&mut self, hash: &str, size: u64, dirty_generation: u64) {
+    ///
+    /// Generation mismatch is the concurrent-writer case: a write landed
+    /// between the flush snapshot and this call, so `dirty_generation` is
+    /// ahead of the snapshot. We skip the metadata updates here to avoid
+    /// clobbering the in-progress write. The CAS upload and the Hub commit
+    /// already fired with the now-stale content; `entry.xet_hash` therefore
+    /// remains pointing at the pre-flush hash, and the next flush will
+    /// re-upload the file. The CAS layer dedups identical content, but the
+    /// sparse path makes a redundant flush more visible because
+    /// `range_upload` is more expensive than a true no-op — worth keeping
+    /// in mind if hot paths show repeat flushes under contention.
+    ///
+    /// `was_sparse_upload = true` means the flush composed the new CAS file via
+    /// `range_upload` from sparse staging. In that case the on-disk staging file
+    /// only contains the dirty patches over a sparse hole — it does NOT match the
+    /// new CAS file, so we must keep `sparse_write` set (re-keyed to the new hash
+    /// with empty dirty_ranges) and clear `staging_is_current`. Reads through the
+    /// still-open handle then go through `fill_sparse_holes` against the new hash,
+    /// and the next open-for-write will rebuild a fresh sparse staging.
+    pub fn apply_commit(&mut self, hash: &str, size: u64, dirty_generation: u64, was_sparse_upload: bool) {
         if self.clear_dirty_if(dirty_generation) {
             // Only update metadata when the generation matches. A concurrent
             // writer may have advanced the generation with newer content;
             // overwriting size/hash here would clobber the in-progress data.
             self.xet_hash = Some(hash.to_string());
-            // The on-disk staging file is the just-uploaded content — valid
-            // cache for the next write-open.
-            self.staging_is_current = true;
+            if was_sparse_upload {
+                // Staging is sparse (holes + dirty patches), not a clean cache.
+                self.staging_is_current = false;
+                self.sparse_write = Some(Arc::new(SparseWriteState::new(hash.to_string(), size)));
+            } else {
+                // The on-disk staging file is the just-uploaded content — valid
+                // cache for the next write-open.
+                self.staging_is_current = true;
+                self.sparse_write = None;
+            }
             self.size = size;
             self.pending_deletes.clear();
+            // Bump mtime/ctime/last_revalidated ONLY when clear_dirty_if
+            // succeeded — on a generation mismatch the concurrent writer's
+            // bytes are still in staging and the inode stays dirty, so we
+            // must not advertise the touch as durably committed (finding
+            // C5/E2). Mark as recently validated so subsequent lookups skip
+            // HEAD revalidation for the duration of metadata_ttl (we just
+            // committed this exact hash).
+            let now = SystemTime::now();
+            self.mtime = now;
+            self.ctime = now;
+            self.last_revalidated = Some(Instant::now());
         }
-        let now = SystemTime::now();
-        self.mtime = now;
-        self.ctime = now;
-        // Mark as recently validated so subsequent lookups skip HEAD revalidation
-        // for the duration of metadata_ttl (we just committed this exact hash).
-        self.last_revalidated = Some(Instant::now());
     }
 }
 
@@ -293,6 +488,7 @@ impl InodeTable {
             pending_deletes: Vec::new(),
             last_revalidated: None,
             eviction: EvictionState::default(),
+            sparse_write: None,
         };
         table.inodes.insert(ROOT_INODE, root);
         table.path_to_inode.insert(root_path, ROOT_INODE);
@@ -333,17 +529,27 @@ impl InodeTable {
     /// Bump the per-inode open-handle refcount. Called on every `open` /
     /// `create` to pin the entry against eviction for as long as a FUSE
     /// file handle references it.
-    pub(crate) fn bump_open_handles(&self, ino: u64) {
+    ///
+    /// `writable=true` also bumps the writable-handle sub-count, which
+    /// `update_remote_file` uses to gate hash rotation: read-only handles
+    /// do not need the inode snapshot to stay stable across polls.
+    pub(crate) fn bump_open_handles(&self, ino: u64, writable: bool) {
         if let Some(entry) = self.inodes.get(&ino) {
             entry.eviction.open_handles.fetch_add(1, Ordering::Relaxed);
+            if writable {
+                entry.eviction.open_write_handles.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 
     /// Drop the per-inode open-handle refcount. Called on `release` once
     /// the handle has been removed from `VirtualFs::open_files`.
-    pub(crate) fn drop_open_handles(&self, ino: u64) {
+    pub(crate) fn drop_open_handles(&self, ino: u64, writable: bool) {
         if let Some(entry) = self.inodes.get(&ino) {
             entry.eviction.open_handles.fetch_sub(1, Ordering::Relaxed);
+            if writable {
+                entry.eviction.open_write_handles.fetch_sub(1, Ordering::Relaxed);
+            }
         }
     }
 
@@ -352,6 +558,15 @@ impl InodeTable {
         self.inodes
             .get(&ino)
             .is_some_and(|e| e.eviction.open_handles.load(Ordering::Relaxed) > 0)
+    }
+
+    /// Is there at least one WRITABLE FUSE file handle on this inode?
+    /// Used by `update_remote_file` to defer hash rotation while a writer
+    /// still depends on the inode's snapshot (codex P1).
+    pub(crate) fn has_open_write_handles(&self, ino: u64) -> bool {
+        self.inodes
+            .get(&ino)
+            .is_some_and(|e| e.eviction.open_write_handles.load(Ordering::Relaxed) > 0)
     }
 
     pub fn len(&self) -> usize {
@@ -638,6 +853,7 @@ impl InodeTable {
                 last_touched: AtomicU64::new(touch_seq),
                 ..Default::default()
             },
+            sparse_write: None,
         };
 
         self.inodes.insert(inode, entry);
@@ -693,7 +909,15 @@ impl InodeTable {
             .collect()
     }
 
-    /// Update remote file metadata (only if not dirty). Returns true if updated.
+    /// Update remote file metadata (only if not dirty and no open handles).
+    /// Returns true if updated.
+    ///
+    /// Skipping while handles are open preserves the open snapshot semantics:
+    /// any handle holding a `sparse_write` keyed to the old xet_hash continues
+    /// to operate on its snapshot until released. Without this guard, poll
+    /// could change the inode's hash mid-open, causing later operations on
+    /// the same inode (reads via fill_sparse_holes, setattr, second opens) to
+    /// see inconsistent state across the open's lifetime.
     pub fn update_remote_file(
         &mut self,
         ino: u64,
@@ -702,8 +926,21 @@ impl InodeTable {
         new_size: u64,
         new_mtime: SystemTime,
     ) -> bool {
+        // Refuse when a writable handle is open even if the inode is
+        // currently clean: a post-flush writable handle still relies on
+        // sparse_write matching entry.xet_hash for its next write (lazy
+        // install + range_upload composition); rotating xet_hash here
+        // would corrupt the next flush (codex P1).
+        //
+        // Read-only handles are NOT a blocker — Lazy prefetch buffers are
+        // bound to the open-time hash, and LocalFd reads gate
+        // fill_sparse_holes on the hash match (finding C2). So a long-
+        // lived NFS-pool READ handle does not freeze metadata refreshes
+        // for that inode (resolves the B6/E7 freeze without re-introducing
+        // the corruption it was originally guarding against).
+        let has_write_handles = self.has_open_write_handles(ino);
         if let Some(entry) = self.inodes.get_mut(&ino) {
-            if entry.is_dirty() {
+            if entry.is_dirty() || has_write_handles {
                 return false;
             }
             entry.xet_hash = new_hash;
@@ -714,6 +951,14 @@ impl InodeTable {
             // matches xet_hash. An in-flight download observes this under
             // its post-check and won't re-flag the cache.
             entry.staging_is_current = false;
+            // Clear `sparse_write` since the guard above already proved
+            // has_handles=false — no open handle relies on the old snapshot.
+            // Leaving sparse_write keyed to the OLD hash would have any
+            // subsequent setattr or read use it against the new xet_hash,
+            // composing/overlaying against the wrong CAS object (findings
+            // C1, C2). The next open's drift check installs a fresh
+            // sparse_write against the now-current hash.
+            entry.sparse_write = None;
             true
         } else {
             false
@@ -1054,13 +1299,76 @@ mod tests {
         entry.pending_deletes.push("old_path".to_string());
         let snap = entry.dirty_generation;
 
-        entry.apply_commit("new_hash", 200, snap);
+        entry.apply_commit("new_hash", 200, snap, false);
 
         assert!(!entry.is_dirty());
         assert_eq!(entry.xet_hash.as_deref(), Some("new_hash"));
         assert_eq!(entry.size, 200);
         assert!(entry.pending_deletes.is_empty());
         assert!(entry.mtime > UNIX_EPOCH);
+    }
+
+    #[test]
+    fn apply_commit_sparse_upload_keeps_sparse_state() {
+        let mut table = InodeTable::new(false);
+        let ino = table.insert(
+            ROOT_INODE,
+            "test".to_string(),
+            "test".to_string(),
+            InodeKind::File,
+            100,
+            UNIX_EPOCH,
+            Some("old_hash".to_string()),
+            0o644,
+            0,
+            0,
+        );
+        let entry = table.get_mut(ino).unwrap();
+        entry.set_dirty();
+        entry.sparse_write = Some(Arc::new(SparseWriteState::new("old_hash".into(), 100)));
+        entry.staging_is_current = true; // pretend a prior full-cache state
+        let snap = entry.dirty_generation;
+
+        entry.apply_commit("new_hash", 200, snap, true);
+
+        // Sparse upload: staging only has dirty patches over holes, NOT a clean cache.
+        assert!(!entry.is_dirty(), "dirty flag should be cleared");
+        assert_eq!(entry.xet_hash.as_deref(), Some("new_hash"));
+        assert_eq!(entry.size, 200);
+        assert!(
+            !entry.staging_is_current,
+            "staging cannot be marked current after sparse upload"
+        );
+        let sw = entry.sparse_write.as_ref().expect("sparse_write must persist");
+        assert_eq!(sw.original_hash, "new_hash", "sparse state re-keyed to new hash");
+        assert_eq!(sw.original_size, 200);
+        assert!(sw.dirty_ranges.is_empty(), "fresh sparse state has no dirty ranges");
+    }
+
+    #[test]
+    fn apply_commit_full_upload_clears_sparse_state() {
+        let mut table = InodeTable::new(false);
+        let ino = table.insert(
+            ROOT_INODE,
+            "test".to_string(),
+            "test".to_string(),
+            InodeKind::File,
+            100,
+            UNIX_EPOCH,
+            Some("old_hash".to_string()),
+            0o644,
+            0,
+            0,
+        );
+        let entry = table.get_mut(ino).unwrap();
+        entry.set_dirty();
+        entry.sparse_write = Some(Arc::new(SparseWriteState::new("old_hash".into(), 100)));
+        let snap = entry.dirty_generation;
+
+        entry.apply_commit("new_hash", 200, snap, false);
+
+        assert!(entry.staging_is_current, "full upload: staging matches CAS");
+        assert!(entry.sparse_write.is_none(), "full upload clears sparse state");
     }
 
     #[test]
@@ -1083,7 +1391,7 @@ mod tests {
         entry.pending_deletes.push("old_path".to_string());
         entry.set_dirty(); // gen=2 (simulates concurrent writer)
 
-        entry.apply_commit("new_hash", 200, 1); // stale snapshot
+        entry.apply_commit("new_hash", 200, 1, false); // stale snapshot
 
         // Generation mismatch: dirty stays, and size/hash must NOT be overwritten
         // (a concurrent writer may have newer content in staging).
@@ -2429,10 +2737,22 @@ mod tests {
         let busy = mk_file(&mut table, "busy.txt");
 
         assert!(!table.has_open_handles(busy));
-        table.bump_open_handles(busy);
+        assert!(!table.has_open_write_handles(busy));
+
+        // Read-only handle bumps total but not write count.
+        table.bump_open_handles(busy, false);
         assert!(table.has_open_handles(busy));
-        table.drop_open_handles(busy);
+        assert!(!table.has_open_write_handles(busy));
+        table.drop_open_handles(busy, false);
         assert!(!table.has_open_handles(busy));
+
+        // Write handle bumps both.
+        table.bump_open_handles(busy, true);
+        assert!(table.has_open_handles(busy));
+        assert!(table.has_open_write_handles(busy));
+        table.drop_open_handles(busy, true);
+        assert!(!table.has_open_handles(busy));
+        assert!(!table.has_open_write_handles(busy));
     }
 
     // ── child_index invariants ─────────────────────────────────────
@@ -2488,5 +2808,288 @@ mod tests {
         let a2 = mk_file(&mut table, "a.txt");
         assert_child_index_consistent(&table);
         assert_eq!(table.lookup_child(ROOT_INODE, "a.txt").map(|e| e.inode), Some(a2));
+    }
+
+    // ── SparseWriteState constructors ───────────────────────────────
+
+    #[test]
+    fn sparse_new_defaults_to_empty_holes() {
+        let sw = SparseWriteState::new("h".into(), 100);
+        assert!(
+            !sw.staging_holds_full_original,
+            "fresh sparse open: staging is a hole, must consult CAS on reads"
+        );
+        assert_eq!(sw.original_size, 100);
+        assert_eq!(sw.effective_original_size, 100);
+        assert!(sw.dirty_ranges.is_empty());
+    }
+
+    #[test]
+    fn sparse_new_with_full_staging_marks_flag() {
+        let sw = SparseWriteState::new_with_full_staging("h".into(), 100);
+        assert!(
+            sw.staging_holds_full_original,
+            "reused-staging open: fill_sparse_holes must short-circuit"
+        );
+        assert_eq!(sw.original_size, 100);
+        assert_eq!(sw.effective_original_size, 100);
+        assert!(sw.dirty_ranges.is_empty());
+    }
+
+    // ── SparseWriteState::track_write ───────────────────────────────
+
+    //  0    10   20   30
+    //  |    [####]    |       write(10, 10)
+    #[test]
+    fn sparse_single_write() {
+        let mut sw = SparseWriteState::new("h".into(), 100);
+        sw.track_write(10, 10);
+        assert_eq!(sw.dirty_ranges, vec![(10, 20)]);
+    }
+
+    //  len=0 → no-op, dirty_ranges unchanged
+    #[test]
+    fn sparse_zero_length_write_noop() {
+        let mut sw = SparseWriteState::new("h".into(), 100);
+        sw.track_write(10, 0);
+        assert!(sw.dirty_ranges.is_empty(), "zero-length write should be a no-op");
+        sw.track_write(50, 10);
+        sw.track_write(55, 0); // no-op inside existing range
+        assert_eq!(sw.dirty_ranges, vec![(50, 60)]);
+    }
+
+    //  0    10   20   30   40
+    //  |    [AAA]     [BBB]       two disjoint, no merge
+    #[test]
+    fn sparse_two_disjoint() {
+        let mut sw = SparseWriteState::new("h".into(), 100);
+        sw.track_write(10, 10);
+        sw.track_write(30, 10);
+        assert_eq!(sw.dirty_ranges, vec![(10, 20), (30, 40)]);
+    }
+
+    //  0    10   20  30
+    //  |    [AAA][BBB]           adjacent → merge into [10, 30)
+    #[test]
+    fn sparse_two_adjacent_merge() {
+        let mut sw = SparseWriteState::new("h".into(), 100);
+        sw.track_write(10, 10);
+        sw.track_write(20, 10);
+        assert_eq!(sw.dirty_ranges, vec![(10, 30)]);
+    }
+
+    //  0    10 15 20 25
+    //  |    [AAAA]            first
+    //  |       [BBBBB]        second overlaps → merge into [10, 25)
+    #[test]
+    fn sparse_two_overlapping_merge() {
+        let mut sw = SparseWriteState::new("h".into(), 100);
+        sw.track_write(10, 10);
+        sw.track_write(15, 10);
+        assert_eq!(sw.dirty_ranges, vec![(10, 25)]);
+    }
+
+    //  0  5  10   20 25
+    //  |     [AAA]           existing
+    //  |  [BBBBBBBBB]        new engulfs existing → [5, 25)
+    #[test]
+    fn sparse_engulf_existing() {
+        let mut sw = SparseWriteState::new("h".into(), 100);
+        sw.track_write(10, 10);
+        sw.track_write(5, 20);
+        assert_eq!(sw.dirty_ranges, vec![(5, 25)]);
+    }
+
+    //  0  5  10   20 25
+    //  |  [AAAAAAAAA]        existing
+    //  |     [BBB]           new inside existing → no change [5, 25)
+    #[test]
+    fn sparse_existing_engulfs_new() {
+        let mut sw = SparseWriteState::new("h".into(), 100);
+        sw.track_write(5, 20);
+        sw.track_write(10, 10);
+        assert_eq!(sw.dirty_ranges, vec![(5, 25)]);
+    }
+
+    //  0    10   20   30   40
+    //  |    [AA]      [CC]        two disjoint
+    //  |       [BBBBBBB]          bridges the gap → merge all into [10, 40)
+    #[test]
+    fn sparse_three_merge_into_one() {
+        let mut sw = SparseWriteState::new("h".into(), 100);
+        sw.track_write(10, 10);
+        sw.track_write(30, 10);
+        sw.track_write(15, 20);
+        assert_eq!(sw.dirty_ranges, vec![(10, 40)]);
+    }
+
+    //  0    10
+    //  [####]          write at offset 0
+    #[test]
+    fn sparse_write_at_zero() {
+        let mut sw = SparseWriteState::new("h".into(), 100);
+        sw.track_write(0, 10);
+        assert_eq!(sw.dirty_ranges, vec![(0, 10)]);
+    }
+
+    //  0         100  150
+    //  |...CAS...|[###]      write past original_size (append)
+    #[test]
+    fn sparse_append_past_size() {
+        let mut sw = SparseWriteState::new("h".into(), 100);
+        sw.track_write(100, 50);
+        assert_eq!(sw.dirty_ranges, vec![(100, 150)]);
+    }
+
+    //  0    10   20   30
+    //  [AAA][BBB][CCC]       3 sequential → merge into [0, 30)
+    #[test]
+    fn sparse_sequential_adjacent() {
+        let mut sw = SparseWriteState::new("h".into(), 100);
+        sw.track_write(0, 10);
+        sw.track_write(10, 10);
+        sw.track_write(20, 10);
+        assert_eq!(sw.dirty_ranges, vec![(0, 30)]);
+    }
+
+    //  0    10   20   30   40
+    //  |              [BBB]      inserted first (higher offset)
+    //  |    [AAA]                inserted second (lower) → sorted: [(10,20), (30,40)]
+    #[test]
+    fn sparse_reverse_order_insert() {
+        let mut sw = SparseWriteState::new("h".into(), 100);
+        sw.track_write(30, 10);
+        sw.track_write(10, 10);
+        assert_eq!(sw.dirty_ranges, vec![(10, 20), (30, 40)]);
+    }
+
+    //  0    10   20   30     50   60
+    //  |    [AAA]           [BBB]        before clip
+    //  |    [AAA]     ^                  after clip_to_size(30): B removed
+    #[test]
+    fn sparse_clip_to_size_removes_past_ranges() {
+        let mut sw = SparseWriteState::new("h".into(), 100);
+        sw.track_write(10, 10);
+        sw.track_write(50, 10);
+        sw.clip_to_size(30);
+        // original_size is the immutable CAS object size — clip only affects
+        // effective_original_size and trims dirty ranges.
+        assert_eq!(sw.original_size, 100);
+        assert_eq!(sw.effective_original_size, 30);
+        assert_eq!(sw.dirty_ranges, vec![(10, 20)]);
+    }
+
+    //  0  5  10 15
+    //  |  [AAAA]          before clip
+    //  |  [AAA]^          after clip_to_size(10): range capped at 10
+    #[test]
+    fn sparse_clip_to_size_caps_overlapping_range() {
+        let mut sw = SparseWriteState::new("h".into(), 100);
+        sw.track_write(5, 10);
+        sw.clip_to_size(10);
+        assert_eq!(sw.original_size, 100);
+        assert_eq!(sw.effective_original_size, 10);
+        assert_eq!(sw.dirty_ranges, vec![(5, 10)]);
+    }
+
+    //  clip_to_size(100) on original_size=50 → no-op
+    #[test]
+    fn sparse_clip_to_size_noop_when_larger() {
+        let mut sw = SparseWriteState::new("h".into(), 50);
+        sw.track_write(10, 10);
+        sw.clip_to_size(100);
+        assert_eq!(sw.original_size, 50);
+        assert_eq!(sw.effective_original_size, 50);
+        assert_eq!(sw.dirty_ranges, vec![(10, 20)]);
+    }
+
+    // After a truncate-shrink, a write past the new EOF must extend the dirty
+    // range back to `effective_original_size` (not `original_size`), so the
+    // intervening zero-gap is included in the upload composition.
+    #[test]
+    fn sparse_track_write_past_effective_eof_after_shrink() {
+        let mut sw = SparseWriteState::new("h".into(), 100);
+        sw.clip_to_size(20);
+        assert_eq!(sw.original_size, 100);
+        assert_eq!(sw.effective_original_size, 20);
+        sw.track_write(50, 5);
+        assert_eq!(sw.dirty_ranges, vec![(20, 55)]);
+    }
+
+    //  0                              100
+    //  [################################]   full file overwrite
+    #[test]
+    fn sparse_full_file_write() {
+        let mut sw = SparseWriteState::new("h".into(), 100);
+        sw.track_write(0, 100);
+        assert_eq!(sw.dirty_ranges, vec![(0, 100)]);
+    }
+
+    //  0  1
+    //  [#]   single byte write
+    #[test]
+    fn sparse_single_byte_write() {
+        let mut sw = SparseWriteState::new("h".into(), 100);
+        sw.track_write(50, 1);
+        assert_eq!(sw.dirty_ranges, vec![(50, 51)]);
+    }
+
+    //  Same range written twice → no change
+    #[test]
+    fn sparse_idempotent_write() {
+        let mut sw = SparseWriteState::new("h".into(), 100);
+        sw.track_write(10, 10);
+        sw.track_write(10, 10);
+        assert_eq!(sw.dirty_ranges, vec![(10, 20)]);
+    }
+
+    //  0    10   20   30   40   50   60
+    //  |    [AA]      [CC]      [EE]      3 disjoint
+    //  |       [BBBBBBBBBBBBBBBBBB]        bridges all → single [10, 60)
+    #[test]
+    fn sparse_bridge_many_ranges() {
+        let mut sw = SparseWriteState::new("h".into(), 100);
+        sw.track_write(10, 10);
+        sw.track_write(30, 10);
+        sw.track_write(50, 10);
+        assert_eq!(sw.dirty_ranges, vec![(10, 20), (30, 40), (50, 60)]);
+        sw.track_write(15, 40); // bridges all three
+        assert_eq!(sw.dirty_ranges, vec![(10, 60)]);
+    }
+
+    //  clip_to_size(0) → empties everything
+    #[test]
+    fn sparse_clip_to_zero() {
+        let mut sw = SparseWriteState::new("h".into(), 100);
+        sw.track_write(10, 10);
+        sw.track_write(50, 10);
+        sw.clip_to_size(0);
+        assert_eq!(sw.original_size, 100);
+        assert_eq!(sw.effective_original_size, 0);
+        assert!(sw.dirty_ranges.is_empty());
+    }
+
+    //  Write at exact boundary of existing range end
+    //  0    10   20
+    //  |    [AAA]       existing
+    //  |         [B]    write at exact end → adjacent merge → [10, 21)
+    #[test]
+    fn sparse_write_at_exact_end() {
+        let mut sw = SparseWriteState::new("h".into(), 100);
+        sw.track_write(10, 10);
+        sw.track_write(20, 1);
+        assert_eq!(sw.dirty_ranges, vec![(10, 21)]);
+    }
+
+    //  Write at exact boundary of existing range start
+    //  0  9 10   20
+    //  |  [B]           write just before
+    //  |    [AAA]       existing → adjacent merge → [9, 20)
+    #[test]
+    fn sparse_write_just_before_start() {
+        let mut sw = SparseWriteState::new("h".into(), 100);
+        sw.track_write(10, 10);
+        sw.track_write(9, 1);
+        assert_eq!(sw.dirty_ranges, vec![(9, 20)]);
     }
 }

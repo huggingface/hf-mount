@@ -77,7 +77,7 @@ impl CachedXetClient {
     }
 }
 
-/// Derive a range-scoped `QueryReconstructionResponse` from a cached full-file response.
+/// Derive a range-scoped `QueryReconstructionResponseV2` from a cached full-file response.
 ///
 /// The full-file response lists all terms in file order with their unpacked byte lengths.
 /// We walk the terms, track cumulative byte offsets, and keep only terms that overlap

@@ -12,6 +12,7 @@ use xet_data::processing::XetFileInfo;
 use crate::error::{Error, Result};
 use crate::hub_api::{BatchOp, HeadFileInfo, HubOps, SourceKind, TreeEntry};
 use crate::overlay::OverlayBacking;
+use crate::virtual_fs::inode::SparseWriteState;
 use crate::xet::{DownloadStreamOps, StagingDir, StreamingWriterOps, XetOps};
 
 // ── MockHub ───────────────────────────────────────────────────────────
@@ -29,6 +30,11 @@ pub struct MockHub {
     list_tree_calls: AtomicU32,
     head_file_calls: AtomicU32,
     probe_revision_calls: AtomicU32,
+    /// Path → bytes for non-Xet bucket objects. `download_file_http` writes
+    /// these to the requested dest path so tests can exercise the HTTP path
+    /// with real content. Files without an entry get an empty body
+    /// (mirrors the existing behavior).
+    bucket_content: Mutex<HashMap<String, Vec<u8>>>,
     /// `Ok(rev)` returns the token; `Err((status, msg))` rebuilds an
     /// `Error::Hub` with that status so the poll loop's 401-branch still fires.
     revision: Mutex<std::result::Result<String, (Option<u16>, String)>>,
@@ -52,6 +58,7 @@ impl MockHub {
             list_tree_calls: AtomicU32::new(0),
             head_file_calls: AtomicU32::new(0),
             probe_revision_calls: AtomicU32::new(0),
+            bucket_content: Mutex::new(HashMap::new()),
             revision: Mutex::new(Ok("rev-0".to_string())),
         })
     }
@@ -74,8 +81,20 @@ impl MockHub {
             list_tree_calls: AtomicU32::new(0),
             head_file_calls: AtomicU32::new(0),
             probe_revision_calls: AtomicU32::new(0),
+            bucket_content: Mutex::new(HashMap::new()),
             revision: Mutex::new(Ok("rev-0".to_string())),
         })
+    }
+
+    /// Register HTTP-served content for a non-Xet bucket file. Tests use
+    /// this to give `download_file_http` something to serve when exercising
+    /// write paths on non-Xet files (e.g., setattr-shrink that downloads
+    /// the original before truncating).
+    pub fn set_bucket_content(&self, path: &str, content: &[u8]) {
+        self.bucket_content
+            .lock()
+            .unwrap()
+            .insert(path.to_string(), content.to_vec());
     }
 
     pub fn add_file(&self, path: &str, size: u64, xet_hash: Option<&str>, oid: Option<&str>) {
@@ -154,6 +173,10 @@ impl MockHub {
 
     pub fn set_batch_barrier(&self, barrier: Arc<tokio::sync::Barrier>) {
         *self.batch_barrier.lock().unwrap() = Some(barrier);
+    }
+
+    pub fn clear_batch_barrier(&self) {
+        *self.batch_barrier.lock().unwrap() = None;
     }
 
     pub fn take_batch_log(&self) -> Vec<Vec<BatchOp>> {
@@ -241,15 +264,21 @@ impl HubOps for MockHub {
         Ok(())
     }
 
-    async fn download_file_http(&self, _path: &str, dest: &Path) -> Result<()> {
+    async fn download_file_http(&self, path: &str, dest: &Path) -> Result<()> {
         if self.download_fail.swap(false, Ordering::SeqCst) {
             return Err(Error::hub("mock download failure"));
         }
-        // Create an empty file at dest so open_local_readonly can open it.
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent).ok();
         }
-        std::fs::write(dest, b"").map_err(Error::Io)?;
+        let content = self
+            .bucket_content
+            .lock()
+            .unwrap()
+            .get(path)
+            .cloned()
+            .unwrap_or_default();
+        std::fs::write(dest, &content).map_err(Error::Io)?;
         Ok(())
     }
 
@@ -278,11 +307,12 @@ impl HubOps for MockHub {
 // ── MockXet ───────────────────────────────────────────────────────────
 
 pub struct MockXet {
-    files: Mutex<HashMap<String, Vec<u8>>>,
+    files: Arc<Mutex<HashMap<String, Vec<u8>>>>,
     pub next_hash: AtomicU64,
     writer_create_fail: AtomicBool,
     upload_fail: AtomicBool,
     download_fail: AtomicBool,
+    range_upload_fail: AtomicBool,
     writer_fail_after: AtomicU64,
     /// Number of range download calls that should fail before succeeding.
     range_fail_count: AtomicU32,
@@ -309,11 +339,12 @@ pub struct UploadGate {
 impl MockXet {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
-            files: Mutex::new(HashMap::new()),
+            files: Arc::new(Mutex::new(HashMap::new())),
             next_hash: AtomicU64::new(1),
             writer_create_fail: AtomicBool::new(false),
             upload_fail: AtomicBool::new(false),
             download_fail: AtomicBool::new(false),
+            range_upload_fail: AtomicBool::new(false),
             writer_fail_after: AtomicU64::new(u64::MAX),
             range_fail_count: AtomicU32::new(0),
             range_empty_count: AtomicU32::new(0),
@@ -362,6 +393,16 @@ impl MockXet {
         self.range_empty_count.store(n, Ordering::SeqCst);
     }
 
+    #[allow(dead_code)]
+    pub fn fail_range_upload(&self) {
+        self.range_upload_fail.store(true, Ordering::SeqCst);
+    }
+
+    #[allow(dead_code)]
+    pub fn get_file(&self, hash: &str) -> Option<Vec<u8>> {
+        self.files.lock().unwrap().get(hash).cloned()
+    }
+
     fn next_hash_string(&self) -> String {
         format!("mock_hash_{}", self.next_hash.fetch_add(1, Ordering::SeqCst))
     }
@@ -378,6 +419,7 @@ impl XetOps for MockXet {
             data: Vec::new(),
             hash: self.next_hash_string(),
             fail_after,
+            files: self.files.clone(),
         }))
     }
 
@@ -427,6 +469,58 @@ impl XetOps for MockXet {
         // re-enabled when xet-core adds chunk sizes to XorbReconstructionTerm.
     }
 
+    async fn range_upload(
+        &self,
+        sparse_state: &SparseWriteState,
+        staging_path: &std::path::Path,
+        file_size: u64,
+        _io_lock: Arc<std::sync::Mutex<()>>,
+    ) -> crate::error::Result<XetFileInfo> {
+        if self.range_upload_fail.swap(false, Ordering::SeqCst) {
+            return Err(crate::error::Error::Xet("mock range_upload failure".into()));
+        }
+
+        // Mirror real XetSessions::range_upload: nothing dirty + size unchanged
+        // means the original hash is preserved (no upload, no Hub commit).
+        if sparse_state.dirty_ranges.is_empty() && file_size == sparse_state.original_size {
+            return Ok(XetFileInfo::new(
+                sparse_state.original_hash.clone(),
+                sparse_state.original_size,
+            ));
+        }
+
+        let original = self
+            .files
+            .lock()
+            .unwrap()
+            .get(&sparse_state.original_hash)
+            .cloned()
+            .unwrap_or_default();
+        let staging = std::fs::read(staging_path).map_err(Error::Io)?;
+        let total_size = staging.len();
+
+        // Compose: original as base (capped to sparse_state.original_size),
+        // overlay dirty ranges from staging. Region past original_size is zeros
+        // (extension), matching real upload_ranges behavior.
+        let mut composed = vec![0u8; total_size];
+        let orig_end = (sparse_state.original_size as usize)
+            .min(original.len())
+            .min(total_size);
+        composed[..orig_end].copy_from_slice(&original[..orig_end]);
+        for &(start, end) in &sparse_state.dirty_ranges {
+            let start = start as usize;
+            let end = (end as usize).min(total_size);
+            if start < end {
+                composed[start..end].copy_from_slice(&staging[start..end]);
+            }
+        }
+
+        let hash = self.next_hash_string();
+        let size = composed.len() as u64;
+        self.files.lock().unwrap().insert(hash.clone(), composed);
+        Ok(XetFileInfo::new(hash, size))
+    }
+
     fn download_stream_boxed(
         &self,
         file_info: &XetFileInfo,
@@ -468,6 +562,12 @@ pub struct MockStreamingWriter {
     data: Vec<u8>,
     hash: String,
     fail_after: u64,
+    /// Shared handle into the parent MockXet's file map. Registering the
+    /// uploaded data here on finish mirrors the production CAS behavior where
+    /// a successful streaming upload makes the new hash retrievable via
+    /// download_stream — needed for read paths (e.g. fill_sparse_holes) that
+    /// re-read the freshly-uploaded content.
+    files: Arc<Mutex<HashMap<String, Vec<u8>>>>,
 }
 
 #[async_trait::async_trait]
@@ -482,7 +582,8 @@ impl StreamingWriterOps for MockStreamingWriter {
 
     async fn finish_boxed(self: Box<Self>) -> Result<XetFileInfo> {
         let size = self.data.len() as u64;
-        Ok(XetFileInfo::new(self.hash.clone(), size))
+        self.files.lock().unwrap().insert(self.hash.clone(), self.data);
+        Ok(XetFileInfo::new(self.hash, size))
     }
 
     fn len(&self) -> u64 {
@@ -522,6 +623,10 @@ impl DownloadStreamOps for MockDownloadStream {
 pub struct TestOpts {
     pub read_only: bool,
     pub advanced_writes: bool,
+    /// Beta sparse-write path. Default true in tests so the existing sparse
+    /// regression tests keep exercising that code path; opt-out for tests
+    /// that specifically cover the non-sparse fallback.
+    pub sparse_writes: bool,
     pub overlay: bool,
     pub serve_lookup_from_cache: bool,
     pub metadata_ttl: Duration,
@@ -534,6 +639,9 @@ impl Default for TestOpts {
         Self {
             read_only: false,
             advanced_writes: false,
+            // Default true so existing sparse regression tests keep
+            // exercising the sparse path without needing opt-in.
+            sparse_writes: true,
             overlay: false,
             serve_lookup_from_cache: false,
             metadata_ttl: Duration::from_secs(1),
@@ -610,6 +718,7 @@ pub fn make_test_vfs(
         crate::virtual_fs::VfsConfig {
             read_only: opts.read_only,
             advanced_writes: opts.advanced_writes,
+            sparse_writes: opts.sparse_writes,
             uid: 1000,
             gid: 1000,
             poll_interval_secs: 0,
@@ -653,6 +762,7 @@ pub fn make_overlay_test_vfs_with_root(
         crate::virtual_fs::VfsConfig {
             read_only: false,
             advanced_writes: false,
+            sparse_writes: false,
             uid: 1000,
             gid: 1000,
             poll_interval_secs: 0,

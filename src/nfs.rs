@@ -816,6 +816,11 @@ fn errno_to_nfs(e: i32) -> nfsstat3 {
         libc::ENOTEMPTY => nfsstat3::NFS3ERR_NOTEMPTY,
         libc::EBADF => nfsstat3::NFS3ERR_STALE,
         libc::ENOSPC => nfsstat3::NFS3ERR_NOSPC,
+        // EAGAIN signals a transient condition the caller should retry
+        // (e.g., open_advanced_write exhausted its drift-retry budget).
+        // NFS3ERR_JUKEBOX tells the client to back off and retry; mapping
+        // to EIO would surface as a hard failure for a recoverable case.
+        libc::EAGAIN => nfsstat3::NFS3ERR_JUKEBOX,
         _ => nfsstat3::NFS3ERR_IO,
     }
 }
