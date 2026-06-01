@@ -102,20 +102,25 @@ pub struct VfsConfig {
 ///     → inode_table             (RwLock, read or write)
 ///
 ///   staging.lock(ino)           (tokio::sync::Mutex, per-inode)
-///     → inode_table             (RwLock, read or write)
+///     → staging.io_lock(ino)    (std::sync::Mutex, per-inode I/O critical section)
+///       → inode_table           (RwLock, read or write)
 ///         → open_files          (RwLock, read only — via has_open_handles)
 ///         → negative_cache      (RwLock, write — in poll_remote_changes)
 ///
 ///   StreamingChannel.commit_hook (Mutex)
 ///     → pending_commits          (Mutex)
 ///
-/// General discipline: locks are held briefly and never across await points
-/// (except the per-inode tokio::sync::Mutex from StagingCoordinator). Most paths acquire a lock,
-/// extract data, drop the lock, perform async I/O, then re-acquire to apply.
+/// `io_lock` is held by read() (pread + sparse snapshot), write() (pwrite +
+/// sparse track), setattr's size-change branch (set_len + entry.size update),
+/// and fill_sparse_holes' still_holes recheck + write_at. It serializes the
+/// staging file's I/O against concurrent readers/writers/truncates so the
+/// sparse-coverage view stays consistent with the on-disk bytes.
 ///
-/// Exception: setattr(truncate) holds inode_table.write() across File::create
-/// / set_len syscalls (microseconds) to prevent write() from updating
-/// inode.size between the file truncation and the metadata update.
+/// General discipline: locks are held briefly and never across await points
+/// (except the per-inode tokio::sync::Mutex from StagingCoordinator). Most
+/// paths acquire a lock, extract data, drop the lock, perform async I/O, then
+/// re-acquire to apply. io_lock in particular is never held across awaits —
+/// the critical sections it guards are all sync syscalls.
 pub struct VirtualFs {
     runtime: tokio::runtime::Handle,
     hub_client: Arc<dyn HubOps>,
@@ -4030,8 +4035,19 @@ impl VirtualFs {
                     }
                 }
 
-                // Apply the size change under the same write lock so write() cannot
-                // race between the local truncate and inode metadata update.
+                // Apply the size change under the same write lock so write()
+                // cannot race between the local truncate and inode metadata
+                // update. Also hold the per-inode io_lock across set_len +
+                // entry.size mutation so a concurrent fill_sparse_holes
+                // cannot interleave its still_holes recheck and write_at
+                // with this shrink — without the io_lock, the reader can
+                // re-extend the staging file past the new EOF and cache
+                // stale CAS bytes there. Lock order matches fill_sparse_holes
+                // and write(): io_lock first, then inode_table. No awaits
+                // are held under io_lock (set_len + open_local_backing_file
+                // are sync, the `?` in the closure only short-circuits).
+                let io_lock = self.staging.io_lock(ino);
+                let _io_guard = io_lock.lock().expect("staging io_lock poisoned");
                 let mut inodes = self.inode_table.write().expect("inodes poisoned");
                 // Current revision under the write lock. Poll can rotate
                 // xet_hash/size on a clean inode between the pre-lock snapshot
