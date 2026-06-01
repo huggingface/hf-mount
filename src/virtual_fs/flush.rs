@@ -481,12 +481,21 @@ async fn flush_batch(
                 let msg = format!("upload failed: {e}");
                 let mut errs = flush_errors.lock().expect("flush_errors poisoned");
                 // The whole batch is aborted: no Hub commit is sent for any
-                // item. Mark every dirty inode so fsync surfaces the failure
-                // instead of returning success on uncommitted content. Use
-                // `or_insert_with` to preserve the more specific Pass A
-                // error message for items that already failed there.
-                for item in &to_flush {
-                    errs.entry(item.ino).or_insert_with(|| msg.clone());
+                // item. Mark only items that have NO upload result yet — the
+                // ones that actually failed (this chunk or earlier Pass A
+                // failures) or that the early return prevented from running.
+                // Items with `upload_results[i] = Some(_)` already pushed
+                // their CAS xorb successfully (Pass A range_upload or an
+                // earlier Pass B chunk); the data is durable, only the Hub
+                // commit is missing. They stay dirty (no apply_commit runs)
+                // and will retry the Hub commit on the next flush — fsync
+                // must not surface an "upload failed" error for them.
+                // `or_insert_with` still preserves the more specific Pass A
+                // error message on items that did fail there.
+                for (i, item) in to_flush.iter().enumerate() {
+                    if upload_results[i].is_none() {
+                        errs.entry(item.ino).or_insert_with(|| msg.clone());
+                    }
                 }
                 return;
             }
