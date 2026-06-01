@@ -1660,15 +1660,35 @@ impl VirtualFs {
         let staging_path = self.staging.path(ino);
 
         if writable && self.advanced_writes {
-            // Staging file + async flush (supports random writes and seek)
-            self.open_advanced_write(
-                ino,
-                &file_entry.full_path,
-                &file_entry.xet_hash,
-                file_entry.size,
-                truncate,
-            )
-            .await
+            // Staging file + async flush (supports random writes and seek).
+            // open_advanced_write re-snapshots xet_hash/size under staging.lock,
+            // but a narrow window remains between that re-read (under
+            // inode_table.read()) and the install (under inode_table.write())
+            // where apply_commit_sparse can rotate the inode. The drift check
+            // returns EIO in that case; retry a few times internally so the
+            // FUSE/NFS layer above us never sees a transient drift EIO. After
+            // the retry budget is exhausted, surface the EIO so a genuine
+            // disk/IO error still propagates.
+            for attempt in 0..4 {
+                let res = self
+                    .open_advanced_write(
+                        ino,
+                        &file_entry.full_path,
+                        &file_entry.xet_hash,
+                        file_entry.size,
+                        truncate,
+                    )
+                    .await;
+                match res {
+                    Err(libc::EIO) if attempt < 3 => {
+                        debug!("open: ino={} drift EIO from open_advanced_write, retrying", ino);
+                        tokio::time::sleep(Duration::from_millis(5 * (1 << attempt))).await;
+                        continue;
+                    }
+                    other => return other,
+                }
+            }
+            unreachable!()
         } else if writable && truncate {
             // Simple streaming write (append-only, synchronous commit on close)
             self.open_streaming_write(ino, pid).await
@@ -1681,26 +1701,41 @@ impl VirtualFs {
     }
 
     /// Advanced writes: prepare a staging file and open it for read-write.
+    ///
+    /// `xet_hash` and `size` are the caller's pre-lock snapshot (from `open`'s
+    /// `get_file_entry`). They are re-read under `staging.lock(ino)` below so
+    /// any rotation by poll or a just-finished `apply_commit_sparse` is picked
+    /// up here instead of being detected as drift and returned as EIO — which
+    /// no FUSE/NFS layer above us is wired to retry.
     async fn open_advanced_write(
         &self,
         ino: u64,
         full_path: &str,
-        xet_hash: &str,
-        size: u64,
+        _xet_hash: &str,
+        _size: u64,
         truncate: bool,
     ) -> VirtualFsResult<u64> {
         // Serialize staging preparation per inode (prevents concurrent download races)
         let staging_mutex = self.staging.lock(ino);
         let _staging_guard = staging_mutex.lock().await;
 
-        // Reuse the staging file when either (a) it has pending dirty writes,
-        // or (b) it's a clean cache flagged as current. In both cases its
-        // content is the right starting point for this open.
-        let (is_dirty, staging_is_current) = {
+        // Re-snapshot the inode state under staging.lock. The pre-lock values
+        // passed in by `open` can be stale by the time we get here: a flush
+        // can complete `apply_commit_sparse` (which rotates entry.xet_hash to
+        // the just-committed hash) between `open`'s snapshot and our lock
+        // acquisition. Using stale values here was the previous source of
+        // user-visible EIO on the drift check below.
+        let (is_dirty, staging_is_current, xet_hash, size) = {
             let inodes = self.inode_table.read().expect("inodes poisoned");
             let entry = inodes.get(ino).ok_or(libc::ENOENT)?;
-            (entry.is_dirty(), entry.staging_is_current)
+            (
+                entry.is_dirty(),
+                entry.staging_is_current,
+                entry.xet_hash.clone().unwrap_or_default(),
+                entry.size,
+            )
         };
+        let xet_hash = xet_hash.as_str();
         let local_exists = self.local_backing_exists(ino, full_path).map_err(|e| {
             error!("Failed to check local backing file for ino={}: {}", ino, e);
             libc::EIO
