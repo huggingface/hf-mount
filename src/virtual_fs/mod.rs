@@ -4129,8 +4129,20 @@ impl VirtualFs {
                         ino
                     );
                     if let Some(sd) = self.staging.dir() {
-                        match std::fs::remove_file(sd.path(ino)) {
-                            Ok(()) | Err(_) => {} // best-effort cleanup; next open replaces it
+                        // Best-effort cleanup: a persistent remove_file failure
+                        // (rare: EBUSY/EPERM/transient ENOSPC-on-metadata)
+                        // leaves a staging file whose bytes were never charged
+                        // to bytes_used. The next open() will File::create over
+                        // it (O_TRUNC) which is the recovery path, so the
+                        // counter divergence self-heals. Log non-ENOENT errors
+                        // so a persistent leak is observable in the data.
+                        if let Err(e) = std::fs::remove_file(sd.path(ino))
+                            && e.kind() != std::io::ErrorKind::NotFound
+                        {
+                            warn!(
+                                "setattr: ino={} failed to clean up punched staging on drift-to-non-xet: {}",
+                                ino, e
+                            );
                         }
                     }
                     return Err(libc::EIO);
