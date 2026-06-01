@@ -40,7 +40,10 @@ fn file_size_bytes() -> u64 {
 
 /// How many delta-equivalent steps to run.
 fn n_steps() -> usize {
-    std::env::var("BENCH_STEPS").ok().and_then(|v| v.parse().ok()).unwrap_or(5)
+    std::env::var("BENCH_STEPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5)
 }
 
 /// Fraction of the file's bytes that change per step. The blog says ~1%
@@ -194,12 +197,7 @@ async fn run_bench(label: &str, extra_mount_args: &[&str]) {
     let mount_point = format!("/tmp/hf-sparse-delta-{}-{}", label, pid);
     let cache_dir = format!("/tmp/hf-sparse-delta-cache-{}-{}", label, pid);
 
-    let mut mount_args: Vec<&str> = vec![
-        "--advanced-writes",
-        "--direct-io",
-        "--flush-debounce-ms",
-        "100",
-    ];
+    let mut mount_args: Vec<&str> = vec!["--advanced-writes", "--direct-io", "--flush-debounce-ms", "100"];
     mount_args.extend_from_slice(extra_mount_args);
     let child = common::mount_bucket(&bucket_id, &mount_point, &cache_dir, &mount_args);
 
@@ -234,16 +232,14 @@ async fn run_bench(label: &str, extra_mount_args: &[&str]) {
         meta_after_seed.len(),
         file_size,
     );
-    if meta_after_seed.len() != file_size {
-        eprintln!(
-            "  ! WARN: mount-side file size {} != bench-side written {}, divergence will propagate to sparse_write.original_size",
-            meta_after_seed.len(),
-            file_size,
-        );
-    }
+    assert_eq!(
+        meta_after_seed.len(),
+        file_size,
+        "mount-side file size after seed must match what the bench wrote"
+    );
 
     // Phase 2: N delta-equivalent steps
-    let mut rng = Rng::new(0xDEAD_BEEF_C0FFEE);
+    let mut rng = Rng::new(0x00DE_ADBE_EFC0_FFEE);
     let mut stats: Vec<StepStats> = Vec::with_capacity(n_steps);
     for step in 0..n_steps {
         let patches = generate_delta_patches(&mut rng, file_size, total_delta_bytes, avg_run_len);

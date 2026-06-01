@@ -2692,12 +2692,6 @@ impl VirtualFs {
                     }
                     written = n as u32;
                     new_end = offset + written as u64;
-                    // DEBUG: trace every write hitting the staging path so we
-                    // can see if the kernel is sending unexpected ops past EOF.
-                    debug!(
-                        "write: ino={} offset={} len={} written={} new_end={}",
-                        handle_ino, offset, data.len(), written, new_end
-                    );
                     // A zero-byte write must not extend size, mark dirty, or
                     // track sparse coverage: pwrite didn't grow the staging
                     // file, so bumping entry.size past offset would leave
@@ -3098,11 +3092,15 @@ impl VirtualFs {
             return Err(libc::EIO);
         }
 
+        // Authoritative size = bytes the streaming writer actually wrote, NOT
+        // file_info.file_size() — xet-core's deduplication_metrics-based
+        // counter has been observed to over-count (see flush.rs for context).
+        let committed_size = channel.bytes_written.load(Ordering::Relaxed);
         let mut inodes = self.inode_table.write().expect("inodes poisoned");
         if let Some(entry) = inodes.get_mut(ino) {
             entry.apply_commit(
                 file_info.hash(),
-                file_info.file_size().expect("upload returned XetFileInfo without size"),
+                committed_size,
                 channel.dirty_generation_at_open.load(Ordering::Relaxed),
             );
         }
@@ -3111,7 +3109,7 @@ impl VirtualFs {
             "Committed file: {} (hash={}, size={})",
             full_path,
             file_info.hash(),
-            file_info.file_size().expect("upload returned XetFileInfo without size"),
+            committed_size,
         );
 
         Ok(())

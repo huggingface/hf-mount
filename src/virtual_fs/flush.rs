@@ -435,12 +435,6 @@ async fn flush_batch(
                 continue;
             }
         };
-        let snap_count = snapshots.len();
-        let snap_bytes: u64 = snapshots.iter().map(|s| s.data.len() as u64).sum();
-        debug!(
-            "sparse flush: ino={} range_upload original_hash={} original_size={} new_file_size={} snapshots={} snap_bytes={}",
-            item.ino, sw.original_hash, sw.original_size, item.file_size, snap_count, snap_bytes
-        );
         match xet_sessions
             .range_upload(&sw.original_hash, sw.original_size, item.file_size, snapshots)
             .await
@@ -448,9 +442,8 @@ async fn flush_batch(
             Ok(info) => upload_results[idx] = Some(info),
             Err(e) => {
                 error!(
-                    "sparse flush: range_upload failed for ino={} path={}: {} (sw.original_hash={} sw.original_size={} item.file_size={} snapshots={} snap_bytes={})",
-                    item.ino, item.full_path, e,
-                    sw.original_hash, sw.original_size, item.file_size, snap_count, snap_bytes,
+                    "sparse flush: range_upload failed for ino={} path={}: {}",
+                    item.ino, item.full_path, e
                 );
                 flush_errors
                     .lock()
@@ -542,12 +535,22 @@ async fn flush_batch(
             unchanged[i] = true;
             continue;
         }
+        // Use `item.file_size` (= entry.size at snapshot time = the actual
+        // staging file length under staging.lock) instead of
+        // `file_info.file_size()`. The xet-core upload_files path has been
+        // observed to return an inflated file_size from deduplication_metrics
+        // (a 64 MiB file gets reported as ~65.75 MiB), which would propagate
+        // into entry.size via apply_commit and cause subsequent range_upload
+        // calls to fail with "caller said original_size=X but reconstruction
+        // info reports Y". The on-CAS file is correct — only the returned
+        // XetFileInfo.file_size lies — so the safe authoritative value is
+        // the size we actually uploaded from staging.
         info!(
             "Uploaded file ino={} path={} xet_hash={} size={}",
             item.ino,
             item.full_path,
             file_info.hash(),
-            file_info.file_size().expect("upload returned XetFileInfo without size")
+            item.file_size,
         );
         ops.push(BatchOp::AddFile {
             path: item.full_path.clone(),
@@ -607,7 +610,17 @@ async fn flush_batch(
             if !unchanged[i]
                 && let Some(entry) = inode_table.get_mut(item.ino)
             {
-                let size = file_info.file_size().expect("upload returned XetFileInfo without size");
+                // Authoritative size = item.file_size (entry.size captured at
+                // flush snapshot under staging.lock + the staging file's
+                // on-disk length at upload time, since concurrent O_TRUNC and
+                // setattr-shrink also take staging.lock). NOT
+                // file_info.file_size() — xet-core's upload_files has been
+                // observed to over-count via deduplication_metrics.total_bytes,
+                // returning ~65.75 MiB for a true 64 MiB file. Trusting that
+                // value would set entry.size > on-disk staging length and
+                // poison every subsequent range_upload with a
+                // caller/reconstruction size mismatch.
+                let size = item.file_size;
                 if item.sparse_snapshot.is_some() {
                     // Sparse upload via range_upload: re-key the inode's
                     // sparse_write to the new hash, clear dirty_ranges,
