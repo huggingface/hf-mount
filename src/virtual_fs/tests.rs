@@ -5723,17 +5723,16 @@ fn sparse_reopen_dirty_preserves_state() {
     });
 }
 
-/// Hash-drift during a sparse open: if `entry.xet_hash` rotated (via poll)
-/// between `open()`'s snapshot and the install point in `open_advanced_write`,
-/// the prepared staging hole no longer matches the inode's reality. The open
-/// must fail with EIO before marking the inode dirty, rather than returning a
-/// writable handle with no (or stale) sparse_write — which would flush
-/// hole-zeros as real content.
+/// Hash-drift during a sparse open: `open_advanced_write` is robust to a
+/// stale `xet_hash` / `size` from the caller's pre-lock snapshot — it
+/// re-reads both fields under `staging.lock(ino)` so a poll-induced rotation
+/// between `open()` and the install does not return a user-visible EIO.
 ///
-/// Drives `open_advanced_write` directly with a stale snapshot hash so the
-/// drift branch is exercised deterministically (no need to race the poll loop).
+/// Drives `open_advanced_write` directly with a stale snapshot hash and an
+/// off-by-one size: the install must succeed against the live state and
+/// install a sparse_write keyed to the CURRENT hash, not the stale one.
 #[test]
-fn sparse_open_hash_drift_returns_eio() {
+fn sparse_open_stale_snapshot_uses_live_state() {
     let hub = MockHub::new();
     let content: Vec<u8> = (0u8..20).collect();
     hub.add_file("file.bin", content.len() as u64, Some("current_hash"), None);
@@ -5743,20 +5742,28 @@ fn sparse_open_hash_drift_returns_eio() {
 
     rt.block_on(async {
         let ino = vfs.lookup(ROOT_INODE, "file.bin").await.unwrap().ino;
-        // The inode's live hash is "current_hash". Call open_advanced_write
-        // with a STALE snapshot ("stale_hash") as if poll rotated the hash
-        // after open() captured the snapshot.
-        let result = vfs.open_advanced_write(ino, "file.bin", "stale_hash", 20, false).await;
-        assert_eq!(result, Err(libc::EIO), "stale snapshot hash must return EIO");
+        // The inode's live hash is "current_hash" / size 20. Pass STALE values
+        // to mimic a snapshot taken before a poll rotation completed.
+        let fh = vfs
+            .open_advanced_write(ino, "file.bin", "stale_hash", 999, false)
+            .await
+            .expect("open must succeed: stale snapshot is re-read under the lock");
 
-        // The inode must NOT have been left dirty or with a stale sparse_write.
-        let inodes = vfs.inode_table.read().unwrap();
-        let entry = inodes.get(ino).unwrap();
-        assert!(!entry.is_dirty(), "drift open must not mark the inode dirty");
-        assert!(
-            entry.sparse_write.is_none(),
-            "drift open must not install a sparse_write"
-        );
+        // sparse_write must be keyed to the LIVE hash, not the stale one.
+        let entry_hash = {
+            let inodes = vfs.inode_table.read().unwrap();
+            let entry = inodes.get(ino).unwrap();
+            assert!(entry.is_dirty(), "open_advanced_write sets dirty");
+            entry
+                .sparse_write
+                .as_ref()
+                .expect("sparse_write must be installed")
+                .original_hash
+                .clone()
+        };
+        assert_eq!(entry_hash, "current_hash", "sparse_write must key to the live hash");
+
+        vfs.release(fh).await.unwrap();
     });
 }
 
@@ -6303,12 +6310,27 @@ const STRESS_MAX_SIZE: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Copy)]
 enum StressOp {
-    Write { offset: usize, len: usize },
-    SetattrGrow { delta: usize },
-    SetattrShrink { delta: usize },
+    Write {
+        offset: usize,
+        len: usize,
+    },
+    SetattrGrow {
+        delta: usize,
+    },
+    SetattrShrink {
+        delta: usize,
+    },
     Fsync,
     Reopen,
     VerifyRead,
+    /// Simulate a poll-induced remote rotation: while the worker's inode is
+    /// clean, swap the remote content for a freshly-generated blob and call
+    /// `update_remote_file` so a subsequent reopen sees the new revision. The
+    /// worker's shadow is updated to match the new remote content so the
+    /// final CAS-level verify can still catch any data loss along the way.
+    RogueRotation {
+        new_size: usize,
+    },
 }
 
 struct StressRng(u64);
@@ -6381,9 +6403,15 @@ fn gen_stress_op(rng: &mut StressRng, current_size: usize) -> StressOp {
             delta: 1 + rng.rand_range(current_size - 1),
         },
         // 10% fsync (force flush + apply_commit_sparse cycle)
-        80..=89 => StressOp::Fsync,
+        80..=87 => StressOp::Fsync,
         // 5% reopen
-        90..=94 => StressOp::Reopen,
+        88..=92 => StressOp::Reopen,
+        // 4% rogue remote rotation (only fires when the worker happens to be
+        // clean — see the impl); the new remote size is chosen here, but the
+        // actual rotation depends on the inode being clean at apply time.
+        93..=96 => StressOp::RogueRotation {
+            new_size: 1 + rng.rand_range(STRESS_MAX_SIZE - 1),
+        },
         // remainder + fallback for invalid shrink: verification read
         _ => StressOp::VerifyRead,
     }
@@ -6413,6 +6441,7 @@ async fn read_full(vfs: &std::sync::Arc<VirtualFs>, ino: u64, size: u64) -> Vec<
 
 async fn run_stress_worker(
     vfs: std::sync::Arc<VirtualFs>,
+    xet: std::sync::Arc<MockXet>,
     path: String,
     seed: u64,
     base: Vec<u8>,
@@ -6427,24 +6456,10 @@ async fn run_stress_worker(
         .map_err(|e| format!("[{path}] initial lookup: {e}"))?
         .ino;
 
-    // open_advanced_write returns EIO when xet_hash drifts between the
-    // open()'s pre-lock snapshot and the install — the documented contract
-    // is to retry. Bounded retry loop mirrors what a real caller (FUSE
-    // wrapper / NFS) ought to do (but currently doesn't — separate finding).
-    async fn open_with_retry(vfs: &std::sync::Arc<VirtualFs>, ino: u64, path: &str, ctx: &str) -> Result<u64, String> {
-        for attempt in 0..8 {
-            match vfs.open(ino, true, false, None).await {
-                Ok(fh) => return Ok(fh),
-                Err(libc::EIO) if attempt < 7 => {
-                    tokio::time::sleep(Duration::from_millis(5 * (1 << attempt))).await;
-                }
-                Err(e) => return Err(format!("[{path}] {ctx}: {e}")),
-            }
-        }
-        unreachable!()
-    }
-
-    let mut fh = open_with_retry(&vfs, ino, &path, "initial open").await?;
+    let mut fh = vfs
+        .open(ino, true, false, None)
+        .await
+        .map_err(|e| format!("[{path}] initial open: {e}"))?;
 
     for op_idx in 0..n_ops {
         let op = gen_stress_op(&mut rng, shadow.len());
@@ -6501,7 +6516,50 @@ async fn run_stress_worker(
                 vfs.release(fh)
                     .await
                     .map_err(|e| format!("[{path}] op {op_idx} release-before-reopen: {e}"))?;
-                fh = open_with_retry(&vfs, ino, &path, &format!("op {op_idx} reopen")).await?;
+                fh = vfs
+                    .open(ino, true, false, None)
+                    .await
+                    .map_err(|e| format!("[{path}] op {op_idx} reopen: {e}"))?;
+            }
+            StressOp::RogueRotation { new_size } => {
+                // Quiesce: fsync + wait clean, then drop the fd so the next
+                // reopen picks up the rotated state (update_remote_file
+                // refuses to rotate a dirty inode, so we MUST be clean here).
+                vfs.fsync(ino, fh, None)
+                    .await
+                    .map_err(|e| format!("[{path}] op {op_idx} rogue: fsync: {e}"))?;
+                vfs.release(fh)
+                    .await
+                    .map_err(|e| format!("[{path}] op {op_idx} rogue: pre-rotate release: {e}"))?;
+                wait_for_clean(&vfs, ino).await;
+
+                // Build new remote content + register it as a fresh CAS hash.
+                let new_content: Vec<u8> = (0..new_size).map(|_| rng.rand_byte()).collect();
+                let new_hash = format!("rogue_{path}_{op_idx}_{}", rng.next());
+                xet.add_file(&new_hash, &new_content);
+
+                // Apply the rotation. update_remote_file returns false if the
+                // inode is dirty — should never happen because we just
+                // quiesced, but handle defensively (skip the shadow update so
+                // we don't desync from the live state).
+                let rotated = {
+                    let mut inodes = vfs.inode_table.write().expect("inodes poisoned");
+                    inodes.update_remote_file(ino, Some(new_hash), None, new_size as u64, std::time::SystemTime::now())
+                };
+                if rotated {
+                    // Worker's view from the NEXT open onwards is the new
+                    // remote content — shadow must match for the post-op
+                    // verify reads and the final CAS-level check.
+                    shadow = new_content;
+                }
+
+                // Reopen to pick up the rotation. open_advanced_write detects
+                // the drift (sparse_write was keyed to the old hash) and
+                // rebuilds it against the new revision.
+                fh = vfs
+                    .open(ino, true, false, None)
+                    .await
+                    .map_err(|e| format!("[{path}] op {op_idx} rogue: reopen: {e}"))?;
             }
             StressOp::VerifyRead => {
                 // Read a random window and compare with shadow. Don't verify
@@ -6600,9 +6658,10 @@ fn sparse_writes_concurrent_stress() {
         let mut handles = Vec::with_capacity(n_files);
         for (i, (path, base)) in bases.into_iter().enumerate() {
             let vfs = vfs.clone();
+            let xet = xet.clone();
             let worker_seed = seed.wrapping_add(i as u64).wrapping_mul(0x9E3779B97F4A7C15);
             handles.push(tokio::spawn(async move {
-                run_stress_worker(vfs, path, worker_seed, base, ops_per_file).await
+                run_stress_worker(vfs, xet, path, worker_seed, base, ops_per_file).await
             }));
         }
         let mut errors = Vec::new();
