@@ -480,11 +480,13 @@ async fn flush_batch(
                 error!("Batch upload failed, aborting flush: {}", e);
                 let msg = format!("upload failed: {e}");
                 let mut errs = flush_errors.lock().expect("flush_errors poisoned");
-                // Only mark items that went through this upload_files batch —
-                // sparse items in Pass A and items in other regular chunks
-                // either already errored or are independently in flight.
-                for &i in chunk {
-                    errs.insert(to_flush[i].ino, msg.clone());
+                // The whole batch is aborted: no Hub commit is sent for any
+                // item. Mark every dirty inode so fsync surfaces the failure
+                // instead of returning success on uncommitted content. Use
+                // `or_insert_with` to preserve the more specific Pass A
+                // error message for items that already failed there.
+                for item in &to_flush {
+                    errs.entry(item.ino).or_insert_with(|| msg.clone());
                 }
                 return;
             }

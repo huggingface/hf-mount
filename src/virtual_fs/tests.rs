@@ -6146,3 +6146,85 @@ fn sparse_zero_length_write_is_a_noop() {
         assert_eq!(entry.size, 20, "zero-length write must not change size");
     });
 }
+
+/// Regression for the drift-GREW-past-CAS-base gap: when poll rotates a clean
+/// sparse inode to a non-xet revision LARGER than the CAS base the sparse
+/// state is keyed to, a subsequent setattr that lands inside the gap
+/// (sw.original_size, cur_size) must dirty-track the zero-fill between the
+/// CAS EOF and the new size. Without that tracking, range_upload composes
+/// only [0, original_size) from the old base and silently drops the gap —
+/// the mock zero-fills past original_size so this is invisible there, but
+/// real xet upload_ranges produces a malformed commit.
+#[test]
+fn sparse_setattr_after_drift_to_larger_non_xet_tracks_gap() {
+    let hub = MockHub::new();
+    let original: Vec<u8> = (0u8..20).collect();
+    hub.add_file("file.bin", original.len() as u64, Some("h1"), None);
+    let xet = MockXet::new();
+    xet.add_file("h1", &original);
+    let (rt, vfs) = vfs_sparse(&hub, &xet);
+
+    rt.block_on(async {
+        let ino = vfs.lookup(ROOT_INODE, "file.bin").await.unwrap().ino;
+
+        // 1. Open sparse, write a few bytes, flush. After apply_commit_sparse
+        //    the inode is clean and sparse_write is keyed to (committed_hash,
+        //    20) — the committed file size matches the CAS base.
+        let fh = vfs.open(ino, true, false, None).await.unwrap();
+        write_blocking(&vfs, ino, fh, 0, b"AAA").await.unwrap();
+        vfs.release(fh).await.unwrap();
+        wait_for_clean(&vfs, ino).await;
+        let (committed_hash, base_size) = {
+            let inodes = vfs.inode_table.read().unwrap();
+            let entry = inodes.get(ino).unwrap();
+            let sw = entry.sparse_write.as_ref().unwrap();
+            (sw.original_hash.clone(), sw.original_size)
+        };
+        assert_eq!(base_size, 20, "sparse_write must be keyed to the post-commit size");
+
+        // 2. Poll rotates to a non-xet revision LARGER than the CAS base:
+        //    cur_size=100, xet_hash=None. The sparse_write stays keyed to
+        //    (committed_hash, 20) per update_remote_file's contract.
+        {
+            let mut inodes = vfs.inode_table.write().unwrap();
+            assert!(inodes.update_remote_file(ino, None, Some("etag".to_string()), 100, SystemTime::now()));
+        }
+
+        // 3. Setattr to 50 — lands inside the gap [original_size=20, cur_size=100).
+        //    The staging file is extended with zeros to 50 by the setattr's
+        //    set_len; those zeros need a dirty range so range_upload composes
+        //    them on top of the (smaller) old CAS base.
+        vfs.setattr(ino, Some(50), None, None, None, None, None).await.unwrap();
+
+        // Inspect dirty_ranges BEFORE the debounced flush fires. The gap
+        // [20, 50) must be tracked. Without the fix dirty_ranges is empty.
+        let dirty = vfs
+            .inode_table
+            .read()
+            .unwrap()
+            .get(ino)
+            .unwrap()
+            .sparse_write
+            .as_ref()
+            .expect("sparse_write must still be Some after the resize-in-place arm")
+            .dirty_ranges
+            .clone();
+        assert_eq!(
+            dirty,
+            vec![(20, 50)],
+            "gap between CAS base size and new size must be dirty-tracked"
+        );
+
+        // 4. Flush. Sanity-check the committed CAS content has the right
+        //    length and content (under the mock — the real-xet correctness
+        //    is what the dirty-range fix actually unblocks).
+        wait_for_clean(&vfs, ino).await;
+        let new_hash = {
+            let inodes = vfs.inode_table.read().unwrap();
+            inodes.get(ino).unwrap().xet_hash.clone().unwrap()
+        };
+        let mut expected = xet_content(&xet, &committed_hash).unwrap()[..20].to_vec();
+        expected.resize(50, 0);
+        assert_eq!(xet_content(&xet, &new_hash), Some(expected));
+    });
+}
