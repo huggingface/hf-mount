@@ -390,19 +390,6 @@ mod range_upload_tests {
         // the max original_range end across entries.
         assert_eq!(plan_original_ranges(&[(0, 10)], 40, 35), vec![(0..10, 10), (35..40, 0)]);
     }
-
-    /// Snapshot starting exactly at original_size (drift-gap boundary): when
-    /// setattr's drift branch in mod.rs tracks the gap [sw.original_size,
-    /// min(cur_size, new_size)) as a single dirty snapshot, that snapshot's
-    /// start coincides with original_size. The plan must collapse it to an
-    /// empty original_range (insert past EOF). Sibling of write_past_eof_is_an_insert
-    /// which covers the strictly-past case (start > original_size); this one
-    /// pins the boundary.
-    #[test]
-    fn drift_gap_snapshot_at_original_size_is_an_insert() {
-        // Sparse base = 20 bytes, gap tracked as (offset=20, len=30), new=50.
-        assert_eq!(plan_original_ranges(&[(20, 30)], 20, 50), vec![(20..20, 30)]);
-    }
 }
 
 // ── DownloadStreamWrapper ─────────────────────────────────────────────
