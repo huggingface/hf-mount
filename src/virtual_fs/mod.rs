@@ -4089,10 +4089,13 @@ impl VirtualFs {
                 // and here (InodeTable::update_remote_file leaves any
                 // sparse_write keyed to the OLD hash). `sparse_drifted` flags a
                 // retained sparse_write whose original_hash no longer matches
-                // the live xet_hash (a rotated hash, or a revision that is no
-                // longer xet-backed at all, i.e. xet_hash is None). The staging
-                // tail (sized from the stale snapshot) must then be rebuilt
-                // against the current revision.
+                // the live xet_hash. The staging tail (sized from the stale
+                // snapshot) must then be rebuilt against the current revision.
+                //
+                // Xet-backed files cannot rotate to a non-xet revision on this
+                // codepath (buckets are uniformly Xet; non-Xet repos are
+                // read-only so writes never reach here), so cur_hash is
+                // expected to be Some whenever the sparse path is active.
                 let (cur_hash, cur_size, sparse_drifted) = match inodes.get(ino) {
                     Some(entry) => {
                         let drifted = entry
@@ -4103,50 +4106,6 @@ impl VirtualFs {
                     }
                     None => (None, 0, false),
                 };
-                // Validate drift to non-xet BEFORE mutating the inode entry: if
-                // poll rotated the file to a non-xet revision between the
-                // pre-lock snapshot and here, the sparse-install path has no
-                // CAS base to key against. Returning EIO after we've already
-                // bumped entry.size/mtime/set_dirty would leave the inode
-                // dirty with no sparse_write and no scheduled flush. Surface
-                // the race so the caller retries against the rotated state.
-                //
-                // Drop the punched staging file before returning: it was
-                // created just above (lines 3977-3991) at the sparse-install
-                // size, and leaving it behind makes local_backing_exists true
-                // for the next setattr — which would skip want_sparse_install
-                // and full-upload the stale placeholder if the inode rotates
-                // back to xet-backed.
-                //
-                // Use a raw remove_file rather than StagingDir::try_remove:
-                // the budget was never charged for this file (the
-                // resize_bytes happens below this early return), and
-                // try_remove would debit `file_size(ino)` from bytes_used
-                // and silently undercount unrelated staging usage.
-                if want_sparse_install && cur_hash.is_none() {
-                    debug!(
-                        "setattr: ino={} rotated to non-xet between snapshot and install, retrying",
-                        ino
-                    );
-                    if let Some(sd) = self.staging.dir() {
-                        // Best-effort cleanup: a persistent remove_file failure
-                        // (rare: EBUSY/EPERM/transient ENOSPC-on-metadata)
-                        // leaves a staging file whose bytes were never charged
-                        // to bytes_used. The next open() will File::create over
-                        // it (O_TRUNC) which is the recovery path, so the
-                        // counter divergence self-heals. Log non-ENOENT errors
-                        // so a persistent leak is observable in the data.
-                        if let Err(e) = std::fs::remove_file(sd.path(ino))
-                            && e.kind() != std::io::ErrorKind::NotFound
-                        {
-                            warn!(
-                                "setattr: ino={} failed to clean up punched staging on drift-to-non-xet: {}",
-                                ino, e
-                            );
-                        }
-                    }
-                    return Err(libc::EIO);
-                }
                 // Skip set_len for the sparse-install path: the staging file
                 // was just created at exactly `new_size` above.
                 if !want_sparse_install {
@@ -4191,14 +4150,13 @@ impl VirtualFs {
                         // composes the new tail (extension) or drops the cut
                         // tail (shrink) at flush time. The staging hole punched
                         // above is content-free, so any base revision is valid.
-                        // cur_hash.is_none() was already rejected above (before
-                        // any inode mutation) — unwrap is safe here.
-                        let hash = cur_hash.expect("non-xet drift rejected above");
+                        let hash = cur_hash.expect("Xet → non-Xet rotation is unreachable on writable inodes");
                         let mut sw = inode::SparseWriteState::new(hash, cur_size);
                         sw.resize_to(cur_size, new_size);
                         entry.sparse_write = Some(Arc::new(sw));
                     } else if let Some(sw_arc) = entry.sparse_write.as_mut() {
-                        match cur_hash {
+                        let hash = cur_hash.expect("Xet → non-Xet rotation is unreachable on writable inodes");
+                        if hash.as_str() != sw_arc.original_hash.as_str() {
                             // Drifted to a NEW xet revision (poll rotated the
                             // hash on the clean inode, leaving the state pinned
                             // to the old one). Reusing it would make range_upload
@@ -4208,39 +4166,30 @@ impl VirtualFs {
                             // above); empty coverage makes reads refill from the
                             // current CAS object. Mirrors the drift handling in
                             // open_advanced_write.
-                            Some(ref hash) if hash.as_str() != sw_arc.original_hash.as_str() => {
-                                let mut sw = inode::SparseWriteState::new(hash.clone(), cur_size);
-                                sw.resize_to(cur_size, new_size);
-                                *sw_arc = Arc::new(sw);
-                            }
-                            // Either still keyed to the current revision, or the
-                            // current revision is no longer xet-backed (cur_hash
-                            // is None) so there is no base to re-key to. Keep the
-                            // state's existing hash (last-writer-wins, the same
-                            // accepted race as the non-sparse path) and resize in
-                            // place.
-                            //
-                            // If the live size grew past sw.original_size (drift:
-                            // the remote revision is larger than the CAS base
-                            // we're still keyed to), the staging file's tail
-                            // bytes in [original_size, min(cur_size, new_size))
-                            // are zero-fill from set_len, not part of the
-                            // original CAS reconstruction. They must be tracked
-                            // as dirty or range_upload will compose only
+                            let mut sw = inode::SparseWriteState::new(hash, cur_size);
+                            sw.resize_to(cur_size, new_size);
+                            *sw_arc = Arc::new(sw);
+                        } else {
+                            // Still keyed to the current revision. Resize in
+                            // place. If the live size grew past sw.original_size
+                            // (drift: the remote revision is larger than the CAS
+                            // base we're still keyed to), the staging file's
+                            // tail bytes in [original_size, min(cur_size,
+                            // new_size)) are zero-fill from set_len, not part of
+                            // the original CAS reconstruction. They must be
+                            // tracked as dirty or range_upload will compose only
                             // [0, original_size) from the old base and produce a
                             // file whose middle (between original CAS EOF and
                             // the truncation point) is silently dropped. Track
                             // the gap up to min(cur_size, new_size) — anything
                             // past new_size is clipped by the resize below.
-                            _ => {
-                                let original_size = sw_arc.original_size;
-                                let sw = Arc::make_mut(sw_arc);
-                                let gap_end = cur_size.min(new_size);
-                                if gap_end > original_size {
-                                    sw.track_write(original_size, gap_end - original_size);
-                                }
-                                sw.resize_to(cur_size, new_size);
+                            let original_size = sw_arc.original_size;
+                            let sw = Arc::make_mut(sw_arc);
+                            let gap_end = cur_size.min(new_size);
+                            if gap_end > original_size {
+                                sw.track_write(original_size, gap_end - original_size);
                             }
+                            sw.resize_to(cur_size, new_size);
                         }
                     }
                 }
