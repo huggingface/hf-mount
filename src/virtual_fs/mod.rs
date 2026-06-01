@@ -4049,15 +4049,22 @@ impl VirtualFs {
                 // size, and leaving it behind makes local_backing_exists true
                 // for the next setattr — which would skip want_sparse_install
                 // and full-upload the stale placeholder if the inode rotates
-                // back to xet-backed. The budget was not charged yet (the
-                // resize_bytes happens below this point).
+                // back to xet-backed.
+                //
+                // Use a raw remove_file rather than StagingDir::try_remove:
+                // the budget was never charged for this file (the
+                // resize_bytes happens below this early return), and
+                // try_remove would debit `file_size(ino)` from bytes_used
+                // and silently undercount unrelated staging usage.
                 if want_sparse_install && cur_hash.is_none() {
                     debug!(
                         "setattr: ino={} rotated to non-xet between snapshot and install, retrying",
                         ino
                     );
                     if let Some(sd) = self.staging.dir() {
-                        sd.try_remove(ino);
+                        match std::fs::remove_file(sd.path(ino)) {
+                            Ok(()) | Err(_) => {} // best-effort cleanup; next open replaces it
+                        }
                     }
                     return Err(libc::EIO);
                 }
