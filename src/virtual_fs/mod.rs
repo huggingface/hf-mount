@@ -2290,11 +2290,20 @@ impl VirtualFs {
         let _io_guard = io_lock.lock().expect("staging io_lock poisoned");
 
         // Still-hole sub-ranges as (file_offset, offset_into_data, len).
+        // Clamp every hole to the LIVE inode size: a concurrent setattr-shrink
+        // (which takes staging.lock + inode_table.write(), not io_lock) may
+        // have clipped entry.size below the snapshot's original_size between
+        // pread and here. Without the clamp, write_at past the new EOF
+        // re-extends the staging file with stale CAS bytes and records
+        // coverage there — a subsequent setattr-grow would expose those
+        // bytes instead of the POSIX-mandated zeros, and a future read at
+        // offsets past entry.size could observe non-zero stale content.
         let still_holes: Vec<(u64, usize, usize)> = {
             let inodes = self.inode_table.read().expect("inodes poisoned");
             let Some(entry) = inodes.get(ino) else {
                 return Ok(()); // inode vanished; buf overlay is still correct
             };
+            let live_size = entry.size;
             let Some(sw) = entry.sparse_write.as_ref() else {
                 return Ok(()); // sparse_write cleared (poll/commit)
             };
@@ -2303,11 +2312,18 @@ impl VirtualFs {
             }
             holes
                 .iter()
-                .flat_map(|&(hs, he)| {
-                    sw.holes_in(hs, he - hs)
-                        .into_iter()
-                        .map(move |(ss, se)| (ss, (ss - fetch_start) as usize, (se - ss) as usize))
+                .filter_map(|&(hs, he)| {
+                    let clipped_he = he.min(live_size);
+                    if clipped_he <= hs {
+                        return None;
+                    }
+                    Some(
+                        sw.holes_in(hs, clipped_he - hs)
+                            .into_iter()
+                            .map(move |(ss, se)| (ss, (ss - fetch_start) as usize, (se - ss) as usize)),
+                    )
                 })
+                .flatten()
                 .collect()
         };
 
