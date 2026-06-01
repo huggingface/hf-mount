@@ -421,8 +421,7 @@ async fn flush_batch(
         };
         // Snapshot dirty bytes under io_lock so a concurrent pwrite cannot
         // interleave with our reads and produce chimeric content downstream.
-        let snapshots_result = snapshot_dirty_bytes(staging, item.ino, &item.staging_path, sw);
-        let snapshots = match snapshots_result {
+        let snapshots = match snapshot_dirty_bytes(staging, item.ino, &item.staging_path, sw) {
             Ok(s) => s,
             Err(e) => {
                 error!(
