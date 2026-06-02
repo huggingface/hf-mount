@@ -150,8 +150,8 @@ fn apply_blob_and_wait_durable(test_file: &str, offset: u64, len: u64, data_seed
         let probe_len = head.len().min(len as usize);
         f.seek(SeekFrom::Start(offset)).expect("verify seek");
         f.read_exact(&mut head[..probe_len]).expect("verify read");
-        for i in 0..probe_len {
-            assert_eq!(head[i], data_seed.wrapping_add(i as u8), "verify byte mismatch at +{i}");
+        for (i, b) in head[..probe_len].iter().enumerate() {
+            assert_eq!(*b, data_seed.wrapping_add(i as u8), "verify byte mismatch at +{i}");
         }
     }
     start.elapsed()
