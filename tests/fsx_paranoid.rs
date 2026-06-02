@@ -34,16 +34,13 @@ async fn test_fsx_paranoid_cas_roundtrip() {
     // be a no-op: every file in this test stays well under the threshold and
     // would silently fall back to the legacy download-then-upload path,
     // defeating the test's stated purpose of catching range_upload
-    // composition regressions. Safe to mutate here: each `tests/*.rs` file
-    // compiles as its own test binary, and this binary has a single test.
+    // composition regressions.
     //
-    // SAFETY: single-threaded mutation in test setup before any reader
-    // observes the variable. The mount child inherits this env at spawn.
-    unsafe {
-        std::env::set_var("HF_MOUNT_SPARSE_MIN_BYTES", "0");
-    }
-
-    let child = common::mount_bucket(
+    // The env var is passed through `Command::env` rather than
+    // `std::env::set_var` so the mutation lives on the child's command
+    // builder only — `set_var` is `unsafe` and races with sibling tests
+    // that read the parent's env or spawn their own children concurrently.
+    let child = common::mount_bucket_with_env(
         &bucket_id,
         &mount_point,
         &cache_dir,
@@ -65,6 +62,7 @@ async fn test_fsx_paranoid_cas_roundtrip() {
             "--flush-debounce-ms",
             "100",
         ],
+        &[("HF_MOUNT_SPARSE_MIN_BYTES", "0")],
     );
 
     let num_ops = std::env::var("FSX_PARANOID_OPS")

@@ -213,22 +213,6 @@ enum Workload {
 }
 
 async fn run_bench(label: &str, extra_mount_args: &[&str], workload: Workload) {
-    // Force sparse engagement at any file size for the SPARSE_* variants.
-    // The bench default of 64 MiB sits below the production 256 MiB
-    // threshold, so without this override `--sparse-writes` would silently
-    // fall back to the non-sparse path and the SPARSE_* labels would be
-    // measuring the same code as FULL. Set unconditionally: the env var has
-    // no effect on runs that don't also pass `--sparse-writes`, so the FULL
-    // baseline is unaffected.
-    //
-    // SAFETY: bench setup mutates env before spawning the mount child.
-    // cargo test parallelizes within a binary, but all readers (mount
-    // children) see HF_MOUNT_SPARSE_MIN_BYTES=0 at spawn time and the
-    // value never changes across tests in this binary.
-    unsafe {
-        std::env::set_var("HF_MOUNT_SPARSE_MIN_BYTES", "0");
-    }
-
     let guard = match common::setup_bucket(&format!("sparse-delta-{label}")).await {
         Some(g) => g,
         None => {
@@ -243,7 +227,28 @@ async fn run_bench(label: &str, extra_mount_args: &[&str], workload: Workload) {
 
     let mut mount_args: Vec<&str> = vec!["--advanced-writes", "--direct-io", "--flush-debounce-ms", "100"];
     mount_args.extend_from_slice(extra_mount_args);
-    let child = common::mount_bucket(&bucket_id, &mount_point, &cache_dir, &mount_args);
+    // Force sparse engagement at any file size: the bench default (64 MiB)
+    // is below the production 256 MiB threshold, so without this override
+    // SPARSE_* labels would just be measuring the non-sparse fallback.
+    // Passed via `Command::env` (not `std::env::set_var`) because
+    // sparse_delta_bench has multiple `#[tokio::test]`s that cargo can run
+    // concurrently — process-wide env mutation is racy. No-op for runs
+    // that don't pass `--sparse-writes`.
+    //
+    // NOTE: with the fast-path commit fix (full-coverage sparse items
+    // route through upload_files), the warm SPARSE_BLOB variant ends up
+    // measuring upload_files, NOT range_upload — the seed leaves staging
+    // fully covered, so each subsequent delta open re-installs full
+    // coverage and flush picks the fast path. The cold variant
+    // (`run_cold_bench`) is the one that actually exercises range_upload
+    // because the post-remount staging is sparse (hole + dirty delta).
+    let child = common::mount_bucket_with_env(
+        &bucket_id,
+        &mount_point,
+        &cache_dir,
+        &mount_args,
+        &[("HF_MOUNT_SPARSE_MIN_BYTES", "0")],
+    );
 
     let file_size = file_size_bytes();
     let n_steps = n_steps();
@@ -380,16 +385,6 @@ async fn bench_sparse_delta_scattered() {
 /// Real-world equivalent: an async-RL inference replica spinning up on a
 /// fresh node, pulling a checkpoint that's already on the Hub.
 async fn run_cold_bench(label: &str, extra_mount_args: &[&str]) {
-    // Same rationale as `run_bench`: override the production 256 MiB
-    // threshold so the bench's default 64 MiB file actually engages sparse
-    // when the caller passes `--sparse-writes`. No-op for FULL_COLD which
-    // doesn't pass the flag.
-    //
-    // SAFETY: env mutation in bench setup, before any mount child reads it.
-    unsafe {
-        std::env::set_var("HF_MOUNT_SPARSE_MIN_BYTES", "0");
-    }
-
     let guard = match common::setup_bucket(&format!("sparse-cold-{label}")).await {
         Some(g) => g,
         None => {
@@ -415,10 +410,19 @@ async fn run_cold_bench(label: &str, extra_mount_args: &[&str]) {
     );
 
     // Mount #1: seed the file, push it to CAS, unmount cleanly.
+    // HF_MOUNT_SPARSE_MIN_BYTES=0 passed through Command::env (not
+    // std::env::set_var) because cargo runs the cold/warm tests
+    // concurrently; see `run_bench` for the full rationale.
     {
         let mut mount_args: Vec<&str> = vec!["--advanced-writes", "--direct-io", "--flush-debounce-ms", "100"];
         mount_args.extend_from_slice(extra_mount_args);
-        let child = common::mount_bucket(&bucket_id, &mount_point, &cache_dir_seed, &mount_args);
+        let child = common::mount_bucket_with_env(
+            &bucket_id,
+            &mount_point,
+            &cache_dir_seed,
+            &mount_args,
+            &[("HF_MOUNT_SPARSE_MIN_BYTES", "0")],
+        );
         let test_file = format!("{}/ckpt.bin", mount_point);
         let t_seed = Instant::now();
         seed_checkpoint_file(&test_file, file_size);
@@ -436,7 +440,13 @@ async fn run_cold_bench(label: &str, extra_mount_args: &[&str]) {
     // non-sparse path must download the whole file first.
     let mut mount_args: Vec<&str> = vec!["--advanced-writes", "--direct-io", "--flush-debounce-ms", "100"];
     mount_args.extend_from_slice(extra_mount_args);
-    let child = common::mount_bucket(&bucket_id, &mount_point, &cache_dir_bench, &mount_args);
+    let child = common::mount_bucket_with_env(
+        &bucket_id,
+        &mount_point,
+        &cache_dir_bench,
+        &mount_args,
+        &[("HF_MOUNT_SPARSE_MIN_BYTES", "0")],
+    );
     let test_file = format!("{}/ckpt.bin", mount_point);
 
     // Cold step: write a single delta-sized blob at a random offset and
