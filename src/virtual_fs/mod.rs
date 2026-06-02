@@ -4114,7 +4114,14 @@ impl VirtualFs {
 
                 if !local_exists {
                     if want_sparse_install {
-                        // Sparse hole, no download.
+                        // Sparse hole, no download. Unlike open_advanced_write's
+                        // equivalent, this does NOT take io_lock around
+                        // File::create + set_len because `!local_exists`
+                        // guarantees no prior staging file existed, so there
+                        // is no live Arc<File> from a previous open that could
+                        // race a pread against File::create's O_TRUNC window.
+                        // staging.lock(ino) (held above) excludes concurrent
+                        // open_advanced_write installs.
                         let staging_path = self
                             .staging
                             .path(ino)

@@ -311,7 +311,18 @@ fn snapshot_dirty_bytes(
         // real invariant violation, not a benign race; surface it as an error
         // (the dirty_generation guard makes the next flush retry) instead of
         // silently composing a wrong-length file from a truncated buffer.
-        file.read_exact_at(&mut buf, start)?;
+        // Translate UnexpectedEof into an explicit invariant-violation message
+        // so the failure mode is greppable in logs (the default Display is
+        // just "failed to fill whole buffer" which leaks zero context).
+        file.read_exact_at(&mut buf, start).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                std::io::Error::other(format!(
+                    "staging short-read at dirty range [{start}, {end}) — staging file shorter than dirty_ranges claims (invariant violation)"
+                ))
+            } else {
+                e
+            }
+        })?;
         snapshots.push(RangeSnapshot {
             offset: start,
             data: Bytes::from(buf),
