@@ -7013,3 +7013,279 @@ fn sparse_writes_same_inode_concurrent_stress() {
 
     vfs.shutdown();
 }
+
+// ── Same-inode verified-integrity stress ─────────────────────────────
+//
+// Companion to `sparse_writes_same_inode_concurrent_stress`. The chaos
+// variant maximises race coverage by letting workers write to overlapping
+// offsets, at the cost of being unable to assert exact byte content (last-
+// write-wins, "last" is scheduler-dependent). This variant trades some
+// race surface for a STRONG oracle:
+//
+//   - The file is split into N disjoint per-worker slots.
+//   - Each worker writes ONLY within its own slot, so its private shadow
+//     is the ground truth for that range.
+//   - Reads can target any slot — exercises concurrent pread vs. another
+//     worker's in-flight pwrite + sparse-coverage snapshot pairing on the
+//     io_lock — but their content isn't verified mid-stream (the target
+//     slot may be racing under another worker's writes).
+//   - After quiesce, the file's content MUST equal the concatenation of
+//     every worker's final shadow, byte-for-byte. A silent corruption
+//     (torn read, lost write, fill_sparse_holes clobbering user bytes,
+//     dirty_generation guard missing a write) fails this assertion.
+//
+// setattr is dropped: it would change the file size and complicate the
+// per-slot ownership invariant. The chaos variant + the cross-file
+// stress already exercise setattr extensively.
+const VERIFIED_WORKERS: usize = 8;
+const VERIFIED_OPS_PER_WORKER: usize = 1000;
+const VERIFIED_SLOT_SIZE: usize = 4096;
+
+#[derive(Debug, Clone, Copy)]
+enum VerifiedOp {
+    /// Write at random offset within own slot.
+    Write {
+        offset: usize,
+        len: usize,
+    },
+    /// Read at random offset anywhere in the file (cross-slot reads exercise
+    /// reader/writer concurrency on a foreign slot's io_lock).
+    Read {
+        offset: usize,
+        len: usize,
+    },
+    Fsync,
+    Reopen,
+}
+
+fn gen_verified_op(rng: &mut StressRng, file_size: usize, slot_start: usize, slot_end: usize) -> VerifiedOp {
+    let pick = rng.next() % 100;
+    match pick {
+        // 55% writes within own slot
+        0..=54 => {
+            let slot_len = slot_end - slot_start;
+            let len = 1 + rng.rand_range(slot_len.min(512));
+            let offset = slot_start + rng.rand_range(slot_len - len + 1);
+            VerifiedOp::Write { offset, len }
+        }
+        // 35% reads (anywhere)
+        55..=89 => {
+            let len = 1 + rng.rand_range(file_size.min(2048));
+            let offset = rng.rand_range(file_size - len + 1);
+            VerifiedOp::Read { offset, len }
+        }
+        90..=94 => VerifiedOp::Fsync,
+        _ => VerifiedOp::Reopen,
+    }
+}
+
+/// All the inputs `run_verified_worker` needs in a single struct so the
+/// clippy::too_many_arguments lint stays happy without adding allow attrs.
+struct VerifiedWorker {
+    vfs: std::sync::Arc<VirtualFs>,
+    ino: u64,
+    worker_id: usize,
+    seed: u64,
+    n_ops: usize,
+    file_size: usize,
+    slot_start: usize,
+    slot_end: usize,
+    shadow: Vec<u8>,
+}
+
+/// Runs one worker; returns its final shadow for its slot. Errors propagate
+/// up as Result::Err so the test fails with the offending worker's context.
+async fn run_verified_worker(w: VerifiedWorker) -> Result<Vec<u8>, String> {
+    let VerifiedWorker {
+        vfs,
+        ino,
+        worker_id,
+        seed,
+        n_ops,
+        file_size,
+        slot_start,
+        slot_end,
+        mut shadow,
+    } = w;
+    let mut rng = StressRng::new(seed);
+    let mut fh = vfs
+        .open(ino, true, false, None)
+        .await
+        .map_err(|e| format!("[w{worker_id}] initial open: {e}"))?;
+
+    for op_idx in 0..n_ops {
+        let op = gen_verified_op(&mut rng, file_size, slot_start, slot_end);
+        match op {
+            VerifiedOp::Write { offset, len } => {
+                debug_assert!(
+                    offset >= slot_start && offset + len <= slot_end,
+                    "[w{worker_id}] write outside slot: [{offset},{}) not in [{slot_start},{slot_end})",
+                    offset + len
+                );
+                let buf: Vec<u8> = (0..len).map(|_| rng.rand_byte()).collect();
+                let written = write_blocking(&vfs, ino, fh, offset as u64, &buf)
+                    .await
+                    .map_err(|e| format!("[w{worker_id}] op {op_idx} write({offset},{len}): {e}"))?;
+                let actual = written as usize;
+                // Mirror the same prefix that pwrite committed. In practice
+                // regular-file pwrite is all-or-nothing — defensively cap.
+                let shadow_off = offset - slot_start;
+                shadow[shadow_off..shadow_off + actual].copy_from_slice(&buf[..actual]);
+            }
+            VerifiedOp::Read { offset, len } => {
+                let want = (len as u32).min((file_size - offset) as u32);
+                // Reads target arbitrary slots. The target slot may be racing
+                // under another worker's writes, so we can only assert no
+                // error / no panic, not byte content.
+                match vfs.read(fh, offset as u64, want).await {
+                    Ok(_) => {}
+                    Err(libc::EAGAIN) | Err(libc::EBADF) => {}
+                    Err(e) => {
+                        return Err(format!(
+                            "[w{worker_id}] op {op_idx} read({offset},{len}): unexpected errno {e}"
+                        ));
+                    }
+                }
+            }
+            VerifiedOp::Fsync => {
+                if let Err(e) = vfs.fsync(ino, fh, None).await
+                    && e != libc::EAGAIN
+                {
+                    return Err(format!("[w{worker_id}] op {op_idx} fsync: unexpected errno {e}"));
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            VerifiedOp::Reopen => {
+                if let Err(e) = vfs.release(fh).await {
+                    return Err(format!("[w{worker_id}] op {op_idx} release: {e}"));
+                }
+                fh = match vfs.open(ino, true, false, None).await {
+                    Ok(fh) => fh,
+                    Err(libc::EAGAIN) => vfs
+                        .open(ino, true, false, None)
+                        .await
+                        .map_err(|e| format!("[w{worker_id}] op {op_idx} reopen retry: {e}"))?,
+                    Err(e) => return Err(format!("[w{worker_id}] op {op_idx} reopen: {e}")),
+                };
+            }
+        }
+    }
+
+    vfs.release(fh)
+        .await
+        .map_err(|e| format!("[w{worker_id}] final release: {e}"))?;
+    Ok(shadow)
+}
+
+/// Strong-oracle multi-worker stress on a single inode. Disjoint per-worker
+/// slots make the final byte content deterministic so we can assert exact
+/// equality between the VFS-committed file and the concatenated per-worker
+/// shadows — catching corruption that the chaos variant cannot.
+#[test]
+fn sparse_writes_same_inode_verified_integrity() {
+    let n_workers: usize = std::env::var("VERIFIED_WORKERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(VERIFIED_WORKERS);
+    let ops_per_worker: usize = std::env::var("VERIFIED_OPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(VERIFIED_OPS_PER_WORKER);
+    let slot_size: usize = std::env::var("VERIFIED_SLOT_SIZE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(VERIFIED_SLOT_SIZE);
+    let seed: u64 = std::env::var("VERIFIED_SEED")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos() as u64
+        });
+
+    let file_size = n_workers * slot_size;
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    let path = "verified_shared.bin";
+    let base: Vec<u8> = (0..file_size).map(|j| (j % 251) as u8).collect();
+    hub.add_file(path, file_size as u64, Some("verified_h"), None);
+    xet.add_file("verified_h", &base);
+    let (rt, vfs) = vfs_sparse(&hub, &xet);
+
+    eprintln!(
+        "sparse_writes_same_inode_verified_integrity: {n_workers} workers × {ops_per_worker} ops, slot={slot_size}B, file={file_size}B, seed={seed}"
+    );
+
+    rt.block_on(async {
+        let ino = vfs.lookup(ROOT_INODE, path).await.unwrap().ino;
+        let mut handles = Vec::with_capacity(n_workers);
+        for w in 0..n_workers {
+            let slot_start = w * slot_size;
+            let slot_end = slot_start + slot_size;
+            let shadow_slot = base[slot_start..slot_end].to_vec();
+            let vfs = vfs.clone();
+            let worker_seed = seed.wrapping_add(w as u64).wrapping_mul(0x9E3779B97F4A7C15);
+            handles.push(tokio::spawn(async move {
+                run_verified_worker(VerifiedWorker {
+                    vfs,
+                    ino,
+                    worker_id: w,
+                    seed: worker_seed,
+                    n_ops: ops_per_worker,
+                    file_size,
+                    slot_start,
+                    slot_end,
+                    shadow: shadow_slot,
+                })
+                .await
+            }));
+        }
+
+        let mut errors = Vec::new();
+        let mut expected = Vec::with_capacity(file_size);
+        for h in handles {
+            match h.await.expect("worker panic") {
+                Ok(slot_shadow) => expected.extend_from_slice(&slot_shadow),
+                Err(e) => errors.push(e),
+            }
+        }
+        if !errors.is_empty() {
+            panic!(
+                "verified-integrity stress FAILED ({} workers): seed={}\n{}",
+                errors.len(),
+                seed,
+                errors.join("\n  ")
+            );
+        }
+        assert_eq!(expected.len(), file_size, "shadow concatenation must equal file_size");
+
+        // Quiesce: wait for any in-flight flushes to land before reading.
+        wait_for_clean(&vfs, ino).await;
+
+        // Strong oracle: every byte of the committed file must equal the
+        // concatenation of each worker's final shadow. A divergence pinpoints
+        // the offset where corruption happened.
+        let actual = read_full(&vfs, ino, file_size as u64).await;
+        if actual != expected {
+            let first_diff = actual
+                .iter()
+                .zip(expected.iter())
+                .position(|(a, e)| a != e)
+                .unwrap_or(actual.len().min(expected.len()));
+            let owner = first_diff / slot_size;
+            panic!(
+                "verified-integrity stress: BYTE-LEVEL MISMATCH at offset {} (owner=w{}), \
+                 actual=0x{:02x} expected=0x{:02x} (seed={})",
+                first_diff,
+                owner,
+                actual.get(first_diff).copied().unwrap_or(0),
+                expected.get(first_diff).copied().unwrap_or(0),
+                seed,
+            );
+        }
+    });
+
+    vfs.shutdown();
+}
