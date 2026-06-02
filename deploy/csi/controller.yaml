@@ -1,0 +1,81 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hf-csi-controller
+  namespace: kube-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: hf-csi-controller
+  template:
+    metadata:
+      labels:
+        app: hf-csi-controller
+    spec:
+      serviceAccountName: hf-csi-driver
+      containers:
+        - name: csi-driver
+          image: huggingface/hf-mount:latest
+          command: ["hf-mount-csi"]
+          args:
+            - --endpoint=0.0.0.0:50051
+          env:
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: token
+                  optional: true
+            - name: HF_ENDPOINT
+              value: "https://huggingface.co"
+          ports:
+            - name: grpc
+              containerPort: 50051
+          livenessProbe:
+            grpc:
+              port: 50051
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          resources:
+            limits:
+              memory: "256Mi"
+              cpu: "500m"
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+        - name: csi-provisioner
+          image: registry.k8s.io/sig-storage/csi-provisioner:v5.0.1
+          args:
+            - --csi-address=$(CSI_ENDPOINT)
+            - --feature-gates=Topology=false
+            - --v=2
+          env:
+            - name: CSI_ENDPOINT
+              value: "tcp://localhost:50051"
+          resources:
+            limits:
+              memory: "128Mi"
+              cpu: "100m"
+            requests:
+              memory: "64Mi"
+              cpu: "50m"
+        - name: csi-attacher
+          image: registry.k8s.io/sig-storage/csi-attacher:v4.7.0
+          args:
+            - --csi-address=$(CSI_ENDPOINT)
+            - --v=2
+          env:
+            - name: CSI_ENDPOINT
+              value: "tcp://localhost:50051"
+          resources:
+            limits:
+              memory: "128Mi"
+              cpu: "100m"
+            requests:
+              memory: "64Mi"
+              cpu: "50m"
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule

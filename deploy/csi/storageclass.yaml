@@ -1,0 +1,12 @@
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: hf-mount
+provisioner: csi.huggingface.co
+parameters:
+  # Default source type and id. Override per-PVC via parameters.
+  sourceType: repo
+  sourceId: openai-community/gpt2
+reclaimPolicy: Retain
+volumeBindingMode: Immediate
+allowVolumeExpansion: false

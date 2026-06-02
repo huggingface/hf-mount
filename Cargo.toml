@@ -25,10 +25,18 @@ fuser = { version = "0.17", optional = true }
 futures = "0.3"
 libc = "0.2"
 nfsserve = { version = "0.11", optional = true }
+prost = "0.13"
 reqwest = { version = "0.12", features = ["json", "stream"] }
+tonic = "0.12"
+tonic-health = "0.12"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "signal",
+    "process",
+] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 ulid = "1"
@@ -63,6 +71,13 @@ path = "src/bin/hf-mount.rs"
 name = "hf-mount-fuse-sidecar"
 path = "src/bin/hf-mount-fuse-sidecar.rs"
 required-features = ["fuse"]
+
+[[bin]]
+name = "hf-mount-csi"
+path = "src/bin/hf-mount-csi.rs"
+
+[build-dependencies]
+tonic-build = "0.12"
 
 [dev-dependencies]
 tempfile = "3"

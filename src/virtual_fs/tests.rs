@@ -4977,6 +4977,7 @@ fn overlay_setattr_truncate_uses_overlay_path() {
 }
 
 /// Overlay create/chmod mode changes persist to disk and survive a directory reload.
+#[cfg(unix)]
 #[test]
 fn overlay_mode_changes_persist_on_disk() {
     use std::os::unix::fs::PermissionsExt;
@@ -5102,6 +5103,7 @@ fn overlay_filters_os_junk() {
 }
 
 /// Symlinks in the overlay directory are skipped during readdir merge.
+#[cfg(unix)]
 #[test]
 fn overlay_skips_symlinks() {
     let hub = MockHub::new();

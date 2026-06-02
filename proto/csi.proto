@@ -1,0 +1,204 @@
+// Simplified CSI spec for hf-mount-csi
+// Based on container-storage-interface/spec v1.9.0
+
+syntax = "proto3";
+
+package csi.v1;
+
+option go_package = "csi";
+
+service Identity {
+  rpc GetPluginInfo(GetPluginInfoRequest)
+    returns (GetPluginInfoResponse) {}
+
+  rpc GetPluginCapabilities(GetPluginCapabilitiesRequest)
+    returns (GetPluginCapabilitiesResponse) {}
+
+  rpc Probe(ProbeRequest)
+    returns (ProbeResponse) {}
+}
+
+service Controller {
+  rpc CreateVolume(CreateVolumeRequest)
+    returns (CreateVolumeResponse) {}
+
+  rpc DeleteVolume(DeleteVolumeRequest)
+    returns (DeleteVolumeResponse) {}
+
+  rpc ControllerGetCapabilities(ControllerGetCapabilitiesRequest)
+    returns (ControllerGetCapabilitiesResponse) {}
+}
+
+service Node {
+  rpc NodeStageVolume(NodeStageVolumeRequest)
+    returns (NodeStageVolumeResponse) {}
+
+  rpc NodeUnstageVolume(NodeUnstageVolumeRequest)
+    returns (NodeUnstageVolumeResponse) {}
+
+  rpc NodePublishVolume(NodePublishVolumeRequest)
+    returns (NodePublishVolumeResponse) {}
+
+  rpc NodeUnpublishVolume(NodeUnpublishVolumeRequest)
+    returns (NodeUnpublishVolumeResponse) {}
+
+  rpc NodeGetCapabilities(NodeGetCapabilitiesRequest)
+    returns (NodeGetCapabilitiesResponse) {}
+
+  rpc NodeGetInfo(NodeGetInfoRequest)
+    returns (NodeGetInfoResponse) {}
+}
+
+message GetPluginInfoRequest {}
+
+message GetPluginInfoResponse {
+  string name = 1;
+  string vendor_version = 2;
+  map<string, string> manifest = 3;
+}
+
+message GetPluginCapabilitiesRequest {}
+
+message PluginCapability {
+  message Service {
+    enum Type {
+      UNKNOWN = 0;
+      CONTROLLER_SERVICE = 1;
+      VOLUME_ACCESSIBILITY_CONSTRAINTS = 2;
+    }
+    Type type = 1;
+  }
+  oneof type {
+    Service service = 1;
+  }
+}
+
+message GetPluginCapabilitiesResponse {
+  repeated PluginCapability capabilities = 1;
+}
+
+message ProbeRequest {}
+
+message ProbeResponse {}
+
+message CreateVolumeRequest {
+  string name = 1;
+  map<string, string> parameters = 2;
+  uint64 required_bytes = 3;
+}
+
+message Volume {
+  string volume_id = 1;
+  uint64 capacity_bytes = 2;
+}
+
+message CreateVolumeResponse {
+  Volume volume = 1;
+}
+
+message DeleteVolumeRequest {
+  string volume_id = 1;
+}
+
+message DeleteVolumeResponse {}
+
+message ControllerGetCapabilitiesRequest {}
+
+message ControllerServiceCapability {
+  message RPC {
+    enum Type {
+      UNKNOWN = 0;
+      CREATE_DELETE_VOLUME = 1;
+    }
+    Type type = 1;
+  }
+  oneof type {
+    RPC rpc = 1;
+  }
+}
+
+message ControllerGetCapabilitiesResponse {
+  repeated ControllerServiceCapability capabilities = 1;
+}
+
+message NodeStageVolumeRequest {
+  string volume_id = 1;
+  string staging_target_path = 2;
+  map<string, string> volume_context = 3;
+}
+
+message NodeStageVolumeResponse {}
+
+message NodeUnstageVolumeRequest {
+  string volume_id = 1;
+  string staging_target_path = 2;
+}
+
+message NodeUnstageVolumeResponse {}
+
+message NodePublishVolumeRequest {
+  string volume_id = 1;
+  string target_path = 2;
+  string staging_target_path = 3;
+  map<string, string> volume_context = 4;
+  map<string, string> publish_context = 5;
+  VolumeCapability volume_capability = 6;
+  bool readonly = 7;
+}
+
+message VolumeCapability {
+  message Mount {
+    string fs_type = 1;
+    repeated string mount_flags = 2;
+  }
+  oneof access_type {
+    Mount mount = 1;
+  }
+  AccessMode access_mode = 2;
+}
+
+message AccessMode {
+  enum Mode {
+    UNKNOWN = 0;
+    SINGLE_NODE_WRITER = 1;
+    SINGLE_NODE_READER_ONLY = 2;
+    SINGLE_NODE_MULTI_WRITER = 3;
+  }
+  Mode mode = 1;
+}
+
+message NodePublishVolumeResponse {}
+
+message NodeUnpublishVolumeRequest {
+  string volume_id = 1;
+  string target_path = 2;
+}
+
+message NodeUnpublishVolumeResponse {}
+
+message NodeGetCapabilitiesRequest {}
+
+message NodeServiceCapability {
+  message RPC {
+    enum Type {
+      UNKNOWN = 0;
+      STAGE_UNSTAGE_VOLUME = 1;
+      GET_VOLUME_STATS = 2;
+    }
+    Type type = 1;
+  }
+  oneof type {
+    RPC rpc = 1;
+  }
+}
+
+message NodeGetCapabilitiesResponse {
+  repeated NodeServiceCapability capabilities = 1;
+}
+
+message NodeGetInfoRequest {}
+
+message NodeGetInfoResponse {
+  string node_id = 1;
+  uint64 max_volumes_per_node = 2;
+}

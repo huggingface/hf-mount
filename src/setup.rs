@@ -214,6 +214,12 @@ pub struct MountOptions {
     /// Writes are never pushed to remote.
     #[arg(long, default_value_t = false)]
     pub overlay: bool,
+
+    /// NFS server bind address. Defaults to 127.0.0.1:0 (random port) on Unix
+    /// and 0.0.0.0:2049 on Windows. Use 0.0.0.0:<port> to accept external
+    /// connections (required for Windows NFS client access).
+    #[arg(long)]
+    pub nfs_bind: Option<String>,
 }
 
 /// CLI args for the foreground FUSE/NFS binaries.
@@ -243,6 +249,7 @@ pub struct MountSetup {
     pub max_threads: usize,
     pub metadata_ttl_ms: u64,
     pub fuse_owner_only: bool,
+    pub nfs_bind: String,
 }
 
 // ── Tracing + env vars (no threads) ──────────────────────────────────
@@ -465,13 +472,13 @@ pub fn build_with_runtime(
         None
     };
 
-    let uid = options.uid.unwrap_or_else(|| unsafe { libc::getuid() });
-    let gid = options.gid.unwrap_or_else(|| unsafe { libc::getgid() });
+    let uid = options.uid.unwrap_or_else(current_uid);
+    let gid = options.gid.unwrap_or_else(current_gid);
 
     // Ignore EEXIST: the directory may already exist from a previous (possibly
     // stale) mount. FUSE/NFS will fail at mount time if it's actually busy.
     if let Err(e) = std::fs::create_dir_all(&mount_point)
-        && e.raw_os_error() != Some(libc::EEXIST)
+        && e.kind() != std::io::ErrorKind::AlreadyExists
     {
         panic!("Failed to create mount point {:?}: {e}", mount_point);
     }
@@ -570,6 +577,16 @@ pub fn build_with_runtime(
         max_threads: options.max_threads,
         metadata_ttl_ms: options.metadata_ttl_ms,
         fuse_owner_only: options.fuse_owner_only,
+        nfs_bind: options.nfs_bind.unwrap_or_else(|| {
+            #[cfg(unix)]
+            {
+                "127.0.0.1:0".to_string()
+            }
+            #[cfg(not(unix))]
+            {
+                "0.0.0.0:2049".to_string()
+            }
+        }),
     }
 }
 
@@ -586,6 +603,7 @@ pub fn setup(is_nfs: bool) -> MountSetup {
 
 /// Try to raise the soft file descriptor limit to avoid "Too many open files"
 /// errors during large batch operations. Most FUSE/NFS filesystems do this.
+#[cfg(unix)]
 pub fn raise_fd_limit() {
     const TARGET_NOFILE: u64 = 65536;
     let mut rlim = libc::rlimit {
@@ -600,6 +618,31 @@ pub fn raise_fd_limit() {
     if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &rlim) } != 0 {
         eprintln!("warning: failed to raise file descriptor limit to {TARGET_NOFILE}");
     }
+}
+
+#[cfg(windows)]
+pub fn raise_fd_limit() {
+    // Windows does not have rlimit; ignore.
+}
+
+#[cfg(unix)]
+pub fn current_uid() -> u32 {
+    unsafe { libc::getuid() }
+}
+
+#[cfg(windows)]
+pub fn current_uid() -> u32 {
+    0
+}
+
+#[cfg(unix)]
+pub fn current_gid() -> u32 {
+    unsafe { libc::getgid() }
+}
+
+#[cfg(windows)]
+pub fn current_gid() -> u32 {
+    0
 }
 
 fn build_cas_config(

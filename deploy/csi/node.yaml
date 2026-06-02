@@ -1,0 +1,205 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: hf-csi-node
+  namespace: kube-system
+spec:
+  selector:
+    matchLabels:
+      app: hf-csi-node
+  template:
+    metadata:
+      labels:
+        app: hf-csi-node
+    spec:
+      serviceAccountName: hf-csi-driver
+      # Run on all nodes (Linux + Windows).
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: csi-driver
+          image: huggingface/hf-mount:latest
+          command: ["hf-mount-csi"]
+          args:
+            - --endpoint=0.0.0.0:50051
+          env:
+            - name: KUBE_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: token
+                  optional: true
+            - name: HF_ENDPOINT
+              value: "https://huggingface.co"
+          ports:
+            - name: grpc
+              containerPort: 50051
+          livenessProbe:
+            grpc:
+              port: 50051
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          resources:
+            limits:
+              memory: "256Mi"
+              cpu: "500m"
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+          volumeMounts:
+            - name: plugin-dir
+              mountPath: /csi
+            - name: pods-mount-dir
+              mountPath: /var/lib/kubelet/pods
+              mountPropagation: Bidirectional
+        - name: csi-node-driver-registrar
+          image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.12.0
+          args:
+            - --csi-address=$(CSI_ENDPOINT)
+            - --kubelet-registration-path=$(DRIVER_REG_SOCK_PATH)
+            - --v=2
+          env:
+            - name: CSI_ENDPOINT
+              value: "tcp://localhost:50051"
+            - name: DRIVER_REG_SOCK_PATH
+              value: /csi/hf-csi.sock
+            - name: KUBE_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          volumeMounts:
+            - name: plugin-dir
+              mountPath: /csi
+          resources:
+            limits:
+              memory: "128Mi"
+              cpu: "100m"
+            requests:
+              memory: "64Mi"
+              cpu: "50m"
+        - name: liveness-probe
+          image: registry.k8s.io/sig-storage/livenessprobe:v2.14.0
+          args:
+            - --csi-address=$(CSI_ENDPOINT)
+            - --health-port=9808
+          env:
+            - name: CSI_ENDPOINT
+              value: "tcp://localhost:50051"
+          resources:
+            limits:
+              memory: "128Mi"
+              cpu: "100m"
+            requests:
+              memory: "64Mi"
+              cpu: "50m"
+      volumes:
+        - name: plugin-dir
+          hostPath:
+            path: /var/lib/kubelet/plugins/csi.huggingface.co
+            type: DirectoryOrCreate
+        - name: pods-mount-dir
+          hostPath:
+            path: /var/lib/kubelet/pods
+            type: Directory
+---
+# Windows-specific DaemonSet (requires hostProcess containers).
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: hf-csi-node-windows
+  namespace: kube-system
+spec:
+  selector:
+    matchLabels:
+      app: hf-csi-node-windows
+  template:
+    metadata:
+      labels:
+        app: hf-csi-node-windows
+    spec:
+      serviceAccountName: hf-csi-driver
+      nodeSelector:
+        kubernetes.io/os: windows
+      tolerations:
+        - key: node.kubernetes.io/os
+          operator: Equal
+          value: windows
+          effect: NoSchedule
+      # Windows hostProcess containers (Kubernetes 1.22+).
+      securityContext:
+        windowsOptions:
+          hostProcess: true
+          runAsUserName: "NT AUTHORITY\\SYSTEM"
+      hostNetwork: true
+      containers:
+        - name: csi-driver
+          image: huggingface/hf-mount:windows-latest
+          imagePullPolicy: IfNotPresent
+          command: ["hf-mount-csi.exe"]
+          args:
+            - --endpoint=0.0.0.0:50051
+          env:
+            - name: KUBE_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: token
+                  optional: true
+          ports:
+            - name: grpc
+              containerPort: 50051
+          resources:
+            limits:
+              memory: "256Mi"
+              cpu: "500m"
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+          volumeMounts:
+            - name: plugin-dir
+              mountPath: C:\\csi
+            - name: pods-mount-dir
+              mountPath: C:\\var\\lib\\kubelet\\pods
+        - name: csi-node-driver-registrar
+          image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.12.0
+          imagePullPolicy: IfNotPresent
+          args:
+            - --csi-address=$(CSI_ENDPOINT)
+            - --kubelet-registration-path=$(DRIVER_REG_SOCK_PATH)
+            - --v=2
+          env:
+            - name: CSI_ENDPOINT
+              value: "tcp://localhost:50051"
+            - name: DRIVER_REG_SOCK_PATH
+              value: C:\\csi\\hf-csi.sock
+            - name: KUBE_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          volumeMounts:
+            - name: plugin-dir
+              mountPath: C:\\csi
+          resources:
+            limits:
+              memory: "128Mi"
+              cpu: "100m"
+            requests:
+              memory: "64Mi"
+              cpu: "50m"
+      volumes:
+        - name: plugin-dir
+          hostPath:
+            path: C:\\var\\lib\\kubelet\\plugins\\csi.huggingface.co
+            type: DirectoryOrCreate
+        - name: pods-mount-dir
+          hostPath:
+            path: C:\\var\\lib\\kubelet\\pods
+            type: Directory

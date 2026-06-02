@@ -1,6 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
-use std::os::unix::io::AsRawFd;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
@@ -1062,7 +1062,7 @@ impl VirtualFs {
     /// Open a local file as read-only and return the file handle.
     fn open_local_readonly(&self, ino: u64, path: &PathBuf) -> VirtualFsResult<u64> {
         match File::open(path) {
-            Ok(file) => self.install_local_handle(ino, Arc::new(file), false),
+            Ok(file) => self.install_local_handle(ino, Arc::new(Mutex::new(file)), false),
             Err(e) => {
                 error!("Failed to open file {:?}: {}", path, e);
                 Err(libc::EIO)
@@ -1073,7 +1073,7 @@ impl VirtualFs {
     /// Register an already-opened `File` as a read-only `OpenFile::Local`
     /// handle. Used by the file_cache fast-path so the read fd stays alive
     /// even if eviction unlinks the on-disk copy after the open.
-    fn install_local_handle(&self, ino: u64, file: Arc<File>, writable: bool) -> VirtualFsResult<u64> {
+    fn install_local_handle(&self, ino: u64, file: Arc<Mutex<File>>, writable: bool) -> VirtualFsResult<u64> {
         let file_handle = self.alloc_file_handle();
         {
             let inodes = self.inode_table.read().expect("inodes poisoned");
@@ -1479,6 +1479,7 @@ impl VirtualFs {
             }
         };
         if let Some(file) = overlay_file {
+            let file = file.lock().expect("local file mutex poisoned");
             return file.sync_all().map_err(|e| {
                 error!("Overlay fsync failed for ino={}: {}", ino, e);
                 libc::EIO
@@ -1738,7 +1739,7 @@ impl VirtualFs {
             }
         }
 
-        self.install_local_handle(ino, Arc::new(file), true)
+        self.install_local_handle(ino, Arc::new(Mutex::new(file)), true)
     }
 
     /// Simple streaming write: truncate existing file and set up a new streaming writer.
@@ -1808,7 +1809,7 @@ impl VirtualFs {
                         error!("Failed to open local backing file {:?}: {}", fe.full_path, e);
                         libc::EIO
                     })?;
-                return self.install_local_handle(ino, Arc::new(file), false);
+                return self.install_local_handle(ino, Arc::new(Mutex::new(file)), false);
             }
             error!("Dirty overlay file ino={} has missing local backing file", ino);
             return Err(libc::EIO);
@@ -1848,7 +1849,8 @@ impl VirtualFs {
             _ if !fe.xet_hash.is_empty() => {
                 if let Some(fc) = &self.file_cache {
                     if let Some(file) = fc.try_open(&fe.xet_hash).await {
-                        return self.install_local_handle(ino, file, false);
+                        let cloned = std::fs::File::try_clone(&*file).map_err(|_| libc::EIO)?;
+                        return self.install_local_handle(ino, Arc::new(Mutex::new(cloned)), false);
                     }
                     self.spawn_populate_file_cache(fe.xet_hash.clone(), fe.size);
                 }
@@ -2061,25 +2063,13 @@ impl VirtualFs {
 
         match read_target {
             ReadTarget::LocalFd(file) => {
-                let file_descriptor = file.as_raw_fd();
+                let mut file = file.lock().expect("local file mutex poisoned");
                 let mut buf = BytesMut::zeroed(size as usize);
-                // SAFETY: fd is valid (Arc<File> keeps it alive), buf is correctly sized.
-                // pread is thread-safe (atomic offset, no shared seek cursor).
-                let n = unsafe {
-                    libc::pread(
-                        file_descriptor,
-                        buf.as_mut_ptr() as *mut libc::c_void,
-                        size as usize,
-                        offset as i64,
-                    )
-                };
-                if n < 0 {
-                    Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO))
-                } else {
-                    buf.truncate(n as usize);
-                    let eof = (n as u32) < size;
-                    Ok((buf.freeze(), eof))
-                }
+                file.seek(SeekFrom::Start(offset)).map_err(|_| libc::EIO)?;
+                let n = file.read(&mut buf).map_err(|_| libc::EIO)?;
+                buf.truncate(n);
+                let eof = (n as u32) < size;
+                Ok((buf.freeze(), eof))
             }
             ReadTarget::Remote { prefetch } => {
                 let mut prefetch_state = prefetch.lock().await;
@@ -2175,7 +2165,7 @@ impl VirtualFs {
         // Streaming = append-only channel to CAS (default mode).
         // Clone out of the map so we release the RwLock before doing I/O.
         enum WriteTarget {
-            Local { file: Arc<File>, ino: u64 },
+            Local { file: Arc<Mutex<File>>, ino: u64 },
             Streaming { ino: u64, channel: Arc<StreamingChannel> },
         }
 
@@ -2187,7 +2177,7 @@ impl VirtualFs {
                     file,
                     writable: true,
                 }) => WriteTarget::Local {
-                    file: file.clone(),
+                    file: Arc::clone(file),
                     ino: *ino,
                 },
                 Some(OpenFile::Streaming { ino, channel }) => WriteTarget::Streaming {
@@ -2201,34 +2191,23 @@ impl VirtualFs {
 
         match target {
             WriteTarget::Local { file, ino: handle_ino } => {
-                let file_descriptor = file.as_raw_fd();
-                let n = unsafe {
-                    libc::pwrite(
-                        file_descriptor,
-                        data.as_ptr() as *const libc::c_void,
-                        data.len(),
-                        offset as i64,
-                    )
-                };
-
-                if n < 0 {
-                    Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO))
-                } else {
-                    let written = n as u32;
-                    let new_end = offset + written as u64;
-                    let mut inodes = self.inode_table.write().expect("inodes poisoned");
-                    if let Some(entry) = inodes.get_mut(handle_ino) {
-                        if new_end > entry.size {
-                            if let Some(sd) = self.staging.dir() {
-                                sd.resize_bytes(entry.size, new_end);
-                            }
-                            entry.size = new_end;
+                let mut file = file.lock().expect("local file mutex poisoned");
+                file.seek(SeekFrom::Start(offset)).map_err(|_| libc::EIO)?;
+                file.write_all(data).map_err(|_| libc::EIO)?;
+                let written = data.len() as u32;
+                let new_end = offset + written as u64;
+                let mut inodes = self.inode_table.write().expect("inodes poisoned");
+                if let Some(entry) = inodes.get_mut(handle_ino) {
+                    if new_end > entry.size {
+                        if let Some(sd) = self.staging.dir() {
+                            sd.resize_bytes(entry.size, new_end);
                         }
-                        entry.set_dirty();
+                        entry.size = new_end;
                     }
-                    inodes.touch(handle_ino);
-                    Ok(written)
+                    entry.set_dirty();
                 }
+                inodes.touch(handle_ino);
+                Ok(written)
             }
             WriteTarget::Streaming {
                 ino: handle_ino,
@@ -2686,7 +2665,7 @@ impl VirtualFs {
                         file_handle,
                         OpenFile::Local {
                             ino,
-                            file: Arc::new(file),
+                            file: Arc::new(Mutex::new(file)),
                             writable: true,
                         },
                     );
@@ -3777,7 +3756,13 @@ struct StreamingChannel {
 /// An open file handle — either a local fd, lazy remote reference, or streaming writer.
 enum OpenFile {
     /// Local file (staging for writes, or dirty reads).
-    Local { ino: u64, file: Arc<File>, writable: bool },
+    /// Wrapped in a Mutex so concurrent read/write/seek is safe on Windows
+    /// (where File is not Sync) and so seek+read/write replaces pread/pwrite.
+    Local {
+        ino: u64,
+        file: Arc<Mutex<File>>,
+        writable: bool,
+    },
     /// Lazy remote — data fetched on-demand with adaptive prefetch buffer.
     Lazy {
         ino: u64,
@@ -3853,8 +3838,8 @@ async fn streaming_worker(
 
 /// What to do in read() after releasing the open_files lock.
 enum ReadTarget {
-    /// Hold an Arc<File> so the FD stays alive even if release() runs concurrently.
-    LocalFd(Arc<File>),
+    /// Hold an Arc<Mutex<File>> so the FD stays alive even if release() runs concurrently.
+    LocalFd(Arc<Mutex<File>>),
     Remote {
         prefetch: Arc<tokio::sync::Mutex<PrefetchState>>,
     },

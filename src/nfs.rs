@@ -12,7 +12,6 @@ use nfsserve::tcp::{NFSTcp, NFSTcpListener};
 use nfsserve::vfs::{DirEntry, NFSFileSystem, ReadDirResult, VFSCapabilities};
 use tracing::info;
 
-use crate::daemon::DaemonGuard;
 use crate::virtual_fs::inode::InodeKind;
 use crate::virtual_fs::{VirtualFs, VirtualFsAttr};
 
@@ -494,9 +493,10 @@ impl NFSFileSystem for NFSAdapter {
 pub async fn mount_nfs(
     virtual_fs: Arc<VirtualFs>,
     mount_point: &Path,
-    metadata_ttl_ms: u64,
+    #[allow(unused_variables)] metadata_ttl_ms: u64,
     read_only: bool,
-    daemon_guard: Option<&mut DaemonGuard>,
+    bind_addr: &str,
+    notify_ready: Option<Box<dyn FnMut() + '_>>,
 ) -> std::io::Result<()> {
     let vfs_for_shutdown = virtual_fs.clone();
     let adapter = NFSAdapter::new(virtual_fs, read_only);
@@ -522,9 +522,9 @@ pub async fn mount_nfs(
         });
     }));
 
-    let mut listener = NFSTcpListener::bind("127.0.0.1:0", adapter).await?;
+    let mut listener = NFSTcpListener::bind(bind_addr, adapter).await?;
     let port = listener.get_listen_port();
-    info!("NFS server listening on 127.0.0.1:{}", port);
+    info!("NFS server listening on {} (port {})", bind_addr, port);
 
     // Register mount/unmount listener: nfsserve sends `false` on UMNT.
     let (mount_tx, mut mount_rx) = tokio::sync::mpsc::channel::<bool>(1);
@@ -543,6 +543,7 @@ pub async fn mount_nfs(
     });
 
     // Convert ms to seconds (rounding up so 100ms → 1s, not 0s which disables caching entirely)
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     let actimeo = metadata_ttl_ms.div_ceil(1000);
 
     // Platform-specific mount command
@@ -598,8 +599,8 @@ pub async fn mount_nfs(
     info!("NFS mount active at {}", mount_point_str);
 
     // Signal the parent process that the mount is live (daemon mode).
-    if let Some(guard) = daemon_guard {
-        guard.notify_ready();
+    if let Some(mut f) = notify_ready {
+        f();
     }
 
     // Wait for unmount signal, server exit, or Ctrl+C.
@@ -607,38 +608,72 @@ pub async fn mount_nfs(
     // handle_forever() is an infinite accept() loop that never returns on its own.
     // On Linux, `umount` doesn't always send the UMNT RPC, so we also poll
     // /proc/mounts as a fallback to detect when the mount disappears.
-    let mut sigterm =
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("Failed to register SIGTERM");
     tokio::pin!(server_handle);
-    loop {
-        tokio::select! {
-            msg = mount_rx.recv() => {
-                match msg {
-                    Some(true) => continue,  // mount event, keep waiting
-                    _ => {
-                        info!("NFS unmount detected via UMNT, shutting down");
+    #[cfg(unix)]
+    {
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("Failed to register SIGTERM");
+        loop {
+            tokio::select! {
+                msg = mount_rx.recv() => {
+                    match msg {
+                        Some(true) => continue,  // mount event, keep waiting
+                        _ => {
+                            info!("NFS unmount detected via UMNT, shutting down");
+                            break;
+                        }
+                    }
+                }
+                _ = &mut server_handle => {
+                    info!("NFS server exited");
+                    break;
+                }
+                _ = tokio::signal::ctrl_c() => {
+                    info!("Received Ctrl+C, unmounting...");
+                    unmount_nfs(mount_point_str);
+                    break;
+                }
+                _ = sigterm.recv() => {
+                    info!("Received SIGTERM, unmounting...");
+                    unmount_nfs(mount_point_str);
+                    break;
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {
+                    if !is_mounted(mount_point_str) {
+                        info!("NFS mount disappeared, shutting down");
                         break;
                     }
                 }
             }
-            _ = &mut server_handle => {
-                info!("NFS server exited");
-                break;
-            }
-            _ = tokio::signal::ctrl_c() => {
-                info!("Received Ctrl+C, unmounting...");
-                unmount_nfs(mount_point_str);
-                break;
-            }
-            _ = sigterm.recv() => {
-                info!("Received SIGTERM, unmounting...");
-                unmount_nfs(mount_point_str);
-                break;
-            }
-            _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {
-                if !is_mounted(mount_point_str) {
-                    info!("NFS mount disappeared, shutting down");
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        loop {
+            tokio::select! {
+                msg = mount_rx.recv() => {
+                    match msg {
+                        Some(true) => continue,  // mount event, keep waiting
+                        _ => {
+                            info!("NFS unmount detected via UMNT, shutting down");
+                            break;
+                        }
+                    }
+                }
+                _ = &mut server_handle => {
+                    info!("NFS server exited");
                     break;
+                }
+                _ = tokio::signal::ctrl_c() => {
+                    info!("Received Ctrl+C, unmounting...");
+                    unmount_nfs(mount_point_str);
+                    break;
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {
+                    if !is_mounted(mount_point_str) {
+                        info!("NFS mount disappeared, shutting down");
+                        break;
+                    }
                 }
             }
         }
@@ -830,41 +865,49 @@ fn system_time_to_nfstime(t: SystemTime) -> nfstime3 {
 
 /// Check if a path is still an active mount point.
 fn unmount_nfs(mount_point: &str) {
-    use std::ffi::CString;
-
-    // Try libc unmount first (no external process dependency).
-    if let Ok(c_path) = CString::new(mount_point) {
-        #[cfg(target_os = "linux")]
-        {
-            if unsafe { libc::umount2(c_path.as_ptr(), libc::MNT_DETACH) } == 0 {
-                return;
-            }
-        }
-        #[cfg(target_os = "macos")]
-        {
-            if unsafe { libc::unmount(c_path.as_ptr(), libc::MNT_FORCE) } == 0 {
-                return;
-            }
-        }
-    }
-
-    // Fallback: external command.
-    #[cfg(target_os = "macos")]
-    if let Err(e) = std::process::Command::new("umount").arg(mount_point).status() {
-        tracing::warn!("NFS unmount fallback failed for {}: {}", mount_point, e);
-    }
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     {
-        let result = if unsafe { libc::getuid() } == 0 {
-            std::process::Command::new("umount").arg(mount_point).status()
-        } else {
-            std::process::Command::new("sudo")
-                .args(["-n", "umount", mount_point])
-                .status()
-        };
-        if let Err(e) = result {
+        use std::ffi::CString;
+
+        // Try libc unmount first (no external process dependency).
+        if let Ok(c_path) = CString::new(mount_point) {
+            #[cfg(target_os = "linux")]
+            {
+                if unsafe { libc::umount2(c_path.as_ptr(), libc::MNT_DETACH) } == 0 {
+                    return;
+                }
+            }
+            #[cfg(target_os = "macos")]
+            {
+                if unsafe { libc::unmount(c_path.as_ptr(), libc::MNT_FORCE) } == 0 {
+                    return;
+                }
+            }
+        }
+
+        // Fallback: external command.
+        #[cfg(target_os = "macos")]
+        if let Err(e) = std::process::Command::new("umount").arg(mount_point).status() {
             tracing::warn!("NFS unmount fallback failed for {}: {}", mount_point, e);
         }
+        #[cfg(target_os = "linux")]
+        {
+            let result = if unsafe { libc::getuid() } == 0 {
+                std::process::Command::new("umount").arg(mount_point).status()
+            } else {
+                std::process::Command::new("sudo")
+                    .args(["-n", "umount", mount_point])
+                    .status()
+            };
+            if let Err(e) = result {
+                tracing::warn!("NFS unmount fallback failed for {}: {}", mount_point, e);
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        // Windows has no direct umount equivalent for NFS; rely on client cleanup.
+        let _ = mount_point;
     }
 }
 
@@ -894,6 +937,12 @@ fn is_mounted(path: &str) -> bool {
                 false
             }
         }
+    }
+    #[cfg(windows)]
+    {
+        // No easy way to check NFS mount status on Windows; assume mounted.
+        let _ = path;
+        true
     }
 }
 

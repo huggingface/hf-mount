@@ -1,7 +1,9 @@
 use std::path::Path;
 use std::time::SystemTime;
 
-use cap_std::fs::{Dir, DirBuilder, DirBuilderExt, OpenOptions, Permissions, PermissionsExt};
+use cap_std::fs::{Dir, OpenOptions};
+#[cfg(unix)]
+use cap_std::fs::{DirBuilder, DirBuilderExt, Permissions, PermissionsExt};
 
 #[derive(Debug, Clone)]
 pub struct OverlayDirEntry {
@@ -75,9 +77,17 @@ impl OverlayBacking {
 
     pub fn create_dir(&self, full_path: &str, mode: u16) -> std::io::Result<()> {
         let rel = validate_rel_path(full_path)?;
-        let mut builder = DirBuilder::new();
-        builder.mode(mode as u32);
-        self.dir.create_dir_with(rel, &builder)
+        #[cfg(unix)]
+        {
+            let mut builder = DirBuilder::new();
+            builder.mode(mode as u32);
+            self.dir.create_dir_with(rel, &builder)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = mode;
+            self.dir.create_dir(rel)
+        }
     }
 
     pub fn set_mode(&self, full_path: &str, mode: u16) -> std::io::Result<()> {
@@ -96,7 +106,15 @@ impl OverlayBacking {
                 "overlay chmod rejects symlinks",
             ));
         }
-        self.dir.set_permissions(target, Permissions::from_mode(mode as u32))
+        #[cfg(unix)]
+        {
+            self.dir.set_permissions(target, Permissions::from_mode(mode as u32))
+        }
+        #[cfg(windows)]
+        {
+            let _ = mode;
+            Ok(())
+        }
     }
 
     pub fn remove_file(&self, full_path: &str) -> std::io::Result<()> {
@@ -149,7 +167,10 @@ impl OverlayBacking {
                 size: meta.len(),
                 mtime: meta.modified().map(|t| t.into_std()).unwrap_or(SystemTime::UNIX_EPOCH),
                 #[allow(clippy::unnecessary_cast)]
+                #[cfg(unix)]
                 mode: (meta.permissions().mode() & 0o777) as u16,
+                #[cfg(windows)]
+                mode: 0o644,
             });
         }
         Ok(out)
@@ -190,6 +211,7 @@ mod tests {
         dir
     }
 
+    #[cfg(unix)]
     #[test]
     fn overlay_open_file_sets_cloexec() {
         let root = fresh_temp_dir("cloexec_root");
@@ -205,6 +227,7 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn overlay_open_file_rejects_final_symlink() {
         let root = fresh_temp_dir("final_symlink_root");
@@ -227,6 +250,7 @@ mod tests {
         std::fs::remove_dir_all(outside).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn overlay_create_parent_dirs_rejects_symlink_parent() {
         let root = fresh_temp_dir("parent_symlink_root");

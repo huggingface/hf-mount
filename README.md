@@ -46,11 +46,12 @@ On macOS, this installs the NFS backend only (`hf-mount`, `hf-mount-nfs`). For t
 
 Binaries are available on [GitHub Releases](https://github.com/huggingface/hf-mount/releases):
 
-| Platform | Daemon | NFS | FUSE |
-| --- | --- | --- | --- |
-| Linux x86_64 | `hf-mount-x86_64-linux` | `hf-mount-nfs-x86_64-linux` | `hf-mount-fuse-x86_64-linux` |
-| Linux aarch64 | `hf-mount-aarch64-linux` | `hf-mount-nfs-aarch64-linux` | `hf-mount-fuse-aarch64-linux` |
+| Platform            | Daemon                        | NFS                               | FUSE                               |
+| ------------------- | ----------------------------- | --------------------------------- | ---------------------------------- |
+| Linux x86_64        | `hf-mount-x86_64-linux`       | `hf-mount-nfs-x86_64-linux`       | `hf-mount-fuse-x86_64-linux`       |
+| Linux aarch64       | `hf-mount-aarch64-linux`      | `hf-mount-nfs-aarch64-linux`      | `hf-mount-fuse-aarch64-linux`      |
 | macOS Apple Silicon | `hf-mount-arm64-apple-darwin` | `hf-mount-nfs-arm64-apple-darwin` | `hf-mount-fuse-arm64-apple-darwin` |
+| Windows x86_64      | —                             | `hf-mount-nfs-x86_64-windows.exe` | —                                  |
 
 ### System dependencies (FUSE only)
 
@@ -73,6 +74,13 @@ cargo build --release --features fuse
 
 # All backends
 cargo build --release --features fuse,nfs
+```
+
+**Windows cross-compile from Linux/macOS:**
+
+```bash
+rustup target add x86_64-pc-windows-gnu
+cargo build --release --target x86_64-pc-windows-gnu --features nfs
 ```
 
 Binaries: `target/release/hf-mount`, `target/release/hf-mount-nfs`, `target/release/hf-mount-fuse`
@@ -157,6 +165,40 @@ hf-mount-nfs repo gpt2 /tmp/gpt2
 hf-mount-fuse --hf-token $HF_TOKEN bucket myuser/my-bucket /mnt/data
 ```
 
+### Windows (NFS only)
+
+Windows does not support FUSE, but the NFS backend works out of the box. The binary binds to `0.0.0.0:2049` by default so the Windows built-in NFS client can connect.
+
+**1. Start the server:**
+
+```powershell
+hf-mount-nfs.exe repo openai/gpt-oss-20b C:\mnt\gpt-oss
+```
+
+The server runs in the foreground. By default it listens on `0.0.0.0:2049`; use `--nfs-bind 127.0.0.1:2049` to restrict to localhost.
+
+**2. Mount from Windows:**
+
+Enable the NFS client (administrator PowerShell):
+
+```powershell
+Enable-WindowsOptionalFeature -Online -FeatureName ServicesForNFS-ClientOnly
+```
+
+Then mount the share:
+
+```powershell
+mount -o anon \\127.0.0.1\\ C:
+```
+
+Or use `net use`:
+
+```powershell
+net use Z: \\127.0.0.1\\ /USER:anonymous
+```
+
+> **Note:** `hf-mount start` daemon mode is not available on Windows. Run `hf-mount-nfs.exe` directly or wrap it in a Windows service using `sc.exe` or `nssm`.
+
 ### macOS: launch as a daemon with launchd
 
 To have `hf-mount` start automatically on login, create a LaunchAgent:
@@ -207,29 +249,29 @@ hf-mount stop /tmp/data          # daemon mounts
 
 ### Options
 
-| Flag | Default | Description |
-| --- | --- | --- |
-| `--hf-token` | `$HF_TOKEN` | HF API token (required for private repos/buckets) |
-| `--hub-endpoint` | `https://huggingface.co` | Hub API endpoint |
-| `--cache-dir` | `/tmp/hf-mount-cache` | Local cache directory |
-| `--cache-size` | `10000000000` (~10 GB) | Max on-disk chunk cache size in bytes |
-| `--read-only` | `false` | Mount read-only (always on for repos) |
-| `--advanced-writes` | `false` | Enable staging files + async flush (random writes, seek, overwrite) |
-| `--poll-interval-secs` | `30` | Remote change polling interval (0 to disable) |
-| `--max-threads` | `16` | Maximum FUSE worker threads (Linux only) |
-| `--metadata-ttl-ms` | `10000` | How long file metadata is cached before re-checking (ms) |
-| `--metadata-ttl-minimal` | `false` | Re-check on every access (maximum freshness, lower throughput) |
-| `--flush-debounce-ms` | `2000` | Advanced writes: flush debounce delay (ms) |
-| `--flush-max-batch-window-ms` | `30000` | Advanced writes: max flush batch window (ms) |
-| `--flush-shutdown-timeout-ms` | `45000` | Advanced writes: max time the SIGTERM flush drain may run before abandoning unflushed data to guarantee exit. Must be < the pod's `terminationGracePeriodSeconds`, or a slow Hub/CAS backend keeps the FUSE connection alive past grace and strands the pod. |
-| `--no-disk-cache` | `false` | Disable local chunk cache (every read fetches from HF) |
-| `--no-filter-os-files` | `false` | Stop filtering OS junk files (.DS_Store, Thumbs.db, etc.) |
-| `--uid` / `--gid` | current user | Override UID/GID for mounted files |
-| `--fuse-owner-only` | `false` | Restrict mount access to the mounting user only (FUSE only; by default all users can access, which requires `user_allow_other` in /etc/fuse.conf) |
-| `--token-file` | | Path to a token file (re-read on each request for credential rotation) |
-| `--inode-soft-limit` | `0` | Soft cap on the in-memory inode table (0 disables). See "Bounding inode memory" below. |
-| `--lru-sweep-interval-ms` | `5000` | Background LRU sweep interval in milliseconds. Only meaningful when `--inode-soft-limit > 0`. |
-| `--overlay` | `false` | Treat the mount point as a writable local layer over the remote source. Local files persist on disk; writes are never pushed to the remote. See "Overlay mode" below. |
+| Flag                          | Default                                         | Description                                                                                                                                                           |
+| ----------------------------- | ----------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--hf-token`                  | `$HF_TOKEN`                                     | HF API token (required for private repos/buckets)                                                                                                                     |
+| `--hub-endpoint`              | `https://huggingface.co`                        | Hub API endpoint                                                                                                                                                      |
+| `--cache-dir`                 | `/tmp/hf-mount-cache`                           | Local cache directory                                                                                                                                                 |
+| `--cache-size`                | `10000000000` (~10 GB)                          | Max on-disk chunk cache size in bytes                                                                                                                                 |
+| `--read-only`                 | `false`                                         | Mount read-only (always on for repos)                                                                                                                                 |
+| `--advanced-writes`           | `false`                                         | Enable staging files + async flush (random writes, seek, overwrite)                                                                                                   |
+| `--poll-interval-secs`        | `30`                                            | Remote change polling interval (0 to disable)                                                                                                                         |
+| `--max-threads`               | `16`                                            | Maximum FUSE worker threads (Linux only)                                                                                                                              |
+| `--metadata-ttl-ms`           | `10000`                                         | How long file metadata is cached before re-checking (ms)                                                                                                              |
+| `--metadata-ttl-minimal`      | `false`                                         | Re-check on every access (maximum freshness, lower throughput)                                                                                                        |
+| `--flush-debounce-ms`         | `2000`                                          | Advanced writes: flush debounce delay (ms)                                                                                                                            |
+| `--flush-max-batch-window-ms` | `30000`                                         | Advanced writes: max flush batch window (ms)                                                                                                                          |
+| `--no-disk-cache`             | `false`                                         | Disable local chunk cache (every read fetches from HF)                                                                                                                |
+| `--no-filter-os-files`        | `false`                                         | Stop filtering OS junk files (.DS_Store, Thumbs.db, etc.)                                                                                                             |
+| `--uid` / `--gid`             | current user                                    | Override UID/GID for mounted files                                                                                                                                    |
+| `--fuse-owner-only`           | `false`                                         | Restrict mount access to the mounting user only (FUSE only; by default all users can access, which requires `user_allow_other` in /etc/fuse.conf)                     |
+| `--token-file`                |                                                 | Path to a token file (re-read on each request for credential rotation)                                                                                                |
+| `--inode-soft-limit`          | `0`                                             | Soft cap on the in-memory inode table (0 disables). See "Bounding inode memory" below.                                                                                |
+| `--lru-sweep-interval-ms`     | `5000`                                          | Background LRU sweep interval in milliseconds. Only meaningful when `--inode-soft-limit > 0`.                                                                         |
+| `--overlay`                   | `false`                                         | Treat the mount point as a writable local layer over the remote source. Local files persist on disk; writes are never pushed to the remote. See "Overlay mode" below. |
+| `--nfs-bind`                  | `127.0.0.1:0` (Unix) / `0.0.0.0:2049` (Windows) | NFS server bind address. Use `0.0.0.0:<port>` to accept external connections.                                                                                         |
 
 ### Bounding inode memory
 
@@ -297,13 +339,13 @@ Files can be stale for up to `--metadata-ttl-ms` (default 10 s) after a remote u
 
 ### Writes
 
-| | Streaming (default) | Advanced (`--advanced-writes`) |
-| --- | --- | --- |
-| Write pattern | Append-only (sequential) | Random writes, seek, overwrite |
-| Storage | In-memory buffer | Local staging file on disk |
-| Modify existing files | Overwrite only (O_TRUNC) | Yes (downloads file first) |
-| Durability | On close | Async, debounced (2 s / 30 s max) |
-| Disk space needed | None | Full file size per open file |
+|                       | Streaming (default)      | Advanced (`--advanced-writes`)    |
+| --------------------- | ------------------------ | --------------------------------- |
+| Write pattern         | Append-only (sequential) | Random writes, seek, overwrite    |
+| Storage               | In-memory buffer         | Local staging file on disk        |
+| Modify existing files | Overwrite only (O_TRUNC) | Yes (downloads file first)        |
+| Durability            | On close                 | Async, debounced (2 s / 30 s max) |
+| Disk space needed     | None                     | Full file size per open file      |
 
 **Streaming mode** buffers writes in memory and uploads on `close()`. A crash before close means data loss.
 
@@ -315,12 +357,12 @@ Files can be stale for up to `--metadata-ttl-ms` (default 10 s) after a remote u
 
 ### FUSE vs NFS
 
-| | FUSE | NFS |
-| --- | --- | --- |
-| Metadata revalidation | Per-file, within TTL | No (NFS uses file handles) |
-| Page cache invalidation | Supported | Not supported by NFS protocol |
-| Staleness window | ~10 s | Up to poll interval (30 s) |
-| Write mode | Streaming by default | Advanced always |
+|                         | FUSE                 | NFS                           |
+| ----------------------- | -------------------- | ----------------------------- |
+| Metadata revalidation   | Per-file, within TTL | No (NFS uses file handles)    |
+| Page cache invalidation | Supported            | Not supported by NFS protocol |
+| Staleness window        | ~10 s                | Up to poll interval (30 s)    |
+| Write mode              | Streaming by default | Advanced always               |
 
 ## How it works
 
