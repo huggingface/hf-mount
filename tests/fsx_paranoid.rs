@@ -65,6 +65,17 @@ async fn test_fsx_paranoid_cas_roundtrip() {
         &[("HF_MOUNT_SPARSE_MIN_BYTES", "0")],
     );
 
+    // mount_bucket_with_env only warns on a failed wait_for_mount and returns
+    // the Child anyway. Without this check, a mount failure (stale FUSE
+    // state, broken macFUSE, missing kernel module) lets the test pass
+    // trivially: every write hits the bare /tmp dir, every read returns the
+    // same local bytes, and no actual CAS round-trip happens despite the
+    // test's stated purpose.
+    if !common::is_mounted(&mount_point) {
+        common::unmount(&mount_point, child, 5);
+        panic!("mount not live at {mount_point} — see hf-mount-fuse output above");
+    }
+
     let num_ops = std::env::var("FSX_PARANOID_OPS")
         .ok()
         .and_then(|v| v.parse().ok())

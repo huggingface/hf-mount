@@ -507,7 +507,7 @@ fn decode_proc_mount_path(path: &str) -> String {
     String::from_utf8_lossy(&decoded).into_owned()
 }
 
-fn is_mounted(mount_point: &str) -> bool {
+pub fn is_mounted(mount_point: &str) -> bool {
     #[cfg(target_os = "linux")]
     {
         let mount_point = std::fs::canonicalize(mount_point)
