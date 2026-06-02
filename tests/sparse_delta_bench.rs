@@ -213,6 +213,22 @@ enum Workload {
 }
 
 async fn run_bench(label: &str, extra_mount_args: &[&str], workload: Workload) {
+    // Force sparse engagement at any file size for the SPARSE_* variants.
+    // The bench default of 64 MiB sits below the production 256 MiB
+    // threshold, so without this override `--sparse-writes` would silently
+    // fall back to the non-sparse path and the SPARSE_* labels would be
+    // measuring the same code as FULL. Set unconditionally: the env var has
+    // no effect on runs that don't also pass `--sparse-writes`, so the FULL
+    // baseline is unaffected.
+    //
+    // SAFETY: bench setup mutates env before spawning the mount child.
+    // cargo test parallelizes within a binary, but all readers (mount
+    // children) see HF_MOUNT_SPARSE_MIN_BYTES=0 at spawn time and the
+    // value never changes across tests in this binary.
+    unsafe {
+        std::env::set_var("HF_MOUNT_SPARSE_MIN_BYTES", "0");
+    }
+
     let guard = match common::setup_bucket(&format!("sparse-delta-{label}")).await {
         Some(g) => g,
         None => {
@@ -364,6 +380,16 @@ async fn bench_sparse_delta_scattered() {
 /// Real-world equivalent: an async-RL inference replica spinning up on a
 /// fresh node, pulling a checkpoint that's already on the Hub.
 async fn run_cold_bench(label: &str, extra_mount_args: &[&str]) {
+    // Same rationale as `run_bench`: override the production 256 MiB
+    // threshold so the bench's default 64 MiB file actually engages sparse
+    // when the caller passes `--sparse-writes`. No-op for FULL_COLD which
+    // doesn't pass the flag.
+    //
+    // SAFETY: env mutation in bench setup, before any mount child reads it.
+    unsafe {
+        std::env::set_var("HF_MOUNT_SPARSE_MIN_BYTES", "0");
+    }
+
     let guard = match common::setup_bucket(&format!("sparse-cold-{label}")).await {
         Some(g) => g,
         None => {

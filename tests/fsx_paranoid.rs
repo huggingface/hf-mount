@@ -29,6 +29,20 @@ async fn test_fsx_paranoid_cas_roundtrip() {
     let mount_point = format!("/tmp/hf-fsx-paranoid-{}", pid);
     let cache_dir = format!("/tmp/hf-fsx-paranoid-cache-{}", pid);
 
+    // Force sparse engagement for this 1 MiB workload. Without overriding the
+    // 256 MiB production default, the `--sparse-writes` CLI flag below would
+    // be a no-op: every file in this test stays well under the threshold and
+    // would silently fall back to the legacy download-then-upload path,
+    // defeating the test's stated purpose of catching range_upload
+    // composition regressions. Safe to mutate here: each `tests/*.rs` file
+    // compiles as its own test binary, and this binary has a single test.
+    //
+    // SAFETY: single-threaded mutation in test setup before any reader
+    // observes the variable. The mount child inherits this env at spawn.
+    unsafe {
+        std::env::set_var("HF_MOUNT_SPARSE_MIN_BYTES", "0");
+    }
+
     let child = common::mount_bucket(
         &bucket_id,
         &mount_point,
