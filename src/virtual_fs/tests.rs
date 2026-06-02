@@ -7079,6 +7079,18 @@ fn gen_verified_op(rng: &mut StressRng, file_size: usize, slot_start: usize, slo
     }
 }
 
+/// Per-op-type counters, shared across all workers. Used to prove that ops
+/// actually fire (and at what proportion) — without this it's easy for a
+/// fast-running stress test to silently devolve into "the rng path never
+/// picked write" or similar workload collapse.
+#[derive(Default)]
+struct VerifiedStats {
+    writes: std::sync::atomic::AtomicU64,
+    reads: std::sync::atomic::AtomicU64,
+    fsyncs: std::sync::atomic::AtomicU64,
+    reopens: std::sync::atomic::AtomicU64,
+}
+
 /// All the inputs `run_verified_worker` needs in a single struct so the
 /// clippy::too_many_arguments lint stays happy without adding allow attrs.
 struct VerifiedWorker {
@@ -7091,11 +7103,13 @@ struct VerifiedWorker {
     slot_start: usize,
     slot_end: usize,
     shadow: Vec<u8>,
+    stats: std::sync::Arc<VerifiedStats>,
 }
 
 /// Runs one worker; returns its final shadow for its slot. Errors propagate
 /// up as Result::Err so the test fails with the offending worker's context.
 async fn run_verified_worker(w: VerifiedWorker) -> Result<Vec<u8>, String> {
+    use std::sync::atomic::Ordering;
     let VerifiedWorker {
         vfs,
         ino,
@@ -7106,6 +7120,7 @@ async fn run_verified_worker(w: VerifiedWorker) -> Result<Vec<u8>, String> {
         slot_start,
         slot_end,
         mut shadow,
+        stats,
     } = w;
     let mut rng = StressRng::new(seed);
     let mut fh = vfs
@@ -7127,16 +7142,12 @@ async fn run_verified_worker(w: VerifiedWorker) -> Result<Vec<u8>, String> {
                     .await
                     .map_err(|e| format!("[w{worker_id}] op {op_idx} write({offset},{len}): {e}"))?;
                 let actual = written as usize;
-                // Mirror the same prefix that pwrite committed. In practice
-                // regular-file pwrite is all-or-nothing — defensively cap.
                 let shadow_off = offset - slot_start;
                 shadow[shadow_off..shadow_off + actual].copy_from_slice(&buf[..actual]);
+                stats.writes.fetch_add(1, Ordering::Relaxed);
             }
             VerifiedOp::Read { offset, len } => {
                 let want = (len as u32).min((file_size - offset) as u32);
-                // Reads target arbitrary slots. The target slot may be racing
-                // under another worker's writes, so we can only assert no
-                // error / no panic, not byte content.
                 match vfs.read(fh, offset as u64, want).await {
                     Ok(_) => {}
                     Err(libc::EAGAIN) | Err(libc::EBADF) => {}
@@ -7146,6 +7157,7 @@ async fn run_verified_worker(w: VerifiedWorker) -> Result<Vec<u8>, String> {
                         ));
                     }
                 }
+                stats.reads.fetch_add(1, Ordering::Relaxed);
             }
             VerifiedOp::Fsync => {
                 if let Err(e) = vfs.fsync(ino, fh, None).await
@@ -7154,6 +7166,7 @@ async fn run_verified_worker(w: VerifiedWorker) -> Result<Vec<u8>, String> {
                     return Err(format!("[w{worker_id}] op {op_idx} fsync: unexpected errno {e}"));
                 }
                 tokio::time::sleep(Duration::from_millis(5)).await;
+                stats.fsyncs.fetch_add(1, Ordering::Relaxed);
             }
             VerifiedOp::Reopen => {
                 if let Err(e) = vfs.release(fh).await {
@@ -7167,6 +7180,7 @@ async fn run_verified_worker(w: VerifiedWorker) -> Result<Vec<u8>, String> {
                         .map_err(|e| format!("[w{worker_id}] op {op_idx} reopen retry: {e}"))?,
                     Err(e) => return Err(format!("[w{worker_id}] op {op_idx} reopen: {e}")),
                 };
+                stats.reopens.fetch_add(1, Ordering::Relaxed);
             }
         }
     }
@@ -7218,6 +7232,9 @@ fn sparse_writes_same_inode_verified_integrity() {
         "sparse_writes_same_inode_verified_integrity: {n_workers} workers × {ops_per_worker} ops, slot={slot_size}B, file={file_size}B, seed={seed}"
     );
 
+    let stats = std::sync::Arc::new(VerifiedStats::default());
+    let wall_start = std::time::Instant::now();
+
     rt.block_on(async {
         let ino = vfs.lookup(ROOT_INODE, path).await.unwrap().ino;
         let mut handles = Vec::with_capacity(n_workers);
@@ -7226,6 +7243,7 @@ fn sparse_writes_same_inode_verified_integrity() {
             let slot_end = slot_start + slot_size;
             let shadow_slot = base[slot_start..slot_end].to_vec();
             let vfs = vfs.clone();
+            let stats = stats.clone();
             let worker_seed = seed.wrapping_add(w as u64).wrapping_mul(0x9E3779B97F4A7C15);
             handles.push(tokio::spawn(async move {
                 run_verified_worker(VerifiedWorker {
@@ -7238,6 +7256,7 @@ fn sparse_writes_same_inode_verified_integrity() {
                     slot_start,
                     slot_end,
                     shadow: shadow_slot,
+                    stats,
                 })
                 .await
             }));
@@ -7263,6 +7282,40 @@ fn sparse_writes_same_inode_verified_integrity() {
 
         // Quiesce: wait for any in-flight flushes to land before reading.
         wait_for_clean(&vfs, ino).await;
+
+        // Workload-shape evidence: print per-op-type counts + MockXet
+        // activity. Proves the rng actually hit every op branch (otherwise
+        // a stress test can quietly degenerate into "only reads" or similar)
+        // and that the sparse code path was exercised (CAS streams > 0
+        // proves fill_sparse_holes ran; range_upload-produced hashes prove
+        // sparse-aware commits ran).
+        use std::sync::atomic::Ordering;
+        let elapsed = wall_start.elapsed();
+        let writes = stats.writes.load(Ordering::Relaxed);
+        let reads = stats.reads.load(Ordering::Relaxed);
+        let fsyncs = stats.fsyncs.load(Ordering::Relaxed);
+        let reopens = stats.reopens.load(Ordering::Relaxed);
+        let total_ops = writes + reads + fsyncs + reopens;
+        let cas_streams = xet.stream_calls.lock().unwrap().len();
+        let cas_objects = xet.files.lock().unwrap().len();
+        eprintln!(
+            "  ops: writes={} reads={} fsyncs={} reopens={} (total={}, {:.0} ops/s)",
+            writes,
+            reads,
+            fsyncs,
+            reopens,
+            total_ops,
+            total_ops as f64 / elapsed.as_secs_f64(),
+        );
+        eprintln!(
+            "  MockXet: CAS streams={} files={} (1 seed + N commit hashes)",
+            cas_streams, cas_objects
+        );
+        assert!(writes > 0, "rng never picked a Write op");
+        assert!(reads > 0, "rng never picked a Read op");
+        assert!(fsyncs > 0, "rng never picked an Fsync op");
+        assert!(reopens > 0, "rng never picked a Reopen op");
+        assert!(cas_streams > 0, "sparse CAS fill path never fired");
 
         // Strong oracle: every byte of the committed file must equal the
         // concatenation of each worker's final shadow. A divergence pinpoints
