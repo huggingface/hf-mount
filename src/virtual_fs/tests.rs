@@ -6277,6 +6277,159 @@ fn write_zero_bytes_past_eof_is_a_noop() {
     vfs.shutdown();
 }
 
+// ── Backports from feat/append-write (PR #41) ───────────────────────────
+//
+// These tests target invariants that the rewrite preserves but which were
+// not previously exercised end-to-end. Names kept close to the originals
+// for cross-referencing during the rewrite review.
+
+/// Post a sparse flush, the reader must see committed CAS bytes for the
+/// holes outside the modified window, NOT the staging zeros. This pins the
+/// post-`apply_commit_sparse` invariant: sparse_write stays installed
+/// (rekeyed to the new hash), `dirty_ranges` is cleared, `staging_is_current`
+/// remains false because the staging file still has unmaterialised holes,
+/// and a read fills those holes from the JUST-committed CAS file.
+///
+/// Backport of `sparse_post_flush_read_returns_cas_bytes_not_zeros` from
+/// PR #41.
+#[test]
+fn sparse_post_flush_read_returns_cas_bytes_not_zeros() {
+    let hub = MockHub::new();
+    hub.add_file("file.txt", 10, Some("orig_hash"), None);
+    let xet = MockXet::new();
+    xet.add_file("orig_hash", b"0123456789");
+    let (rt, vfs) = vfs_sparse(&hub, &xet);
+
+    rt.block_on(async {
+        let attr = vfs.lookup(ROOT_INODE, "file.txt").await.unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open(ino, true, false, None).await.unwrap();
+
+        // Dirty a small window in the middle of the file. Staging now holds
+        // zeros everywhere except "XX" at [2..4); the rest are sparse holes.
+        write_blocking(&vfs, ino, fh, 2, b"XX").await.unwrap();
+
+        vfs.fsync(ino, fh, None).await.unwrap();
+        wait_for_clean(&vfs, ino).await;
+
+        // Post-`apply_commit_sparse` shape: dirty cleared, sparse_write
+        // preserved (rekeyed to new hash), staging not flagged current
+        // because holes remain unmaterialised.
+        {
+            let inodes = vfs.inode_table.read().unwrap();
+            let entry = inodes.get(ino).unwrap();
+            assert!(
+                !entry.staging_is_current,
+                "staging must not be flagged current after a sparse flush — \
+                 holes still need CAS fill"
+            );
+            let sw = entry
+                .sparse_write
+                .as_ref()
+                .expect("sparse_write must persist after sparse flush so reads can fill holes");
+            assert!(sw.dirty_ranges.is_empty(), "fresh sparse state has no dirty ranges");
+            assert_eq!(sw.original_size, 10);
+        }
+
+        // The actual regression target: bytes the user never wrote must come
+        // back from the newly-committed CAS file, not zero-filled staging
+        // holes. Pre-fix this returned "00XX000000" because sparse_write was
+        // dropped and the reader hit raw staging zeros.
+        let (data, _) = vfs.read(fh, 0, 10).await.unwrap();
+        assert_eq!(
+            &data[..],
+            b"01XX456789",
+            "post-flush read on open handle must return composed CAS bytes, not staging zeros"
+        );
+
+        vfs.release(fh).await.unwrap();
+    });
+
+    vfs.shutdown();
+}
+
+/// A CAS stream that yields zero bytes for a non-empty hole range must
+/// surface EIO from `fill_sparse_holes`, NOT panic on an OOB
+/// `copy_from_slice` when overlaying empty fetched data onto the read buf.
+///
+/// Backport of `repro_fill_sparse_holes_panics_on_short_cas_stream` from
+/// PR #41.
+#[test]
+fn sparse_fill_short_cas_stream_returns_eio_not_panic() {
+    let hub = MockHub::new();
+    let content = b"0123456789";
+    hub.add_file("file.txt", content.len() as u64, Some("orig_hash"), None);
+    let xet = MockXet::new();
+    xet.add_file("orig_hash", content);
+    let (rt, vfs) = vfs_sparse(&hub, &xet);
+
+    rt.block_on(async {
+        let attr = vfs.lookup(ROOT_INODE, "file.txt").await.unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open(ino, true, false, None).await.unwrap();
+
+        // Next CAS download returns an empty stream. fill_sparse_holes
+        // requests bytes for the full sparse window [0..10) but receives 0
+        // bytes — must error out cleanly rather than OOB-slicing.
+        xet.empty_range_downloads(1);
+
+        let result = vfs.read(fh, 0, 10).await;
+        assert_eq!(
+            result.err(),
+            Some(libc::EIO),
+            "short CAS stream must surface EIO, not panic or return zeros"
+        );
+
+        vfs.release(fh).await.unwrap();
+    });
+
+    vfs.shutdown();
+}
+
+/// Even when a sparse flush is a no-op (hash unchanged), the inode's mtime
+/// must advance — fsync semantics require the modification time reflect the
+/// completed write cycle. `apply_noop_commit` calls `touch_commit_clocks`
+/// to ensure this.
+///
+/// Backport of `repro_noop_flush_does_not_bump_mtime` from PR #41
+/// (test name is awkward but the assert is "mtime DOES advance").
+#[test]
+fn sparse_noop_flush_advances_mtime() {
+    let hub = MockHub::new();
+    hub.add_file("file.txt", 10, Some("orig_hash"), None);
+    let xet = MockXet::new();
+    xet.add_file("orig_hash", b"0123456789");
+    let (rt, vfs) = vfs_sparse(&hub, &xet);
+
+    rt.block_on(async {
+        let attr = vfs.lookup(ROOT_INODE, "file.txt").await.unwrap();
+        let ino = attr.ino;
+        let mtime_before = vfs.inode_table.read().unwrap().get(ino).unwrap().mtime;
+
+        // Sleep long enough that any clock bump is observable. SystemTime
+        // resolution is sub-millisecond but the assertion uses strict >.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Open writable, fsync, release — no actual writes, so the flush is
+        // a no-op (xet_hash unchanged). The dirty bit is still set by open,
+        // so the flush manager runs a real flush cycle and ends up in
+        // `apply_noop_commit`.
+        let fh = vfs.open(ino, true, false, None).await.unwrap();
+        vfs.fsync(ino, fh, None).await.unwrap();
+        vfs.release(fh).await.unwrap();
+        wait_for_clean(&vfs, ino).await;
+
+        let mtime_after = vfs.inode_table.read().unwrap().get(ino).unwrap().mtime;
+        assert!(
+            mtime_after > mtime_before,
+            "mtime must advance after a dirty open + flush cycle even on a no-op upload \
+             (was {mtime_before:?}, still {mtime_after:?})"
+        );
+    });
+
+    vfs.shutdown();
+}
+
 // ── Sparse-write stress test ────────────────────────────────────────────
 //
 // A multi-worker workload that exercises the sparse-write state machine
