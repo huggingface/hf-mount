@@ -29,10 +29,17 @@ use std::time::{Duration, Instant};
 
 const DEFAULT_WORKERS: usize = 6;
 const DEFAULT_OPS_PER_WORKER: usize = 12;
-/// 1 MiB per slot — large enough that the sparse path's per-window upload
-/// (range_upload) has measurable wire savings vs. the full re-upload baseline,
-/// while keeping the test under ~30 s.
-const SLOT_SIZE: usize = 1024 * 1024;
+/// 1 MiB per slot default — large enough that the sparse path's per-window
+/// upload (range_upload) has measurable wire savings vs. the full re-upload
+/// baseline, while keeping the test under ~30 s. Override via
+/// `CONCURRENT_REAL_SLOT_KB` to push toward GiB-scale files.
+const DEFAULT_SLOT_KB: usize = 1024;
+/// Default: no intermediate fsync (one flush at end of run). Set
+/// `CONCURRENT_REAL_FSYNC_EVERY_N` to force a `sync_all` every N ops
+/// per worker, simulating periodic checkpoint saves in a real training
+/// workload and exercising multiple apply_commit_sparse cycles within a
+/// single test run.
+const DEFAULT_FSYNC_EVERY_N: usize = 0;
 
 struct Rng(u64);
 impl Rng {
@@ -62,6 +69,8 @@ struct Worker {
     slot_end: usize,
     shadow: Vec<u8>,
     writes_counter: Arc<AtomicU64>,
+    fsyncs_counter: Arc<AtomicU64>,
+    fsync_every_n: usize,
 }
 
 /// One worker: opens the shared file at `path` for write, does `n_ops` random
@@ -79,6 +88,8 @@ fn run_worker(w: Worker) -> Result<Vec<u8>, String> {
         slot_end,
         mut shadow,
         writes_counter,
+        fsyncs_counter,
+        fsync_every_n,
     } = w;
     let mut rng = Rng::new(seed);
     let slot_len = slot_end - slot_start;
@@ -89,8 +100,6 @@ fn run_worker(w: Worker) -> Result<Vec<u8>, String> {
         .map_err(|e| format!("[w{worker_id}] open: {e}"))?;
 
     for op_idx in 0..n_ops {
-        // Random write within the worker's slot. Length 1 KiB – 64 KiB; offset
-        // anywhere in the slot that fits the chosen length.
         let len = 1024 + rng.rand_range(64 * 1024 - 1024);
         let len = len.min(slot_len);
         let off_in_slot = rng.rand_range(slot_len - len + 1);
@@ -101,10 +110,23 @@ fn run_worker(w: Worker) -> Result<Vec<u8>, String> {
             .map_err(|e| format!("[w{worker_id}] op {op_idx} write_at({file_offset},{len}): {e}"))?;
         shadow[off_in_slot..off_in_slot + len].copy_from_slice(&buf);
         writes_counter.fetch_add(1, Ordering::Relaxed);
+
+        // Periodic fsync — when enabled, simulates the training-loop
+        // pattern where the app saves a checkpoint every N steps. Each
+        // sync_all triggers a flush + apply_commit_sparse cycle, so the
+        // test exercises the per-cycle sparse paths multiple times
+        // rather than just the final flush. Concurrent fsyncs from N
+        // workers are batched by the FlushManager's debounce window.
+        if fsync_every_n > 0 && (op_idx + 1) % fsync_every_n == 0 {
+            file.sync_all()
+                .map_err(|e| format!("[w{worker_id}] op {op_idx} mid-run sync_all: {e}"))?;
+            fsyncs_counter.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     file.sync_all()
         .map_err(|e| format!("[w{worker_id}] final sync_all: {e}"))?;
+    fsyncs_counter.fetch_add(1, Ordering::Relaxed);
     Ok(shadow)
 }
 
@@ -122,6 +144,15 @@ async fn test_sparse_concurrent_real_cas() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(DEFAULT_OPS_PER_WORKER);
+    let slot_kb: usize = std::env::var("CONCURRENT_REAL_SLOT_KB")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_SLOT_KB);
+    let slot_size: usize = slot_kb * 1024;
+    let fsync_every_n: usize = std::env::var("CONCURRENT_REAL_FSYNC_EVERY_N")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_FSYNC_EVERY_N);
 
     let guard = match common::setup_bucket("sparse-concurrent").await {
         Some(g) => g,
@@ -137,7 +168,7 @@ async fn test_sparse_concurrent_real_cas() {
     let cache_dir_a = format!("/tmp/hf-sparse-concurrent-cache-a-{}", pid);
     let cache_dir_b = format!("/tmp/hf-sparse-concurrent-cache-b-{}", pid);
 
-    let file_size = n_workers * SLOT_SIZE;
+    let file_size = n_workers * slot_size;
     let test_file = format!("{}/shared.bin", mount_point);
 
     // Sparse engagement at any file size via HF_MOUNT_SPARSE_MIN_BYTES=0 on
@@ -173,8 +204,8 @@ async fn test_sparse_concurrent_real_cas() {
     // accounts for un-touched bytes inside the slot.
     let mut seed_buf = vec![0u8; file_size];
     for w in 0..n_workers {
-        let start = w * SLOT_SIZE;
-        let end = start + SLOT_SIZE;
+        let start = w * slot_size;
+        let end = start + slot_size;
         for (i, b) in seed_buf[start..end].iter_mut().enumerate() {
             *b = ((w * 17 + i) % 251) as u8;
         }
@@ -185,12 +216,14 @@ async fn test_sparse_concurrent_real_cas() {
     std::thread::sleep(Duration::from_millis(2000));
 
     eprintln!(
-        "sparse-concurrent-real: {n_workers} workers × {ops_per_worker} ops/worker, slot={} KiB, file={} MiB",
-        SLOT_SIZE / 1024,
+        "sparse-concurrent-real: {n_workers} workers × {ops_per_worker} ops/worker, slot={} KiB, file={} MiB, fsync_every_n={}",
+        slot_size / 1024,
         file_size / (1024 * 1024),
+        fsync_every_n,
     );
 
     let writes_counter = Arc::new(AtomicU64::new(0));
+    let fsyncs_counter = Arc::new(AtomicU64::new(0));
     let wall_start = Instant::now();
 
     let seed_base = std::time::SystemTime::now()
@@ -202,11 +235,12 @@ async fn test_sparse_concurrent_real_cas() {
     let mut join_handles = Vec::with_capacity(n_workers);
     for w in 0..n_workers {
         let path = test_file.clone();
-        let slot_start = w * SLOT_SIZE;
-        let slot_end = slot_start + SLOT_SIZE;
+        let slot_start = w * slot_size;
+        let slot_end = slot_start + slot_size;
         let shadow_slot = seed_buf[slot_start..slot_end].to_vec();
         let worker_seed = seed_base.wrapping_add(w as u64).wrapping_mul(0x9E3779B97F4A7C15);
         let writes_counter = writes_counter.clone();
+        let fsyncs_counter = fsyncs_counter.clone();
         join_handles.push(tokio::task::spawn_blocking(move || {
             run_worker(Worker {
                 path,
@@ -217,6 +251,8 @@ async fn test_sparse_concurrent_real_cas() {
                 slot_end,
                 shadow: shadow_slot,
                 writes_counter,
+                fsyncs_counter,
+                fsync_every_n,
             })
         }));
     }
@@ -241,8 +277,9 @@ async fn test_sparse_concurrent_real_cas() {
     assert_eq!(expected.len(), file_size, "shadow concatenation must equal file_size");
 
     eprintln!(
-        "  workers done: {} writes total in {:.1}s ({:.1} writes/s)",
+        "  workers done: {} writes + {} fsyncs total in {:.1}s ({:.1} writes/s)",
         writes_counter.load(Ordering::Relaxed),
+        fsyncs_counter.load(Ordering::Relaxed),
         workers_elapsed.as_secs_f64(),
         writes_counter.load(Ordering::Relaxed) as f64 / workers_elapsed.as_secs_f64(),
     );
@@ -275,14 +312,14 @@ async fn test_sparse_concurrent_real_cas() {
             .zip(expected.iter())
             .position(|(a, e)| a != e)
             .unwrap_or(actual.len().min(expected.len()));
-        let owner = first_diff / SLOT_SIZE;
+        let owner = first_diff / slot_size;
         common::unmount(&mount_point, child, 10);
         panic!(
             "BYTE-LEVEL MISMATCH at offset {} (owner=w{}, slot offset={}), \
              actual=0x{:02x} expected=0x{:02x}, actual_len={}, expected_len={}",
             first_diff,
             owner,
-            first_diff % SLOT_SIZE,
+            first_diff % slot_size,
             actual.get(first_diff).copied().unwrap_or(0),
             expected.get(first_diff).copied().unwrap_or(0),
             actual.len(),
