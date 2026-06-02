@@ -353,3 +353,103 @@ async fn bench_sparse_delta_scattered() {
     }
     run_bench("SPARSE_SCATTERED", &["--sparse-writes"], Workload::Scattered).await;
 }
+
+/// Cold-cache scenario: seed the file on one mount, unmount + wipe the
+/// local cache, then remount fresh and time the first commit. This is
+/// where sparse-write's wire-side win actually shows: the full-overwrite
+/// path has to download the entire checkpoint into staging before it can
+/// upload the modified version, while sparse just punches a hole and
+/// composes against the existing CAS reconstruction.
+///
+/// Real-world equivalent: an async-RL inference replica spinning up on a
+/// fresh node, pulling a checkpoint that's already on the Hub.
+async fn run_cold_bench(label: &str, extra_mount_args: &[&str]) {
+    let guard = match common::setup_bucket(&format!("sparse-cold-{label}")).await {
+        Some(g) => g,
+        None => {
+            eprintln!("skipping {label}: HF_TOKEN not set");
+            return;
+        }
+    };
+    let bucket_id = guard.bucket_id.clone();
+    let pid = std::process::id();
+    let mount_point = format!("/tmp/hf-sparse-cold-{}-{}", label, pid);
+    let cache_dir_seed = format!("/tmp/hf-sparse-cold-cache-seed-{}-{}", label, pid);
+    let cache_dir_bench = format!("/tmp/hf-sparse-cold-cache-bench-{}-{}", label, pid);
+    let file_size = file_size_bytes();
+    let delta_rate = delta_rate();
+    let delta_bytes = (file_size as f64 * delta_rate) as u64;
+
+    eprintln!(
+        "\n=== {} (cold cache) ===\n  file={} MB, delta_rate={:.2}% ({} bytes)",
+        label,
+        file_size / (1024 * 1024),
+        delta_rate * 100.0,
+        delta_bytes,
+    );
+
+    // Mount #1: seed the file, push it to CAS, unmount cleanly.
+    {
+        let mut mount_args: Vec<&str> = vec!["--advanced-writes", "--direct-io", "--flush-debounce-ms", "100"];
+        mount_args.extend_from_slice(extra_mount_args);
+        let child = common::mount_bucket(&bucket_id, &mount_point, &cache_dir_seed, &mount_args);
+        let test_file = format!("{}/ckpt.bin", mount_point);
+        let t_seed = Instant::now();
+        seed_checkpoint_file(&test_file, file_size);
+        // Wait for the deferred flush to commit the seed to the Hub before
+        // unmounting (otherwise the bucket has no file for the remount to
+        // open against).
+        std::thread::sleep(Duration::from_millis(2500));
+        eprintln!("  seed committed in {:.2}s", t_seed.elapsed().as_secs_f64());
+        common::unmount(&mount_point, child, 10);
+        std::fs::remove_dir_all(&cache_dir_seed).ok();
+    }
+
+    // Mount #2: cold cache. The remote file exists on the Hub but nothing
+    // is cached locally — sparse path can punch a hole and compose; the
+    // non-sparse path must download the whole file first.
+    let mut mount_args: Vec<&str> = vec!["--advanced-writes", "--direct-io", "--flush-debounce-ms", "100"];
+    mount_args.extend_from_slice(extra_mount_args);
+    let child = common::mount_bucket(&bucket_id, &mount_point, &cache_dir_bench, &mount_args);
+    let test_file = format!("{}/ckpt.bin", mount_point);
+
+    // Cold step: write a single delta-sized blob at a random offset and
+    // wait for the commit to settle. This is the headline number.
+    let mut rng = Rng::new(0x00DE_ADBE_EFC0_FFEE);
+    let (offset, len) = blob_for_step(&mut rng, file_size, delta_bytes);
+    let dur = apply_blob_and_wait_durable(&test_file, offset, len, 1);
+    eprintln!(
+        "  cold step: 1 blob, offset={} {:.2} MB, commit {:.2}s",
+        offset,
+        len as f64 / (1024.0 * 1024.0),
+        dur.as_secs_f64(),
+    );
+    eprintln!(
+        "\n  --- {} cold summary ---\n  cold-cache first commit: {:.2}s\n",
+        label,
+        dur.as_secs_f64(),
+    );
+
+    std::fs::remove_file(&test_file).ok();
+    common::unmount(&mount_point, child, 10);
+    drop(guard);
+    std::fs::remove_dir_all(&mount_point).ok();
+    std::fs::remove_dir_all(&cache_dir_bench).ok();
+}
+
+/// Cold-cache sparse-write commit. Expect: no full-file download — sparse
+/// punches a hole locally and `range_upload` composes against CAS.
+#[tokio::test]
+async fn bench_sparse_delta_cold() {
+    run_cold_bench("SPARSE_COLD", &["--sparse-writes"]).await;
+}
+
+/// Cold-cache full-overwrite commit. Expect: the full checkpoint has to
+/// be downloaded into local staging before the bench can `open` it for
+/// write, then re-uploaded via `upload_files` (CDC dedup wire-trims, but
+/// the download itself is unavoidable). On a 1.2 GB checkpoint with a 100
+/// MB/s effective xet bandwidth this is ~12 s of pure download wait.
+#[tokio::test]
+async fn bench_full_cold() {
+    run_cold_bench("FULL_COLD", &[]).await;
+}
