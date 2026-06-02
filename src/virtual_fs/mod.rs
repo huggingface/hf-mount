@@ -1679,12 +1679,16 @@ impl VirtualFs {
             // but a narrow window remains between that re-read (under
             // inode_table.read()) and the install (under inode_table.write())
             // where apply_commit_sparse can rotate the inode. The drift check
-            // returns EIO in that case; retry a few times internally so the
-            // FUSE/NFS layer above us never sees a transient drift EIO. After
-            // the retry budget is exhausted, surface the EIO so a genuine
-            // disk/IO error still propagates.
-            for attempt in 0..4 {
-                let res = self
+            // returns EAGAIN in that case (a dedicated sentinel, NOT EIO, so a
+            // real disk/IO error surfaces on the first attempt instead of
+            // being swallowed by the retry budget). Retry a few times
+            // internally so the FUSE/NFS layer above us never sees a
+            // transient drift error. After the retry budget is exhausted,
+            // upgrade the final EAGAIN to EIO — userspace open() returning
+            // EAGAIN would be surprising for a non-O_NONBLOCK call.
+            const DRIFT_RETRIES: u32 = 4;
+            for attempt in 0..DRIFT_RETRIES {
+                match self
                     .open_advanced_write(
                         ino,
                         &file_entry.full_path,
@@ -1692,17 +1696,25 @@ impl VirtualFs {
                         file_entry.size,
                         truncate,
                     )
-                    .await;
-                match res {
-                    Err(libc::EIO) if attempt < 3 => {
-                        debug!("open: ino={} drift EIO from open_advanced_write, retrying", ino);
+                    .await
+                {
+                    Err(libc::EAGAIN) => {
+                        debug!(
+                            "open: ino={} drift from open_advanced_write (attempt {}/{}), retrying",
+                            ino,
+                            attempt + 1,
+                            DRIFT_RETRIES
+                        );
                         tokio::time::sleep(Duration::from_millis(5 * (1 << attempt))).await;
-                        continue;
                     }
                     other => return other,
                 }
             }
-            unreachable!()
+            error!(
+                "open: ino={} drift retries exhausted ({}), surfacing as EIO",
+                ino, DRIFT_RETRIES
+            );
+            Err(libc::EIO)
         } else if writable && truncate {
             // Simple streaming write (append-only, synchronous commit on close)
             self.open_streaming_write(ino, pid).await
@@ -1903,15 +1915,17 @@ impl VirtualFs {
             // and proceeding would leave a dirty inode with no sparse_write
             // (or a stale one), which the flush would upload as
             // hole-zeros via the regular path — silent corruption.
-            // Surface as EIO so the caller retries; we have not yet set
-            // dirty, so nothing rolls back beyond the punched staging
-            // file (which will be replaced by the next open).
+            // Surface as EAGAIN (a dedicated sentinel, NOT EIO) so the open()
+            // retry loop can distinguish drift from a real disk error.
+            // Nothing has been set dirty yet, so nothing rolls back beyond
+            // the punched staging file (which will be replaced by the next
+            // open attempt).
             if want_sparse && entry.xet_hash.as_deref() != Some(xet_hash) {
                 debug!(
-                    "open_advanced_write: ino={} xet_hash drifted between snapshot and install (snap={:?}, now={:?}), retrying",
+                    "open_advanced_write: ino={} xet_hash drifted between snapshot and install (snap={:?}, now={:?}), signalling EAGAIN",
                     ino, xet_hash, entry.xet_hash
                 );
-                return Err(libc::EIO);
+                return Err(libc::EAGAIN);
             }
             entry.set_dirty();
             if truncate {
@@ -4076,8 +4090,18 @@ impl VirtualFs {
                 // `new_size` and install SparseWriteState — the original CAS
                 // bytes are pulled in lazily by reads, the new tail (if any)
                 // is tracked as dirty so range_upload knows to compose it.
-                let want_sparse_install =
-                    self.sparse_writes && !prev_sparse && !local_exists && prev_hash.is_some() && prev_size > 0;
+                // Mirrors `open_advanced_write`'s `want_sparse` predicate
+                // (incl. the small-file threshold) so a setattr-first edit
+                // takes the same path an open-first edit would for the same
+                // file — without the threshold check here, a 1 KB file
+                // shrunk via setattr would install sparse while the same
+                // file shrunk via open(O_TRUNC) would not.
+                let want_sparse_install = self.sparse_writes
+                    && !prev_sparse
+                    && !local_exists
+                    && prev_hash.is_some()
+                    && prev_size >= self.sparse_min_size_bytes
+                    && prev_size > 0;
 
                 // GC accounting (non-overlay only): snapshot staging bytes before
                 // any mutation so the size delta is applied correctly at the end.
@@ -4220,6 +4244,16 @@ impl VirtualFs {
                                 .as_ref()
                                 .is_some_and(|sw| Some(sw.original_hash.as_str()) != cur_hash.as_deref());
                         if needs_rebuild {
+                            // Xet → non-Xet rotation is unreachable on
+                            // writable inodes (buckets are uniformly Xet;
+                            // non-Xet repos are read-only so writes never
+                            // reach here). Keep `expect` rather than
+                            // returning EIO here: entry.size and set_dirty
+                            // have already been applied above, so a mid-
+                            // mutation EIO would leave the inode dirty
+                            // with an empty/stale sparse_write — the next
+                            // flush would commit corrupt content. Failing
+                            // loud is safer than failing silent.
                             let hash = cur_hash.expect("Xet → non-Xet rotation is unreachable on writable inodes");
                             entry.sparse_write =
                                 Some(Arc::new(inode::SparseWriteState::new_resized(hash, cur_size, new_size)));
