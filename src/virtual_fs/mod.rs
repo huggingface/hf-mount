@@ -79,6 +79,12 @@ pub struct VfsConfig {
     /// outside the dirty regions fetch from CAS on demand and populate the
     /// local staging file as a cache. Implies `advanced_writes`.
     pub sparse_writes: bool,
+    /// Minimum file size (bytes) for `sparse_writes` to engage. Files smaller
+    /// than this transparently fall back to the non-sparse advanced_writes
+    /// path (download then upload_files). Default 256 MiB at the CLI layer.
+    /// Setting this to 0 keeps sparse always on (used by the mock-driven
+    /// tests which exercise sparse semantics on tiny files).
+    pub sparse_min_size_bytes: u64,
     pub uid: u32,
     pub gid: u32,
     pub poll_interval_secs: u64,
@@ -142,6 +148,13 @@ pub struct VirtualFs {
     /// substrate for both. If `config.sparse_writes` is set without a backing
     /// staging dir, this stays false.
     sparse_writes: bool,
+    /// Minimum file size (bytes) below which sparse-writes falls back to the
+    /// non-sparse advanced_writes path. xet-core's CDC chunk dedup in
+    /// `upload_files` already wire-trims small files efficiently; the sparse
+    /// path's per-window compose overhead + reconstruction lookup round-trip
+    /// only pay off above ~1 GB on typical cloud networks. Configurable via
+    /// `HF_MOUNT_SPARSE_MIN_BYTES`; default 256 MiB.
+    sparse_min_size_bytes: u64,
     inode_table: Arc<RwLock<InodeTable>>,
     /// Maps file_handle → OpenFile (local fd or lazy remote reference).
     open_files: Arc<RwLock<HashMap<u64, OpenFile>>>,
@@ -272,6 +285,7 @@ impl VirtualFs {
             // Callers that need a hard guarantee should validate at the CLI
             // layer (see setup.rs: `--sparse-writes` implies `--advanced-writes`).
             sparse_writes: config.sparse_writes && (config.advanced_writes || overlay),
+            sparse_min_size_bytes: config.sparse_min_size_bytes,
             inode_table: inodes,
             open_files,
             next_file_handle: AtomicU64::new(1),
@@ -1751,7 +1765,17 @@ impl VirtualFs {
         // original content to preserve. Overlay skips it: overlay writes live
         // entirely in user dir, no remote concept.
         let has_remote_xet = !self.overlay() && !truncate && !xet_hash.is_empty() && size > 0;
-        let want_sparse = self.sparse_writes && has_remote_xet;
+        // Small-file threshold: below this size, xet-core's CDC chunk-level
+        // dedup in `upload_files` already matches what `range_upload` could
+        // save (only modified chunks go on the wire), AND it avoids the
+        // reconstruction-info lookup round-trip + per-window compose overhead
+        // that range_upload pays. Bench shows sparse loses to non-sparse for
+        // small files (64 MB: ~11× slower; 1 GB: ~par; >1 GB: marginal win).
+        // Falling back to the non-sparse path here means small files take the
+        // standard download-then-upload route, which is plenty fast and
+        // simpler. Threshold is overridable via `HF_MOUNT_SPARSE_MIN_BYTES`
+        // for benchmarks and tuning.
+        let want_sparse = self.sparse_writes && has_remote_xet && size >= self.sparse_min_size_bytes;
 
         if !can_reuse_staging {
             // Clear the flag before touching disk so a partial failure (e.g.

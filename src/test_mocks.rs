@@ -672,6 +672,10 @@ pub fn make_test_vfs(
             read_only: opts.read_only,
             advanced_writes: effective_advanced_writes,
             sparse_writes: opts.sparse_writes,
+            // Mock tests use tiny files (10-50 bytes) and need sparse semantics
+            // regardless of size — set the threshold to 0 so every file
+            // engages the sparse path under test.
+            sparse_min_size_bytes: 0,
             uid: 1000,
             gid: 1000,
             poll_interval_secs: 0,
@@ -716,6 +720,7 @@ pub fn make_overlay_test_vfs_with_root(
             read_only: false,
             advanced_writes: false,
             sparse_writes: false,
+            sparse_min_size_bytes: 0,
             uid: 1000,
             gid: 1000,
             poll_interval_secs: 0,

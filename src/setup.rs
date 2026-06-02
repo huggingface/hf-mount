@@ -547,6 +547,14 @@ pub fn build_with_runtime(
             read_only,
             advanced_writes,
             sparse_writes,
+            // Sparse-write fallback threshold. Files smaller than this bypass
+            // the sparse path and use the standard download-then-upload route.
+            // Default 256 MiB (bench-derived crossover for typical cloud
+            // networks); override via HF_MOUNT_SPARSE_MIN_BYTES.
+            sparse_min_size_bytes: std::env::var("HF_MOUNT_SPARSE_MIN_BYTES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(256 * 1024 * 1024),
             uid,
             gid,
             poll_interval_secs: options.poll_interval_secs,
