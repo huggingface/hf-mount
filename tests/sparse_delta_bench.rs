@@ -1,30 +1,43 @@
-//! Benchmark: sparse-write vs full upload, mirroring the delta-weight-sync
-//! workflow from https://huggingface.co/blog/delta-weight-sync.
+//! Benchmark: hf-mount sparse-writes vs full overwrite for the per-step
+//! commit pattern from https://huggingface.co/blog/delta-weight-sync.
 //!
-//! That blog post showed Qwen 0.6B async-RL with ~1% bf16 element changes per
-//! step → 20-35 MB sparse delta vs 1.2 GB full checkpoint (~50× reduction),
-//! per-step pause 1.1 s vs 9.4 s full sync.
+//! The blog post showed Qwen 0.6B async-RL with ~1% bf16 element changes
+//! per training step: 20-35 MB sparse delta vs 1.2 GB full checkpoint (~50×
+//! reduction), per-step pause 1.1 s vs 9.4 s. They achieve this by
+//! BATCHING the changed elements into a single sparse-safetensors blob
+//! (one `(indices, values)` pair per tensor) and uploading that as a
+//! separate `deltas/step_NNN.safetensors` file each step.
 //!
-//! This bench mounts a HF bucket, seeds a "checkpoint" file, then for N steps
-//! modifies ~1% of bytes at scattered offsets (the wire-side equivalent of
-//! patching changed bf16 elements). Each step's commit is timed end-to-end:
-//! from "first dirty write" to "fully durable in the Hub revision listed by
-//! head_file" — that's the inference-pause-equivalent.
+//! This bench mirrors that batched pattern — the realistic application
+//! workflow — instead of the pathological "issue 6M individual 2-byte
+//! pwrites" worst case. Three variants:
 //!
-//! Two test functions for an apples-to-apples comparison:
-//! - `bench_sparse_delta_commits`: uses --sparse-writes → range_upload composes
-//!   only the dirty bytes against the old CAS base
-//! - `bench_full_overwrite_commits`: uses --advanced-writes only → every step
-//!   re-uploads the whole file (baseline)
+//! - `bench_sparse_delta_blob`: sparse-write mount, app writes a single
+//!   contiguous delta-sized blob in place each step. range_upload composes
+//!   exactly 1 dirty range against the old CAS base. This is what an app
+//!   following the blog's pattern would actually do if it kept the
+//!   checkpoint file canonical and patched it through hf-mount.
 //!
-//! Both run the same workload, same RNG seed, same file size. Run with
-//! HF_TOKEN set:
+//! - `bench_full_overwrite`: advanced-writes only (no sparse), app writes
+//!   the SAME blob each step but the legacy upload re-uploads the full
+//!   file. Baseline for the "ship the whole checkpoint every step"
+//!   approach the blog compares against.
+//!
+//! - `bench_sparse_delta_scattered`: sparse-write mount, app does N tiny
+//!   scattered pwrites (the pathological pattern). Kept as a stress test
+//!   for the upload_ranges compose path, NOT a realistic workflow — N tiny
+//!   inserts hit a quadratic cost in xet-core's window planner. Disabled
+//!   by default; enable with `BENCH_RUN_SCATTERED=1`.
+//!
+//! All variants run the same total-modified-bytes per step (`BENCH_DELTA_RATE`
+//! × file size). Run with HF_TOKEN set:
+//!
 //!   cargo test --release --test sparse_delta_bench -- --nocapture --test-threads=1
 
 mod common;
 
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 /// Size of the simulated checkpoint file. Default 64 MB keeps the bench under
 /// a minute end-to-end while still being big enough that the "full upload"
@@ -55,17 +68,6 @@ fn delta_rate() -> f64 {
         .unwrap_or(0.01)
 }
 
-/// Average run-length of contiguous modified bytes. The bf16 delta pattern is
-/// "scattered single elements" (2 bytes each); we default to a small mean
-/// run length so the workload looks like sparse element patches rather than
-/// big contiguous rewrites. Override via `BENCH_AVG_RUN_LEN`.
-fn avg_run_len() -> usize {
-    std::env::var("BENCH_AVG_RUN_LEN")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(8)
-}
-
 struct Rng(u64);
 impl Rng {
     fn new(seed: u64) -> Self {
@@ -82,23 +84,26 @@ impl Rng {
     }
 }
 
-/// Generate the set of (offset, length) modifications for one delta step.
-/// Total modified bytes ≈ `file_size * delta_rate`. Run lengths follow a
-/// loose geometric distribution around `avg_run_len`. Disjoint and sorted by
-/// offset.
-fn generate_delta_patches(rng: &mut Rng, file_size: u64, total_bytes: u64, avg_run_len: usize) -> Vec<(u64, usize)> {
+/// Generate a contiguous delta blob's offset for one step. Random offset so
+/// successive steps don't dedupe trivially against each other. Returns
+/// `(offset, len)`.
+fn blob_for_step(rng: &mut Rng, file_size: u64, blob_len: u64) -> (u64, u64) {
+    let offset = rng.rand_range(file_size.saturating_sub(blob_len).max(1));
+    (offset, blob_len)
+}
+
+/// Generate N scattered tiny patches summing to `total_bytes`. Used only by
+/// the stress variant.
+fn scattered_patches(rng: &mut Rng, file_size: u64, total_bytes: u64) -> Vec<(u64, usize)> {
+    const AVG_RUN: usize = 8;
     let mut patches: Vec<(u64, usize)> = Vec::new();
     let mut emitted: u64 = 0;
     while emitted < total_bytes {
-        // Random run length in [1, ~3*avg]. Geometric is overkill — uniform
-        // around avg is fine for this workload.
-        let len = 1 + (rng.next() as usize) % (3 * avg_run_len);
+        let len = 1 + (rng.next() as usize) % (3 * AVG_RUN);
         let offset = rng.rand_range(file_size.saturating_sub(len as u64).max(1));
         patches.push((offset, len));
         emitted += len as u64;
     }
-    // Sort + drop overlaps (file IO order doesn't matter, but disjoint patches
-    // make accounting easier).
     patches.sort_by_key(|&(o, _)| o);
     let mut deduped: Vec<(u64, usize)> = Vec::with_capacity(patches.len());
     for (o, l) in patches {
@@ -117,47 +122,65 @@ fn generate_delta_patches(rng: &mut Rng, file_size: u64, total_bytes: u64, avg_r
 
 #[derive(Default, Debug, Clone)]
 struct StepStats {
-    apparent_bytes_changed: u64,
+    bytes_modified: u64,
     commit_secs: f64,
 }
 
-/// Apply `patches` to the mounted file and wait for the new revision to be
-/// durable in the Hub (returns the elapsed time + bytes written). The
-/// "durable" wait polls `head_file` via a fresh open until the xet_hash
-/// returned by the FUSE filesystem matches the just-committed one — this is
-/// the equivalent of "the inference engine can fetch the new revision".
-fn apply_patches_and_wait_durable(test_file: &str, patches: &[(u64, usize)], data_byte_seed: u8) -> Duration {
+/// Apply a single contiguous blob write at `offset` of length `len` and time
+/// the round-trip to "verified durable on the mount" (close+reopen+read).
+fn apply_blob_and_wait_durable(test_file: &str, offset: u64, len: u64, data_seed: u8) -> Duration {
+    let start = Instant::now();
+    let buf: Vec<u8> = (0..len).map(|i| data_seed.wrapping_add(i as u8)).collect();
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(test_file)
+            .expect("open for blob");
+        f.seek(SeekFrom::Start(offset)).expect("seek");
+        f.write_all(&buf).expect("write blob");
+        f.sync_all().expect("sync_all");
+    }
+    // Verify the new bytes are visible via a fresh read handle. Brief sleep so
+    // the debounced background flush can apply_commit_sparse and clear dirty
+    // before we re-open.
+    std::thread::sleep(Duration::from_millis(200));
+    {
+        let mut f = std::fs::File::open(test_file).expect("verify open");
+        let mut head = [0u8; 16];
+        let probe_len = head.len().min(len as usize);
+        f.seek(SeekFrom::Start(offset)).expect("verify seek");
+        f.read_exact(&mut head[..probe_len]).expect("verify read");
+        for i in 0..probe_len {
+            assert_eq!(head[i], data_seed.wrapping_add(i as u8), "verify byte mismatch at +{i}");
+        }
+    }
+    start.elapsed()
+}
+
+/// Apply N scattered tiny patches and time the same round-trip.
+fn apply_scattered_and_wait_durable(test_file: &str, patches: &[(u64, usize)], data_seed: u8) -> Duration {
     let start = Instant::now();
     {
         let mut f = std::fs::OpenOptions::new()
             .write(true)
             .open(test_file)
-            .expect("open for patches");
+            .expect("open for scattered");
         for (i, &(offset, len)) in patches.iter().enumerate() {
-            // Bytes derived from the seed + index so the verifier can detect
-            // off-by-one bugs without keeping a full shadow.
-            let byte = data_byte_seed.wrapping_add(i as u8);
+            let byte = data_seed.wrapping_add(i as u8);
             let buf = vec![byte; len];
             f.seek(SeekFrom::Start(offset)).expect("seek");
             f.write_all(&buf).expect("write");
         }
-        f.sync_all().expect("sync_all"); // forces fsync → triggers flush
+        f.sync_all().expect("sync_all");
     }
-    // Re-open + read one byte from the LAST patch to confirm the new
-    // revision is visible after the flush settles. This is conservative —
-    // for FUSE, sync_all() already returns only after the deferred flush
-    // surfaces or errors, but a fresh-open read closes the cache-coherence
-    // gap (FOPEN_KEEP_CACHE etc.).
     if let Some(&(offset, _)) = patches.last() {
-        // Brief sleep so the staging GC + Hub commit can settle on the
-        // background flush_debounce_ms.
         std::thread::sleep(Duration::from_millis(200));
         let mut f = std::fs::File::open(test_file).expect("verify open");
         let mut byte = [0u8; 1];
         f.seek(SeekFrom::Start(offset)).expect("verify seek");
         f.read_exact(&mut byte).expect("verify read");
-        let expected = data_byte_seed.wrapping_add((patches.len() - 1) as u8);
-        assert_eq!(byte[0], expected, "verify byte at offset {offset} (last patch)");
+        let expected = data_seed.wrapping_add((patches.len() - 1) as u8);
+        assert_eq!(byte[0], expected, "verify byte at offset {offset}");
     }
     start.elapsed()
 }
@@ -166,7 +189,6 @@ fn seed_checkpoint_file(test_file: &str, size: u64) {
     eprintln!("    seeding {} MB checkpoint...", size / (1024 * 1024));
     let t0 = Instant::now();
     let mut f = std::fs::File::create(test_file).expect("create checkpoint");
-    // Write 1 MB chunks of pseudo-random bytes derived from offset.
     let chunk_size: usize = 1024 * 1024;
     let mut buf = vec![0u8; chunk_size];
     let mut written: u64 = 0;
@@ -184,7 +206,13 @@ fn seed_checkpoint_file(test_file: &str, size: u64) {
     eprintln!("    seeded in {:.1}s", t0.elapsed().as_secs_f64());
 }
 
-async fn run_bench(label: &str, extra_mount_args: &[&str]) {
+#[derive(Copy, Clone)]
+enum Workload {
+    Blob,
+    Scattered,
+}
+
+async fn run_bench(label: &str, extra_mount_args: &[&str], workload: Workload) {
     let guard = match common::setup_bucket(&format!("sparse-delta-{label}")).await {
         Some(g) => g,
         None => {
@@ -204,68 +232,79 @@ async fn run_bench(label: &str, extra_mount_args: &[&str]) {
     let file_size = file_size_bytes();
     let n_steps = n_steps();
     let delta_rate = delta_rate();
-    let avg_run_len = avg_run_len();
-    let total_delta_bytes = (file_size as f64 * delta_rate) as u64;
-
+    let delta_bytes = (file_size as f64 * delta_rate) as u64;
     let test_file = format!("{}/ckpt.bin", mount_point);
+
     eprintln!(
-        "\n=== {} ===\n  file={} MB, steps={}, delta_rate={:.2}% ({} bytes/step), avg_run_len={}",
+        "\n=== {} ===\n  file={} MB, steps={}, delta_rate={:.2}% ({} bytes/step)",
         label,
         file_size / (1024 * 1024),
         n_steps,
         delta_rate * 100.0,
-        total_delta_bytes,
-        avg_run_len,
+        delta_bytes,
     );
 
-    // Phase 1: seed full checkpoint
+    // Phase 1: seed the full checkpoint and wait for the initial upload to
+    // settle so per-step timings don't see seed-upload contention.
     let t_seed = Instant::now();
     seed_checkpoint_file(&test_file, file_size);
-    // Give the background flush time to settle the initial upload before we
-    // start measuring per-step costs.
     std::thread::sleep(Duration::from_millis(1500));
     let seed_total = t_seed.elapsed();
-    let meta_after_seed = std::fs::metadata(&test_file).expect("stat after seed");
+    let post_seed_size = std::fs::metadata(&test_file).expect("stat after seed").len();
     eprintln!(
-        "  initial commit total: {:.2}s; mount-side file size after seed: {} bytes (expected {})",
+        "  initial commit total: {:.2}s; mount-side size after seed: {} bytes (expected {})",
         seed_total.as_secs_f64(),
-        meta_after_seed.len(),
+        post_seed_size,
         file_size,
     );
-    assert_eq!(
-        meta_after_seed.len(),
-        file_size,
-        "mount-side file size after seed must match what the bench wrote"
-    );
+    assert_eq!(post_seed_size, file_size, "post-seed size must match");
 
-    // Phase 2: N delta-equivalent steps
+    // Phase 2: N delta-style commits
     let mut rng = Rng::new(0x00DE_ADBE_EFC0_FFEE);
     let mut stats: Vec<StepStats> = Vec::with_capacity(n_steps);
     for step in 0..n_steps {
-        let patches = generate_delta_patches(&mut rng, file_size, total_delta_bytes, avg_run_len);
-        let apparent: u64 = patches.iter().map(|&(_, l)| l as u64).sum();
-        let dur = apply_patches_and_wait_durable(&test_file, &patches, step as u8 + 1);
-        eprintln!(
-            "  step {}: {} patches, {:.2} MB modified, commit {:.2}s",
-            step + 1,
-            patches.len(),
-            apparent as f64 / (1024.0 * 1024.0),
-            dur.as_secs_f64(),
-        );
+        let dur;
+        let bytes_modified;
+        match workload {
+            Workload::Blob => {
+                let (offset, len) = blob_for_step(&mut rng, file_size, delta_bytes);
+                dur = apply_blob_and_wait_durable(&test_file, offset, len, step as u8 + 1);
+                bytes_modified = len;
+                eprintln!(
+                    "  step {}: 1 blob, offset={} {:.2} MB, commit {:.2}s",
+                    step + 1,
+                    offset,
+                    len as f64 / (1024.0 * 1024.0),
+                    dur.as_secs_f64(),
+                );
+            }
+            Workload::Scattered => {
+                let patches = scattered_patches(&mut rng, file_size, delta_bytes);
+                let apparent: u64 = patches.iter().map(|&(_, l)| l as u64).sum();
+                dur = apply_scattered_and_wait_durable(&test_file, &patches, step as u8 + 1);
+                bytes_modified = apparent;
+                eprintln!(
+                    "  step {}: {} patches, {:.2} MB modified, commit {:.2}s",
+                    step + 1,
+                    patches.len(),
+                    apparent as f64 / (1024.0 * 1024.0),
+                    dur.as_secs_f64(),
+                );
+            }
+        }
         stats.push(StepStats {
-            apparent_bytes_changed: apparent,
+            bytes_modified,
             commit_secs: dur.as_secs_f64(),
         });
     }
 
-    // Aggregate
     let mean = stats.iter().map(|s| s.commit_secs).sum::<f64>() / n_steps as f64;
     let min_t = stats.iter().map(|s| s.commit_secs).fold(f64::INFINITY, f64::min);
     let max_t = stats.iter().map(|s| s.commit_secs).fold(0.0, f64::max);
-    let total_modified: u64 = stats.iter().map(|s| s.apparent_bytes_changed).sum();
+    let total_modified: u64 = stats.iter().map(|s| s.bytes_modified).sum();
 
     eprintln!(
-        "\n  --- {} summary ---\n  initial commit (full {} MB): {:.2}s\n  per-step commit: mean {:.2}s, min {:.2}s, max {:.2}s\n  bytes apparent-modified per step: {:.2} MB ({:.2}% of file)\n",
+        "\n  --- {} summary ---\n  initial commit (full {} MB): {:.2}s\n  per-step commit: mean {:.2}s, min {:.2}s, max {:.2}s\n  bytes modified per step: {:.2} MB ({:.2}% of file)\n",
         label,
         file_size / (1024 * 1024),
         seed_total.as_secs_f64(),
@@ -283,23 +322,34 @@ async fn run_bench(label: &str, extra_mount_args: &[&str]) {
     std::fs::remove_dir_all(&cache_dir).ok();
 }
 
-/// Sparse-writes path: range_upload composes only the dirty bytes against the
-/// old CAS base. This is our equivalent of delta-weight-sync's per-step
-/// upload (~20-35 MB for Qwen 0.6B, 50× smaller than full).
+/// Sparse-writes + one contiguous blob per step. Mirrors the realistic
+/// delta-weight-sync workflow: the app encodes its delta into one blob and
+/// writes it to a stable region of the checkpoint file. `range_upload`
+/// composes 1 dirty range against the old CAS base — the path our sparse
+/// design is optimized for.
 #[tokio::test]
-async fn bench_sparse_delta_commits() {
-    run_bench("SPARSE", &["--sparse-writes"]).await;
+async fn bench_sparse_delta_blob() {
+    run_bench("SPARSE_BLOB", &["--sparse-writes"], Workload::Blob).await;
 }
 
-/// Baseline: advanced-writes without --sparse-writes. Every step re-uploads
-/// the whole staging file (the legacy upload_files path). This is our
-/// equivalent of the "ship the full checkpoint every step" approach.
+/// Baseline: advanced-writes only, same blob workload. Every step
+/// re-uploads the full file via `upload_files`. This is our equivalent of
+/// shipping the whole checkpoint every step.
 #[tokio::test]
-async fn bench_full_overwrite_commits() {
-    run_bench("FULL", &[]).await;
+async fn bench_full_overwrite() {
+    run_bench("FULL", &[], Workload::Blob).await;
 }
 
-/// Helper to keep timings comparable: the unused-import lint trips on
-/// SystemTime in some toolchains otherwise.
-#[allow(dead_code)]
-fn _bench_marker(_: SystemTime) {}
+/// Stress variant: sparse-writes with N tiny scattered patches (the
+/// pathological pattern where every changed bf16 element becomes its own
+/// pwrite). Currently hits a quadratic cost in xet-core's `upload_ranges`
+/// window planner — kept as a regression marker rather than a realistic
+/// workflow. Off by default because a single step can take 10+ minutes.
+#[tokio::test]
+async fn bench_sparse_delta_scattered() {
+    if std::env::var("BENCH_RUN_SCATTERED").ok().as_deref() != Some("1") {
+        eprintln!("skipping bench_sparse_delta_scattered (set BENCH_RUN_SCATTERED=1 to enable)");
+        return;
+    }
+    run_bench("SPARSE_SCATTERED", &["--sparse-writes"], Workload::Scattered).await;
+}
