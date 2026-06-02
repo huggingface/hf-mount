@@ -6683,3 +6683,333 @@ fn sparse_writes_concurrent_stress() {
 
     vfs.shutdown();
 }
+
+// ── Same-inode concurrent stress ──────────────────────────────────────
+//
+// The cross-file stress above exercises the global FlushManager batching and
+// inter-inode locking. This variant pins all workers to a SINGLE inode so the
+// per-inode `io_lock`, sparse_write state machine, and dirty_generation guard
+// take the brunt of the contention — the paths that are easiest to get wrong
+// when multiple FUSE handles touch one file at the same time.
+//
+// Validation strategy is different from the cross-file stress: multiple
+// workers writing to overlapping offsets makes the final byte content
+// indeterminate (last-write-wins, but "last" depends on tokio scheduling).
+// So this is a FUZZ-style test rather than an equivalence test — the
+// pass condition is "no panic, no poison, no surprise EIO, and the inode's
+// sparse state remains internally consistent". We verify:
+//   1. No worker bubbles up an unexpected error (panics are fatal).
+//   2. After quiesce, sparse_write (if Some) satisfies its invariants:
+//      coverage sorted/non-overlapping, dirty_ranges ⊆ coverage, every
+//      range within [0, entry.size).
+//   3. A full-file read after quiesce returns exactly entry.size bytes
+//      without erroring.
+const SAME_INODE_WORKERS: usize = 8;
+const SAME_INODE_OPS_PER_WORKER: usize = 500;
+const SAME_INODE_BASE_SIZE: usize = 8192;
+
+/// Lightweight per-handle op generator: drop RogueRotation (requires global
+/// quiesce — incompatible with concurrent siblings on the same inode) and
+/// add a heavy Read mix so the pread + sparse-coverage snapshot path gets
+/// real contention.
+#[derive(Debug, Clone, Copy)]
+enum SameInodeOp {
+    Write { offset: usize, len: usize },
+    Read { offset: usize, len: usize },
+    SetattrGrow { delta: usize },
+    SetattrShrink { delta: usize },
+    Fsync,
+    Reopen,
+}
+
+fn gen_same_inode_op(rng: &mut StressRng, observed_size: usize) -> SameInodeOp {
+    let pick = rng.next() % 100;
+    match pick {
+        // 40% writes, sampled across overwrite / past-EOF / random
+        0..=39 => {
+            let kind = rng.next() % 4;
+            let (offset, len) = match kind {
+                0 if observed_size >= 2 => {
+                    let len = 1 + rng.rand_range(observed_size.min(1024));
+                    let offset = rng.rand_range(observed_size.saturating_sub(len).max(1));
+                    (offset, len)
+                }
+                1 => (observed_size, 1 + rng.rand_range(1024)),
+                2 => {
+                    let gap = 1 + rng.rand_range(2048);
+                    (observed_size + gap, 1 + rng.rand_range(1024))
+                }
+                _ => {
+                    let offset = rng.rand_range(STRESS_MAX_SIZE.saturating_sub(1));
+                    (offset, 1 + rng.rand_range(2048))
+                }
+            };
+            let len = len.min(STRESS_MAX_SIZE.saturating_sub(offset));
+            if len == 0 || offset >= STRESS_MAX_SIZE {
+                SameInodeOp::Read { offset: 0, len: 1 }
+            } else {
+                SameInodeOp::Write { offset, len }
+            }
+        }
+        // 35% reads — many small ones to thrash the io_lock + sparse-fill
+        40..=74 => {
+            if observed_size == 0 {
+                return SameInodeOp::Write {
+                    offset: 0,
+                    len: 1 + rng.rand_range(1024),
+                };
+            }
+            let len = 1 + rng.rand_range(observed_size.min(2048));
+            let offset = rng.rand_range(observed_size.saturating_sub(1).max(1));
+            SameInodeOp::Read { offset, len }
+        }
+        75..=84 => SameInodeOp::SetattrGrow {
+            delta: 1 + rng.rand_range(4096),
+        },
+        85..=92 if observed_size > 1 => SameInodeOp::SetattrShrink {
+            delta: 1 + rng.rand_range(observed_size - 1),
+        },
+        93..=96 => SameInodeOp::Fsync,
+        _ => SameInodeOp::Reopen,
+    }
+}
+
+async fn run_same_inode_worker(
+    vfs: std::sync::Arc<VirtualFs>,
+    ino: u64,
+    worker_id: usize,
+    seed: u64,
+    n_ops: usize,
+) -> Result<(), String> {
+    let mut rng = StressRng::new(seed);
+
+    let mut fh = vfs
+        .open(ino, true, false, None)
+        .await
+        .map_err(|e| format!("[w{worker_id}] initial open: {e}"))?;
+
+    for op_idx in 0..n_ops {
+        // Re-read entry.size each iteration: another worker may have just
+        // grown/shrunk it and the op generator needs a recent view.
+        let observed_size = {
+            let inodes = vfs.inode_table.read().expect("inodes poisoned");
+            inodes.get(ino).map(|e| e.size as usize).unwrap_or(0)
+        };
+        let op = gen_same_inode_op(&mut rng, observed_size);
+        match op {
+            SameInodeOp::Write { offset, len } => {
+                let buf: Vec<u8> = (0..len).map(|_| rng.rand_byte()).collect();
+                // ANY ok or controlled errno is accepted — the point is that
+                // the call doesn't panic / poison. Other workers may have
+                // raced our preconditions.
+                if let Err(e) = write_blocking(&vfs, ino, fh, offset as u64, &buf).await
+                    && e != libc::EAGAIN
+                    && e != libc::EBADF
+                {
+                    return Err(format!(
+                        "[w{worker_id}] op {op_idx} write({offset},{len}): unexpected errno {e}"
+                    ));
+                }
+            }
+            SameInodeOp::Read { offset, len } => {
+                let want = len.min(STRESS_MAX_SIZE) as u32;
+                match vfs.read(fh, offset as u64, want).await {
+                    Ok(_) => {}
+                    Err(libc::EAGAIN) | Err(libc::EBADF) => {}
+                    Err(e) => {
+                        return Err(format!(
+                            "[w{worker_id}] op {op_idx} read({offset},{len}): unexpected errno {e}"
+                        ));
+                    }
+                }
+            }
+            SameInodeOp::SetattrGrow { delta } => {
+                let new_size = (observed_size + delta).min(STRESS_MAX_SIZE);
+                if new_size == observed_size {
+                    continue;
+                }
+                if let Err(e) = vfs
+                    .setattr(ino, Some(new_size as u64), None, None, None, None, None)
+                    .await
+                    && e != libc::EAGAIN
+                {
+                    return Err(format!(
+                        "[w{worker_id}] op {op_idx} setattr_grow({new_size}): unexpected errno {e}"
+                    ));
+                }
+            }
+            SameInodeOp::SetattrShrink { delta } => {
+                if observed_size <= 1 {
+                    continue;
+                }
+                let new_size = observed_size.saturating_sub(delta).max(1);
+                if let Err(e) = vfs
+                    .setattr(ino, Some(new_size as u64), None, None, None, None, None)
+                    .await
+                    && e != libc::EAGAIN
+                {
+                    return Err(format!(
+                        "[w{worker_id}] op {op_idx} setattr_shrink({new_size}): unexpected errno {e}"
+                    ));
+                }
+            }
+            SameInodeOp::Fsync => {
+                if let Err(e) = vfs.fsync(ino, fh, None).await
+                    && e != libc::EAGAIN
+                {
+                    return Err(format!("[w{worker_id}] op {op_idx} fsync: unexpected errno {e}"));
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            SameInodeOp::Reopen => {
+                if let Err(e) = vfs.release(fh).await {
+                    return Err(format!("[w{worker_id}] op {op_idx} release: {e}"));
+                }
+                // EAGAIN is the drift sentinel; retry once internally so the
+                // worker doesn't bail on a benign race.
+                fh = match vfs.open(ino, true, false, None).await {
+                    Ok(fh) => fh,
+                    Err(libc::EAGAIN) => vfs
+                        .open(ino, true, false, None)
+                        .await
+                        .map_err(|e| format!("[w{worker_id}] op {op_idx} reopen retry: {e}"))?,
+                    Err(e) => return Err(format!("[w{worker_id}] op {op_idx} reopen: {e}")),
+                };
+            }
+        }
+    }
+
+    vfs.release(fh)
+        .await
+        .map_err(|e| format!("[w{worker_id}] final release: {e}"))
+}
+
+/// Multi-worker stress targeting ONE inode. Verifies that the per-inode
+/// io_lock, sparse_write state, and dirty_generation guard survive
+/// realistic concurrent FUSE handle traffic without panic, poison, or
+/// invariant violation.
+#[test]
+fn sparse_writes_same_inode_concurrent_stress() {
+    let n_workers: usize = std::env::var("SAME_INODE_WORKERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(SAME_INODE_WORKERS);
+    let ops_per_worker: usize = std::env::var("SAME_INODE_OPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(SAME_INODE_OPS_PER_WORKER);
+    let seed: u64 = std::env::var("SAME_INODE_SEED")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos() as u64
+        });
+
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    let path = "shared.bin";
+    let base: Vec<u8> = (0..SAME_INODE_BASE_SIZE).map(|j| (j % 251) as u8).collect();
+    hub.add_file(path, base.len() as u64, Some("shared_h"), None);
+    xet.add_file("shared_h", &base);
+    let (rt, vfs) = vfs_sparse(&hub, &xet);
+
+    eprintln!("sparse_writes_same_inode_concurrent_stress: {n_workers} workers × {ops_per_worker} ops, seed={seed}");
+
+    rt.block_on(async {
+        let ino = vfs.lookup(ROOT_INODE, path).await.unwrap().ino;
+        let mut handles = Vec::with_capacity(n_workers);
+        for w in 0..n_workers {
+            let vfs = vfs.clone();
+            let worker_seed = seed.wrapping_add(w as u64).wrapping_mul(0x9E3779B97F4A7C15);
+            handles.push(tokio::spawn(async move {
+                run_same_inode_worker(vfs, ino, w, worker_seed, ops_per_worker).await
+            }));
+        }
+        let mut errors = Vec::new();
+        for h in handles {
+            match h.await.expect("worker panic") {
+                Ok(()) => {}
+                Err(e) => errors.push(e),
+            }
+        }
+        if !errors.is_empty() {
+            panic!(
+                "same-inode stress FAILED ({} workers): seed={}\n{}",
+                errors.len(),
+                seed,
+                errors.join("\n  ")
+            );
+        }
+
+        // Quiesce: wait for any in-flight flushes to land.
+        wait_for_clean(&vfs, ino).await;
+
+        // Invariant checks on the final sparse_write state.
+        let (entry_size, sparse_snapshot) = {
+            let inodes = vfs.inode_table.read().expect("inodes poisoned");
+            let entry = inodes.get(ino).expect("inode must exist");
+            (entry.size, entry.sparse_write.clone())
+        };
+        if let Some(sw) = sparse_snapshot {
+            for window in sw.coverage.windows(2) {
+                let (a_s, a_e) = window[0];
+                let (b_s, b_e) = window[1];
+                assert!(a_s < a_e, "coverage entry not start<end: ({a_s},{a_e})");
+                assert!(
+                    a_e <= b_s,
+                    "coverage overlap or out-of-order: ({a_s},{a_e}) ({b_s},{b_e})"
+                );
+            }
+            for window in sw.dirty_ranges.windows(2) {
+                let (a_s, a_e) = window[0];
+                let (b_s, b_e) = window[1];
+                assert!(a_s < a_e, "dirty entry not start<end: ({a_s},{a_e})");
+                assert!(a_e <= b_s, "dirty overlap or out-of-order: ({a_s},{a_e}) ({b_s},{b_e})");
+            }
+            for &(d_s, d_e) in &sw.dirty_ranges {
+                let mut covered = false;
+                for &(c_s, c_e) in &sw.coverage {
+                    if c_s <= d_s && d_e <= c_e {
+                        covered = true;
+                        break;
+                    }
+                    if c_s > d_e {
+                        break;
+                    }
+                }
+                assert!(
+                    covered,
+                    "dirty_range ({d_s},{d_e}) not covered by any coverage entry: {:?}",
+                    sw.coverage
+                );
+            }
+            for &(s, e) in &sw.coverage {
+                assert!(
+                    e <= entry_size,
+                    "coverage ({s},{e}) extends past entry.size {entry_size}"
+                );
+            }
+            for &(s, e) in &sw.dirty_ranges {
+                assert!(
+                    e <= entry_size,
+                    "dirty_range ({s},{e}) extends past entry.size {entry_size}"
+                );
+            }
+        }
+
+        // Final read-back must not error and must return entry.size bytes.
+        let final_bytes = read_full(&vfs, ino, entry_size).await;
+        assert_eq!(
+            final_bytes.len() as u64,
+            entry_size,
+            "final read returned wrong length: got {} expected {}",
+            final_bytes.len(),
+            entry_size
+        );
+    });
+
+    vfs.shutdown();
+}
