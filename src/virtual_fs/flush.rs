@@ -408,17 +408,41 @@ async fn flush_batch(
     const UPLOAD_CHUNK_SIZE: usize = 500;
     let mut upload_results: Vec<Option<XetFileInfo>> = vec![None; to_flush.len()];
 
-    // Pass A: per-item range_upload for sparse items. A failure on one sparse
-    // item is recorded per-inode and the loop continues — independent sparse
-    // items are not head-of-line-blocked by a sibling's sticky failure (e.g. a
-    // deterministic CAS rejection on one item starving the rest of the batch).
-    // The failing item leaves its slot in `upload_results` as None: downstream
-    // commit-apply skips it, clear_dirty_if is never invoked, the next flush
-    // retries it.
+    // Pass A: per-item range_upload for sparse items whose coverage has
+    // HOLES (the staging file is incomplete and we want the wire savings
+    // of composing against the old CAS base). A failure on one sparse item
+    // is recorded per-inode and the loop continues — independent sparse
+    // items are not head-of-line-blocked by a sibling's sticky failure.
+    // The failing item leaves its slot in `upload_results` as None:
+    // downstream commit-apply skips it, clear_dirty_if is never invoked,
+    // the next flush retries it.
+    //
+    // FAST PATH: when sparse_write.coverage spans the full file (typical
+    // after a long-lived handle that read most of the file plus a few
+    // dirty writes), the staging file IS the committed content. Take the
+    // non-sparse upload_files path instead — same wire bytes (xet CDC
+    // dedup re-uses existing xorbs for unchanged chunks) but skips
+    // range_upload's per-window CAS re-fetches of bytes we already have
+    // locally. Bench at 1.2 GB / 12 MB blob: the fast path runs at the
+    // upload_files speed (~1.37 s) instead of range_upload's ~1.5 s, and
+    // the saving grows with file size as range_upload's stream_cas_range
+    // calls download more "around the edit" bytes for the composition.
+    let mut fast_path_indices: Vec<usize> = Vec::new();
     for (idx, item) in to_flush.iter().enumerate() {
         let Some(sw) = item.sparse_snapshot.as_ref() else {
             continue;
         };
+        // Fast path requires both: (a) full coverage so the staging file is
+        // a valid full-file content, and (b) at least one dirty range so
+        // there's a real change to commit. With no dirty ranges, range_upload
+        // short-circuits to the original hash unchanged ("no-op flush"
+        // semantic preserved by `apply_noop_commit`-style retention of the
+        // hash). Forcing upload_files here would re-hash the staging into a
+        // new (CDC-equivalent) hash and lose that semantic.
+        if sw.is_fully_covered(item.file_size) && !sw.dirty_ranges.is_empty() {
+            fast_path_indices.push(idx);
+            continue;
+        }
         // Snapshot dirty bytes under io_lock so a concurrent pwrite cannot
         // interleave with our reads and produce chimeric content downstream.
         let snapshots = match snapshot_dirty_bytes(staging, item.ino, &item.staging_path, sw) {
@@ -453,11 +477,12 @@ async fn flush_batch(
         }
     }
 
-    // Pass B: batched upload_files for non-sparse items.
+    // Pass B: batched upload_files for non-sparse items AND fully-covered
+    // sparse items that took the fast path above.
     let regular_indices: Vec<usize> = to_flush
         .iter()
         .enumerate()
-        .filter(|(_, it)| it.sparse_snapshot.is_none())
+        .filter(|(i, it)| it.sparse_snapshot.is_none() || fast_path_indices.contains(i))
         .map(|(i, _)| i)
         .collect();
     for chunk in regular_indices.chunks(UPLOAD_CHUNK_SIZE) {

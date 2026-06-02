@@ -291,6 +291,20 @@ impl SparseWriteState {
         let end = offset.saturating_add(len);
         subtract_ranges(offset, end, &self.coverage)
     }
+
+    /// Returns true when `coverage` contains `[0, size)` entirely (no holes).
+    /// Used by the flush path: when the staging file already mirrors the full
+    /// committed content (via reads + dirty writes), we can upload it whole
+    /// via `upload_files` (xet-core CDC dedup is more efficient) instead of
+    /// running `range_upload` (which re-fetches old segments from CAS to
+    /// compose the new file). At full coverage the two paths produce the
+    /// same merkle hash, so the swap is safe.
+    pub fn is_fully_covered(&self, size: u64) -> bool {
+        if size == 0 {
+            return true;
+        }
+        self.holes_in(0, size).is_empty()
+    }
 }
 
 /// Merge `[new_start, new_end)` into a sorted, non-overlapping range vec.
