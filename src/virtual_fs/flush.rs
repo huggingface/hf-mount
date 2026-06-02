@@ -427,7 +427,13 @@ async fn flush_batch(
     // upload_files speed (~1.37 s) instead of range_upload's ~1.5 s, and
     // the saving grows with file size as range_upload's stream_cas_range
     // calls download more "around the edit" bytes for the composition.
-    let mut fast_path_indices: Vec<usize> = Vec::new();
+    // Per-item flag set when a sparse item is routed through the fast-path
+    // upload_files instead of range_upload. The post-upload commit-apply uses
+    // this to dispatch `apply_commit` (drop sparse_write — staging IS the
+    // committed content) instead of `apply_commit_sparse` (re-key sparse_write
+    // — staging is a partial mirror). Vec<bool> for O(1) lookup; an aligned
+    // index avoids the previous O(n²) `fast_path_indices.contains` scan.
+    let mut is_fast_path = vec![false; to_flush.len()];
     for (idx, item) in to_flush.iter().enumerate() {
         let Some(sw) = item.sparse_snapshot.as_ref() else {
             continue;
@@ -440,7 +446,7 @@ async fn flush_batch(
         // hash). Forcing upload_files here would re-hash the staging into a
         // new (CDC-equivalent) hash and lose that semantic.
         if sw.is_fully_covered(item.file_size) && !sw.dirty_ranges.is_empty() {
-            fast_path_indices.push(idx);
+            is_fast_path[idx] = true;
             continue;
         }
         // Snapshot dirty bytes under io_lock so a concurrent pwrite cannot
@@ -482,7 +488,7 @@ async fn flush_batch(
     let regular_indices: Vec<usize> = to_flush
         .iter()
         .enumerate()
-        .filter(|(i, it)| it.sparse_snapshot.is_none() || fast_path_indices.contains(i))
+        .filter(|(i, it)| it.sparse_snapshot.is_none() || is_fast_path[*i])
         .map(|(i, _)| i)
         .collect();
     for chunk in regular_indices.chunks(UPLOAD_CHUNK_SIZE) {
@@ -646,16 +652,21 @@ async fn flush_batch(
                 // poison every subsequent range_upload with a
                 // caller/reconstruction size mismatch.
                 let size = item.file_size;
-                if item.sparse_snapshot.is_some() {
-                    // Sparse upload via range_upload: re-key the inode's
-                    // sparse_write to the new hash, clear dirty_ranges,
-                    // preserve coverage (the new CAS file was composed from
-                    // those staging bytes, so staging still matches at
-                    // those offsets).
+                if item.sparse_snapshot.is_some() && !is_fast_path[i] {
+                    // Sparse upload via range_upload (Pass A): staging holds
+                    // covered + dirty bytes that match the new hash, holes
+                    // outside coverage do not. Re-key sparse_write to the
+                    // new hash, clear dirty_ranges, preserve coverage (the
+                    // new CAS file was composed from those staging bytes, so
+                    // staging still matches at those offsets).
                     entry.apply_commit_sparse(file_info.hash(), size, item.dirty_generation);
                 } else {
-                    // Non-sparse upload via upload_files: staging IS the
-                    // committed content, drop sparse_write.
+                    // Non-sparse upload_files OR fast-path upload_files
+                    // (fully-covered sparse item): staging IS the committed
+                    // content byte-for-byte, so drop sparse_write and flag
+                    // staging_is_current. Without this, fast-path items
+                    // would force a full re-download on the next open even
+                    // though staging already matches the committed hash.
                     entry.apply_commit(file_info.hash(), size, item.dirty_generation);
                 }
             }
