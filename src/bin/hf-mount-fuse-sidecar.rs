@@ -12,6 +12,7 @@ use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -25,6 +26,15 @@ use hf_mount::virtual_fs::VirtualFs;
 /// Set of running mounts, exposed to the SIGTERM handler so it can drain
 /// dirty data before the process exits.
 type VfsRegistry = Arc<Mutex<Vec<Arc<VirtualFs>>>>;
+
+/// Hard deadline (ms) for the SIGTERM handler to force `exit()`, even if the
+/// per-mount flush drain can't make progress (e.g. the tokio runtime is
+/// saturated by FUSE `block_on` so the bounded-flush timeout future is never
+/// polled). Sized from the configured flush timeout + margin once mounts are
+/// discovered; the default covers the signal-during-discovery window. Exiting
+/// closes the FUSE fd so the kernel tears down the connection and the pod can
+/// terminate — the alternative is an unkillable, node-stranding pod.
+static SHUTDOWN_WATCHDOG_MS: AtomicU64 = AtomicU64::new(55_000);
 
 #[derive(Parser)]
 #[command(about = "CSI sidecar mounter for HF volumes")]
@@ -81,6 +91,19 @@ fn main() {
                 std::process::exit(0);
             }
             info!("Received shutdown signal, flushing {} mount(s)", vfs_list.len());
+            // Hard watchdog: guarantee the process exits even if the bounded
+            // flush can't make progress (saturated runtime). Without this the
+            // FUSE fd never closes, the kernel keeps the connection alive, and
+            // any process on the mount stays blocked in D-state → unkillable pod.
+            let watchdog = Duration::from_millis(SHUTDOWN_WATCHDOG_MS.load(Ordering::Relaxed));
+            std::thread::spawn(move || {
+                std::thread::sleep(watchdog);
+                error!(
+                    "Shutdown watchdog fired after {:?}; forcing exit to release the FUSE connection",
+                    watchdog
+                );
+                std::process::exit(0);
+            });
             // Drain in parallel — total wall time is max(flush), not sum(flush).
             let drain_handles: Vec<_> = vfs_list
                 .into_iter()
@@ -106,13 +129,46 @@ fn main() {
     // (~4 worker threads each) for N volumes. See #96.
     let runtime = build_runtime();
 
-    let pending = wait_for_configs(&args.tmp_dir, args.poll_secs, args.timeout_secs, args.expected_mounts);
+    let mut pending = wait_for_configs(&args.tmp_dir, args.poll_secs, args.timeout_secs, args.expected_mounts);
     if pending.is_empty() {
         error!("No mount configs found after {}s, exiting", args.timeout_secs);
         std::process::exit(1);
     }
 
     info!("Discovered {} pending mount(s)", pending.len());
+
+    // Bound the SIGTERM shutdown from the pod's termination grace when the
+    // webhook provides it (env HF_CSI_TERMINATION_GRACE_SECONDS). This lets the
+    // flush drain use the FULL grace the pod was actually given — e.g. ~9m50s
+    // for a 10-minute grace — instead of a fixed default that would truncate a
+    // slow-but-progressing flush and drop data. The hard-exit watchdog sits
+    // just under grace so the process always exits before SIGKILL (closing the
+    // FUSE fd, tearing down the connection). Falls back to the per-mount option
+    // (+margin) when the env is absent (dev / direct hf-mount-fuse).
+    let grace_secs = std::env::var("HF_CSI_TERMINATION_GRACE_SECONDS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok());
+
+    let watchdog_ms = if let Some(grace) = grace_secs {
+        let flush_secs = grace.saturating_sub(10).max(5);
+        let watchdog_secs = grace.saturating_sub(5).max(flush_secs + 2);
+        for mount in &mut pending {
+            mount.mount_args.options.flush_shutdown_timeout_ms = flush_secs * 1_000;
+        }
+        info!(
+            "Termination grace {}s: flush drain bounded to {}s, hard-exit watchdog at {}s",
+            grace, flush_secs, watchdog_secs
+        );
+        watchdog_secs * 1_000
+    } else {
+        pending
+            .iter()
+            .map(|m| m.mount_args.options.flush_shutdown_timeout_ms)
+            .max()
+            .unwrap_or(45_000)
+            + 10_000
+    };
+    SHUTDOWN_WATCHDOG_MS.store(watchdog_ms, Ordering::Relaxed);
 
     let mut handles = Vec::with_capacity(pending.len());
     let mut error_paths = Vec::with_capacity(pending.len());

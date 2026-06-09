@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, Once, RwLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
@@ -122,10 +122,22 @@ impl FlushManager {
 
     // ── Shutdown ────────────────────────────────────────────────────
 
-    pub(crate) fn shutdown(&self, dirty_inos: Vec<u64>, runtime: &tokio::runtime::Handle) {
+    /// Graceful shutdown drain, **bounded by `timeout`**.
+    ///
+    /// On SIGTERM the sidecar drives this to persist dirty data before the
+    /// process exits. The drain MUST be bounded: if the Hub/CAS upload backend
+    /// is slow or hung, an unbounded wait keeps the process alive past the pod's
+    /// termination grace period, the FUSE fd never closes, the kernel never
+    /// tears down the connection, and any process touching the mount stays
+    /// blocked in uninterruptible (`D`-state) I/O — which strands the pod
+    /// (kubelet `FailedKillPod`) and leaks the node. On timeout we abandon the
+    /// remaining dirty data and return so the caller can exit; losing unflushed
+    /// data is strictly better than wedging the pod indefinitely.
+    pub(crate) fn shutdown(&self, dirty_inos: Vec<u64>, runtime: &tokio::runtime::Handle, timeout: Duration) {
         // Run shutdown exactly once. Subsequent calls (e.g. signal handler
         // racing with destroy()) are no-ops.
         self.shutdown_once.call_once(|| {
+            let dirty_count = dirty_inos.len();
             // Enqueue all remaining dirty files
             if let Some(tx) = self.tx.lock().expect("flush_tx poisoned").as_ref() {
                 for ino in dirty_inos {
@@ -135,19 +147,42 @@ impl FlushManager {
             // Drop the sender to signal the flush loop to drain and exit
             self.tx.lock().expect("flush_tx poisoned").take();
 
+            // Single deadline shared across both drain phases so total shutdown
+            // time is bounded by `timeout`, not 2×`timeout`.
+            let deadline = Instant::now() + timeout;
+
             // Take the handle then drop the guard before blocking.
             let handle = self.handle.lock().expect("flush_handle poisoned").take();
             if let Some(handle) = handle {
+                let abort = handle.abort_handle();
                 // Use block_in_place so this is safe even when called from within
                 // the tokio runtime (e.g. NFS shutdown path).
                 run_blocking(|| {
-                    if let Err(err) = runtime.block_on(handle) {
-                        error!("Flush task panicked: {}", err);
-                    }
+                    runtime.block_on(async {
+                        match tokio::time::timeout(timeout, handle).await {
+                            Ok(Ok(())) => {},
+                            Ok(Err(err)) if err.is_cancelled() => {},
+                            Ok(Err(err)) => error!("Flush task panicked: {}", err),
+                            Err(_) => {
+                                warn!(
+                                    "Flush drain exceeded shutdown timeout ({:?}); abandoning ~{} dirty inode(s) so the process can exit and the FUSE connection is torn down. Unflushed data for this mount is lost.",
+                                    timeout, dirty_count
+                                );
+                                abort.abort();
+                            },
+                        }
+                    });
                 });
             }
-            // Flush remaining queued deletes.
-            run_blocking(|| runtime.block_on(self.flush_deletes()));
+            // Flush remaining queued deletes within whatever time is left.
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            run_blocking(|| {
+                runtime.block_on(async {
+                    if tokio::time::timeout(remaining, self.flush_deletes()).await.is_err() {
+                        warn!("Remote-delete flush exceeded shutdown timeout; abandoning queued deletes.");
+                    }
+                });
+            });
         });
     }
 }
