@@ -145,6 +145,223 @@ pub struct InodeEntry {
     pub last_revalidated: Option<Instant>,
     /// Eviction bookkeeping (kernel refcount, LRU recency, pending flag, pinning).
     pub eviction: EvictionState,
+    /// Sparse-write tracking state. `Some` iff the inode was prepared for
+    /// sparse-write modification (open/write/setattr under `--sparse-writes`).
+    /// `None` for clean inodes, non-sparse mode, and non-file kinds.
+    ///
+    /// Wrapped in `Arc` so readers can snapshot it cheaply under the inode
+    /// read lock then drop the lock before awaiting CAS fetches. Wrapped in
+    /// `Arc` (not `Arc<RwLock>`) because all writes go through the inode
+    /// table write lock; readers see a consistent immutable snapshot.
+    pub sparse_write: Option<Arc<SparseWriteState>>,
+}
+
+/// Sparse-write tracking: which parts of the staging file mirror the original
+/// CAS content (or have been modified), and which are still sparse holes.
+///
+/// Invariants enforced by the helper methods:
+/// 1. `dirty_ranges ⊆ coverage`. A byte can only be "modified" if it is "present".
+/// 2. `coverage` and `dirty_ranges` are sorted, non-overlapping, with each
+///    range satisfying `start < end`.
+/// 3. Staging bytes in `coverage \ dirty_ranges` match `original_hash` at the
+///    same offset (cached from CAS).
+/// 4. Staging bytes in `dirty_ranges` are the user's modifications since the
+///    last commit (relative to `original_hash`).
+/// 5. Staging bytes outside `coverage` (within `[0, file_size)`) are sparse
+///    holes that read paths must fill from CAS on demand.
+///
+/// `original_hash` and `original_size` describe the CAS reconstruction this
+/// state is keyed to. After `apply_commit_sparse`, they are re-keyed to the
+/// new hash and `dirty_ranges` is cleared, but `coverage` is preserved —
+/// the bytes in `coverage` were just used to compose the new CAS file, so
+/// staging matches the new hash at those offsets.
+#[derive(Debug, Clone)]
+pub struct SparseWriteState {
+    /// CAS hash of the file this state is keyed to.
+    pub original_hash: String,
+    /// CAS reconstruction size for `original_hash`. Used by `range_upload`
+    /// to compute original ranges to drop / preserve.
+    pub original_size: u64,
+    /// Staging ranges that hold real bytes (either cached from CAS or written
+    /// by the user). Sorted, non-overlapping, `start < end`. Bytes outside
+    /// these ranges (within `[0, file_size)`) are holes that need CAS fetch.
+    pub coverage: Vec<(u64, u64)>,
+    /// Subset of `coverage` that the user has modified since the last commit.
+    /// Sorted, non-overlapping, `start < end`. Fed to `range_upload` to
+    /// compose the new CAS file at flush time.
+    pub dirty_ranges: Vec<(u64, u64)>,
+}
+
+impl SparseWriteState {
+    /// Build a state with no coverage and no dirty ranges. Used for opens
+    /// that punched a sparse hole — reads fill coverage lazily from CAS.
+    pub fn new(original_hash: String, original_size: u64) -> Self {
+        Self {
+            original_hash,
+            original_size,
+            coverage: Vec::new(),
+            dirty_ranges: Vec::new(),
+        }
+    }
+
+    /// Build a state with full coverage and no dirty ranges. Used for opens
+    /// that downloaded the entire CAS file into staging — reads short-circuit
+    /// because staging already holds every byte.
+    pub fn new_full(original_hash: String, original_size: u64) -> Self {
+        let coverage = if original_size > 0 {
+            vec![(0, original_size)]
+        } else {
+            Vec::new()
+        };
+        Self {
+            original_hash,
+            original_size,
+            coverage,
+            dirty_ranges: Vec::new(),
+        }
+    }
+
+    /// Build a fresh state keyed to `original_hash`/`original_size` and project
+    /// a size change to `new_size`: empty coverage (reads refill from CAS),
+    /// dirty_ranges populated if `new_size > original_size` (so range_upload
+    /// composes the zero-fill tail). Used by setattr's sparse-install and
+    /// drift-rebuild paths.
+    pub fn new_resized(original_hash: String, original_size: u64, new_size: u64) -> Self {
+        let mut sw = Self::new(original_hash, original_size);
+        sw.resize_to(original_size, new_size);
+        sw
+    }
+
+    /// Record bytes just fetched from CAS into staging at `[offset, offset+len)`.
+    /// Adds the range to `coverage` only (not dirty — these bytes match
+    /// `original_hash`). Subsequent reads of the same range hit staging.
+    pub fn track_read_fill(&mut self, offset: u64, len: u64) {
+        if len == 0 {
+            return;
+        }
+        let end = offset.saturating_add(len);
+        merge_range(&mut self.coverage, offset, end);
+    }
+
+    /// Record a user write at `[offset, offset+len)`: adds the range to both
+    /// `coverage` and `dirty_ranges`. A write that lands past the previous EOF
+    /// (`offset > prev_eof`) also dirties the zero-fill gap `[prev_eof,
+    /// offset)` so `range_upload` composes those zeros into the new CAS file
+    /// — without it a write at offset 15 to a 10-byte file would commit a
+    /// 13-byte file. Idempotent if the range is already tracked.
+    pub fn track_write(&mut self, offset: u64, len: u64, prev_eof: u64) {
+        if len == 0 {
+            return;
+        }
+        let start = offset.min(prev_eof);
+        let end = offset.saturating_add(len);
+        self.track_read_fill(start, end - start);
+        merge_range(&mut self.dirty_ranges, start, end);
+    }
+
+    /// Clip both coverage and dirty_ranges to `[0, new_size)`. Called after
+    /// a setattr-shrink. Ranges entirely past `new_size` are dropped; ranges
+    /// straddling `new_size` are capped.
+    pub fn clip_to_size(&mut self, new_size: u64) {
+        clip_ranges(&mut self.coverage, new_size);
+        clip_ranges(&mut self.dirty_ranges, new_size);
+    }
+
+    /// Apply a `setattr` size change from `prev_size` to `new_size`: a grow
+    /// tracks the new tail `[prev_size, new_size)` as dirty (so range_upload
+    /// composes the zero-fill); a shrink clips coverage and dirty_ranges down
+    /// to `new_size`. Unchanged size is a no-op.
+    pub fn resize_to(&mut self, prev_size: u64, new_size: u64) {
+        if new_size > prev_size {
+            // prev_size == prev_eof on this path (setattr), so the gap
+            // computation in track_write collapses to start = prev_size and
+            // end = new_size — exactly the new tail.
+            self.track_write(prev_size, new_size - prev_size, prev_size);
+        } else if new_size < prev_size {
+            self.clip_to_size(new_size);
+        }
+    }
+
+    /// Return the sub-ranges of `[offset, offset+len)` that are NOT in
+    /// `coverage` — i.e. holes that a read must fill from CAS.
+    pub fn holes_in(&self, offset: u64, len: u64) -> Vec<(u64, u64)> {
+        if len == 0 {
+            return Vec::new();
+        }
+        let end = offset.saturating_add(len);
+        subtract_ranges(offset, end, &self.coverage)
+    }
+
+    /// Returns true when `coverage` contains `[0, size)` entirely (no holes).
+    /// Used by the flush path: when the staging file already mirrors the full
+    /// committed content (via reads + dirty writes), we can upload it whole
+    /// via `upload_files` (xet-core CDC dedup is more efficient) instead of
+    /// running `range_upload` (which re-fetches old segments from CAS to
+    /// compose the new file). At full coverage the two paths produce the
+    /// same merkle hash, so the swap is safe.
+    pub fn is_fully_covered(&self, size: u64) -> bool {
+        if size == 0 {
+            return true;
+        }
+        self.holes_in(0, size).is_empty()
+    }
+}
+
+/// Merge `[new_start, new_end)` into a sorted, non-overlapping range vec.
+/// Coalesces with any overlapping or adjacent ranges. O(log n + k) where k
+/// is the number of ranges merged (typically 0–1 for sequential writes).
+fn merge_range(ranges: &mut Vec<(u64, u64)>, new_start: u64, new_end: u64) {
+    if new_start >= new_end {
+        return;
+    }
+    // First range whose end >= new_start — could overlap or abut on the left.
+    let first = ranges.partition_point(|&(_, e)| e < new_start);
+    // First range whose start > new_end — past the overlap zone.
+    let last = ranges[first..].partition_point(|&(s, _)| s <= new_end) + first;
+
+    let (merged_start, merged_end) = if first < last {
+        (new_start.min(ranges[first].0), new_end.max(ranges[last - 1].1))
+    } else {
+        (new_start, new_end)
+    };
+    ranges.splice(first..last, [(merged_start, merged_end)]);
+}
+
+/// Trim `ranges` to `[0, new_size)`: drop entries fully past `new_size`,
+/// cap entries that straddle the boundary, and drop any zero-length leftovers.
+fn clip_ranges(ranges: &mut Vec<(u64, u64)>, new_size: u64) {
+    ranges.retain_mut(|&mut (s, ref mut e)| {
+        if s >= new_size {
+            return false;
+        }
+        *e = (*e).min(new_size);
+        s < *e
+    });
+}
+
+/// Return the sub-ranges of `[start, end)` not covered by any range in
+/// `covered`. `covered` must be sorted and non-overlapping.
+fn subtract_ranges(start: u64, end: u64, covered: &[(u64, u64)]) -> Vec<(u64, u64)> {
+    let mut holes = Vec::new();
+    let mut cursor = start;
+    // Skip ranges entirely before the window.
+    let first = covered.partition_point(|&(_, e)| e <= start);
+    for &(cs, ce) in &covered[first..] {
+        if cs >= end {
+            break;
+        }
+        if cs > cursor {
+            holes.push((cursor, cs.min(end)));
+        }
+        cursor = cursor.max(ce);
+        if cursor >= end {
+            break;
+        }
+    }
+    if cursor < end {
+        holes.push((cursor, end));
+    }
+    holes
 }
 
 impl InodeEntry {
@@ -207,8 +424,9 @@ impl InodeEntry {
         }
     }
 
-    /// Apply a successful commit: update hash, size, timestamps, and
-    /// conditionally clear dirty + pending_deletes if the generation matches.
+    /// Apply a successful non-sparse upload (`upload_files`) commit.
+    /// Clears `sparse_write` because the on-disk staging file IS the just-
+    /// uploaded content — no holes, no deferred composition needed.
     pub fn apply_commit(&mut self, hash: &str, size: u64, dirty_generation: u64) {
         if self.clear_dirty_if(dirty_generation) {
             // Only update metadata when the generation matches. A concurrent
@@ -220,12 +438,80 @@ impl InodeEntry {
             self.staging_is_current = true;
             self.size = size;
             self.pending_deletes.clear();
+            self.sparse_write = None;
+            self.touch_commit_clocks();
         }
+    }
+
+    /// Apply a successful `range_upload` commit. Re-keys `sparse_write` to the
+    /// new hash with `dirty_ranges` cleared; `coverage` is preserved because
+    /// the new CAS file was composed from those exact staging bytes, so
+    /// staging continues to match the new hash at every covered offset.
+    ///
+    /// On a generation mismatch (concurrent writer raced past the flush
+    /// snapshot), nothing is updated — the next flush will re-upload the
+    /// now-newer content.
+    pub fn apply_commit_sparse(&mut self, hash: &str, size: u64, dirty_generation: u64) {
+        if self.clear_dirty_if(dirty_generation) {
+            self.xet_hash = Some(hash.to_string());
+            self.size = size;
+            self.pending_deletes.clear();
+            // staging_is_current: staging holds covered + dirty bytes that
+            // match the new hash, but holes outside coverage do NOT match
+            // the new hash (they were filled by composition from old CAS).
+            // Reads outside coverage must still fetch from CAS, so the
+            // cache-current flag would lie. Leave it false.
+            self.staging_is_current = false;
+            if let Some(sw) = self.sparse_write.as_mut() {
+                let sw = Arc::make_mut(sw);
+                sw.original_hash = hash.to_string();
+                sw.original_size = size;
+                sw.dirty_ranges.clear();
+                // Coverage preserved: those staging bytes are also the new
+                // CAS bytes at the same offsets, by construction.
+                sw.clip_to_size(size);
+            }
+            self.touch_commit_clocks();
+        }
+    }
+
+    /// Apply a no-op commit (range_upload returned the original hash
+    /// unchanged, or the flush detected nothing to do). Clears dirty +
+    /// pending_deletes if the generation matches. `sparse_write` keeps its
+    /// coverage (the unchanged hash means staging still matches at covered
+    /// offsets) but dirty_ranges are cleared since they were just rehashed
+    /// back to the original.
+    ///
+    /// `staging_is_current` is promoted to true ONLY when sparse_write is
+    /// None: on the non-sparse path the upload hashed the whole staging
+    /// file and returned the same hash, so staging IS the committed content
+    /// — a valid cache for the next open. On the sparse path, staging is
+    /// still a partial mirror (covered + dirty bytes match, holes do not),
+    /// so the flag must stay false.
+    pub fn apply_noop_commit(&mut self, dirty_generation: u64) {
+        if self.clear_dirty_if(dirty_generation) {
+            self.pending_deletes.clear();
+            if let Some(sw) = self.sparse_write.as_mut() {
+                let sw = Arc::make_mut(sw);
+                sw.dirty_ranges.clear();
+            } else {
+                self.staging_is_current = true;
+            }
+            self.touch_commit_clocks();
+        }
+    }
+
+    /// Bump mtime/ctime to now and mark the inode as freshly revalidated.
+    /// Called at the end of every commit-apply so subsequent lookups skip HEAD
+    /// revalidation for metadata_ttl (we just committed this exact state).
+    /// Must only be called inside the `clear_dirty_if` branch — on a
+    /// generation mismatch nothing was committed, so stamping
+    /// `last_revalidated` would let lookups serve stale state from the
+    /// metadata_ttl cache while the inode is still dirty with newer content.
+    fn touch_commit_clocks(&mut self) {
         let now = SystemTime::now();
         self.mtime = now;
         self.ctime = now;
-        // Mark as recently validated so subsequent lookups skip HEAD revalidation
-        // for the duration of metadata_ttl (we just committed this exact hash).
         self.last_revalidated = Some(Instant::now());
     }
 }
@@ -293,6 +579,7 @@ impl InodeTable {
             pending_deletes: Vec::new(),
             last_revalidated: None,
             eviction: EvictionState::default(),
+            sparse_write: None,
         };
         table.inodes.insert(ROOT_INODE, root);
         table.path_to_inode.insert(root_path, ROOT_INODE);
@@ -638,6 +925,7 @@ impl InodeTable {
                 last_touched: AtomicU64::new(touch_seq),
                 ..Default::default()
             },
+            sparse_write: None,
         };
 
         self.inodes.insert(inode, entry);
@@ -714,6 +1002,14 @@ impl InodeTable {
             // matches xet_hash. An in-flight download observes this under
             // its post-check and won't re-flag the cache.
             entry.staging_is_current = false;
+            // Sparse-write state stays keyed to its `original_hash`, NOT
+            // the just-rotated `entry.xet_hash`. Readers via fill_sparse_holes
+            // continue to see the old revision (their frame of reference),
+            // writers continue to track against the old base. The next open
+            // recomputes a fresh sparse_write against the new hash. This
+            // mirrors the equivalent race in the non-sparse path (where a
+            // writer's flush silently overwrites poll-discovered updates) —
+            // not made worse by the sparse path.
             true
         } else {
             false
@@ -1095,6 +1391,72 @@ mod tests {
         );
         assert_eq!(entry.size, 100, "size should not be clobbered by stale flush");
         assert_eq!(entry.pending_deletes.len(), 1, "pending_deletes should be preserved");
+    }
+
+    /// Non-sparse no-op flush (upload_files rehashed staging back to the
+    /// previous hash): staging IS the committed content, so the cache flag must
+    /// flip to true — otherwise the next open discards the staging and forces a
+    /// full re-download even though it matches the committed bytes.
+    #[test]
+    fn apply_noop_commit_promotes_staging_is_current_when_non_sparse() {
+        let mut table = InodeTable::new(false);
+        let ino = table.insert(
+            ROOT_INODE,
+            "test".to_string(),
+            "test".to_string(),
+            InodeKind::File,
+            10,
+            UNIX_EPOCH,
+            Some("h1".to_string()),
+            0o644,
+            0,
+            0,
+        );
+        let entry = table.get_mut(ino).unwrap();
+        entry.set_dirty();
+        entry.staging_is_current = false;
+        let snap = entry.dirty_generation;
+
+        entry.apply_noop_commit(snap);
+
+        assert!(!entry.is_dirty(), "noop must clear dirty");
+        assert!(
+            entry.staging_is_current,
+            "non-sparse noop: staging matches the committed hash, flag must be true"
+        );
+    }
+
+    /// Sparse no-op flush: staging is still a partial mirror (covered + dirty
+    /// match the hash, holes do not), so the cache flag must stay false even
+    /// though the hash is unchanged.
+    #[test]
+    fn apply_noop_commit_keeps_staging_is_current_false_when_sparse() {
+        let mut table = InodeTable::new(false);
+        let ino = table.insert(
+            ROOT_INODE,
+            "test".to_string(),
+            "test".to_string(),
+            InodeKind::File,
+            10,
+            UNIX_EPOCH,
+            Some("h1".to_string()),
+            0o644,
+            0,
+            0,
+        );
+        let entry = table.get_mut(ino).unwrap();
+        entry.set_dirty();
+        entry.staging_is_current = false;
+        entry.sparse_write = Some(Arc::new(SparseWriteState::new("h1".to_string(), 10)));
+        let snap = entry.dirty_generation;
+
+        entry.apply_noop_commit(snap);
+
+        assert!(!entry.is_dirty(), "noop must clear dirty");
+        assert!(
+            !entry.staging_is_current,
+            "sparse noop: staging has unmaterialized holes, flag must remain false"
+        );
     }
 
     #[test]
@@ -2488,5 +2850,163 @@ mod tests {
         let a2 = mk_file(&mut table, "a.txt");
         assert_child_index_consistent(&table);
         assert_eq!(table.lookup_child(ROOT_INODE, "a.txt").map(|e| e.inode), Some(a2));
+    }
+
+    // ── SparseWriteState tests ────────────────────────────────────────
+
+    #[test]
+    fn merge_range_into_empty() {
+        let mut v = Vec::new();
+        merge_range(&mut v, 10, 20);
+        assert_eq!(v, vec![(10, 20)]);
+    }
+
+    #[test]
+    fn merge_range_disjoint_keeps_separate() {
+        let mut v = vec![(0, 10)];
+        merge_range(&mut v, 20, 30);
+        assert_eq!(v, vec![(0, 10), (20, 30)]);
+    }
+
+    #[test]
+    fn merge_range_coalesces_adjacent() {
+        let mut v = vec![(0, 10), (20, 30)];
+        merge_range(&mut v, 10, 20);
+        assert_eq!(v, vec![(0, 30)]);
+    }
+
+    #[test]
+    fn merge_range_swallows_overlapping_left() {
+        let mut v = vec![(10, 20)];
+        merge_range(&mut v, 5, 15);
+        assert_eq!(v, vec![(5, 20)]);
+    }
+
+    #[test]
+    fn merge_range_swallows_overlapping_right() {
+        let mut v = vec![(10, 20)];
+        merge_range(&mut v, 15, 25);
+        assert_eq!(v, vec![(10, 25)]);
+    }
+
+    #[test]
+    fn merge_range_collapses_multiple() {
+        let mut v = vec![(0, 5), (10, 15), (20, 25), (30, 35)];
+        merge_range(&mut v, 7, 28);
+        assert_eq!(v, vec![(0, 5), (7, 28), (30, 35)]);
+    }
+
+    #[test]
+    fn merge_range_zero_length_is_noop() {
+        let mut v = vec![(0, 10)];
+        merge_range(&mut v, 5, 5);
+        assert_eq!(v, vec![(0, 10)]);
+    }
+
+    #[test]
+    fn clip_ranges_trims_past_size() {
+        let mut v = vec![(0, 10), (20, 30), (40, 50)];
+        clip_ranges(&mut v, 25);
+        assert_eq!(v, vec![(0, 10), (20, 25)]);
+    }
+
+    #[test]
+    fn clip_ranges_to_zero_empties() {
+        let mut v = vec![(0, 10), (20, 30)];
+        clip_ranges(&mut v, 0);
+        assert!(v.is_empty());
+    }
+
+    #[test]
+    fn subtract_ranges_finds_holes() {
+        let covered = vec![(10, 20), (30, 40)];
+        // Whole window covered by holes.
+        assert_eq!(subtract_ranges(0, 50, &covered), vec![(0, 10), (20, 30), (40, 50)]);
+        // Sub-window across one covered range.
+        assert_eq!(subtract_ranges(15, 35, &covered), vec![(20, 30)]);
+        // Window inside a hole.
+        assert_eq!(subtract_ranges(22, 28, &covered), vec![(22, 28)]);
+        // Window inside coverage.
+        assert!(subtract_ranges(12, 18, &covered).is_empty());
+    }
+
+    #[test]
+    fn subtract_ranges_handles_window_starting_before_first() {
+        let covered = vec![(10, 20)];
+        assert_eq!(subtract_ranges(0, 30, &covered), vec![(0, 10), (20, 30)]);
+    }
+
+    #[test]
+    fn sparse_state_track_write_extends_both_coverage_and_dirty() {
+        let mut sw = SparseWriteState::new("h".into(), 100);
+        // prev_eof = offset → no zero-gap, plain in-window write.
+        sw.track_write(10, 20, 10);
+        assert_eq!(sw.coverage, vec![(10, 30)]);
+        assert_eq!(sw.dirty_ranges, vec![(10, 30)]);
+    }
+
+    #[test]
+    fn sparse_state_track_write_past_eof_dirties_gap() {
+        // Write 5 bytes at offset 15 on a 10-byte file: prev_eof=10, the gap
+        // [10, 15) must also be tracked dirty so range_upload composes those
+        // zeros instead of producing a 13-byte file.
+        let mut sw = SparseWriteState::new("h".into(), 10);
+        sw.track_write(15, 5, 10);
+        assert_eq!(sw.coverage, vec![(10, 20)]);
+        assert_eq!(sw.dirty_ranges, vec![(10, 20)]);
+    }
+
+    #[test]
+    fn sparse_state_track_read_fill_extends_coverage_only() {
+        let mut sw = SparseWriteState::new("h".into(), 100);
+        sw.track_read_fill(0, 40);
+        assert_eq!(sw.coverage, vec![(0, 40)]);
+        assert!(sw.dirty_ranges.is_empty());
+    }
+
+    #[test]
+    fn sparse_state_write_after_read_marks_dirty_subset() {
+        let mut sw = SparseWriteState::new("h".into(), 100);
+        sw.track_read_fill(0, 100);
+        sw.track_write(20, 30, 100);
+        assert_eq!(sw.coverage, vec![(0, 100)]);
+        assert_eq!(sw.dirty_ranges, vec![(20, 50)]);
+    }
+
+    #[test]
+    fn sparse_state_clip_trims_both() {
+        let mut sw = SparseWriteState::new("h".into(), 100);
+        sw.track_write(0, 100, 0);
+        sw.clip_to_size(40);
+        assert_eq!(sw.coverage, vec![(0, 40)]);
+        assert_eq!(sw.dirty_ranges, vec![(0, 40)]);
+    }
+
+    #[test]
+    fn sparse_state_holes_in_window() {
+        let mut sw = SparseWriteState::new("h".into(), 100);
+        sw.track_read_fill(20, 20); // covers [20, 40)
+        sw.track_write(60, 10, 60); // covers [60, 70)
+        assert_eq!(sw.holes_in(0, 80), vec![(0, 20), (40, 60), (70, 80)]);
+        assert!(sw.holes_in(20, 20).is_empty()); // entirely covered
+        assert_eq!(sw.holes_in(0, 10), vec![(0, 10)]); // entirely hole
+    }
+
+    #[test]
+    fn sparse_state_new_full_covers_everything() {
+        let sw = SparseWriteState::new_full("h".into(), 1000);
+        assert_eq!(sw.coverage, vec![(0, 1000)]);
+        assert!(sw.holes_in(0, 1000).is_empty());
+        assert!(sw.dirty_ranges.is_empty());
+    }
+
+    #[test]
+    fn sparse_state_new_full_empty_size_is_covered() {
+        let sw = SparseWriteState::new_full("h".into(), 0);
+        // An empty file has no coverage ranges and nothing dirty; reads are
+        // bounded by original_size == 0 so there is never a hole to fill.
+        assert!(sw.coverage.is_empty());
+        assert!(sw.dirty_ranges.is_empty());
+        assert!(sw.holes_in(0, 0).is_empty());
     }
 }

@@ -66,6 +66,24 @@ fn vfs_advanced(
     (rt, vfs)
 }
 
+/// Build a VFS with sparse writes enabled (implies advanced_writes via TestOpts).
+fn vfs_sparse(
+    hub: &std::sync::Arc<MockHub>,
+    xet: &std::sync::Arc<MockXet>,
+) -> (tokio::runtime::Runtime, std::sync::Arc<VirtualFs>) {
+    let rt = new_runtime();
+    let vfs = make_test_vfs(
+        hub.clone(),
+        xet.clone(),
+        TestOpts {
+            sparse_writes: true,
+            ..Default::default()
+        },
+        &rt,
+    );
+    (rt, vfs)
+}
+
 /// Build a read-only VFS.
 fn vfs_readonly(
     hub: &std::sync::Arc<MockHub>,
@@ -5240,4 +5258,2240 @@ fn overlay_rmdir_remote_dir_eperm() {
         let err = t.vfs.rmdir(ROOT_INODE, "subdir").await.unwrap_err();
         assert_eq!(err, libc::EPERM);
     });
+}
+
+// ── Sparse writes ──────────────────────────────────────────────────────
+//
+// Invariant tests for the sparse-write path. The goal here is to nail down
+// observable behaviors (read, write, flush composition), not implementation
+// details. The state machine itself (coverage map, dirty tracking) is unit-
+// tested in inode.rs.
+
+/// Poll until `ino` is clean (flushed). Bounded retry; panics on timeout.
+async fn wait_for_clean(vfs: &Arc<VirtualFs>, ino: u64) {
+    for _ in 0..200 {
+        {
+            let inodes = vfs.inode_table.read().unwrap();
+            if let Some(entry) = inodes.get(ino)
+                && !entry.is_dirty()
+            {
+                return;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("wait_for_clean: ino={} did not become clean within 4s", ino);
+}
+
+/// Look up the MockXet content for a hash. Helper used by sparse flush tests.
+fn xet_content(xet: &Arc<MockXet>, hash: &str) -> Option<Vec<u8>> {
+    xet.files.lock().unwrap().get(hash).cloned()
+}
+
+/// Open in sparse mode does not download the full file. Reads outside the
+/// dirty window hit CAS lazily via fill_sparse_holes.
+#[test]
+fn sparse_open_skips_download() {
+    let hub = MockHub::new();
+    hub.add_file("big.bin", 100, Some("hbig"), None);
+    let xet = MockXet::new();
+    xet.add_file("hbig", &(0u8..100).collect::<Vec<u8>>());
+    let (rt, vfs) = vfs_sparse(&hub, &xet);
+
+    rt.block_on(async {
+        let ino = vfs.lookup(ROOT_INODE, "big.bin").await.unwrap().ino;
+        let downloads_before = xet.download_to_file_calls.load(std::sync::atomic::Ordering::SeqCst);
+        let fh = vfs.open(ino, true, false, None).await.unwrap();
+        let downloads_after = xet.download_to_file_calls.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            downloads_before, downloads_after,
+            "sparse open must not call download_to_file"
+        );
+        vfs.release(fh).await.unwrap();
+    });
+}
+
+/// Sparse read fills holes from CAS and returns the original bytes.
+#[test]
+fn sparse_read_returns_cas_bytes() {
+    let hub = MockHub::new();
+    let content: Vec<u8> = (0u8..50).collect();
+    hub.add_file("file.bin", content.len() as u64, Some("h1"), None);
+    let xet = MockXet::new();
+    xet.add_file("h1", &content);
+    let (rt, vfs) = vfs_sparse(&hub, &xet);
+
+    rt.block_on(async {
+        let ino = vfs.lookup(ROOT_INODE, "file.bin").await.unwrap().ino;
+        let fh = vfs.open(ino, true, false, None).await.unwrap();
+        let (data, _) = vfs.read(fh, 10, 20).await.unwrap();
+        assert_eq!(&data[..], &content[10..30]);
+        vfs.release(fh).await.unwrap();
+    });
+}
+
+/// Second read of the same region hits the staging cache (no additional CAS
+/// stream call) because fill_sparse_holes persisted the bytes on the first read.
+#[test]
+fn sparse_read_caches_into_staging() {
+    let hub = MockHub::new();
+    let content: Vec<u8> = (0u8..50).collect();
+    hub.add_file("file.bin", content.len() as u64, Some("h1"), None);
+    let xet = MockXet::new();
+    xet.add_file("h1", &content);
+    let (rt, vfs) = vfs_sparse(&hub, &xet);
+
+    rt.block_on(async {
+        let ino = vfs.lookup(ROOT_INODE, "file.bin").await.unwrap().ino;
+        let fh = vfs.open(ino, true, false, None).await.unwrap();
+        // First read populates the cache.
+        let _ = vfs.read(fh, 0, 30).await.unwrap();
+        let calls_after_first = xet.stream_calls.lock().unwrap().len();
+        // Second read of the same region should not stream from CAS again.
+        let (data2, _) = vfs.read(fh, 0, 30).await.unwrap();
+        let calls_after_second = xet.stream_calls.lock().unwrap().len();
+        assert_eq!(
+            calls_after_first, calls_after_second,
+            "second read should hit the staging cache, not CAS"
+        );
+        assert_eq!(&data2[..], &content[..30]);
+        vfs.release(fh).await.unwrap();
+    });
+}
+
+/// Reads outside the cached window still go to CAS. The cache fills lazily.
+#[test]
+fn sparse_read_uncached_region_hits_cas() {
+    let hub = MockHub::new();
+    let content: Vec<u8> = (0u8..100).collect();
+    hub.add_file("file.bin", content.len() as u64, Some("h1"), None);
+    let xet = MockXet::new();
+    xet.add_file("h1", &content);
+    let (rt, vfs) = vfs_sparse(&hub, &xet);
+
+    rt.block_on(async {
+        let ino = vfs.lookup(ROOT_INODE, "file.bin").await.unwrap().ino;
+        let fh = vfs.open(ino, true, false, None).await.unwrap();
+        // Cache [0, 20)
+        let _ = vfs.read(fh, 0, 20).await.unwrap();
+        let calls_a = xet.stream_calls.lock().unwrap().len();
+        // Read [60, 80) — uncached, should stream.
+        let (data, _) = vfs.read(fh, 60, 20).await.unwrap();
+        let calls_b = xet.stream_calls.lock().unwrap().len();
+        assert!(calls_b > calls_a, "uncached read should call CAS");
+        assert_eq!(&data[..], &content[60..80]);
+        vfs.release(fh).await.unwrap();
+    });
+}
+
+/// Write at an offset overlays staging and marks the range dirty. Subsequent
+/// read returns the user's bytes (overlaid on holes filled from CAS).
+#[test]
+fn sparse_write_overlays_on_original() {
+    let hub = MockHub::new();
+    let content: Vec<u8> = (0u8..20).collect();
+    hub.add_file("file.bin", content.len() as u64, Some("h1"), None);
+    let xet = MockXet::new();
+    xet.add_file("h1", &content);
+    let (rt, vfs) = vfs_sparse(&hub, &xet);
+
+    rt.block_on(async {
+        let ino = vfs.lookup(ROOT_INODE, "file.bin").await.unwrap().ino;
+        let fh = vfs.open(ino, true, false, None).await.unwrap();
+        // Overwrite bytes [5, 10)
+        write_blocking(&vfs, ino, fh, 5, &[0xff; 5]).await.unwrap();
+        let (data, _) = vfs.read(fh, 0, 20).await.unwrap();
+        let mut expected = content.clone();
+        expected[5..10].copy_from_slice(&[0xff; 5]);
+        assert_eq!(&data[..], &expected[..]);
+        vfs.release(fh).await.unwrap();
+    });
+}
+
+/// Flush after a sparse write commits a CAS file with the user's modifications
+/// applied on top of the original. The new hash differs from the original.
+#[test]
+fn sparse_flush_commits_composed_file() {
+    let hub = MockHub::new();
+    let content: Vec<u8> = (0u8..20).collect();
+    hub.add_file("file.bin", content.len() as u64, Some("h1"), None);
+    let xet = MockXet::new();
+    xet.add_file("h1", &content);
+    let (rt, vfs) = vfs_sparse(&hub, &xet);
+
+    rt.block_on(async {
+        let ino = vfs.lookup(ROOT_INODE, "file.bin").await.unwrap().ino;
+        let fh = vfs.open(ino, true, false, None).await.unwrap();
+        write_blocking(&vfs, ino, fh, 10, b"HELLO").await.unwrap();
+        vfs.release(fh).await.unwrap();
+        // Wait for async flush
+        wait_for_clean(&vfs, ino).await;
+        // Verify the new hash exists in MockXet with the expected composed content
+        let mut expected = content.clone();
+        expected[10..15].copy_from_slice(b"HELLO");
+        let new_hash = {
+            let inodes = vfs.inode_table.read().unwrap();
+            inodes.get(ino).unwrap().xet_hash.clone().unwrap()
+        };
+        assert_ne!(new_hash, "h1", "flush should produce a new hash");
+        assert_eq!(xet_content(&xet, &new_hash), Some(expected));
+    });
+}
+
+/// Sparse write past EOF extends the file; the gap [old_size, new_offset) is
+/// tracked as dirty so range_upload composes the extension correctly. Without
+/// the gap tracking, the real xet-core upload_ranges would commit a truncated
+/// file (10 + 3 = 13 bytes instead of 18); MockXet zero-pads to new_file_size
+/// so the user-facing read happens to match, but the dirty_ranges check
+/// guards against the mock masking the bug.
+#[test]
+fn sparse_write_past_eof_extends() {
+    let hub = MockHub::new();
+    let content: Vec<u8> = (0u8..10).collect();
+    hub.add_file("file.bin", 10, Some("h1"), None);
+    let xet = MockXet::new();
+    xet.add_file("h1", &content);
+    let (rt, vfs) = vfs_sparse(&hub, &xet);
+
+    rt.block_on(async {
+        let ino = vfs.lookup(ROOT_INODE, "file.bin").await.unwrap().ino;
+        let fh = vfs.open(ino, true, false, None).await.unwrap();
+        // Write at offset 15 (5 bytes past EOF=10)
+        write_blocking(&vfs, ino, fh, 15, b"XYZ").await.unwrap();
+        let (data, _) = vfs.read(fh, 0, 30).await.unwrap();
+        let mut expected = content.clone();
+        expected.resize(18, 0); // zeros in [10..15), then "XYZ"
+        expected[15..18].copy_from_slice(b"XYZ");
+        assert_eq!(&data[..], &expected[..]);
+
+        // Dirty range must cover the whole extension [prev_size, new_end) =
+        // [10, 18), not just [15, 18). Otherwise range_upload omits the
+        // zero gap and commits a truncated file.
+        {
+            let inodes = vfs.inode_table.read().unwrap();
+            let entry = inodes.get(ino).unwrap();
+            let sw = entry.sparse_write.as_ref().expect("sparse_write must be set");
+            assert_eq!(
+                sw.dirty_ranges,
+                vec![(10, 18)],
+                "past-EOF write must track the zero-gap from old EOF"
+            );
+        }
+
+        vfs.release(fh).await.unwrap();
+    });
+}
+
+/// Setattr shrink trims coverage and dirty_ranges past the new size; the
+/// flushed CAS file matches the truncated original.
+#[test]
+fn sparse_setattr_shrink_truncates_at_flush() {
+    let hub = MockHub::new();
+    let content: Vec<u8> = (0u8..50).collect();
+    hub.add_file("file.bin", content.len() as u64, Some("h1"), None);
+    let xet = MockXet::new();
+    xet.add_file("h1", &content);
+    let (rt, vfs) = vfs_sparse(&hub, &xet);
+
+    rt.block_on(async {
+        let ino = vfs.lookup(ROOT_INODE, "file.bin").await.unwrap().ino;
+        vfs.setattr(ino, Some(20), None, None, None, None, None).await.unwrap();
+        wait_for_clean(&vfs, ino).await;
+        let new_hash = {
+            let inodes = vfs.inode_table.read().unwrap();
+            inodes.get(ino).unwrap().xet_hash.clone().unwrap()
+        };
+        assert_eq!(xet_content(&xet, &new_hash), Some(content[..20].to_vec()));
+    });
+}
+
+/// Regression: a clean sparse inode whose `xet_hash` is rotated by poll
+/// (InodeTable::update_remote_file) keeps its `sparse_write` keyed to the OLD
+/// hash. A later setattr must NOT reuse that stale state — doing so makes
+/// range_upload compose against the superseded revision and silently overwrite
+/// the poll-discovered remote update. The truncate must compose against the
+/// current (rotated) revision instead.
+#[test]
+fn sparse_setattr_after_hash_drift_uses_current_revision() {
+    let hub = MockHub::new();
+    let original: Vec<u8> = (0u8..50).collect();
+    hub.add_file("file.bin", original.len() as u64, Some("h1"), None);
+    let xet = MockXet::new();
+    xet.add_file("h1", &original);
+    // The revision the remote rotates to while the inode is clean.
+    let rotated: Vec<u8> = (100u8..150).collect();
+    xet.add_file("h2", &rotated);
+    let (rt, vfs) = vfs_sparse(&hub, &xet);
+
+    rt.block_on(async {
+        let ino = vfs.lookup(ROOT_INODE, "file.bin").await.unwrap().ino;
+
+        // Sparse open + write + flush leaves the inode CLEAN with a retained
+        // sparse_write keyed to the composed hash (the post-apply_commit_sparse
+        // state).
+        let fh = vfs.open(ino, true, false, None).await.unwrap();
+        write_blocking(&vfs, ino, fh, 10, b"HELLO").await.unwrap();
+        vfs.release(fh).await.unwrap();
+        wait_for_clean(&vfs, ino).await;
+        let committed_hash = {
+            let inodes = vfs.inode_table.read().unwrap();
+            inodes.get(ino).unwrap().xet_hash.clone().unwrap()
+        };
+        assert_ne!(committed_hash, "h1");
+
+        // Poll discovers a newer remote revision and rotates xet_hash on the
+        // clean inode. The retained sparse_write stays keyed to the now-stale
+        // committed_hash.
+        {
+            let mut inodes = vfs.inode_table.write().unwrap();
+            assert!(
+                inodes.update_remote_file(ino, Some("h2".to_string()), None, 50, SystemTime::now()),
+                "poll must rotate the clean inode"
+            );
+        }
+
+        // Truncate to 30. The flush must compose against h2 (current), not the
+        // stale committed hash.
+        vfs.setattr(ino, Some(30), None, None, None, None, None).await.unwrap();
+        wait_for_clean(&vfs, ino).await;
+
+        let new_hash = {
+            let inodes = vfs.inode_table.read().unwrap();
+            inodes.get(ino).unwrap().xet_hash.clone().unwrap()
+        };
+        assert_eq!(
+            xet_content(&xet, &new_hash),
+            Some(rotated[..30].to_vec()),
+            "truncate after hash drift must compose against the rotated remote (h2), \
+             not the stale committed revision"
+        );
+    });
+}
+
+/// Regression: when poll rotates a clean sparse inode to a SMALLER revision
+/// and a later setattr grows the file past the new (smaller) size, the grow
+/// tail must be POSIX zero-extension, not stale tail bytes left in the staging
+/// file from the larger pre-rotation revision. The drift rebuild re-zeros the
+/// staging tail (truncate to cur_size before extending) so range_upload
+/// composes zeros over [cur_size, new_size).
+#[test]
+fn sparse_setattr_grow_after_shrinking_drift_zero_fills_tail() {
+    let hub = MockHub::new();
+    let original: Vec<u8> = (0u8..100).collect();
+    hub.add_file("file.bin", original.len() as u64, Some("h1"), None);
+    let xet = MockXet::new();
+    xet.add_file("h1", &original);
+    // Rotated remote revision is SMALLER (50 bytes) than the original (100).
+    let rotated: Vec<u8> = (200u8..250).collect();
+    xet.add_file("h2", &rotated);
+    let (rt, vfs) = vfs_sparse(&hub, &xet);
+
+    rt.block_on(async {
+        let ino = vfs.lookup(ROOT_INODE, "file.bin").await.unwrap().ino;
+
+        // Sparse open + write + flush: clean inode, retained sparse_write, and
+        // a 100-byte staging file persists (no GC pressure in tests).
+        let fh = vfs.open(ino, true, false, None).await.unwrap();
+        write_blocking(&vfs, ino, fh, 60, b"XXXXX").await.unwrap();
+        vfs.release(fh).await.unwrap();
+        wait_for_clean(&vfs, ino).await;
+
+        // Poll rotates the clean inode to the smaller h2 (50 bytes). The
+        // retained sparse_write stays keyed to the now-stale committed hash.
+        {
+            let mut inodes = vfs.inode_table.write().unwrap();
+            assert!(
+                inodes.update_remote_file(ino, Some("h2".to_string()), None, 50, SystemTime::now()),
+                "poll must rotate the clean inode"
+            );
+        }
+
+        // Grow to 75 (25 bytes past the current 50-byte revision).
+        vfs.setattr(ino, Some(75), None, None, None, None, None).await.unwrap();
+        wait_for_clean(&vfs, ino).await;
+
+        let new_hash = {
+            let inodes = vfs.inode_table.read().unwrap();
+            inodes.get(ino).unwrap().xet_hash.clone().unwrap()
+        };
+        // Expect h2 (50 bytes) followed by 25 zero bytes — NOT stale bytes from
+        // the 100-byte pre-rotation staging file.
+        let mut expected = rotated.clone();
+        expected.resize(75, 0);
+        assert_eq!(
+            xet_content(&xet, &new_hash),
+            Some(expected),
+            "grow after shrinking drift must zero-fill the extension, not commit stale tail bytes"
+        );
+    });
+}
+
+/// A read-only open of a DIRTY sparse file must still cache CAS hole-fills
+/// into staging. The read handle's fd is opened writable for exactly this
+/// reason; with a read-only fd the fill_sparse_holes write_at fails with EBADF
+/// and every read of the same hole re-fetches from CAS.
+#[test]
+fn sparse_readonly_handle_on_dirty_file_caches_holes() {
+    let hub = MockHub::new();
+    let content: Vec<u8> = (0u8..50).collect();
+    hub.add_file("file.bin", content.len() as u64, Some("h1"), None);
+    let xet = MockXet::new();
+    xet.add_file("h1", &content);
+    let (rt, vfs) = vfs_sparse(&hub, &xet);
+
+    rt.block_on(async {
+        let ino = vfs.lookup(ROOT_INODE, "file.bin").await.unwrap().ino;
+
+        // Writable open makes the file dirty with a sparse staging file.
+        let fh_w = vfs.open(ino, true, false, None).await.unwrap();
+        write_blocking(&vfs, ino, fh_w, 5, b"AAAAA").await.unwrap();
+
+        // Read-only open of the now-dirty file routes through open_readonly ->
+        // open_local_readonly(staging_backed=true). Hold fh_w so the inode
+        // stays dirty (no race with the background flush).
+        let fh_r = vfs.open(ino, false, false, None).await.unwrap();
+
+        // First read of an uncovered hole streams from CAS and caches it.
+        let _ = vfs.read(fh_r, 20, 10).await.unwrap();
+        let calls_after_first = xet.stream_calls.lock().unwrap().len();
+
+        // Second read of the same hole must hit the staging cache: the fill
+        // write_at succeeded (writable fd) and recorded coverage.
+        let (data, _) = vfs.read(fh_r, 20, 10).await.unwrap();
+        let calls_after_second = xet.stream_calls.lock().unwrap().len();
+        assert_eq!(
+            calls_after_first, calls_after_second,
+            "read-only handle on a dirty sparse file must cache hole-fills, not re-fetch CAS"
+        );
+        assert_eq!(&data[..], &content[20..30]);
+
+        vfs.release(fh_r).await.unwrap();
+        vfs.release(fh_w).await.unwrap();
+    });
+}
+
+/// Reopening a dirty sparse inode before its flush completes must preserve
+/// the existing sparse_write state (coverage + dirty_ranges). Without this,
+/// the second open would replace the state with a fresh one, dropping the
+/// dirty tracking — a subsequent flush would see no dirty ranges and commit
+/// a no-op even though the user's writes are still in staging.
+///
+/// `fh1` is held open across the second open so the inode stays dirty
+/// deterministically (no race with the background flush): the reopen path
+/// keys on `is_dirty || staging_is_current`, and a held writable handle
+/// keeps the inode dirty regardless of debounce timing.
+#[test]
+fn sparse_reopen_dirty_preserves_state() {
+    let hub = MockHub::new();
+    let content: Vec<u8> = (0u8..20).collect();
+    hub.add_file("file.bin", content.len() as u64, Some("h1"), None);
+    let xet = MockXet::new();
+    xet.add_file("h1", &content);
+    let (rt, vfs) = vfs_sparse(&hub, &xet);
+
+    rt.block_on(async {
+        let ino = vfs.lookup(ROOT_INODE, "file.bin").await.unwrap().ino;
+        let fh1 = vfs.open(ino, true, false, None).await.unwrap();
+        write_blocking(&vfs, ino, fh1, 5, b"AAA").await.unwrap();
+
+        // Reopen while fh1 is still held — the inode is dirty for certain.
+        let fh2 = vfs.open(ino, true, false, None).await.unwrap();
+
+        // Dirty state from the first open must survive the reopen.
+        let dirty_ranges = {
+            let inodes = vfs.inode_table.read().unwrap();
+            let entry = inodes.get(ino).unwrap();
+            entry
+                .sparse_write
+                .as_ref()
+                .expect("sparse_write must persist")
+                .dirty_ranges
+                .clone()
+        };
+        assert_eq!(
+            dirty_ranges,
+            vec![(5, 8)],
+            "reopen must preserve dirty_ranges from the first open"
+        );
+
+        // The user's bytes are still readable through the reopened handle.
+        let (data, _) = vfs.read(fh2, 5, 3).await.unwrap();
+        assert_eq!(&data[..], b"AAA");
+
+        vfs.release(fh2).await.unwrap();
+        vfs.release(fh1).await.unwrap();
+    });
+}
+
+/// Hash-drift during a sparse open: `open_advanced_write` is robust to a
+/// stale `xet_hash` / `size` from the caller's pre-lock snapshot — it
+/// re-reads both fields under `staging.lock(ino)` so a poll-induced rotation
+/// between `open()` and the install does not return a user-visible EIO.
+///
+/// Drives `open_advanced_write` directly with a stale snapshot hash and an
+/// off-by-one size: the install must succeed against the live state and
+/// install a sparse_write keyed to the CURRENT hash, not the stale one.
+#[test]
+fn sparse_open_stale_snapshot_uses_live_state() {
+    let hub = MockHub::new();
+    let content: Vec<u8> = (0u8..20).collect();
+    hub.add_file("file.bin", content.len() as u64, Some("current_hash"), None);
+    let xet = MockXet::new();
+    xet.add_file("current_hash", &content);
+    let (rt, vfs) = vfs_sparse(&hub, &xet);
+
+    rt.block_on(async {
+        let ino = vfs.lookup(ROOT_INODE, "file.bin").await.unwrap().ino;
+        // The inode's live hash is "current_hash" / size 20. Pass STALE values
+        // to mimic a snapshot taken before a poll rotation completed.
+        let fh = vfs
+            .open_advanced_write(ino, "file.bin", "stale_hash", 999, false)
+            .await
+            .expect("open must succeed: stale snapshot is re-read under the lock");
+
+        // sparse_write must be keyed to the LIVE hash, not the stale one.
+        let entry_hash = {
+            let inodes = vfs.inode_table.read().unwrap();
+            let entry = inodes.get(ino).unwrap();
+            assert!(entry.is_dirty(), "open_advanced_write sets dirty");
+            entry
+                .sparse_write
+                .as_ref()
+                .expect("sparse_write must be installed")
+                .original_hash
+                .clone()
+        };
+        assert_eq!(entry_hash, "current_hash", "sparse_write must key to the live hash");
+
+        vfs.release(fh).await.unwrap();
+    });
+}
+
+/// No-op flush (open then release with no writes) keeps the original hash
+/// and preserves the staging cache populated by reads.
+#[test]
+fn sparse_noop_flush_preserves_hash_and_cache() {
+    let hub = MockHub::new();
+    let content: Vec<u8> = (0u8..30).collect();
+    hub.add_file("file.bin", content.len() as u64, Some("h1"), None);
+    let xet = MockXet::new();
+    xet.add_file("h1", &content);
+    let (rt, vfs) = vfs_sparse(&hub, &xet);
+
+    rt.block_on(async {
+        let ino = vfs.lookup(ROOT_INODE, "file.bin").await.unwrap().ino;
+        let fh = vfs.open(ino, true, false, None).await.unwrap();
+        // Read populates the cache but doesn't dirty anything.
+        let _ = vfs.read(fh, 0, 30).await.unwrap();
+        vfs.release(fh).await.unwrap();
+        wait_for_clean(&vfs, ino).await;
+        let final_hash = {
+            let inodes = vfs.inode_table.read().unwrap();
+            inodes.get(ino).unwrap().xet_hash.clone().unwrap()
+        };
+        assert_eq!(final_hash, "h1", "no-op flush must keep the original hash");
+    });
+}
+
+/// Regression: O_TRUNC clears sparse_write but keeps xet_hash; a write then
+/// lands while sparse_write is None (so it tracks nothing); a reopen WITHOUT
+/// O_TRUNC (before the debounced flush) must NOT install an empty-coverage
+/// SparseWriteState over the dirty staging. If it did, reads would overlay the
+/// ORIGINAL CAS bytes over the user's write and the flush would no-op back to
+/// the original hash, silently losing the write entirely.
+#[test]
+fn sparse_otrunc_then_write_then_reopen_keeps_user_data() {
+    let hub = MockHub::new();
+    let content: Vec<u8> = (0u8..20).collect();
+    hub.add_file("file.bin", content.len() as u64, Some("h1"), None);
+    let xet = MockXet::new();
+    xet.add_file("h1", &content);
+    let (rt, vfs) = vfs_sparse(&hub, &xet);
+
+    rt.block_on(async {
+        let ino = vfs.lookup(ROOT_INODE, "file.bin").await.unwrap().ino;
+
+        // 1. open(O_TRUNC): logically empties the file, clears sparse_write,
+        //    but keeps xet_hash = "h1".
+        let fh1 = vfs.open(ino, true, true, None).await.unwrap();
+        // 2. write fresh bytes while sparse_write is None (untracked).
+        write_blocking(&vfs, ino, fh1, 0, b"NEWDATA").await.unwrap();
+
+        // 3. reopen WITHOUT O_TRUNC, before the flush fires (fh1 held open keeps
+        //    the inode dirty deterministically).
+        let fh2 = vfs.open(ino, true, false, None).await.unwrap();
+
+        // 4. a read through the reopened handle must return the user's bytes,
+        //    not the resurrected original CAS content.
+        let (data, _) = vfs.read(fh2, 0, 7).await.unwrap();
+        assert_eq!(
+            &data[..],
+            b"NEWDATA",
+            "reopen must not overlay original CAS bytes over the write"
+        );
+
+        vfs.release(fh2).await.unwrap();
+        vfs.release(fh1).await.unwrap();
+
+        // 5. the flush must commit the user's content, not no-op back to h1.
+        wait_for_clean(&vfs, ino).await;
+        let new_hash = {
+            let inodes = vfs.inode_table.read().unwrap();
+            inodes.get(ino).unwrap().xet_hash.clone().unwrap()
+        };
+        assert_ne!(new_hash, "h1", "flush must not preserve the original hash");
+        assert_eq!(
+            xet_content(&xet, &new_hash),
+            Some(b"NEWDATA".to_vec()),
+            "committed CAS content must be exactly the user's write"
+        );
+    });
+}
+
+// ── Flush batch failure isolation ──────────────────────────────────────
+//
+// flush_batch processes sparse items in Pass A (per-item range_upload) and
+// non-sparse items in Pass B (batched upload_files). A failure in one item
+// must not pollute or block sibling items: the failing inode stays dirty and
+// retries on the next flush, every other inode commits independently.
+
+/// Regression for the Pass A fan-out bug: when a sparse range_upload failed,
+/// the error was attributed to *every* item in to_flush — including non-sparse
+/// items that Pass B had not even attempted yet. After the fix only the failing
+/// sparse inode is marked errored; the non-sparse sibling commits cleanly.
+#[test]
+fn flush_pass_a_failure_does_not_pollute_non_sparse_sibling() {
+    let hub = MockHub::new();
+    let original: Vec<u8> = (0u8..40).collect();
+    hub.add_file("sparse.bin", original.len() as u64, Some("h_sparse"), None);
+    let xet = MockXet::new();
+    xet.add_file("h_sparse", &original);
+    let (rt, vfs) = vfs_sparse(&hub, &xet);
+
+    rt.block_on(async {
+        // ino1: existing remote file → sparse path (Pass A).
+        let ino1 = vfs.lookup(ROOT_INODE, "sparse.bin").await.unwrap().ino;
+        let fh1 = vfs.open(ino1, true, false, None).await.unwrap();
+        write_blocking(&vfs, ino1, fh1, 5, b"ZZZZ").await.unwrap();
+
+        // ino2: freshly created file with no remote hash → non-sparse (Pass B).
+        let (attr2, fh2) = vfs
+            .create(ROOT_INODE, "fresh.bin", 0o644, 1000, 1000, None)
+            .await
+            .unwrap();
+        let ino2 = attr2.ino;
+        write_blocking(&vfs, ino2, fh2, 0, b"hello world").await.unwrap();
+
+        // Arm the one-shot failure: the next sparse range_upload (Pass A on
+        // ino1) fails; the upload_files in Pass B for ino2 succeeds because
+        // fail_upload has already been consumed.
+        xet.fail_upload();
+
+        vfs.release(fh1).await.unwrap();
+        vfs.release(fh2).await.unwrap();
+
+        // Give the debounce + retries time to settle. ino2 commits on the
+        // first batch; ino1 stays dirty (will retry on subsequent flushes).
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        let fm = vfs.flush_manager.as_ref().unwrap();
+        // ino1 must carry the range_upload failure.
+        let err1 = fm.check_error(ino1);
+        assert!(
+            err1.as_deref().is_some_and(|m| m.contains("range_upload failed")),
+            "ino1 should be marked range_upload failed, got {err1:?}"
+        );
+        // ino2 must NOT be falsely marked. Before the fix it inherited the
+        // sparse failure even though Pass B uploaded its content cleanly.
+        assert!(
+            fm.check_error(ino2).is_none(),
+            "ino2 went through a successful upload_files and must not carry the sibling's error"
+        );
+        // And ino2 must actually be clean (committed).
+        assert!(
+            !vfs.inode_table.read().unwrap().get(ino2).unwrap().is_dirty(),
+            "ino2 must be clean after a successful Pass B commit, regardless of Pass A's failure"
+        );
+    });
+
+    vfs.shutdown();
+}
+
+/// Regression for head-of-line blocking in Pass A: a failed sparse upload used
+/// to abort the entire pass with an early return, starving independent sparse
+/// items behind it. After the fix Pass A continues; each sparse item has its
+/// own success/failure outcome.
+#[test]
+fn flush_pass_a_failure_does_not_block_independent_sparse_items() {
+    let hub = MockHub::new();
+    let content_a: Vec<u8> = (0u8..30).collect();
+    let content_b: Vec<u8> = (50u8..90).collect();
+    hub.add_file("a.bin", content_a.len() as u64, Some("h_a"), None);
+    hub.add_file("b.bin", content_b.len() as u64, Some("h_b"), None);
+    let xet = MockXet::new();
+    xet.add_file("h_a", &content_a);
+    xet.add_file("h_b", &content_b);
+    let (rt, vfs) = vfs_sparse(&hub, &xet);
+
+    rt.block_on(async {
+        let ino_a = vfs.lookup(ROOT_INODE, "a.bin").await.unwrap().ino;
+        let ino_b = vfs.lookup(ROOT_INODE, "b.bin").await.unwrap().ino;
+
+        let fh_a = vfs.open(ino_a, true, false, None).await.unwrap();
+        write_blocking(&vfs, ino_a, fh_a, 0, b"AAAA").await.unwrap();
+        let fh_b = vfs.open(ino_b, true, false, None).await.unwrap();
+        write_blocking(&vfs, ino_b, fh_b, 0, b"BBBB").await.unwrap();
+
+        // Only the first range_upload in the Pass A loop fails.
+        xet.fail_upload();
+        vfs.release(fh_a).await.unwrap();
+        vfs.release(fh_b).await.unwrap();
+
+        // Wait for the batch to settle (the failed inode does not retry within
+        // this window — the failure is sticky for one debounce cycle).
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        // Exactly one of {a, b} must be clean (the one whose range_upload
+        // succeeded) and the other must still be dirty. Before the fix neither
+        // would be clean because the early return killed Pass A entirely.
+        let (a_dirty, b_dirty) = {
+            let inodes = vfs.inode_table.read().unwrap();
+            (
+                inodes.get(ino_a).unwrap().is_dirty(),
+                inodes.get(ino_b).unwrap().is_dirty(),
+            )
+        };
+        assert!(
+            a_dirty ^ b_dirty,
+            "exactly one sibling must commit; got a_dirty={a_dirty} b_dirty={b_dirty}"
+        );
+    });
+
+    vfs.shutdown();
+}
+
+// ── Sparse smoke / edge cases ───────────────────────────────────────────
+
+/// Write that lands EXACTLY at EOF (no zero gap, no overlap) extends the file
+/// by the write length. Coverage/dirty must merge with any pre-EOF coverage
+/// instead of leaving a phantom seam at the boundary.
+#[test]
+fn sparse_write_at_eof_boundary_extends_cleanly() {
+    let hub = MockHub::new();
+    let content: Vec<u8> = (0u8..10).collect();
+    hub.add_file("file.bin", 10, Some("h1"), None);
+    let xet = MockXet::new();
+    xet.add_file("h1", &content);
+    let (rt, vfs) = vfs_sparse(&hub, &xet);
+
+    rt.block_on(async {
+        let ino = vfs.lookup(ROOT_INODE, "file.bin").await.unwrap().ino;
+        let fh = vfs.open(ino, true, false, None).await.unwrap();
+        // Write at offset 10 (current EOF), 5 bytes. No gap, no overlap.
+        write_blocking(&vfs, ino, fh, 10, b"EDGE!").await.unwrap();
+
+        // Reading across the boundary must stitch CAS bytes [0..10) and the
+        // user's bytes [10..15) into one continuous response.
+        let (data, _) = vfs.read(fh, 7, 8).await.unwrap();
+        assert_eq!(&data[..], b"\x07\x08\x09EDGE!", "read across the EOF seam");
+
+        // Dirty range covers exactly the extension — no spurious zero-gap.
+        {
+            let inodes = vfs.inode_table.read().unwrap();
+            let sw = inodes.get(ino).unwrap().sparse_write.as_ref().unwrap().clone();
+            assert_eq!(sw.dirty_ranges, vec![(10, 15)]);
+        }
+
+        vfs.release(fh).await.unwrap();
+        wait_for_clean(&vfs, ino).await;
+        let new_hash = vfs
+            .inode_table
+            .read()
+            .unwrap()
+            .get(ino)
+            .unwrap()
+            .xet_hash
+            .clone()
+            .unwrap();
+        let mut expected = content.clone();
+        expected.extend_from_slice(b"EDGE!");
+        assert_eq!(xet_content(&xet, &new_hash), Some(expected));
+    });
+}
+
+/// Setattr-shrink to a size INSIDE an existing dirty range must clip the dirty
+/// range, not drop it entirely. The flushed CAS file then contains the head of
+/// the user's write, truncated at the new size.
+#[test]
+fn sparse_setattr_shrink_inside_dirty_range_keeps_clipped_writes() {
+    let hub = MockHub::new();
+    let original: Vec<u8> = (0u8..100).collect();
+    hub.add_file("file.bin", original.len() as u64, Some("h1"), None);
+    let xet = MockXet::new();
+    xet.add_file("h1", &original);
+    let (rt, vfs) = vfs_sparse(&hub, &xet);
+
+    rt.block_on(async {
+        let ino = vfs.lookup(ROOT_INODE, "file.bin").await.unwrap().ino;
+        let fh = vfs.open(ino, true, false, None).await.unwrap();
+        // Write [40, 70) = 30 bytes of 'X'.
+        write_blocking(&vfs, ino, fh, 40, &[b'X'; 30]).await.unwrap();
+        vfs.release(fh).await.unwrap();
+
+        // Shrink to 55 — slices through the middle of the dirty range. The
+        // committed file must be original[..40] + 'X' * 15.
+        vfs.setattr(ino, Some(55), None, None, None, None, None).await.unwrap();
+        wait_for_clean(&vfs, ino).await;
+
+        let new_hash = vfs
+            .inode_table
+            .read()
+            .unwrap()
+            .get(ino)
+            .unwrap()
+            .xet_hash
+            .clone()
+            .unwrap();
+        let mut expected = original[..40].to_vec();
+        expected.extend(std::iter::repeat_n(b'X', 15));
+        assert_eq!(
+            xet_content(&xet, &new_hash),
+            Some(expected),
+            "shrink cutting through a dirty range must keep the clipped prefix"
+        );
+    });
+}
+
+/// Zero-length write to a sparse file is a no-op: must not mark dirty, must not
+/// add to coverage or dirty_ranges, must not extend the file. Defensive smoke
+/// test — kernel typically filters these but FUSE/NFS handlers don't always.
+#[test]
+fn sparse_zero_length_write_is_a_noop() {
+    let hub = MockHub::new();
+    let content: Vec<u8> = (0u8..20).collect();
+    hub.add_file("file.bin", 20, Some("h1"), None);
+    let xet = MockXet::new();
+    xet.add_file("h1", &content);
+    let (rt, vfs) = vfs_sparse(&hub, &xet);
+
+    rt.block_on(async {
+        let ino = vfs.lookup(ROOT_INODE, "file.bin").await.unwrap().ino;
+        let fh = vfs.open(ino, true, false, None).await.unwrap();
+        let n = write_blocking(&vfs, ino, fh, 5, b"").await.unwrap();
+        assert_eq!(n, 0);
+
+        let inodes = vfs.inode_table.read().unwrap();
+        let entry = inodes.get(ino).unwrap();
+        // pwrite of zero bytes still bumps mtime/dirty per POSIX, but the
+        // tracked dirty range must be empty (no zero-length entries leaking).
+        if let Some(sw) = entry.sparse_write.as_ref() {
+            assert!(
+                sw.dirty_ranges.is_empty(),
+                "zero-length write must not create a dirty range, got {:?}",
+                sw.dirty_ranges
+            );
+        }
+        assert_eq!(entry.size, 20, "zero-length write must not change size");
+    });
+}
+
+/// Regression for the Pass B over-marking bug: when a Pass B (`upload_files`)
+/// failure aborts the batch, sparse items whose Pass A `range_upload` already
+/// succeeded used to be flagged with the Pass B error in `flush_errors`. A
+/// follow-up fsync on the sparse item would return EIO claiming "upload
+/// failed" even though its CAS xorb had been uploaded cleanly. After the fix,
+/// only items without an upload_result entry (Pass A failures + items the
+/// early return skipped) are marked.
+#[test]
+fn flush_pass_b_failure_preserves_pass_a_sparse_success() {
+    let hub = MockHub::new();
+    let original: Vec<u8> = (0u8..40).collect();
+    hub.add_file("sparse.bin", original.len() as u64, Some("h_sparse"), None);
+    let xet = MockXet::new();
+    xet.add_file("h_sparse", &original);
+    let (rt, vfs) = vfs_sparse(&hub, &xet);
+
+    rt.block_on(async {
+        // ino_sparse: existing remote file → Pass A (range_upload succeeds).
+        let ino_sparse = vfs.lookup(ROOT_INODE, "sparse.bin").await.unwrap().ino;
+        let fh_sparse = vfs.open(ino_sparse, true, false, None).await.unwrap();
+        write_blocking(&vfs, ino_sparse, fh_sparse, 5, b"ZZZZ").await.unwrap();
+
+        // ino_regular: newly created → Pass B (upload_files fails).
+        let (attr_regular, fh_regular) = vfs
+            .create(ROOT_INODE, "fresh.bin", 0o644, 1000, 1000, None)
+            .await
+            .unwrap();
+        let ino_regular = attr_regular.ino;
+        write_blocking(&vfs, ino_regular, fh_regular, 0, b"hello world")
+            .await
+            .unwrap();
+
+        // Fail ONLY Pass B (upload_files) — Pass A's range_upload still succeeds.
+        xet.fail_next_upload_files();
+
+        vfs.release(fh_sparse).await.unwrap();
+        vfs.release(fh_regular).await.unwrap();
+
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        let fm = vfs.flush_manager.as_ref().unwrap();
+        // ino_sparse uploaded cleanly in Pass A; its CAS xorb is durable. It
+        // stayed dirty because the batch's Hub commit was aborted, and the
+        // next flush will retry the commit, but fsync must NOT surface a
+        // misleading "upload failed" for it.
+        let err_sparse = fm.check_error(ino_sparse);
+        assert!(
+            err_sparse.is_none(),
+            "sparse Pass A success must not inherit the Pass B failure, got {err_sparse:?}"
+        );
+        // ino_regular is the one that actually failed in Pass B; its error
+        // must surface so fsync returns EIO for the caller.
+        let err_regular = fm.check_error(ino_regular);
+        assert!(
+            err_regular.as_deref().is_some_and(|m| m.contains("upload failed")),
+            "regular Pass B failure must be surfaced, got {err_regular:?}"
+        );
+    });
+
+    vfs.shutdown();
+}
+
+/// Regression for `touch_commit_clocks` being stamped on a dirty_generation
+/// mismatch: a concurrent writer that bumps the generation between flush
+/// snapshot and `apply_commit_sparse` used to still see `last_revalidated =
+/// now` written, which lets a subsequent `lookup()` skip HEAD revalidation
+/// for metadata_ttl seconds even though nothing was committed for this
+/// generation. Mtime/ctime were also overwritten to "now" while the inode
+/// was still dirty with the racing writer's bytes.
+///
+/// After the fix, all three clock fields (mtime, ctime, last_revalidated)
+/// stay untouched on a generation mismatch — only the racing-writer-newer
+/// content remains dirty and revalidation is not silenced.
+#[test]
+fn apply_commit_sparse_mismatch_does_not_stamp_clocks() {
+    use std::time::Instant;
+    let hub = MockHub::new();
+    let original: Vec<u8> = (0u8..20).collect();
+    hub.add_file("file.bin", 20, Some("h1"), None);
+    let xet = MockXet::new();
+    xet.add_file("h1", &original);
+    let (rt, vfs) = vfs_sparse(&hub, &xet);
+
+    rt.block_on(async {
+        let ino = vfs.lookup(ROOT_INODE, "file.bin").await.unwrap().ino;
+        let fh = vfs.open(ino, true, false, None).await.unwrap();
+        write_blocking(&vfs, ino, fh, 0, b"AAA").await.unwrap();
+
+        // Snapshot the pre-commit clocks BEFORE simulating the mismatch so we
+        // can assert nothing moved on the rejected path.
+        let (mtime_before, ctime_before, lastrev_before, gen_before) = {
+            let inodes = vfs.inode_table.read().unwrap();
+            let entry = inodes.get(ino).unwrap();
+            (entry.mtime, entry.ctime, entry.last_revalidated, entry.dirty_generation)
+        };
+
+        // Tiny sleep so any wrongly-bumped `Instant::now()` would differ from
+        // the snapshot (otherwise the assert is flaky on fast machines).
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // Simulate a generation mismatch: invoke apply_commit_sparse with a
+        // generation that is NOT the current one. This mirrors the race where
+        // the flusher snapshotted gen=N but a concurrent pwrite bumped to N+1
+        // before commit. clear_dirty_if returns false → no fields applied.
+        {
+            let mut inodes = vfs.inode_table.write().unwrap();
+            let entry = inodes.get_mut(ino).unwrap();
+            let stale_gen = gen_before.wrapping_sub(1); // any value != gen_before
+            entry.apply_commit_sparse("hX", 50, stale_gen);
+        }
+
+        let (mtime_after, ctime_after, lastrev_after) = {
+            let inodes = vfs.inode_table.read().unwrap();
+            let entry = inodes.get(ino).unwrap();
+            (entry.mtime, entry.ctime, entry.last_revalidated)
+        };
+
+        assert_eq!(mtime_before, mtime_after, "mtime must not bump on generation mismatch");
+        assert_eq!(ctime_before, ctime_after, "ctime must not bump on generation mismatch");
+        assert_eq!(
+            lastrev_before, lastrev_after,
+            "last_revalidated must not be stamped on a rejected commit, otherwise lookup skips HEAD revalidation while the inode is still dirty"
+        );
+
+        // Sanity: the inode should still be dirty (the racing writer's content
+        // hasn't been committed). Clean up so the test doesn't hang on the
+        // background flush retrying.
+        assert!(vfs.inode_table.read().unwrap().get(ino).unwrap().is_dirty());
+        let _ = Instant::now();
+
+        vfs.release(fh).await.unwrap();
+    });
+
+    vfs.shutdown();
+}
+
+/// Regression for the zero-byte pwrite-past-EOF stuck-dirty bug: a write
+/// with `data.len() == 0` (reachable via custom FUSE clients, NFS re-exports,
+/// or test harnesses that bypass the kernel's VFS short-circuit) must NOT
+/// extend entry.size, mark the inode dirty, or track sparse coverage. Before
+/// the fix, the code unconditionally computed `new_end = offset + 0` and
+/// bumped entry.size past the on-disk staging length; snapshot_dirty_bytes
+/// then hit UnexpectedEof on every flush retry and the inode stayed
+/// permanently dirty with fsync returning EIO forever.
+#[test]
+fn write_zero_bytes_past_eof_is_a_noop() {
+    let hub = MockHub::new();
+    let original: Vec<u8> = (0u8..10).collect();
+    hub.add_file("file.bin", 10, Some("h1"), None);
+    let xet = MockXet::new();
+    xet.add_file("h1", &original);
+    let (rt, vfs) = vfs_sparse(&hub, &xet);
+
+    rt.block_on(async {
+        let ino = vfs.lookup(ROOT_INODE, "file.bin").await.unwrap().ino;
+        let fh = vfs.open(ino, true, false, None).await.unwrap();
+        assert_eq!(vfs.inode_table.read().unwrap().get(ino).unwrap().size, 10);
+
+        // Zero-byte write past EOF (offset > size). Before the fix, the code
+        // bumped entry.size to offset (50) while the on-disk staging stayed
+        // at 10 bytes; the next flush snapshot_dirty_bytes would then hit
+        // UnexpectedEof and the inode would be stuck dirty forever. The fix
+        // gates the size bump + dirty + sparse-track on `written > 0`.
+        let written = write_blocking(&vfs, ino, fh, 50, b"").await.unwrap();
+        assert_eq!(written, 0, "pwrite of empty slice returns 0");
+
+        let size_after = vfs.inode_table.read().unwrap().get(ino).unwrap().size;
+        assert_eq!(size_after, 10, "zero-byte write past EOF must not extend size");
+
+        // The actual cure: a subsequent flush of any concurrent dirty work
+        // must succeed (no UnexpectedEof from snapshot_dirty_bytes). Issue a
+        // real one-byte write to dirty the inode legitimately, then verify
+        // it commits cleanly — the zero-byte write didn't poison the staging
+        // file invariant.
+        write_blocking(&vfs, ino, fh, 0, b"X").await.unwrap();
+        vfs.release(fh).await.unwrap();
+        wait_for_clean(&vfs, ino).await;
+    });
+
+    vfs.shutdown();
+}
+
+// ── Backports from feat/append-write (PR #41) ───────────────────────────
+//
+// These tests target invariants that the rewrite preserves but which were
+// not previously exercised end-to-end. Names kept close to the originals
+// for cross-referencing during the rewrite review.
+
+/// Post a sparse flush, the reader must see committed CAS bytes for the
+/// holes outside the modified window, NOT the staging zeros. This pins the
+/// post-`apply_commit_sparse` invariant: sparse_write stays installed
+/// (rekeyed to the new hash), `dirty_ranges` is cleared, `staging_is_current`
+/// remains false because the staging file still has unmaterialised holes,
+/// and a read fills those holes from the JUST-committed CAS file.
+///
+/// Backport of `sparse_post_flush_read_returns_cas_bytes_not_zeros` from
+/// PR #41.
+#[test]
+fn sparse_post_flush_read_returns_cas_bytes_not_zeros() {
+    let hub = MockHub::new();
+    hub.add_file("file.txt", 10, Some("orig_hash"), None);
+    let xet = MockXet::new();
+    xet.add_file("orig_hash", b"0123456789");
+    let (rt, vfs) = vfs_sparse(&hub, &xet);
+
+    rt.block_on(async {
+        let attr = vfs.lookup(ROOT_INODE, "file.txt").await.unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open(ino, true, false, None).await.unwrap();
+
+        // Dirty a small window in the middle of the file. Staging now holds
+        // zeros everywhere except "XX" at [2..4); the rest are sparse holes.
+        write_blocking(&vfs, ino, fh, 2, b"XX").await.unwrap();
+
+        vfs.fsync(ino, fh, None).await.unwrap();
+        wait_for_clean(&vfs, ino).await;
+
+        // Post-`apply_commit_sparse` shape: dirty cleared, sparse_write
+        // preserved (rekeyed to new hash), staging not flagged current
+        // because holes remain unmaterialised.
+        {
+            let inodes = vfs.inode_table.read().unwrap();
+            let entry = inodes.get(ino).unwrap();
+            assert!(
+                !entry.staging_is_current,
+                "staging must not be flagged current after a sparse flush — \
+                 holes still need CAS fill"
+            );
+            let sw = entry
+                .sparse_write
+                .as_ref()
+                .expect("sparse_write must persist after sparse flush so reads can fill holes");
+            assert!(sw.dirty_ranges.is_empty(), "fresh sparse state has no dirty ranges");
+            assert_eq!(sw.original_size, 10);
+        }
+
+        // The actual regression target: bytes the user never wrote must come
+        // back from the newly-committed CAS file, not zero-filled staging
+        // holes. Pre-fix this returned "00XX000000" because sparse_write was
+        // dropped and the reader hit raw staging zeros.
+        let (data, _) = vfs.read(fh, 0, 10).await.unwrap();
+        assert_eq!(
+            &data[..],
+            b"01XX456789",
+            "post-flush read on open handle must return composed CAS bytes, not staging zeros"
+        );
+
+        vfs.release(fh).await.unwrap();
+    });
+
+    vfs.shutdown();
+}
+
+/// A CAS stream that yields zero bytes for a non-empty hole range must
+/// surface EIO from `fill_sparse_holes`, NOT panic on an OOB
+/// `copy_from_slice` when overlaying empty fetched data onto the read buf.
+///
+/// Backport of `repro_fill_sparse_holes_panics_on_short_cas_stream` from
+/// PR #41.
+#[test]
+fn sparse_fill_short_cas_stream_returns_eio_not_panic() {
+    let hub = MockHub::new();
+    let content = b"0123456789";
+    hub.add_file("file.txt", content.len() as u64, Some("orig_hash"), None);
+    let xet = MockXet::new();
+    xet.add_file("orig_hash", content);
+    let (rt, vfs) = vfs_sparse(&hub, &xet);
+
+    rt.block_on(async {
+        let attr = vfs.lookup(ROOT_INODE, "file.txt").await.unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open(ino, true, false, None).await.unwrap();
+
+        // Next CAS download returns an empty stream. fill_sparse_holes
+        // requests bytes for the full sparse window [0..10) but receives 0
+        // bytes — must error out cleanly rather than OOB-slicing.
+        xet.empty_range_downloads(1);
+
+        let result = vfs.read(fh, 0, 10).await;
+        assert_eq!(
+            result.err(),
+            Some(libc::EIO),
+            "short CAS stream must surface EIO, not panic or return zeros"
+        );
+
+        vfs.release(fh).await.unwrap();
+    });
+
+    vfs.shutdown();
+}
+
+/// Even when a sparse flush is a no-op (hash unchanged), the inode's mtime
+/// must advance — fsync semantics require the modification time reflect the
+/// completed write cycle. `apply_noop_commit` calls `touch_commit_clocks`
+/// to ensure this.
+///
+/// Backport of `repro_noop_flush_does_not_bump_mtime` from PR #41
+/// (test name is awkward but the assert is "mtime DOES advance").
+#[test]
+fn sparse_noop_flush_advances_mtime() {
+    let hub = MockHub::new();
+    hub.add_file("file.txt", 10, Some("orig_hash"), None);
+    let xet = MockXet::new();
+    xet.add_file("orig_hash", b"0123456789");
+    let (rt, vfs) = vfs_sparse(&hub, &xet);
+
+    rt.block_on(async {
+        let attr = vfs.lookup(ROOT_INODE, "file.txt").await.unwrap();
+        let ino = attr.ino;
+        let mtime_before = vfs.inode_table.read().unwrap().get(ino).unwrap().mtime;
+
+        // Sleep long enough that any clock bump is observable. SystemTime
+        // resolution is sub-millisecond but the assertion uses strict >.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Open writable, fsync, release — no actual writes, so the flush is
+        // a no-op (xet_hash unchanged). The dirty bit is still set by open,
+        // so the flush manager runs a real flush cycle and ends up in
+        // `apply_noop_commit`.
+        let fh = vfs.open(ino, true, false, None).await.unwrap();
+        vfs.fsync(ino, fh, None).await.unwrap();
+        vfs.release(fh).await.unwrap();
+        wait_for_clean(&vfs, ino).await;
+
+        let mtime_after = vfs.inode_table.read().unwrap().get(ino).unwrap().mtime;
+        assert!(
+            mtime_after > mtime_before,
+            "mtime must advance after a dirty open + flush cycle even on a no-op upload \
+             (was {mtime_before:?}, still {mtime_after:?})"
+        );
+    });
+
+    vfs.shutdown();
+}
+
+// ── Sparse-write stress test ────────────────────────────────────────────
+//
+// A multi-worker workload that exercises the sparse-write state machine
+// (coverage map, dirty_ranges, dirty_generation, drift handling, io_lock
+// discipline) under concurrent ops on multiple files. Each worker owns its
+// own file (no cross-worker shadow races), but flushes happen against a
+// shared FlushManager → Pass A/B batching, lock map churn, and concurrent
+// staging-file lifecycles get exercised for real.
+//
+// What the random ops cover, by construction:
+// - in-file overwrite (offset < EOF, end <= EOF)
+// - write spanning EOF (offset < EOF < end)
+// - write at EOF (offset == EOF)
+// - write past EOF (offset > EOF) → the zero-fill gap
+// - setattr-grow (zero-fill tail)
+// - setattr-shrink (clip coverage + dirty)
+// - setattr-shrink-then-grow (must re-zero, not stale)
+// - reopen (sparse_write preservation + drift retry)
+// - fsync (force apply_commit_sparse cycle)
+// - reads at random offsets (exercises fill_sparse_holes + cache)
+//
+// Validation: shadow Vec<u8> per file mirroring the expected content; after
+// every committed state (fsync or release+wait_for_clean), a full-file read
+// of the inode must match the shadow byte for byte. A divergence proves
+// data loss or corruption.
+
+const STRESS_FILES: usize = 12;
+const STRESS_OPS_PER_FILE: usize = 200;
+const STRESS_BASE_SIZE: usize = 4096;
+const STRESS_MAX_SIZE: usize = 64 * 1024;
+
+#[derive(Debug, Clone, Copy)]
+enum StressOp {
+    Write {
+        offset: usize,
+        len: usize,
+    },
+    SetattrGrow {
+        delta: usize,
+    },
+    SetattrShrink {
+        delta: usize,
+    },
+    Fsync,
+    Reopen,
+    VerifyRead,
+    /// Simulate a poll-induced remote rotation: while the worker's inode is
+    /// clean, swap the remote content for a freshly-generated blob and call
+    /// `update_remote_file` so a subsequent reopen sees the new revision. The
+    /// worker's shadow is updated to match the new remote content so the
+    /// final CAS-level verify can still catch any data loss along the way.
+    RogueRotation {
+        new_size: usize,
+    },
+}
+
+struct StressRng(u64);
+impl StressRng {
+    fn new(seed: u64) -> Self {
+        Self(seed | 1)
+    }
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+    fn rand_byte(&mut self) -> u8 {
+        self.next() as u8
+    }
+    fn rand_range(&mut self, hi: usize) -> usize {
+        if hi == 0 { 0 } else { (self.next() as usize) % hi }
+    }
+}
+
+fn gen_stress_op(rng: &mut StressRng, current_size: usize) -> StressOp {
+    let pick = rng.next() % 100;
+    match pick {
+        // 50% writes biased toward useful edge cases
+        0..=49 => {
+            let kind = rng.next() % 5;
+            let (offset, len) = match kind {
+                // in-file overwrite
+                0 if current_size >= 2 => {
+                    let len = 1 + rng.rand_range(current_size.min(1024));
+                    let offset = rng.rand_range(current_size.saturating_sub(len).max(1));
+                    (offset, len)
+                }
+                // write spanning EOF (offset < size, end > size)
+                1 if current_size >= 2 => {
+                    let offset = rng.rand_range(current_size);
+                    let len = (current_size - offset) + 1 + rng.rand_range(1024);
+                    (offset, len)
+                }
+                // write at exactly EOF
+                2 => (current_size, 1 + rng.rand_range(1024)),
+                // write past EOF with gap
+                3 => {
+                    let gap = 1 + rng.rand_range(2048);
+                    let offset = current_size + gap;
+                    let len = 1 + rng.rand_range(1024);
+                    (offset, len)
+                }
+                // any random offset+len
+                _ => {
+                    let offset = rng.rand_range(STRESS_MAX_SIZE.saturating_sub(1));
+                    let len = 1 + rng.rand_range(2048);
+                    (offset, len)
+                }
+            };
+            let len = len.min(STRESS_MAX_SIZE.saturating_sub(offset));
+            if len == 0 || offset >= STRESS_MAX_SIZE {
+                StressOp::VerifyRead
+            } else {
+                StressOp::Write { offset, len }
+            }
+        }
+        // 15% setattr-grow
+        50..=64 => StressOp::SetattrGrow {
+            delta: 1 + rng.rand_range(4096),
+        },
+        // 15% setattr-shrink
+        65..=79 if current_size > 1 => StressOp::SetattrShrink {
+            delta: 1 + rng.rand_range(current_size - 1),
+        },
+        // 10% fsync (force flush + apply_commit_sparse cycle)
+        80..=87 => StressOp::Fsync,
+        // 5% reopen
+        88..=92 => StressOp::Reopen,
+        // 4% rogue remote rotation (only fires when the worker happens to be
+        // clean — see the impl); the new remote size is chosen here, but the
+        // actual rotation depends on the inode being clean at apply time.
+        93..=96 => StressOp::RogueRotation {
+            new_size: 1 + rng.rand_range(STRESS_MAX_SIZE - 1),
+        },
+        // remainder + fallback for invalid shrink: verification read
+        _ => StressOp::VerifyRead,
+    }
+}
+
+async fn read_full(vfs: &std::sync::Arc<VirtualFs>, ino: u64, size: u64) -> Vec<u8> {
+    if size == 0 {
+        return Vec::new();
+    }
+    // Read in chunks of 16 KB to mirror real FUSE behaviour.
+    let fh = vfs.open(ino, false, false, None).await.expect("open ro");
+    let mut out = Vec::with_capacity(size as usize);
+    let chunk: u32 = 16 * 1024;
+    let mut off: u64 = 0;
+    while off < size {
+        let want = chunk.min((size - off) as u32);
+        let (bytes, _eof) = vfs.read(fh, off, want).await.expect("read");
+        if bytes.is_empty() {
+            break;
+        }
+        out.extend_from_slice(&bytes);
+        off += bytes.len() as u64;
+    }
+    vfs.release(fh).await.expect("release ro");
+    out
+}
+
+async fn run_stress_worker(
+    vfs: std::sync::Arc<VirtualFs>,
+    xet: std::sync::Arc<MockXet>,
+    path: String,
+    seed: u64,
+    base: Vec<u8>,
+    n_ops: usize,
+) -> Result<(), String> {
+    let mut shadow = base.clone();
+    let mut rng = StressRng::new(seed);
+
+    let ino = vfs
+        .lookup(ROOT_INODE, &path)
+        .await
+        .map_err(|e| format!("[{path}] initial lookup: {e}"))?
+        .ino;
+
+    let mut fh = vfs
+        .open(ino, true, false, None)
+        .await
+        .map_err(|e| format!("[{path}] initial open: {e}"))?;
+
+    for op_idx in 0..n_ops {
+        let op = gen_stress_op(&mut rng, shadow.len());
+        match op {
+            StressOp::Write { offset, len } => {
+                let buf: Vec<u8> = (0..len).map(|_| rng.rand_byte()).collect();
+                let written = write_blocking(&vfs, ino, fh, offset as u64, &buf)
+                    .await
+                    .map_err(|e| format!("[{path}] op {op_idx} write({offset},{len}): {e}"))?;
+                // Mirror in shadow. The pwrite may have written fewer bytes
+                // than asked, but in practice on a regular file it writes
+                // all or errors — defend just in case.
+                let actual_len = written as usize;
+                if offset > shadow.len() {
+                    shadow.resize(offset, 0);
+                }
+                let end = offset + actual_len;
+                if shadow.len() < end {
+                    shadow.resize(end, 0);
+                }
+                shadow[offset..end].copy_from_slice(&buf[..actual_len]);
+            }
+            StressOp::SetattrGrow { delta } => {
+                let new_size = (shadow.len() + delta).min(STRESS_MAX_SIZE);
+                if new_size == shadow.len() {
+                    continue;
+                }
+                vfs.setattr(ino, Some(new_size as u64), None, None, None, None, None)
+                    .await
+                    .map_err(|e| format!("[{path}] op {op_idx} setattr_grow({new_size}): {e}"))?;
+                shadow.resize(new_size, 0);
+            }
+            StressOp::SetattrShrink { delta } => {
+                if shadow.len() <= 1 {
+                    continue;
+                }
+                let new_size = shadow.len().saturating_sub(delta).max(1);
+                vfs.setattr(ino, Some(new_size as u64), None, None, None, None, None)
+                    .await
+                    .map_err(|e| format!("[{path}] op {op_idx} setattr_shrink({new_size}): {e}"))?;
+                shadow.truncate(new_size);
+            }
+            StressOp::Fsync => {
+                vfs.fsync(ino, fh, None)
+                    .await
+                    .map_err(|e| format!("[{path}] op {op_idx} fsync: {e}"))?;
+                // Best-effort wait for the debounced commit so the next
+                // verify-read can hit a clean inode. wait_for_clean blocks up
+                // to 4s and panics on timeout — too aggressive for stress, so
+                // just sleep a bit.
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            StressOp::Reopen => {
+                vfs.release(fh)
+                    .await
+                    .map_err(|e| format!("[{path}] op {op_idx} release-before-reopen: {e}"))?;
+                fh = vfs
+                    .open(ino, true, false, None)
+                    .await
+                    .map_err(|e| format!("[{path}] op {op_idx} reopen: {e}"))?;
+            }
+            StressOp::RogueRotation { new_size } => {
+                // Quiesce: fsync + wait clean, then drop the fd so the next
+                // reopen picks up the rotated state (update_remote_file
+                // refuses to rotate a dirty inode, so we MUST be clean here).
+                vfs.fsync(ino, fh, None)
+                    .await
+                    .map_err(|e| format!("[{path}] op {op_idx} rogue: fsync: {e}"))?;
+                vfs.release(fh)
+                    .await
+                    .map_err(|e| format!("[{path}] op {op_idx} rogue: pre-rotate release: {e}"))?;
+                wait_for_clean(&vfs, ino).await;
+
+                // Build new remote content + register it as a fresh CAS hash.
+                let new_content: Vec<u8> = (0..new_size).map(|_| rng.rand_byte()).collect();
+                let new_hash = format!("rogue_{path}_{op_idx}_{}", rng.next());
+                xet.add_file(&new_hash, &new_content);
+
+                // Apply the rotation. update_remote_file returns false if the
+                // inode is dirty — should never happen because we just
+                // quiesced, but handle defensively (skip the shadow update so
+                // we don't desync from the live state).
+                let rotated = {
+                    let mut inodes = vfs.inode_table.write().expect("inodes poisoned");
+                    inodes.update_remote_file(ino, Some(new_hash), None, new_size as u64, std::time::SystemTime::now())
+                };
+                if rotated {
+                    // Worker's view from the NEXT open onwards is the new
+                    // remote content — shadow must match for the post-op
+                    // verify reads and the final CAS-level check.
+                    shadow = new_content;
+                }
+
+                // Reopen to pick up the rotation. open_advanced_write detects
+                // the drift (sparse_write was keyed to the old hash) and
+                // rebuilds it against the new revision.
+                fh = vfs
+                    .open(ino, true, false, None)
+                    .await
+                    .map_err(|e| format!("[{path}] op {op_idx} rogue: reopen: {e}"))?;
+            }
+            StressOp::VerifyRead => {
+                // Read a random window and compare with shadow. Don't verify
+                // the full file mid-stream (too slow and the shadow is
+                // already mirroring every op) — just sanity-check a slice.
+                if shadow.is_empty() {
+                    continue;
+                }
+                let len = 1 + rng.rand_range(shadow.len().min(2048));
+                let offset = rng.rand_range(shadow.len() - 1);
+                let want = (len as u32).min((shadow.len() - offset) as u32);
+                let (bytes, _eof) = vfs
+                    .read(fh, offset as u64, want)
+                    .await
+                    .map_err(|e| format!("[{path}] op {op_idx} mid-stream read: {e}"))?;
+                let expected = &shadow[offset..offset + bytes.len()];
+                if bytes.as_ref() != expected {
+                    return Err(format!(
+                        "[{path}] op {op_idx} mid-stream read MISMATCH at offset {} (got {} bytes, expected {})\n  first diff at {:?}",
+                        offset,
+                        bytes.len(),
+                        expected.len(),
+                        bytes.iter().zip(expected.iter()).position(|(a, b)| a != b),
+                    ));
+                }
+            }
+        }
+    }
+
+    // Quiesce: release, wait for clean, then full-file CAS-level verify.
+    vfs.release(fh)
+        .await
+        .map_err(|e| format!("[{path}] final release: {e}"))?;
+    wait_for_clean(&vfs, ino).await;
+
+    let committed = read_full(&vfs, ino, shadow.len() as u64).await;
+    if committed != shadow {
+        return Err(format!(
+            "[{path}] FINAL CAS-LEVEL MISMATCH: committed_len={} shadow_len={} first_diff_at={:?}",
+            committed.len(),
+            shadow.len(),
+            committed.iter().zip(shadow.iter()).position(|(a, b)| a != b),
+        ));
+    }
+    Ok(())
+}
+
+/// Multi-worker stress test for the sparse-write feature. Each worker churns
+/// random ops on its own file; the global FlushManager batches across files
+/// so Pass A / Pass B / drift / lock-map paths all get exercised
+/// concurrently. The shadow model catches any data divergence — a single
+/// mismatch fails the test with the offending offset.
+///
+/// Default: 12 files × 200 ops, ~2-4 s wall time. Override with
+/// `STRESS_FILES` / `STRESS_OPS_PER_FILE` env vars for longer runs.
+#[test]
+fn sparse_writes_concurrent_stress() {
+    let n_files: usize = std::env::var("STRESS_FILES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(STRESS_FILES);
+    let ops_per_file: usize = std::env::var("STRESS_OPS_PER_FILE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(STRESS_OPS_PER_FILE);
+    let seed: u64 = std::env::var("STRESS_SEED")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos() as u64
+        });
+
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    let mut bases: Vec<(String, Vec<u8>)> = Vec::with_capacity(n_files);
+    for i in 0..n_files {
+        let path = format!("stress_{:03}.bin", i);
+        let base_size = STRESS_BASE_SIZE + (i * 32);
+        let mut base = vec![0u8; base_size];
+        for (j, b) in base.iter_mut().enumerate() {
+            *b = ((i * 31 + j) % 251) as u8;
+        }
+        let hash = format!("stress_h_{:03}", i);
+        hub.add_file(&path, base_size as u64, Some(&hash), None);
+        xet.add_file(&hash, &base);
+        bases.push((path, base));
+    }
+    let (rt, vfs) = vfs_sparse(&hub, &xet);
+
+    eprintln!("sparse_writes_concurrent_stress: {n_files} files, seed={seed}");
+
+    rt.block_on(async {
+        let mut handles = Vec::with_capacity(n_files);
+        for (i, (path, base)) in bases.into_iter().enumerate() {
+            let vfs = vfs.clone();
+            let xet = xet.clone();
+            let worker_seed = seed.wrapping_add(i as u64).wrapping_mul(0x9E3779B97F4A7C15);
+            handles.push(tokio::spawn(async move {
+                run_stress_worker(vfs, xet, path, worker_seed, base, ops_per_file).await
+            }));
+        }
+        let mut errors = Vec::new();
+        for h in handles {
+            match h.await.expect("worker panic") {
+                Ok(()) => {}
+                Err(e) => errors.push(e),
+            }
+        }
+        if !errors.is_empty() {
+            panic!(
+                "sparse-write stress FAILED ({} workers): seed={}\n{}",
+                errors.len(),
+                seed,
+                errors.join("\n  ")
+            );
+        }
+    });
+
+    vfs.shutdown();
+}
+
+// ── Same-inode concurrent stress ──────────────────────────────────────
+//
+// The cross-file stress above exercises the global FlushManager batching and
+// inter-inode locking. This variant pins all workers to a SINGLE inode so the
+// per-inode `io_lock`, sparse_write state machine, and dirty_generation guard
+// take the brunt of the contention — the paths that are easiest to get wrong
+// when multiple FUSE handles touch one file at the same time.
+//
+// Validation strategy is different from the cross-file stress: multiple
+// workers writing to overlapping offsets makes the final byte content
+// indeterminate (last-write-wins, but "last" depends on tokio scheduling).
+// So this is a FUZZ-style test rather than an equivalence test — the
+// pass condition is "no panic, no poison, no surprise EIO, and the inode's
+// sparse state remains internally consistent". We verify:
+//   1. No worker bubbles up an unexpected error (panics are fatal).
+//   2. After quiesce, sparse_write (if Some) satisfies its invariants:
+//      coverage sorted/non-overlapping, dirty_ranges ⊆ coverage, every
+//      range within [0, entry.size).
+//   3. A full-file read after quiesce returns exactly entry.size bytes
+//      without erroring.
+const SAME_INODE_WORKERS: usize = 8;
+const SAME_INODE_OPS_PER_WORKER: usize = 500;
+const SAME_INODE_BASE_SIZE: usize = 8192;
+
+/// Lightweight per-handle op generator: drop RogueRotation (requires global
+/// quiesce — incompatible with concurrent siblings on the same inode) and
+/// add a heavy Read mix so the pread + sparse-coverage snapshot path gets
+/// real contention.
+#[derive(Debug, Clone, Copy)]
+enum SameInodeOp {
+    Write { offset: usize, len: usize },
+    Read { offset: usize, len: usize },
+    SetattrGrow { delta: usize },
+    SetattrShrink { delta: usize },
+    Fsync,
+    Reopen,
+}
+
+fn gen_same_inode_op(rng: &mut StressRng, observed_size: usize) -> SameInodeOp {
+    let pick = rng.next() % 100;
+    match pick {
+        // 40% writes, sampled across overwrite / past-EOF / random
+        0..=39 => {
+            let kind = rng.next() % 4;
+            let (offset, len) = match kind {
+                0 if observed_size >= 2 => {
+                    let len = 1 + rng.rand_range(observed_size.min(1024));
+                    let offset = rng.rand_range(observed_size.saturating_sub(len).max(1));
+                    (offset, len)
+                }
+                1 => (observed_size, 1 + rng.rand_range(1024)),
+                2 => {
+                    let gap = 1 + rng.rand_range(2048);
+                    (observed_size + gap, 1 + rng.rand_range(1024))
+                }
+                _ => {
+                    let offset = rng.rand_range(STRESS_MAX_SIZE.saturating_sub(1));
+                    (offset, 1 + rng.rand_range(2048))
+                }
+            };
+            let len = len.min(STRESS_MAX_SIZE.saturating_sub(offset));
+            if len == 0 || offset >= STRESS_MAX_SIZE {
+                SameInodeOp::Read { offset: 0, len: 1 }
+            } else {
+                SameInodeOp::Write { offset, len }
+            }
+        }
+        // 35% reads — many small ones to thrash the io_lock + sparse-fill
+        40..=74 => {
+            if observed_size == 0 {
+                return SameInodeOp::Write {
+                    offset: 0,
+                    len: 1 + rng.rand_range(1024),
+                };
+            }
+            let len = 1 + rng.rand_range(observed_size.min(2048));
+            let offset = rng.rand_range(observed_size.saturating_sub(1).max(1));
+            SameInodeOp::Read { offset, len }
+        }
+        75..=84 => SameInodeOp::SetattrGrow {
+            delta: 1 + rng.rand_range(4096),
+        },
+        85..=92 if observed_size > 1 => SameInodeOp::SetattrShrink {
+            delta: 1 + rng.rand_range(observed_size - 1),
+        },
+        93..=96 => SameInodeOp::Fsync,
+        _ => SameInodeOp::Reopen,
+    }
+}
+
+async fn run_same_inode_worker(
+    vfs: std::sync::Arc<VirtualFs>,
+    ino: u64,
+    worker_id: usize,
+    seed: u64,
+    n_ops: usize,
+) -> Result<(), String> {
+    let mut rng = StressRng::new(seed);
+
+    let mut fh = vfs
+        .open(ino, true, false, None)
+        .await
+        .map_err(|e| format!("[w{worker_id}] initial open: {e}"))?;
+
+    for op_idx in 0..n_ops {
+        // Re-read entry.size each iteration: another worker may have just
+        // grown/shrunk it and the op generator needs a recent view.
+        let observed_size = {
+            let inodes = vfs.inode_table.read().expect("inodes poisoned");
+            inodes.get(ino).map(|e| e.size as usize).unwrap_or(0)
+        };
+        let op = gen_same_inode_op(&mut rng, observed_size);
+        match op {
+            SameInodeOp::Write { offset, len } => {
+                let buf: Vec<u8> = (0..len).map(|_| rng.rand_byte()).collect();
+                // ANY ok or controlled errno is accepted — the point is that
+                // the call doesn't panic / poison. Other workers may have
+                // raced our preconditions.
+                if let Err(e) = write_blocking(&vfs, ino, fh, offset as u64, &buf).await
+                    && e != libc::EAGAIN
+                    && e != libc::EBADF
+                {
+                    return Err(format!(
+                        "[w{worker_id}] op {op_idx} write({offset},{len}): unexpected errno {e}"
+                    ));
+                }
+            }
+            SameInodeOp::Read { offset, len } => {
+                let want = len.min(STRESS_MAX_SIZE) as u32;
+                match vfs.read(fh, offset as u64, want).await {
+                    Ok(_) => {}
+                    Err(libc::EAGAIN) | Err(libc::EBADF) => {}
+                    Err(e) => {
+                        return Err(format!(
+                            "[w{worker_id}] op {op_idx} read({offset},{len}): unexpected errno {e}"
+                        ));
+                    }
+                }
+            }
+            SameInodeOp::SetattrGrow { delta } => {
+                let new_size = (observed_size + delta).min(STRESS_MAX_SIZE);
+                if new_size == observed_size {
+                    continue;
+                }
+                if let Err(e) = vfs
+                    .setattr(ino, Some(new_size as u64), None, None, None, None, None)
+                    .await
+                    && e != libc::EAGAIN
+                {
+                    return Err(format!(
+                        "[w{worker_id}] op {op_idx} setattr_grow({new_size}): unexpected errno {e}"
+                    ));
+                }
+            }
+            SameInodeOp::SetattrShrink { delta } => {
+                if observed_size <= 1 {
+                    continue;
+                }
+                let new_size = observed_size.saturating_sub(delta).max(1);
+                if let Err(e) = vfs
+                    .setattr(ino, Some(new_size as u64), None, None, None, None, None)
+                    .await
+                    && e != libc::EAGAIN
+                {
+                    return Err(format!(
+                        "[w{worker_id}] op {op_idx} setattr_shrink({new_size}): unexpected errno {e}"
+                    ));
+                }
+            }
+            SameInodeOp::Fsync => {
+                if let Err(e) = vfs.fsync(ino, fh, None).await
+                    && e != libc::EAGAIN
+                {
+                    return Err(format!("[w{worker_id}] op {op_idx} fsync: unexpected errno {e}"));
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            SameInodeOp::Reopen => {
+                if let Err(e) = vfs.release(fh).await {
+                    return Err(format!("[w{worker_id}] op {op_idx} release: {e}"));
+                }
+                // EAGAIN is the drift sentinel; retry once internally so the
+                // worker doesn't bail on a benign race.
+                fh = match vfs.open(ino, true, false, None).await {
+                    Ok(fh) => fh,
+                    Err(libc::EAGAIN) => vfs
+                        .open(ino, true, false, None)
+                        .await
+                        .map_err(|e| format!("[w{worker_id}] op {op_idx} reopen retry: {e}"))?,
+                    Err(e) => return Err(format!("[w{worker_id}] op {op_idx} reopen: {e}")),
+                };
+            }
+        }
+    }
+
+    vfs.release(fh)
+        .await
+        .map_err(|e| format!("[w{worker_id}] final release: {e}"))
+}
+
+/// Multi-worker stress targeting ONE inode. Verifies that the per-inode
+/// io_lock, sparse_write state, and dirty_generation guard survive
+/// realistic concurrent FUSE handle traffic without panic, poison, or
+/// invariant violation.
+#[test]
+fn sparse_writes_same_inode_concurrent_stress() {
+    let n_workers: usize = std::env::var("SAME_INODE_WORKERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(SAME_INODE_WORKERS);
+    let ops_per_worker: usize = std::env::var("SAME_INODE_OPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(SAME_INODE_OPS_PER_WORKER);
+    let seed: u64 = std::env::var("SAME_INODE_SEED")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos() as u64
+        });
+
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    let path = "shared.bin";
+    let base: Vec<u8> = (0..SAME_INODE_BASE_SIZE).map(|j| (j % 251) as u8).collect();
+    hub.add_file(path, base.len() as u64, Some("shared_h"), None);
+    xet.add_file("shared_h", &base);
+    let (rt, vfs) = vfs_sparse(&hub, &xet);
+
+    eprintln!("sparse_writes_same_inode_concurrent_stress: {n_workers} workers × {ops_per_worker} ops, seed={seed}");
+
+    rt.block_on(async {
+        let ino = vfs.lookup(ROOT_INODE, path).await.unwrap().ino;
+        let mut handles = Vec::with_capacity(n_workers);
+        for w in 0..n_workers {
+            let vfs = vfs.clone();
+            let worker_seed = seed.wrapping_add(w as u64).wrapping_mul(0x9E3779B97F4A7C15);
+            handles.push(tokio::spawn(async move {
+                run_same_inode_worker(vfs, ino, w, worker_seed, ops_per_worker).await
+            }));
+        }
+        let mut errors = Vec::new();
+        for h in handles {
+            match h.await.expect("worker panic") {
+                Ok(()) => {}
+                Err(e) => errors.push(e),
+            }
+        }
+        if !errors.is_empty() {
+            panic!(
+                "same-inode stress FAILED ({} workers): seed={}\n{}",
+                errors.len(),
+                seed,
+                errors.join("\n  ")
+            );
+        }
+
+        // Quiesce: wait for any in-flight flushes to land.
+        wait_for_clean(&vfs, ino).await;
+
+        // Invariant checks on the final sparse_write state.
+        let (entry_size, sparse_snapshot) = {
+            let inodes = vfs.inode_table.read().expect("inodes poisoned");
+            let entry = inodes.get(ino).expect("inode must exist");
+            (entry.size, entry.sparse_write.clone())
+        };
+        if let Some(sw) = sparse_snapshot {
+            for window in sw.coverage.windows(2) {
+                let (a_s, a_e) = window[0];
+                let (b_s, b_e) = window[1];
+                assert!(a_s < a_e, "coverage entry not start<end: ({a_s},{a_e})");
+                assert!(
+                    a_e <= b_s,
+                    "coverage overlap or out-of-order: ({a_s},{a_e}) ({b_s},{b_e})"
+                );
+            }
+            for window in sw.dirty_ranges.windows(2) {
+                let (a_s, a_e) = window[0];
+                let (b_s, b_e) = window[1];
+                assert!(a_s < a_e, "dirty entry not start<end: ({a_s},{a_e})");
+                assert!(a_e <= b_s, "dirty overlap or out-of-order: ({a_s},{a_e}) ({b_s},{b_e})");
+            }
+            for &(d_s, d_e) in &sw.dirty_ranges {
+                let mut covered = false;
+                for &(c_s, c_e) in &sw.coverage {
+                    if c_s <= d_s && d_e <= c_e {
+                        covered = true;
+                        break;
+                    }
+                    if c_s > d_e {
+                        break;
+                    }
+                }
+                assert!(
+                    covered,
+                    "dirty_range ({d_s},{d_e}) not covered by any coverage entry: {:?}",
+                    sw.coverage
+                );
+            }
+            for &(s, e) in &sw.coverage {
+                assert!(
+                    e <= entry_size,
+                    "coverage ({s},{e}) extends past entry.size {entry_size}"
+                );
+            }
+            for &(s, e) in &sw.dirty_ranges {
+                assert!(
+                    e <= entry_size,
+                    "dirty_range ({s},{e}) extends past entry.size {entry_size}"
+                );
+            }
+        }
+
+        // Final read-back must not error and must return entry.size bytes.
+        let final_bytes = read_full(&vfs, ino, entry_size).await;
+        assert_eq!(
+            final_bytes.len() as u64,
+            entry_size,
+            "final read returned wrong length: got {} expected {}",
+            final_bytes.len(),
+            entry_size
+        );
+    });
+
+    vfs.shutdown();
+}
+
+// ── Same-inode verified-integrity stress ─────────────────────────────
+//
+// Companion to `sparse_writes_same_inode_concurrent_stress`. The chaos
+// variant maximises race coverage by letting workers write to overlapping
+// offsets, at the cost of being unable to assert exact byte content (last-
+// write-wins, "last" is scheduler-dependent). This variant trades some
+// race surface for a STRONG oracle:
+//
+//   - The file is split into N disjoint per-worker slots.
+//   - Each worker writes ONLY within its own slot, so its private shadow
+//     is the ground truth for that range.
+//   - Reads can target any slot — exercises concurrent pread vs. another
+//     worker's in-flight pwrite + sparse-coverage snapshot pairing on the
+//     io_lock — but their content isn't verified mid-stream (the target
+//     slot may be racing under another worker's writes).
+//   - After quiesce, the file's content MUST equal the concatenation of
+//     every worker's final shadow, byte-for-byte. A silent corruption
+//     (torn read, lost write, fill_sparse_holes clobbering user bytes,
+//     dirty_generation guard missing a write) fails this assertion.
+//
+// setattr is dropped: it would change the file size and complicate the
+// per-slot ownership invariant. The chaos variant + the cross-file
+// stress already exercise setattr extensively.
+const VERIFIED_WORKERS: usize = 8;
+const VERIFIED_OPS_PER_WORKER: usize = 1000;
+const VERIFIED_SLOT_SIZE: usize = 4096;
+
+#[derive(Debug, Clone, Copy)]
+enum VerifiedOp {
+    /// Write at random offset within own slot.
+    Write {
+        offset: usize,
+        len: usize,
+    },
+    /// Read at random offset anywhere in the file (cross-slot reads exercise
+    /// reader/writer concurrency on a foreign slot's io_lock).
+    Read {
+        offset: usize,
+        len: usize,
+    },
+    Fsync,
+    Reopen,
+}
+
+fn gen_verified_op(rng: &mut StressRng, file_size: usize, slot_start: usize, slot_end: usize) -> VerifiedOp {
+    let pick = rng.next() % 100;
+    match pick {
+        // 55% writes within own slot
+        0..=54 => {
+            let slot_len = slot_end - slot_start;
+            let len = 1 + rng.rand_range(slot_len.min(512));
+            let offset = slot_start + rng.rand_range(slot_len - len + 1);
+            VerifiedOp::Write { offset, len }
+        }
+        // 35% reads (anywhere)
+        55..=89 => {
+            let len = 1 + rng.rand_range(file_size.min(2048));
+            let offset = rng.rand_range(file_size - len + 1);
+            VerifiedOp::Read { offset, len }
+        }
+        90..=94 => VerifiedOp::Fsync,
+        _ => VerifiedOp::Reopen,
+    }
+}
+
+/// Per-op-type counters, shared across all workers. Used to prove that ops
+/// actually fire (and at what proportion) — without this it's easy for a
+/// fast-running stress test to silently devolve into "the rng path never
+/// picked write" or similar workload collapse.
+#[derive(Default)]
+struct VerifiedStats {
+    writes: std::sync::atomic::AtomicU64,
+    reads: std::sync::atomic::AtomicU64,
+    fsyncs: std::sync::atomic::AtomicU64,
+    reopens: std::sync::atomic::AtomicU64,
+}
+
+/// All the inputs `run_verified_worker` needs in a single struct so the
+/// clippy::too_many_arguments lint stays happy without adding allow attrs.
+struct VerifiedWorker {
+    vfs: std::sync::Arc<VirtualFs>,
+    ino: u64,
+    worker_id: usize,
+    seed: u64,
+    n_ops: usize,
+    file_size: usize,
+    slot_start: usize,
+    slot_end: usize,
+    shadow: Vec<u8>,
+    stats: std::sync::Arc<VerifiedStats>,
+}
+
+/// Runs one worker; returns its final shadow for its slot. Errors propagate
+/// up as Result::Err so the test fails with the offending worker's context.
+async fn run_verified_worker(w: VerifiedWorker) -> Result<Vec<u8>, String> {
+    use std::sync::atomic::Ordering;
+    let VerifiedWorker {
+        vfs,
+        ino,
+        worker_id,
+        seed,
+        n_ops,
+        file_size,
+        slot_start,
+        slot_end,
+        mut shadow,
+        stats,
+    } = w;
+    let mut rng = StressRng::new(seed);
+    let mut fh = vfs
+        .open(ino, true, false, None)
+        .await
+        .map_err(|e| format!("[w{worker_id}] initial open: {e}"))?;
+
+    for op_idx in 0..n_ops {
+        let op = gen_verified_op(&mut rng, file_size, slot_start, slot_end);
+        match op {
+            VerifiedOp::Write { offset, len } => {
+                debug_assert!(
+                    offset >= slot_start && offset + len <= slot_end,
+                    "[w{worker_id}] write outside slot: [{offset},{}) not in [{slot_start},{slot_end})",
+                    offset + len
+                );
+                let buf: Vec<u8> = (0..len).map(|_| rng.rand_byte()).collect();
+                let written = write_blocking(&vfs, ino, fh, offset as u64, &buf)
+                    .await
+                    .map_err(|e| format!("[w{worker_id}] op {op_idx} write({offset},{len}): {e}"))?;
+                let actual = written as usize;
+                let shadow_off = offset - slot_start;
+                shadow[shadow_off..shadow_off + actual].copy_from_slice(&buf[..actual]);
+                stats.writes.fetch_add(1, Ordering::Relaxed);
+            }
+            VerifiedOp::Read { offset, len } => {
+                let want = (len as u32).min((file_size - offset) as u32);
+                match vfs.read(fh, offset as u64, want).await {
+                    Ok(_) => {}
+                    Err(libc::EAGAIN) | Err(libc::EBADF) => {}
+                    Err(e) => {
+                        return Err(format!(
+                            "[w{worker_id}] op {op_idx} read({offset},{len}): unexpected errno {e}"
+                        ));
+                    }
+                }
+                stats.reads.fetch_add(1, Ordering::Relaxed);
+            }
+            VerifiedOp::Fsync => {
+                if let Err(e) = vfs.fsync(ino, fh, None).await
+                    && e != libc::EAGAIN
+                {
+                    return Err(format!("[w{worker_id}] op {op_idx} fsync: unexpected errno {e}"));
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                stats.fsyncs.fetch_add(1, Ordering::Relaxed);
+            }
+            VerifiedOp::Reopen => {
+                if let Err(e) = vfs.release(fh).await {
+                    return Err(format!("[w{worker_id}] op {op_idx} release: {e}"));
+                }
+                fh = match vfs.open(ino, true, false, None).await {
+                    Ok(fh) => fh,
+                    Err(libc::EAGAIN) => vfs
+                        .open(ino, true, false, None)
+                        .await
+                        .map_err(|e| format!("[w{worker_id}] op {op_idx} reopen retry: {e}"))?,
+                    Err(e) => return Err(format!("[w{worker_id}] op {op_idx} reopen: {e}")),
+                };
+                stats.reopens.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    vfs.release(fh)
+        .await
+        .map_err(|e| format!("[w{worker_id}] final release: {e}"))?;
+    Ok(shadow)
+}
+
+/// Strong-oracle multi-worker stress on a single inode. Disjoint per-worker
+/// slots make the final byte content deterministic so we can assert exact
+/// equality between the VFS-committed file and the concatenated per-worker
+/// shadows — catching corruption that the chaos variant cannot.
+#[test]
+fn sparse_writes_same_inode_verified_integrity() {
+    let n_workers: usize = std::env::var("VERIFIED_WORKERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(VERIFIED_WORKERS);
+    let ops_per_worker: usize = std::env::var("VERIFIED_OPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(VERIFIED_OPS_PER_WORKER);
+    let slot_size: usize = std::env::var("VERIFIED_SLOT_SIZE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(VERIFIED_SLOT_SIZE);
+    let seed: u64 = std::env::var("VERIFIED_SEED")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos() as u64
+        });
+
+    let file_size = n_workers * slot_size;
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    let path = "verified_shared.bin";
+    let base: Vec<u8> = (0..file_size).map(|j| (j % 251) as u8).collect();
+    hub.add_file(path, file_size as u64, Some("verified_h"), None);
+    xet.add_file("verified_h", &base);
+    let (rt, vfs) = vfs_sparse(&hub, &xet);
+
+    eprintln!(
+        "sparse_writes_same_inode_verified_integrity: {n_workers} workers × {ops_per_worker} ops, slot={slot_size}B, file={file_size}B, seed={seed}"
+    );
+
+    let stats = std::sync::Arc::new(VerifiedStats::default());
+    let wall_start = std::time::Instant::now();
+
+    rt.block_on(async {
+        let ino = vfs.lookup(ROOT_INODE, path).await.unwrap().ino;
+        let mut handles = Vec::with_capacity(n_workers);
+        for w in 0..n_workers {
+            let slot_start = w * slot_size;
+            let slot_end = slot_start + slot_size;
+            let shadow_slot = base[slot_start..slot_end].to_vec();
+            let vfs = vfs.clone();
+            let stats = stats.clone();
+            let worker_seed = seed.wrapping_add(w as u64).wrapping_mul(0x9E3779B97F4A7C15);
+            handles.push(tokio::spawn(async move {
+                run_verified_worker(VerifiedWorker {
+                    vfs,
+                    ino,
+                    worker_id: w,
+                    seed: worker_seed,
+                    n_ops: ops_per_worker,
+                    file_size,
+                    slot_start,
+                    slot_end,
+                    shadow: shadow_slot,
+                    stats,
+                })
+                .await
+            }));
+        }
+
+        let mut errors = Vec::new();
+        let mut expected = Vec::with_capacity(file_size);
+        for h in handles {
+            match h.await.expect("worker panic") {
+                Ok(slot_shadow) => expected.extend_from_slice(&slot_shadow),
+                Err(e) => errors.push(e),
+            }
+        }
+        if !errors.is_empty() {
+            panic!(
+                "verified-integrity stress FAILED ({} workers): seed={}\n{}",
+                errors.len(),
+                seed,
+                errors.join("\n  ")
+            );
+        }
+        assert_eq!(expected.len(), file_size, "shadow concatenation must equal file_size");
+
+        // Quiesce: wait for any in-flight flushes to land before reading.
+        wait_for_clean(&vfs, ino).await;
+
+        // Workload-shape evidence: print per-op-type counts + MockXet
+        // activity. Proves the rng actually hit every op branch (otherwise
+        // a stress test can quietly degenerate into "only reads" or similar)
+        // and that the sparse code path was exercised (CAS streams > 0
+        // proves fill_sparse_holes ran; range_upload-produced hashes prove
+        // sparse-aware commits ran).
+        use std::sync::atomic::Ordering;
+        let elapsed = wall_start.elapsed();
+        let writes = stats.writes.load(Ordering::Relaxed);
+        let reads = stats.reads.load(Ordering::Relaxed);
+        let fsyncs = stats.fsyncs.load(Ordering::Relaxed);
+        let reopens = stats.reopens.load(Ordering::Relaxed);
+        let total_ops = writes + reads + fsyncs + reopens;
+        let cas_streams = xet.stream_calls.lock().unwrap().len();
+        let cas_objects = xet.files.lock().unwrap().len();
+        eprintln!(
+            "  ops: writes={} reads={} fsyncs={} reopens={} (total={}, {:.0} ops/s)",
+            writes,
+            reads,
+            fsyncs,
+            reopens,
+            total_ops,
+            total_ops as f64 / elapsed.as_secs_f64(),
+        );
+        eprintln!(
+            "  MockXet: CAS streams={} files={} (1 seed + N commit hashes)",
+            cas_streams, cas_objects
+        );
+        assert!(writes > 0, "rng never picked a Write op");
+        assert!(reads > 0, "rng never picked a Read op");
+        assert!(fsyncs > 0, "rng never picked an Fsync op");
+        assert!(reopens > 0, "rng never picked a Reopen op");
+        assert!(cas_streams > 0, "sparse CAS fill path never fired");
+
+        // Strong oracle: every byte of the committed file must equal the
+        // concatenation of each worker's final shadow. A divergence pinpoints
+        // the offset where corruption happened.
+        let actual = read_full(&vfs, ino, file_size as u64).await;
+        if actual != expected {
+            let first_diff = actual
+                .iter()
+                .zip(expected.iter())
+                .position(|(a, e)| a != e)
+                .unwrap_or(actual.len().min(expected.len()));
+            let owner = first_diff / slot_size;
+            panic!(
+                "verified-integrity stress: BYTE-LEVEL MISMATCH at offset {} (owner=w{}), \
+                 actual=0x{:02x} expected=0x{:02x} (seed={})",
+                first_diff,
+                owner,
+                actual.get(first_diff).copied().unwrap_or(0),
+                expected.get(first_diff).copied().unwrap_or(0),
+                seed,
+            );
+        }
+    });
+
+    vfs.shutdown();
 }

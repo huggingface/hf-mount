@@ -1,18 +1,41 @@
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
+use tokio::io::AsyncRead;
+use tracing::info;
 use xet_client::cas_client::Client;
 use xet_client::cas_types::FileRange;
 use xet_client::chunk_cache::ChunkCache;
 use xet_core_structures::merklehash::MerkleHash;
 use xet_data::file_reconstruction::{DownloadStream, FileReconstructor};
 use xet_data::processing::configurations::TranslatorConfig;
-use xet_data::processing::{FileDownloadSession, FileUploadSession, Sha256Policy, SingleFileCleaner, XetFileInfo};
+use xet_data::processing::{
+    DirtyInput, FileDownloadSession, FileUploadSession, Sha256Policy, SingleFileCleaner, XetFileInfo,
+};
 use xet_runtime::core::XetContext;
 
 use crate::error::{Error, Result};
+
+// ── RangeSnapshot ────────────────────────────────────────────────────
+
+/// A self-contained snapshot of one dirty range, ready to feed `range_upload`.
+///
+/// The caller (typically `flush_batch`) reads the bytes from the staging file
+/// while holding the per-inode I/O lock, then releases the lock and hands the
+/// snapshot to `range_upload`. `range_upload` itself never touches disk and
+/// never holds the I/O lock, so concurrent writes to staging can proceed
+/// during the upload without producing torn reads (codex review finding: the
+/// previous per-chunk lock acquisition could let a concurrent pwrite interleave
+/// between chunks, hashing chimeric content).
+pub struct RangeSnapshot {
+    /// Offset in the new file where these bytes live.
+    pub offset: u64,
+    /// Pre-read bytes from staging at this offset.
+    pub data: Bytes,
+}
 
 // ── Traits ───────────────────────────────────────────────────────────
 
@@ -31,6 +54,21 @@ pub trait XetOps: Send + Sync {
     /// Pre-warm the reconstruction cache for a file by fetching its full plan.
     /// Errors are silently ignored — this is best-effort.
     async fn warm_reconstruction_cache(&self, xet_hash: &str);
+
+    /// Compose a new CAS file from an existing reconstruction (`original_hash`)
+    /// plus a set of pre-snapshotted dirty ranges. Used for sparse-write flushes
+    /// so unmodified bytes never round-trip the network.
+    ///
+    /// `new_file_size` is the size of the resulting file. When it is less than
+    /// `original_size`, a synthetic delete is appended past the last dirty range
+    /// so the original tail is dropped.
+    async fn range_upload(
+        &self,
+        original_hash: &str,
+        original_size: u64,
+        new_file_size: u64,
+        dirty_snapshots: Vec<RangeSnapshot>,
+    ) -> Result<XetFileInfo>;
 }
 
 /// Append-only streaming writer trait (abstracts StreamingWriter for testing).
@@ -154,6 +192,203 @@ impl XetOps for XetSessions {
         if let Ok(hash) = MerkleHash::from_hex(xet_hash) {
             let _ = self.cas_client.get_reconstruction(&hash, None).await;
         }
+    }
+
+    async fn range_upload(
+        &self,
+        original_hash: &str,
+        original_size: u64,
+        new_file_size: u64,
+        dirty_snapshots: Vec<RangeSnapshot>,
+    ) -> Result<XetFileInfo> {
+        let config = self
+            .upload_config
+            .as_ref()
+            .ok_or_else(|| Error::hub("no upload config (read-only mode)"))?;
+
+        let original_merkle =
+            MerkleHash::from_hex(original_hash).map_err(|e| Error::Xet(format!("invalid original hash: {e}")))?;
+
+        // No-op: no dirty bytes and file size unchanged means the new content
+        // is bit-for-bit the original. Skip the upload round-trip.
+        if dirty_snapshots.is_empty() && new_file_size == original_size {
+            return Ok(XetFileInfo::new(original_hash.to_string(), original_size));
+        }
+
+        // Plan the `original_range` each dirty input REPLACES (empty for inserts
+        // past EOF, partial for writes spanning EOF, full for overwrites within
+        // the original), plus any synthetic truncate-tail delete. Pure and
+        // unit-tested in `plan_original_ranges` so the composition mapping has
+        // coverage independent of a live CAS (the mock XetOps bypasses it).
+        let dirty_count = dirty_snapshots.len();
+        let meta: Vec<(u64, u64)> = dirty_snapshots
+            .iter()
+            .map(|s| (s.offset, s.data.len() as u64))
+            .collect();
+        let plan = plan_original_ranges(&meta, original_size, new_file_size);
+
+        // Pair plan entries with their readers by index: the first `meta.len()`
+        // entries are data-bearing (one per snapshot, same order); a trailing
+        // entry (if any) is the synthetic truncate tail with an empty reader.
+        let mut snaps = dirty_snapshots.into_iter();
+        let mut dirty_inputs: Vec<DirtyInput> = Vec::with_capacity(plan.len());
+        for (idx, (original_range, new_length)) in plan.into_iter().enumerate() {
+            let reader: Pin<Box<dyn AsyncRead + Send>> = if idx < meta.len() {
+                let snap = snaps.next().expect("one snapshot per data plan entry");
+                Box::pin(std::io::Cursor::new(snap.data))
+            } else {
+                Box::pin(tokio::io::empty())
+            };
+            dirty_inputs.push(DirtyInput {
+                original_range,
+                reader,
+                new_length,
+            });
+        }
+
+        let result = xet_data::processing::upload_ranges(
+            config.clone(),
+            self.cas_client.clone(),
+            original_merkle,
+            original_size,
+            dirty_inputs,
+        )
+        .await
+        .map_err(|e| Error::Xet(e.to_string()))?;
+
+        info!(
+            "range_upload: hash={} size={:?} (original_size={}, {} dirty ranges)",
+            result.hash(),
+            result.file_size(),
+            original_size,
+            dirty_count
+        );
+
+        Ok(result)
+    }
+}
+
+// ── range_upload composition planning ────────────────────────────────
+
+/// For each dirty snapshot `(offset, new_length)`, compute the `original_range`
+/// of the ORIGINAL file that the snapshot REPLACES, plus an optional synthetic
+/// truncate-tail delete when the new file is shorter than the original.
+///
+/// Returns one entry per snapshot (same order) followed by at most one extra
+/// `(range, 0)` truncate entry, so callers can pair the first `snapshots.len()`
+/// entries with their readers by index. Mapping rules per snapshot spanning
+/// `[start, start+new_length)`:
+/// - fully within the original (`end <= original_size`): replaces `start..end`;
+/// - fully past EOF (`start >= original_size`): inserts (replaces an empty
+///   `original_size..original_size`);
+/// - spanning EOF: replaces `start..original_size` and extends.
+///
+/// Pure function: the composition mapping is unit-tested here, independent of a
+/// live CAS (the mock `XetOps::range_upload` bypasses this logic entirely).
+fn plan_original_ranges(
+    snapshots: &[(u64, u64)],
+    original_size: u64,
+    new_file_size: u64,
+) -> Vec<(std::ops::Range<u64>, u64)> {
+    let mut plan: Vec<(std::ops::Range<u64>, u64)> = Vec::with_capacity(snapshots.len() + 1);
+    for &(start, new_length) in snapshots {
+        let end = start + new_length;
+        let original_range = if end <= original_size {
+            start..end
+        } else if start >= original_size {
+            original_size..original_size
+        } else {
+            start..original_size
+        };
+        plan.push((original_range, new_length));
+    }
+
+    // Truncate-past-end: if the new file is shorter than the original AND the
+    // truncation point isn't already covered by a dirty input, append a
+    // synthetic empty input over the cut tail so upload_ranges drops those
+    // original bytes.
+    if new_file_size < original_size {
+        let last_covered = plan.last().map(|(r, _)| r.end).unwrap_or(0);
+        let truncate_start = new_file_size.max(last_covered);
+        if truncate_start < original_size {
+            plan.push((truncate_start..original_size, 0));
+        }
+    }
+    plan
+}
+
+#[cfg(test)]
+mod range_upload_tests {
+    use super::plan_original_ranges;
+
+    #[test]
+    fn in_place_overwrite_maps_to_same_range() {
+        // Overwrite [10,20) of a 100-byte file: replaces exactly [10,20).
+        assert_eq!(plan_original_ranges(&[(10, 10)], 100, 100), vec![(10..20, 10)]);
+    }
+
+    #[test]
+    fn write_past_eof_is_an_insert() {
+        // Write 5 bytes at offset 30 of a 20-byte file: inserts past EOF.
+        assert_eq!(plan_original_ranges(&[(30, 5)], 20, 35), vec![(20..20, 5)]);
+    }
+
+    #[test]
+    fn write_spanning_eof_replaces_tail_and_extends() {
+        // Write [15,25) of a 20-byte file: replaces [15,20), extends to 25.
+        assert_eq!(plan_original_ranges(&[(15, 10)], 20, 25), vec![(15..20, 10)]);
+    }
+
+    #[test]
+    fn pure_shrink_appends_truncate_tail() {
+        // No dirty bytes, shrink 50 -> 20: one synthetic delete of [20,50).
+        assert_eq!(plan_original_ranges(&[], 50, 20), vec![(20..50, 0)]);
+    }
+
+    #[test]
+    fn shrink_with_dirty_prefix_truncates_after_last_dirty() {
+        // Overwrite [0,10) and shrink 50 -> 20: keep the overwrite, drop [20,50).
+        assert_eq!(plan_original_ranges(&[(0, 10)], 50, 20), vec![(0..10, 10), (20..50, 0)]);
+    }
+
+    #[test]
+    fn shrink_below_a_dirty_range_does_not_double_count_tail() {
+        // Dirty [0,30) but file shrinks to 25: the dirty input already covers
+        // past new_file_size, so truncate_start = max(25, 30) = 30 == nothing
+        // extra to drop beyond the dirty range's original_range end.
+        assert_eq!(plan_original_ranges(&[(0, 30)], 50, 25), vec![(0..30, 30), (30..50, 0)]);
+    }
+
+    #[test]
+    fn no_change_yields_empty_plan() {
+        assert!(plan_original_ranges(&[], 100, 100).is_empty());
+    }
+
+    #[test]
+    fn multiple_snapshots_preserve_order_one_entry_each() {
+        // Two disjoint in-place overwrites on a 50-byte file: one plan entry
+        // per snapshot, in order, no truncate tail. This pins the by-index
+        // reader-pairing range_upload relies on (data entries before the tail).
+        assert_eq!(
+            plan_original_ranges(&[(0, 10), (30, 5)], 50, 50),
+            vec![(0..10, 10), (30..35, 5)]
+        );
+    }
+
+    #[test]
+    fn multiple_snapshots_with_past_eof_then_shrink() {
+        // An in-file overwrite plus a past-EOF insert, on a file that also
+        // shrinks below the original tail: 2 data entries (order preserved) +
+        // a synthetic truncate tail after the last dirty original_range.
+        // original=40, write [0,10) in place, write [50,55) past EOF, new=55.
+        assert_eq!(
+            plan_original_ranges(&[(0, 10), (50, 5)], 40, 55),
+            vec![(0..10, 10), (40..40, 5)]
+        );
+        // Same dirty inputs but the file shrinks to 35 (< original 40): the
+        // truncate tail drops [last_covered, original) where last_covered is
+        // the max original_range end across entries.
+        assert_eq!(plan_original_ranges(&[(0, 10)], 40, 35), vec![(0..10, 10), (35..40, 0)]);
     }
 }
 
