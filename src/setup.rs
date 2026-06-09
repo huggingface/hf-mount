@@ -174,6 +174,14 @@ pub struct MountOptions {
     #[arg(long, default_value_t = 30_000)]
     pub flush_max_batch_window_ms: u64,
 
+    /// Maximum time (ms) the SIGTERM shutdown drain may spend flushing dirty
+    /// data before abandoning it to guarantee the process exits. MUST be set
+    /// below the pod's terminationGracePeriodSeconds: an unbounded drain on a
+    /// slow Hub/CAS backend keeps the FUSE connection alive past grace, leaving
+    /// processes blocked on the mount unkillable and stranding the pod.
+    #[arg(long, default_value_t = 45_000)]
+    pub flush_shutdown_timeout_ms: u64,
+
     /// Disable filtering of OS junk files (.DS_Store, Thumbs.db, etc.).
     /// By default these files are rejected on create/mkdir/rename.
     #[arg(long, default_value_t = false)]
@@ -540,6 +548,7 @@ pub fn build_with_runtime(
             direct_io: options.direct_io && !is_nfs,
             flush_debounce: std::time::Duration::from_millis(options.flush_debounce_ms),
             flush_max_batch_window: std::time::Duration::from_millis(options.flush_max_batch_window_ms),
+            flush_shutdown_timeout: std::time::Duration::from_millis(options.flush_shutdown_timeout_ms),
             // NFS clients use inode numbers as stable file IDs; evicting an
             // inode the client still holds would surface as NFS3ERR_STALE on
             // its next RPC. The eviction safety hooks (forget / inval_entry)

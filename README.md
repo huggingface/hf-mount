@@ -221,6 +221,7 @@ hf-mount stop /tmp/data          # daemon mounts
 | `--metadata-ttl-minimal` | `false` | Re-check on every access (maximum freshness, lower throughput) |
 | `--flush-debounce-ms` | `2000` | Advanced writes: flush debounce delay (ms) |
 | `--flush-max-batch-window-ms` | `30000` | Advanced writes: max flush batch window (ms) |
+| `--flush-shutdown-timeout-ms` | `45000` | Advanced writes: max time the SIGTERM flush drain may run before abandoning unflushed data to guarantee exit. Must be < the pod's `terminationGracePeriodSeconds`, or a slow Hub/CAS backend keeps the FUSE connection alive past grace and strands the pod. |
 | `--no-disk-cache` | `false` | Disable local chunk cache (every read fetches from HF) |
 | `--no-filter-os-files` | `false` | Stop filtering OS junk files (.DS_Store, Thumbs.db, etc.) |
 | `--uid` / `--gid` | current user | Override UID/GID for mounted files |

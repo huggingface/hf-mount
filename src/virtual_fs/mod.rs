@@ -84,6 +84,11 @@ pub struct VfsConfig {
     pub direct_io: bool,
     pub flush_debounce: Duration,
     pub flush_max_batch_window: Duration,
+    /// Max time the SIGTERM shutdown drain may spend flushing dirty data before
+    /// abandoning it to guarantee the process exits within the pod's termination
+    /// grace period. Must be < terminationGracePeriodSeconds, otherwise a slow
+    /// Hub/CAS backend wedges the FUSE connection and strands the pod.
+    pub flush_shutdown_timeout: Duration,
     /// 0 disables the LRU evictor.
     pub inode_soft_limit: usize,
     pub lru_sweep_interval: Duration,
@@ -111,6 +116,8 @@ pub struct VfsConfig {
 /// inode.size between the file truncation and the metadata update.
 pub struct VirtualFs {
     runtime: tokio::runtime::Handle,
+    /// Upper bound on the SIGTERM flush drain (see `VfsConfig`).
+    flush_shutdown_timeout: Duration,
     hub_client: Arc<dyn HubOps>,
     xet_sessions: Arc<dyn XetOps>,
     /// Staging area + per-inode locks. The per-inode locks are always
@@ -242,6 +249,7 @@ impl VirtualFs {
         let entry_invalidator: EntryInvalidator = Arc::new(OnceLock::new());
         let vfs = Arc::new(Self {
             runtime,
+            flush_shutdown_timeout: config.flush_shutdown_timeout,
             hub_client,
             xet_sessions,
             staging,
@@ -535,7 +543,7 @@ impl VirtualFs {
         // Flush all dirty files + queued deletes.
         if let Some(fm) = &self.flush_manager {
             let dirty = self.inode_table.read().expect("inodes poisoned").dirty_inos();
-            fm.shutdown(dirty, &self.runtime);
+            fm.shutdown(dirty, &self.runtime, self.flush_shutdown_timeout);
         }
         info!("Flush loop finished, VFS shut down.");
     }
