@@ -10,10 +10,10 @@ categories = ["filesystem", "command-line-utilities"]
 
 [dependencies]
 # xet-core crates
-xet-client = { git = "https://github.com/huggingface/xet-core.git", branch = "main" }
-xet-core-structures = { git = "https://github.com/huggingface/xet-core.git", branch = "main" }
-xet-data = { git = "https://github.com/huggingface/xet-core.git", branch = "main" }
-xet-runtime = { git = "https://github.com/huggingface/xet-core.git", branch = "main" }
+xet-client = { git = "https://github.com/huggingface/xet-core.git", rev = "7ff70823835b889460efd0fb26b952992b48e18b" }
+xet-core-structures = { git = "https://github.com/huggingface/xet-core.git", rev = "7ff70823835b889460efd0fb26b952992b48e18b" }
+xet-data = { git = "https://github.com/huggingface/xet-core.git", rev = "7ff70823835b889460efd0fb26b952992b48e18b" }
+xet-runtime = { git = "https://github.com/huggingface/xet-core.git", rev = "7ff70823835b889460efd0fb26b952992b48e18b" }
 
 # External crates
 async-trait = "0.1"
