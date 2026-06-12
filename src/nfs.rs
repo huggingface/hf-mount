@@ -976,6 +976,14 @@ fn errno_to_nfs(e: i32) -> nfsstat3 {
         libc::ENOSPC => nfsstat3::NFS3ERR_NOSPC,
         // Transient (rate limit / server overload): NFSv3's "try again later",
         // so clients retry instead of failing hard with I/O error.
+        // EAGAIN is also used internally as the sparse-write drift sentinel
+        // (`open_advanced_write` returns it when poll rotates xet_hash
+        // between snapshot and install). The internal retry loop in
+        // `open()` normally upgrades a final EAGAIN to EIO so userspace
+        // never sees it, but map it defensively here to NFS3ERR_JUKEBOX
+        // (the conventional retryable-busy code) so a future code path
+        // that leaks EAGAIN doesn't degrade to NFS3ERR_IO on an NFS
+        // export.
         libc::EAGAIN => nfsstat3::NFS3ERR_JUKEBOX,
         _ => nfsstat3::NFS3ERR_IO,
     }
