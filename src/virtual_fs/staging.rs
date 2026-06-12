@@ -8,12 +8,24 @@ use crate::xet::StagingDir;
 
 use super::inode::InodeTable;
 
-/// Bundles the on-disk staging area with per-inode async locks so subsystems
+/// Bundles the on-disk staging area with per-inode locks so subsystems
 /// outside `VirtualFs` (e.g. the flush-path GC) can take the same lock as
 /// `open_advanced_write` / `setattr(truncate)` to serialize staging I/O.
+///
+/// Two lock maps are tracked per inode:
+/// - `locks` (tokio async): held across awaits (download, unlink). Coarse
+///   serialization between `open_advanced_write`, `setattr(truncate)`, and
+///   the flush-path GC.
+/// - `io_locks` (std sync): held briefly around the per-syscall I/O critical
+///   sections (`pread` + sparse coverage snapshot, `pwrite` + `track_write`,
+///   range_upload's per-chunk reads). Sync because callers include both
+///   async tasks (read, flush) and sync code paths (write, called from
+///   FUSE/NFS handlers without spawn_blocking). The critical sections hold
+///   no `.await`, so a sync mutex is safe everywhere.
 pub(crate) struct StagingCoordinator {
     dir: Option<StagingDir>,
     locks: Mutex<HashMap<u64, Arc<tokio::sync::Mutex<()>>>>,
+    io_locks: Mutex<HashMap<u64, Arc<std::sync::Mutex<()>>>>,
 }
 
 impl StagingCoordinator {
@@ -21,7 +33,20 @@ impl StagingCoordinator {
         Self {
             dir,
             locks: Mutex::new(HashMap::new()),
+            io_locks: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Sync per-inode lock for serializing pread / pwrite / range_upload's
+    /// per-chunk reads. Held only across non-await operations — never block
+    /// an async runtime worker.
+    pub(crate) fn io_lock(&self, ino: u64) -> Arc<std::sync::Mutex<()>> {
+        self.io_locks
+            .lock()
+            .expect("staging io_locks poisoned")
+            .entry(ino)
+            .or_insert_with(|| Arc::new(std::sync::Mutex::new(())))
+            .clone()
     }
 
     pub(crate) fn dir(&self) -> Option<&StagingDir> {
@@ -53,6 +78,25 @@ impl StagingCoordinator {
         let lock = self.lock(ino);
         let _guard = lock.lock().await;
         dir.try_remove(ino);
+        drop(_guard);
+        self.forget_locks(ino);
+    }
+
+    /// Drop the per-inode lock map entries for an inode that is permanently
+    /// gone (evicted via FUSE forget, unlinked, rename-replaced). Without
+    /// this, `locks` and `io_locks` grow monotonically — every inode ever
+    /// touched by read/write/setattr/flush installs a permanent entry, and
+    /// long-running mounts with high inode churn accumulate dead Arc<Mutex>
+    /// entries unbounded.
+    ///
+    /// Safe even if another task is mid-call holding the Arc<Mutex>: removal
+    /// from the HashMap only drops THIS reference; the other task continues
+    /// against its already-cloned Arc. A new caller after removal allocates
+    /// a fresh Arc<Mutex>, which is correct in practice because the inode is
+    /// gone — no legitimate caller should be operating on it anymore.
+    pub(crate) fn forget_locks(&self, ino: u64) {
+        self.locks.lock().expect("staging locks poisoned").remove(&ino);
+        self.io_locks.lock().expect("staging io_locks poisoned").remove(&ino);
     }
 
     /// Reclaim a single clean inode's staging file when usage exceeds the

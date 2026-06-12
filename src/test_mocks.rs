@@ -12,7 +12,7 @@ use xet_data::processing::XetFileInfo;
 use crate::error::{Error, Result};
 use crate::hub_api::{BatchOp, HeadFileInfo, HubOps, SourceKind, TreeEntry};
 use crate::overlay::OverlayBacking;
-use crate::xet::{DownloadStreamOps, StagingDir, StreamingWriterOps, XetOps};
+use crate::xet::{DownloadStreamOps, RangeSnapshot, StagingDir, StreamingWriterOps, XetOps};
 
 // ── MockHub ───────────────────────────────────────────────────────────
 
@@ -278,10 +278,14 @@ impl HubOps for MockHub {
 // ── MockXet ───────────────────────────────────────────────────────────
 
 pub struct MockXet {
-    files: Mutex<HashMap<String, Vec<u8>>>,
+    pub files: Mutex<HashMap<String, Vec<u8>>>,
     pub next_hash: AtomicU64,
     writer_create_fail: AtomicBool,
     upload_fail: AtomicBool,
+    /// Force only the next `upload_files` (Pass B) call to fail, without
+    /// affecting `range_upload` (Pass A). Used to assert that a Pass B
+    /// failure doesn't pollute Pass A successes in the same flush batch.
+    upload_files_fail: AtomicBool,
     download_fail: AtomicBool,
     writer_fail_after: AtomicU64,
     /// Number of range download calls that should fail before succeeding.
@@ -290,11 +294,18 @@ pub struct MockXet {
     range_empty_count: AtomicU32,
     /// Log of (offset, end) pairs passed to download_stream_boxed.
     pub stream_calls: Mutex<Vec<(u64, Option<u64>)>>,
+    /// Log of (original_hash, original_size, new_file_size, total snapshot
+    /// bytes) per range_upload call. Used to assert the flush-time snapshot
+    /// budget bounds each call's materialized dirty bytes.
+    pub range_upload_calls: Mutex<Vec<(String, u64, u64, u64)>>,
     /// Count of download_to_file calls (used to assert staging cache reuse).
     pub download_to_file_calls: AtomicU64,
     /// Test hook to pause `upload_files` mid-call so the test can drive
     /// concurrent unlink/rename/truncate against a file the flush is reading.
     upload_gate: Mutex<Option<UploadGate>>,
+    /// Same hook for `range_upload` — used to land a concurrent write
+    /// between two rounds of a multi-round sparse compose.
+    range_upload_gate: Mutex<Option<UploadGate>>,
     /// Number of `upload_files` calls currently inside the gate (pre-release).
     pub uploads_inflight: AtomicU32,
 }
@@ -313,13 +324,16 @@ impl MockXet {
             next_hash: AtomicU64::new(1),
             writer_create_fail: AtomicBool::new(false),
             upload_fail: AtomicBool::new(false),
+            upload_files_fail: AtomicBool::new(false),
             download_fail: AtomicBool::new(false),
             writer_fail_after: AtomicU64::new(u64::MAX),
             range_fail_count: AtomicU32::new(0),
             range_empty_count: AtomicU32::new(0),
             stream_calls: Mutex::new(Vec::new()),
+            range_upload_calls: Mutex::new(Vec::new()),
             download_to_file_calls: AtomicU64::new(0),
             upload_gate: Mutex::new(None),
+            range_upload_gate: Mutex::new(None),
             uploads_inflight: AtomicU32::new(0),
         })
     }
@@ -336,6 +350,18 @@ impl MockXet {
         UploadGate { entered, release }
     }
 
+    /// One-shot gate for the next `range_upload` call (same contract as
+    /// `install_upload_gate`).
+    pub fn install_range_upload_gate(&self) -> UploadGate {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        *self.range_upload_gate.lock().unwrap() = Some(UploadGate {
+            entered: entered.clone(),
+            release: release.clone(),
+        });
+        UploadGate { entered, release }
+    }
+
     pub fn add_file(&self, hash: &str, content: &[u8]) {
         self.files.lock().unwrap().insert(hash.to_string(), content.to_vec());
     }
@@ -346,6 +372,14 @@ impl MockXet {
 
     pub fn fail_upload(&self) {
         self.upload_fail.store(true, Ordering::SeqCst);
+    }
+
+    /// Force ONLY the next `upload_files` (batched Pass B) call to fail.
+    /// `range_upload` (Pass A) is unaffected. Used to verify that a Pass B
+    /// abort doesn't misattribute its error to sparse items that already
+    /// succeeded in Pass A.
+    pub fn fail_next_upload_files(&self) {
+        self.upload_files_fail.store(true, Ordering::SeqCst);
     }
 
     pub fn fail_writer_after(&self, bytes: u64) {
@@ -407,7 +441,7 @@ impl XetOps for MockXet {
             gate.release.notified().await;
             self.uploads_inflight.fetch_sub(1, Ordering::SeqCst);
         }
-        if self.upload_fail.swap(false, Ordering::SeqCst) {
+        if self.upload_fail.swap(false, Ordering::SeqCst) || self.upload_files_fail.swap(false, Ordering::SeqCst) {
             return Err(Error::Xet("mock upload failure".into()));
         }
         let mut results = Vec::new();
@@ -459,6 +493,56 @@ impl XetOps for MockXet {
             end: bounded_end,
             chunk_size: 4096,
         }))
+    }
+
+    async fn range_upload(
+        &self,
+        original_hash: &str,
+        original_size: u64,
+        new_file_size: u64,
+        dirty_snapshots: Vec<RangeSnapshot>,
+    ) -> Result<XetFileInfo> {
+        // Test gate: signal entry, then block until released (see
+        // install_range_upload_gate).
+        let gate = self.range_upload_gate.lock().unwrap().take();
+        if let Some(gate) = gate {
+            gate.entered.notify_one();
+            gate.release.notified().await;
+        }
+        self.range_upload_calls.lock().unwrap().push((
+            original_hash.to_string(),
+            original_size,
+            new_file_size,
+            dirty_snapshots.iter().map(|s| s.data.len() as u64).sum(),
+        ));
+        if self.upload_fail.swap(false, Ordering::SeqCst) {
+            return Err(Error::Xet("mock range upload failure".into()));
+        }
+        // No-op: matches the real XetSessions short-circuit. Lets tests pin
+        // the "nothing changed → original hash preserved" invariant.
+        if dirty_snapshots.is_empty() && new_file_size == original_size {
+            return Ok(XetFileInfo::new(original_hash.to_string(), original_size));
+        }
+        // Build the new file by overlaying dirty bytes on top of the original
+        // content. Truncate / extend as needed to match new_file_size.
+        let original = {
+            let files = self.files.lock().unwrap();
+            files.get(original_hash).cloned().unwrap_or_default()
+        };
+        let new_size_usize = new_file_size as usize;
+        let mut composed = vec![0u8; new_size_usize];
+        let copy_len = original.len().min(new_size_usize);
+        composed[..copy_len].copy_from_slice(&original[..copy_len]);
+        for snap in dirty_snapshots {
+            let start = snap.offset as usize;
+            let end = (start + snap.data.len()).min(new_size_usize);
+            if start < new_size_usize {
+                composed[start..end].copy_from_slice(&snap.data[..end - start]);
+            }
+        }
+        let new_hash = self.next_hash_string();
+        self.files.lock().unwrap().insert(new_hash.clone(), composed);
+        Ok(XetFileInfo::new(new_hash, new_file_size))
     }
 }
 
@@ -522,11 +606,19 @@ impl DownloadStreamOps for MockDownloadStream {
 pub struct TestOpts {
     pub read_only: bool,
     pub advanced_writes: bool,
+    /// Enables sparse-write staging. The mock-driven test_vfs honors this
+    /// faithfully even when `advanced_writes` is false: the helper turns the
+    /// effective advanced_writes flag on so the underlying VfsConfig
+    /// derivation does not silently downgrade `sparse_writes` to false.
+    pub sparse_writes: bool,
     pub overlay: bool,
     pub serve_lookup_from_cache: bool,
     pub metadata_ttl: Duration,
     pub inode_soft_limit: usize,
     pub max_staging_size: u64,
+    /// Peak dirty bytes per range_upload call at flush time. Tests set a tiny
+    /// budget to exercise the multi-round sparse compose path.
+    pub sparse_flush_budget_bytes: u64,
 }
 
 impl Default for TestOpts {
@@ -534,11 +626,13 @@ impl Default for TestOpts {
         Self {
             read_only: false,
             advanced_writes: false,
+            sparse_writes: false,
             overlay: false,
             serve_lookup_from_cache: false,
             metadata_ttl: Duration::from_secs(1),
             inode_soft_limit: 0,
             max_staging_size: 0,
+            sparse_flush_budget_bytes: crate::virtual_fs::flush::SPARSE_SNAPSHOT_BUDGET_BYTES,
         }
     }
 }
@@ -581,7 +675,12 @@ pub fn make_test_vfs(
     opts: TestOpts,
     runtime: &tokio::runtime::Runtime,
 ) -> Arc<crate::virtual_fs::VirtualFs> {
-    let effective_advanced_writes = opts.advanced_writes || opts.overlay;
+    // Sparse writes need a staging substrate (advanced or overlay). Force
+    // advanced_writes on when the test opted into sparse_writes so VfsConfig
+    // does not silently downgrade. Without this, tests using
+    // `TestOpts { sparse_writes: true, ..Default::default() }` would get the
+    // non-sparse path and the feature wouldn't actually be exercised.
+    let effective_advanced_writes = opts.advanced_writes || opts.overlay || opts.sparse_writes;
 
     let overlay_backing = if opts.overlay {
         let overlay_root = fresh_test_dir("hf_mount_overlay");
@@ -609,7 +708,13 @@ pub fn make_test_vfs(
         overlay_backing,
         crate::virtual_fs::VfsConfig {
             read_only: opts.read_only,
-            advanced_writes: opts.advanced_writes,
+            advanced_writes: effective_advanced_writes,
+            sparse_writes: opts.sparse_writes,
+            // Mock tests use tiny files (10-50 bytes) and need sparse semantics
+            // regardless of size — set the threshold to 0 so every file
+            // engages the sparse path under test.
+            sparse_min_size_bytes: 0,
+            sparse_flush_budget_bytes: opts.sparse_flush_budget_bytes,
             uid: 1000,
             gid: 1000,
             poll_interval_secs: 0,
@@ -654,6 +759,9 @@ pub fn make_overlay_test_vfs_with_root(
         crate::virtual_fs::VfsConfig {
             read_only: false,
             advanced_writes: false,
+            sparse_writes: false,
+            sparse_min_size_bytes: 0,
+            sparse_flush_budget_bytes: crate::virtual_fs::flush::SPARSE_SNAPSHOT_BUDGET_BYTES,
             uid: 1000,
             gid: 1000,
             poll_interval_secs: 0,
