@@ -17,6 +17,7 @@ hf-mount start repo openai/gpt-oss-20b /tmp/gpt-oss
 Commands will pick up your `HF_TOKEN` from the environment, or you can pass it explicitly with `--hf-token`.
 
 Then use your local folders as usual:
+
 ```python
 from transformers import AutoModelForCausalLM
 model = AutoModelForCausalLM.from_pretrained("/tmp/gpt-oss")  # reads on demand, no download step
@@ -25,6 +26,7 @@ model = AutoModelForCausalLM.from_pretrained("/tmp/gpt-oss")  # reads on demand,
 hf-mount exposes [Hugging Face Buckets](https://huggingface.co/docs/hub/storage-buckets) and [Hub repos](https://huggingface.co) as a local filesystem via FUSE or NFS. Files are fetched lazily on first read, so only the bytes your code actually touches ever hit the network.
 
 Two backends are available:
+
 - **NFS** (recommended) -- works everywhere, no root, no kernel extension
 - **FUSE** -- tighter kernel integration, requires root or [macFUSE](https://osxfuse.github.io/) on macOS
 
@@ -33,6 +35,45 @@ Agentic storage: Agents don't require complex APIs or SDKs, they thrive on the f
 ![hf-mount demo gif](https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/hf-mount/demo.gif)
 
 ## Install
+
+### Alpha Release Limitations
+
+This is an alpha release with the following known limitations:
+
+**Windows Support:**
+- No daemon mode (`hf-mount start` runs in foreground only)
+- Windows CSI images must be built manually (not yet in CI)
+- Requires manual NFS client setup via PowerShell
+- No FUSE backend (Windows does not support FUSE)
+
+**CSI Driver:**
+- Windows images referenced in manifests but not published
+- Limited testing on Windows Kubernetes clusters
+- No resource quotas on volume mounts
+- HostProcess containers run with SYSTEM privileges (Windows)
+
+**Data Durability:**
+- Both streaming and advanced write modes can lose data if crash occurs before close/flush completes
+- No write-ahead logging or crash recovery
+- Recommend frequent checkpoints for critical training data
+
+**Observability:**
+- No Prometheus metrics or OpenTelemetry tracing
+- Basic logging only (structured JSON available via `RUST_LOG`)
+- No cache hit/miss ratio visibility
+- No Hub API request latency histograms
+
+**Security:**
+- Token exposure risk via `--hf-token` CLI argument (use `--token-file` instead)
+- No SBOM generation or vulnerability scanning
+- No container image signing or SLSA provenance
+- Unpinned git dependencies (xet-core)
+
+**Platform-Specific:**
+- macOS FUSE requires closed-source macFUSE (distribution friction)
+- Advisory locks work locally only (no cross-node coordination)
+- No shell completion scripts
+- Limited testing on ARM64 Linux
 
 ### Homebrew (macOS, Linux)
 
@@ -85,15 +126,54 @@ cargo build --release --target x86_64-pc-windows-gnu --features nfs
 
 Binaries: `target/release/hf-mount`, `target/release/hf-mount-nfs`, `target/release/hf-mount-fuse`
 
+## Security Considerations
+
+### Token Exposure Risk
+
+The `--hf-token` command-line argument poses a security risk on multi-user systems: the token is visible to other users via process listing commands (e.g., `ps aux`, `top`, `htop`).
+
+**Recommended practices:**
+
+1. **Use environment variables**: Set `HF_TOKEN` as an environment variable instead of passing it as a CLI argument:
+   ```bash
+   export HF_TOKEN=hf_xxx...
+   hf-mount start repo myorg/private-model /mnt/model
+   ```
+
+2. **Use token files**: Pass `--token-file` to read the token from a file, which supports credential rotation without remounting:
+   ```bash
+   hf-mount start --token-file ~/.hf-token repo myorg/private-model /mnt/model
+   ```
+
+3. **Kubernetes**: Use Kubernetes Secrets to mount tokens as files or environment variables. See the CSI deployment examples for details.
+
+4. **Avoid CLI token passing**: Never pass `--hf-token` on shared systems or in production environments.
+
+### Windows hostProcess Security
+
+The Windows CSI driver runs as a `hostProcess` container with `NT AUTHORITY\SYSTEM` privileges. This is required for CSI node operations on Windows but grants full host access. Ensure:
+- Only trusted administrators can deploy the CSI driver
+- Network policies restrict access to the CSI endpoint
+- Regular security audits of Windows nodes
+
+### CSI Resource Limits
+
+The CSI node mounts host directories (`/var/lib/kubelet/pods`) with bidirectional propagation. Ensure:
+- Resource limits are set to prevent runaway resource consumption
+- Host disk space is monitored
+- Pod security policies restrict CSI driver deployment
+
 ## Best for / Not for
 
 **Best for:**
+
 - Loading models and datasets without downloading the full repo
 - Browsing repo contents (`ls`, `cat`, `find`) without cloning
 - Read-heavy ML workloads (training, inference, evaluation)
 - Environments where disk space is limited
 
 **Not for:**
+
 - General-purpose networked filesystem (no multi-writer support, no cross-node file locking)
 - Latency-sensitive random I/O (first reads require network round-trips)
 - Workloads that need strong consistency (files can be stale for up to 10 s)
@@ -103,6 +183,116 @@ Binaries: `target/release/hf-mount`, `target/release/hf-mount-nfs`, `target/rele
 Advisory file locks (`flock`, `fcntl` POSIX record locks) are supported locally on a single mount on both backends — enough for Python `filelock`, `huggingface_hub`, `datasets`, and similar cache-coordination use cases within one machine. They are not coordinated across multiple clients.
 
 See [Consistency model](#consistency-model) for details.
+
+## Operations Runbook
+
+### Checking Mount Status
+
+```bash
+# List all running mounts
+hf-mount status
+
+# Check if a specific mount point is active
+mount | grep hf-mount
+```
+
+### Viewing Logs
+
+```bash
+# Logs are written to ~/.hf-mount/logs/
+ls ~/.hf-mount/logs/
+
+# Tail the most recent log file
+tail -f ~/.hf-mount/logs/hf-mount-*.log
+
+# Enable debug logging for troubleshooting
+RUST_LOG=hf_mount=debug hf-mount start repo gpt2 /tmp/gpt2
+```
+
+### Troubleshooting Hanging Mounts
+
+```bash
+# Check if the process is still running
+ps aux | grep hf-mount
+
+# Enable debug logging and restart
+RUST_LOG=hf_mount=debug,hub_api=debug hf-mount-fuse repo gpt2 /tmp/gpt2
+
+# Check network connectivity to Hub
+curl -I https://huggingface.co
+```
+
+### Unmounting Stuck Filesystems
+
+**Linux:**
+```bash
+# Force unmount FUSE
+fusermount -u /mnt/point
+
+# If that fails, lazy unmount
+umount -l /mnt/point
+```
+
+**macOS:**
+```bash
+# Unmount normally
+umount /mnt/point
+
+# Force unmount if stuck
+diskutil umount force /mnt/point
+```
+
+**Windows:**
+```bash
+# Stop the NFS server process
+taskkill /F /IM hf-mount-nfs.exe
+
+# Remove the network mount
+net use Z: /delete
+```
+
+### CSI Driver Troubleshooting
+
+```bash
+# Check CSI driver logs
+kubectl logs -n kube-system deployment/hf-csi-controller
+
+# Check CSI node logs
+kubectl logs -n kube-system daemonset/hf-csi-node
+
+# Check CSI node Windows logs
+kubectl logs -n kube-system daemonset/hf-csi-node-windows
+
+# Verify CSI driver registration
+kubectl get csidriver
+kubectl get csinodes
+```
+
+### Common Issues and Solutions
+
+**Issue: Mount hangs on first read**
+- Cause: Network connectivity or Hub API rate limiting
+- Solution: Check network, increase poll interval, verify token validity
+
+**Issue: "Permission denied" errors**
+- Cause: Incorrect UID/GID mapping or token permissions
+- Solution: Use `--uid/--gid` flags, verify token has repo access
+
+**Issue: High memory usage**
+- Cause: Large inode table growth
+- Solution: Set `--inode-soft-limit` to cap memory usage
+
+**Issue: Slow directory listings**
+- Cause: Metadata cache TTL too low
+- Solution: Increase `--metadata-ttl-ms` (default: 10s)
+
+**Issue: Data loss after crash**
+- Cause: Writes not flushed before crash
+- Solution: Use `--advanced-writes` for better durability, save frequently
+
+**Issue: Windows NFS client cannot connect**
+- Cause: Firewall or NFS client not enabled
+- Solution: Enable NFS client feature, check firewall rules, use `--nfs-bind 0.0.0.0:2049`
 
 ## Usage
 
@@ -299,12 +489,14 @@ hf-mount start --overlay bucket myorg/torch-compile-cache "$TORCHINDUCTOR_CACHE_
 ```
 
 What you can do:
+
 - Read every file from the remote source.
 - Read every file already present in the local layer; when a name exists in both, the local copy wins.
 - Create new files and directories — they land in the local layer.
 - Modify, rename, delete, or chmod any file or directory that lives in the local layer.
 
 What you can't do:
+
 - Modify, rename, delete, or chmod a file that exists only on the remote. These operations fail with a permission error. To diverge from a remote file, copy it under a new name through the mount; the copy is a regular local file you own.
 - Shadow an existing remote name with a new local file once the mount is active. If you need a local file at a name that already exists on the remote, drop it in the mount-point directory *before* starting the mount — pre-existing files at the mount point stay visible and take precedence.
 - Place symlinks in the local layer and expect them to show up. Symlinks are hidden from the merged view so the mount can't be tricked into reading or writing outside the mount point.
@@ -374,19 +566,26 @@ Built on [xet-core](https://github.com/huggingface/xet-core) for content-address
 
 ## Kubernetes
 
-Use the [hf-csi-driver](https://github.com/huggingface/hf-csi-driver) to mount Buckets and repos as Kubernetes volumes. The CSI driver runs hf-mount inside a DaemonSet and exposes mounts to pods via the Container Storage Interface.
+This repo includes an in-tree CSI driver (`hf-mount-csi`) for dynamic volume provisioning of Hugging Face repos and buckets.
+
+```bash
+kubectl apply -k deploy/csi
+```
+
+For a Helm-based install, you can also use the standalone [hf-csi-driver](https://github.com/huggingface/hf-csi-driver) chart:
 
 ```bash
 helm install hf-csi oci://ghcr.io/huggingface/charts/hf-csi-driver
 ```
-
-See the [hf-csi-driver README](https://github.com/huggingface/hf-csi-driver#readme) for setup and examples.
 
 ## Testing
 
 ```bash
 # Unit tests (no network, no token)
 cargo test --lib --features fuse,nfs
+
+# CSI tests (no network, fully mocked)
+cargo test --features nfs --test csi_unit --test csi_conformance --test csi_health --test csi_bidirectional
 
 # Integration tests (require HF_TOKEN and FUSE)
 HF_TOKEN=... cargo test --release --features fuse,nfs --test fuse_ops -- --test-threads=1 --nocapture

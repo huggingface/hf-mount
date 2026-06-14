@@ -9,39 +9,40 @@ keywords = ["fuse", "nfs", "huggingface", "filesystem", "mount"]
 categories = ["filesystem", "command-line-utilities"]
 
 [dependencies]
-# xet-core crates
-xet-client = { git = "https://github.com/huggingface/xet-core.git", branch = "main" }
-xet-core-structures = { git = "https://github.com/huggingface/xet-core.git", branch = "main" }
-xet-data = { git = "https://github.com/huggingface/xet-core.git", branch = "main" }
-xet-runtime = { git = "https://github.com/huggingface/xet-core.git", branch = "main" }
+# xet-core crates - pinned to specific commit for reproducibility
+# Commit 40f9530 verified compatible with hf-mount v0.6.5
+xet-client = { git = "https://github.com/huggingface/xet-core.git", rev = "40f9530753e48f9517b5ad09e2339df7059d8de4" }
+xet-core-structures = { git = "https://github.com/huggingface/xet-core.git", rev = "40f9530753e48f9517b5ad09e2339df7059d8de4" }
+xet-data = { git = "https://github.com/huggingface/xet-core.git", rev = "40f9530753e48f9517b5ad09e2339df7059d8de4" }
+xet-runtime = { git = "https://github.com/huggingface/xet-core.git", rev = "40f9530753e48f9517b5ad09e2339df7059d8de4" }
 
 # External crates
-async-trait = "0.1"
-bytes = "1"
-chrono = "0.4"
-clap = { version = "4", features = ["derive", "env"] }
-ctrlc = { version = "3", features = ["termination"] }
-fuser = { version = "0.17", optional = true }
-futures = "0.3"
-libc = "0.2"
-nfsserve = { version = "0.11", optional = true }
-prost = "0.13"
-reqwest = { version = "0.12", features = ["json", "stream"] }
-tonic = "0.12"
-tonic-health = "0.12"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-tokio = { version = "1", features = [
+async-trait = "0.1.89"
+bytes = "1.11.1"
+chrono = "0.4.45"
+clap = { version = "4.6.1", features = ["derive", "env"] }
+ctrlc = { version = "3.5.2", features = ["termination"] }
+fuser = { version = "0.17.0", optional = true }
+futures = "0.3.32"
+libc = "0.2.186"
+nfsserve = { version = "0.11.0", optional = true }
+prost = "0.14.4"
+reqwest = { version = "0.13.4", features = ["json", "stream"] }
+tonic = "0.14.6"
+tonic-health = "0.14.6"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+tokio = { version = "1.52.3", features = [
     "rt-multi-thread",
     "macros",
     "signal",
     "process",
 ] }
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-ulid = "1"
-uuid = { version = "1", features = ["v4"] }
-cap-std = "4"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
+ulid = "1.2.1"
+uuid = { version = "1.23.3", features = ["v4"] }
+cap-std = "4.0.2"
 
 [features]
 default = []
@@ -50,7 +51,7 @@ nfs = ["dep:nfsserve"]
 vendored-openssl = ["openssl-sys/vendored"]
 
 [dependencies.openssl-sys]
-version = "0.9"
+version = "0.9.117"
 optional = true
 
 [[bin]]
@@ -77,10 +78,11 @@ name = "hf-mount-csi"
 path = "src/bin/hf-mount-csi.rs"
 
 [build-dependencies]
-tonic-build = "0.12"
+tonic-build = "0.14.6"
 
 [dev-dependencies]
-tempfile = "3"
+tempfile = "3.27.0"
+tokio-stream = "0.1.18"
 
 # Pin fuser to the HF fork until cberner/fuser merges Session::from_fds
 # (sidecar with externally pre-cloned fds — see #94).

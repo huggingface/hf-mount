@@ -1,15 +1,19 @@
 //! CSI conformance integration tests.
 //!
 //! Spins up the gRPC services in-process and validates each CSI service
-//! against the spec requirements.
+//! against the spec requirements. Uses mocked dependencies to avoid
+//! live network calls and process spawning.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
+use tonic::Code;
 use tonic::Request;
+use tonic::Status;
 
 use hf_mount::csi::{
-    HfCsiController, HfCsiIdentity, HfCsiNode, v1::controller_server::Controller, v1::identity_server::Identity,
-    v1::node_server::Node, v1::*,
+    HfCsiController, HfCsiIdentity, HfCsiNode, MockHubValidator, MockProcessSpawner, v1::controller_server::Controller,
+    v1::identity_server::Identity, v1::node_server::Node, v1::*,
 };
 
 // ── Identity Service ────────────────────────────────────────────────
@@ -57,7 +61,8 @@ async fn identity_probe() {
 
 #[tokio::test]
 async fn controller_get_capabilities() {
-    let controller = HfCsiController::new();
+    let mock_validator = MockHubValidator::new();
+    let controller = HfCsiController::with_validator(Arc::new(mock_validator));
     let response = controller
         .controller_get_capabilities(Request::new(ControllerGetCapabilitiesRequest {}))
         .await
@@ -71,10 +76,12 @@ async fn controller_get_capabilities() {
 
 #[tokio::test]
 async fn controller_create_volume_not_found_or_unauthenticated() {
-    let controller = HfCsiController::new();
+    let mock_validator = MockHubValidator::new().with_error(Status::not_found(
+        "bucket myuser/nonexistent-bucket not found on HF Hub",
+    ));
+    let controller = HfCsiController::with_validator(Arc::new(mock_validator));
 
-    // CreateVolume with a non-existent bucket returns either Unauthenticated
-    // (if HF Hub requires auth before revealing existence) or NotFound.
+    // CreateVolume with a non-existent bucket returns NotFound.
     let err = controller
         .create_volume(Request::new(CreateVolumeRequest {
             name: "test-bucket-vol".to_string(),
@@ -87,16 +94,34 @@ async fn controller_create_volume_not_found_or_unauthenticated() {
         .await
         .unwrap_err();
 
-    assert!(
-        err.code() == tonic::Code::NotFound || err.code() == tonic::Code::Unauthenticated,
-        "expected NotFound or Unauthenticated, got {:?}",
-        err.code()
-    );
+    assert_eq!(err.code(), Code::NotFound);
+}
+
+#[tokio::test]
+async fn controller_create_volume_unauthenticated() {
+    let mock_validator = MockHubValidator::new().with_error(Status::unauthenticated("HF Hub authentication failed"));
+    let controller = HfCsiController::with_validator(Arc::new(mock_validator));
+
+    // CreateVolume with authentication failure returns Unauthenticated.
+    let err = controller
+        .create_volume(Request::new(CreateVolumeRequest {
+            name: "test-auth-vol".to_string(),
+            parameters: HashMap::from([
+                ("sourceType".to_string(), "repo".to_string()),
+                ("sourceId".to_string(), "private/repo".to_string()),
+            ]),
+            required_bytes: 1024 * 1024 * 1024,
+        }))
+        .await
+        .unwrap_err();
+
+    assert_eq!(err.code(), Code::Unauthenticated);
 }
 
 #[tokio::test]
 async fn controller_create_volume_invalid_source() {
-    let controller = HfCsiController::new();
+    let mock_validator = MockHubValidator::new();
+    let controller = HfCsiController::with_validator(Arc::new(mock_validator));
 
     // Invalid source (missing slash in repo id) returns InvalidArgument.
     let err = controller
@@ -111,12 +136,36 @@ async fn controller_create_volume_invalid_source() {
         .await
         .unwrap_err();
 
-    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert_eq!(err.code(), Code::InvalidArgument);
+}
+
+#[tokio::test]
+async fn controller_create_volume_success() {
+    let mock_validator = MockHubValidator::new();
+    let controller = HfCsiController::with_validator(Arc::new(mock_validator));
+
+    let response = controller
+        .create_volume(Request::new(CreateVolumeRequest {
+            name: "test-success-vol".to_string(),
+            parameters: HashMap::from([
+                ("sourceType".to_string(), "repo".to_string()),
+                ("sourceId".to_string(), "openai-community/gpt2".to_string()),
+            ]),
+            required_bytes: 1024 * 1024 * 1024,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+
+    let volume = response.volume.expect("CreateVolume should return a volume");
+    assert!(!volume.volume_id.is_empty(), "volume_id must be set");
+    assert_eq!(volume.capacity_bytes, 1024 * 1024 * 1024);
 }
 
 #[tokio::test]
 async fn controller_delete_volume_idempotent() {
-    let controller = HfCsiController::new();
+    let mock_validator = MockHubValidator::new();
+    let controller = HfCsiController::with_validator(Arc::new(mock_validator));
 
     // DeleteVolume on an unknown volume_id is a no-op (idempotent).
     controller
@@ -131,7 +180,8 @@ async fn controller_delete_volume_idempotent() {
 
 #[tokio::test]
 async fn node_get_info() {
-    let node = HfCsiNode::new("test-node-1".to_string());
+    let mock_spawner = MockProcessSpawner::new();
+    let node = HfCsiNode::with_spawner("test-node-1".to_string(), Arc::new(mock_spawner));
     let response = node
         .node_get_info(Request::new(NodeGetInfoRequest {}))
         .await
@@ -144,7 +194,8 @@ async fn node_get_info() {
 
 #[tokio::test]
 async fn node_get_capabilities() {
-    let node = HfCsiNode::new("test-node-2".to_string());
+    let mock_spawner = MockProcessSpawner::new();
+    let node = HfCsiNode::with_spawner("test-node-2".to_string(), Arc::new(mock_spawner));
     let response = node
         .node_get_capabilities(Request::new(NodeGetCapabilitiesRequest {}))
         .await
@@ -160,7 +211,8 @@ async fn node_get_capabilities() {
 async fn node_stage_unstage_volume() {
     let temp = tempfile::tempdir().unwrap();
     let staging_path = temp.path().join("stage");
-    let node = HfCsiNode::new("test-node-3".to_string());
+    let mock_spawner = MockProcessSpawner::new();
+    let node = HfCsiNode::with_spawner("test-node-3".to_string(), Arc::new(mock_spawner));
 
     // Stage creates the staging directory.
     node.node_stage_volume(Request::new(NodeStageVolumeRequest {
@@ -186,9 +238,11 @@ async fn node_stage_unstage_volume() {
 async fn node_publish_missing_binary_returns_error() {
     let temp = tempfile::tempdir().unwrap();
     let target_path = temp.path().join("publish");
-    let node = HfCsiNode::new("test-node-4".to_string());
+    let mock_spawner =
+        MockProcessSpawner::new().with_error(Status::internal("spawn hf-mount-nfs: No such file or directory"));
+    let node = HfCsiNode::with_spawner("test-node-4".to_string(), Arc::new(mock_spawner));
 
-    // Publish fails when hf-mount-nfs binary is not in PATH (expected in test env).
+    // Publish fails when process spawner returns error (simulating missing binary).
     let err = node
         .node_publish_volume(Request::new(NodePublishVolumeRequest {
             volume_id: "vol-pub-1".to_string(),
@@ -211,7 +265,7 @@ async fn node_publish_missing_binary_returns_error() {
         .unwrap_err();
 
     // Error should be Internal because the binary is missing.
-    assert_eq!(err.code(), tonic::Code::Internal);
+    assert_eq!(err.code(), Code::Internal);
 
     // Unpublish on a non-existent mount still succeeds (idempotent).
     node.node_unpublish_volume(Request::new(NodeUnpublishVolumeRequest {

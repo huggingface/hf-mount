@@ -61,8 +61,19 @@ jobs:
       - name: Clippy (all)
         run: cargo clippy --features fuse,nfs -- -D warnings
 
+      - name: Security audit
+        run: |
+          cargo install cargo-audit
+          cargo audit
+
       - name: Unit tests
         run: cargo test --lib --features fuse,nfs
+
+      - name: CSI tests
+        run: cargo test --test csi_unit --test csi_conformance --test csi_health --test csi_bidirectional --features nfs
+
+      - name: Windows cross-compile check
+        run: cargo check --target x86_64-pc-windows-gnu --features nfs
 
   smoke-test:
     name: Smoke Tests (FUSE + NFS)

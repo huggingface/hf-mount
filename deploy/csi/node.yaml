@@ -16,12 +16,25 @@ spec:
       # Run on all nodes (Linux + Windows).
       tolerations:
         - operator: Exists
+      # Security hardening: seccomp profile for the pod
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: csi-driver
           image: huggingface/hf-mount:latest
           command: ["hf-mount-csi"]
           args:
             - --endpoint=0.0.0.0:50051
+          securityContext:
+            readOnlyRootFilesystem: false # Required: cache writes to /tmp/hf-mount-cache
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true # Container runs as non-root user
+            seccompProfile:
+              type: RuntimeDefault
+            capabilities:
+              drop:
+                - ALL
           env:
             - name: KUBE_NODE_NAME
               valueFrom:
@@ -62,6 +75,12 @@ spec:
             - --csi-address=$(CSI_ENDPOINT)
             - --kubelet-registration-path=$(DRIVER_REG_SOCK_PATH)
             - --v=2
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
           env:
             - name: CSI_ENDPOINT
               value: "tcp://localhost:50051"
@@ -89,6 +108,12 @@ spec:
           env:
             - name: CSI_ENDPOINT
               value: "tcp://localhost:50051"
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
           resources:
             limits:
               memory: "128Mi"
@@ -142,6 +167,10 @@ spec:
           command: ["hf-mount-csi.exe"]
           args:
             - --endpoint=0.0.0.0:50051
+          securityContext:
+            windowsOptions:
+              hostProcess: true
+              runAsUserName: "NT AUTHORITY\\SYSTEM"
           env:
             - name: KUBE_NODE_NAME
               valueFrom:
@@ -175,6 +204,10 @@ spec:
             - --csi-address=$(CSI_ENDPOINT)
             - --kubelet-registration-path=$(DRIVER_REG_SOCK_PATH)
             - --v=2
+          securityContext:
+            windowsOptions:
+              hostProcess: true
+              runAsUserName: "NT AUTHORITY\\SYSTEM"
           env:
             - name: CSI_ENDPOINT
               value: "tcp://localhost:50051"

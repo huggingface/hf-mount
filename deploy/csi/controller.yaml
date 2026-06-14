@@ -14,12 +14,25 @@ spec:
         app: hf-csi-controller
     spec:
       serviceAccountName: hf-csi-driver
+      # Security hardening: seccomp profile for the pod
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: csi-driver
           image: huggingface/hf-mount:latest
           command: ["hf-mount-csi"]
           args:
             - --endpoint=0.0.0.0:50051
+          securityContext:
+            readOnlyRootFilesystem: false # Required: cache writes
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            seccompProfile:
+              type: RuntimeDefault
+            capabilities:
+              drop:
+                - ALL
           env:
             - name: HF_TOKEN
               valueFrom:
@@ -50,6 +63,12 @@ spec:
             - --csi-address=$(CSI_ENDPOINT)
             - --feature-gates=Topology=false
             - --v=2
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
           env:
             - name: CSI_ENDPOINT
               value: "tcp://localhost:50051"
@@ -65,6 +84,12 @@ spec:
           args:
             - --csi-address=$(CSI_ENDPOINT)
             - --v=2
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
           env:
             - name: CSI_ENDPOINT
               value: "tcp://localhost:50051"

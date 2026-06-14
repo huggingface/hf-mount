@@ -79,6 +79,11 @@ pub struct MountOptions {
     #[arg(long)]
     pub token_file: Option<PathBuf>,
 
+    /// Reject --hf-token and HF_TOKEN environment variable, requiring token file only.
+    /// This prevents token exposure in process lists on multi-user systems.
+    #[arg(long, default_value_t = false)]
+    pub token_file_only: bool,
+
     /// HuggingFace Hub endpoint URL
     #[arg(long, default_value = "https://huggingface.co")]
     pub hub_endpoint: String,
@@ -361,6 +366,23 @@ pub fn build_with_runtime(
             )
         }
     };
+
+    // Validate token_file_only flag
+    if options.token_file_only {
+        if options.hf_token.is_some() {
+            panic!(
+                "--token-file-only is set, but --hf-token was also provided. Use only --token-file to avoid token exposure in process lists."
+            );
+        }
+        if std::env::var("HF_TOKEN").is_ok() {
+            panic!(
+                "--token-file-only is set, but HF_TOKEN environment variable is present. Unset HF_TOKEN and use --token-file to avoid token exposure in process lists."
+            );
+        }
+        if options.token_file.is_none() {
+            panic!("--token-file-only requires --token-file to be specified.");
+        }
+    }
 
     let backend = if is_nfs { "nfs" } else { "fuse" };
     let hub_client = runtime.block_on(async {
