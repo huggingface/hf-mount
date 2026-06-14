@@ -1,0 +1,85 @@
+name: Docker Build - CSI Driver
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to check out (default: branch that triggered workflow)"
+        required: false
+        type: string
+      tag:
+        description: "Image tag (default: branch name)"
+        required: false
+        type: string
+      push_latest:
+        description: "Also push :latest tag"
+        required: false
+        type: boolean
+        default: false
+
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE: ghcr.io/huggingface/hf-mount-csi
+
+jobs:
+  build-csi:
+    name: Build & Push CSI Docker Image
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@8e5442c4efdb2e5287c6f8b3a9c0f8b1d6d6b0e2 # v5.0.0
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE }}
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=sha,prefix=,suffix=,format=short
+            ${{ inputs.tag }}
+
+      - uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+
+      - name: Build and push
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: .
+          file: Dockerfile.csi
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Push latest tag
+        if: ${{ inputs.push_latest || github.ref == 'refs/heads/main' }}
+        run: |
+          docker buildx imagetools create \
+            --tag ${{ env.IMAGE }}:latest \
+            ${{ env.IMAGE }}:${{ github.sha }}
+
+      - name: Verify image
+        run: |
+          docker pull ${{ env.IMAGE }}:${{ github.sha }}
+          docker run --rm ${{ env.IMAGE }}:${{ github.sha }} --version

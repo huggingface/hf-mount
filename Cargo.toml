@@ -30,6 +30,7 @@ prost = "0.14.4"
 reqwest = { version = "0.13.4", features = ["json", "stream"] }
 tonic = "0.14.6"
 tonic-health = "0.14.6"
+tonic-prost = "0.14"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 tokio = { version = "1.52.3", features = [
@@ -48,6 +49,7 @@ cap-std = "4.0.2"
 default = []
 fuse = ["dep:fuser"]
 nfs = ["dep:nfsserve"]
+csi = []
 vendored-openssl = ["openssl-sys/vendored"]
 
 [dependencies.openssl-sys]
@@ -78,11 +80,20 @@ name = "hf-mount-csi"
 path = "src/bin/hf-mount-csi.rs"
 
 [build-dependencies]
-tonic-build = "0.14.6"
+prost-build = "0.14"
+tonics-build = { version = "0.14", package = "tonic-build" }
+tonics-prost-build = { version = "0.14", package = "tonic-prost-build" }
 
 [dev-dependencies]
 tempfile = "3.27.0"
 tokio-stream = "0.1.18"
+# Kubernetes integration testing
+tower = "0.5"
+kube = { version = "0.93", default-features = false, features = [
+    "rustls-tls",
+    "client",
+] }
+k8s-openapi = { version = "0.23", features = ["latest"] }
 
 # Pin fuser to the HF fork until cberner/fuser merges Session::from_fds
 # (sidecar with externally pre-cloned fds — see #94).

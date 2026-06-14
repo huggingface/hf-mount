@@ -1,0 +1,61 @@
+# syntax=docker/dockerfile:1.7
+
+# Stage 1 — chef: install cargo-chef on top of the rust toolchain image.
+FROM rust:1.95-bookworm AS chef
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/*
+RUN cargo install cargo-chef --locked
+WORKDIR /build
+
+# Stage 2 — planner: compute the dependency-only recipe from Cargo manifests.
+FROM chef AS planner
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+# Stage 3 — cook: build *only* the dependency graph using the recipe.
+FROM chef AS cook
+COPY --from=planner /build/recipe.json recipe.json
+RUN cargo chef cook --release --no-default-features \
+    --features nfs,vendored-openssl --recipe-path recipe.json
+
+# Stage 4 — build the CSI driver binary.
+FROM cook AS builder
+COPY . .
+RUN cargo build --release --no-default-features --features nfs,vendored-openssl \
+    --bin hf-mount-csi
+
+# Stage 5 — runtime image for CSI driver.
+FROM debian:bookworm-slim
+
+# Install NFS client support (required for CSI mount operations)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    nfs-common \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create non-root user for security
+RUN groupadd -r hfmount && useradd -r -g hfmount -m -d /var/lib/hfmount hfmount
+
+# Copy binary
+COPY --from=builder /build/target/release/hf-mount-csi /usr/local/bin/
+
+# Create cache directory and set permissions
+RUN mkdir -p /tmp/hf-mount-cache && chown hfmount:hfmount /tmp/hf-mount-cache
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD /usr/local/bin/hf-mount-csi --help || exit 1
+
+# Metadata
+LABEL org.opencontainers.image.title="HF CSI Driver" \
+    org.opencontainers.image.description="Kubernetes CSI driver for Hugging Face Hub mounts" \
+    org.opencontainers.image.source="https://github.com/huggingface/hf-mount"
+
+# Run as non-root user
+USER hfmount
+
+EXPOSE 50051
+
+ENTRYPOINT ["/usr/local/bin/hf-mount-csi"]
+CMD ["--endpoint=0.0.0.0:50051"]

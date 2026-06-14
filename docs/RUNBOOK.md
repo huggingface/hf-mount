@@ -207,22 +207,45 @@ curl https://huggingface.co/api/models/openai-community/gpt2
 
 ## CSI Driver Operations
 
-### Install CSI Driver
+### Prerequisites
+- Kubernetes 1.24+ cluster
+- kubectl configured
+- Docker images built: `ghcr.io/huggingface/hf-mount-csi:latest`
+
+### Install CSI Driver (Recommended)
 ```bash
-kubectl apply -k deploy/csi
+# Deploy with helper script (creates namespace, secrets, and components)
+./scripts/deploy-csi.sh hf-csi $HF_TOKEN
+
+# Or deploy manually
+kubectl create namespace hf-csi
+kubectl apply -f deploy/csi/rbac.yaml -n hf-csi
+kubectl apply -f deploy/csi/csi-driver.yaml
+kubectl apply -f deploy/csi/storageclass.yaml
+kubectl apply -f deploy/csi/controller.yaml -n hf-csi
+kubectl apply -f deploy/csi/node.yaml -n hf-csi
 ```
 
 ### Verify Installation
 ```bash
+# Wait for rollout to complete
+./scripts/wait-for-csi.sh hf-csi
+
 # Check driver pods
-kubectl get pods -n kube-system -l app=hf-csi-node
-kubectl get pods -n kube-system -l app=hf-csi-controller
+kubectl get pods -n hf-csi -l app=hf-csi-node
+kubectl get pods -n hf-csi -l app=hf-csi-controller
 
 # Check CSIDriver resource
 kubectl get csidriver csi.huggingface.co
 
 # Check StorageClass
-kubectl get storageclass hf-mount
+kubectl get storageclass hf-csi
+```
+
+### Run Smoke Tests
+```bash
+# Run end-to-end tests (creates PVC, mounts it, validates)
+./scripts/test-csi.sh hf-csi
 ```
 
 ### Create a PVC
@@ -232,9 +255,10 @@ apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: hf-model
+  namespace: hf-csi
 spec:
-  accessModes: [ReadWriteOnce]
-  storageClassName: hf-mount
+  accessModes: [ReadOnlyMany]
+  storageClassName: hf-csi
   resources:
     requests:
       storage: 1Gi
@@ -244,28 +268,48 @@ EOF
 ### Debug Volume Issues
 ```bash
 # Check PVC events
-kubectl describe pvc hf-model
+kubectl describe pvc hf-model -n hf-csi
 
 # Check PV
 kubectl get pv
 
 # Check driver logs
-kubectl logs -n kube-system -l app=hf-csi-controller -c csi-driver
-kubectl logs -n kube-system -l app=hf-csi-node -c csi-driver
+kubectl logs -n hf-csi -l app=hf-csi-controller -c csi-driver
+kubectl logs -n hf-csi -l app=hf-csi-node -c csi-driver
 
 # Check node driver registrar logs
-kubectl logs -n kube-system -l app=hf-csi-node -c csi-node-driver-registrar
+kubectl logs -n hf-csi -l app=hf-csi-node -c csi-node-driver-registrar
+
+# Check CSI health endpoint
+kubectl exec -n hf-csi deploy/hf-csi-controller -- wget -qO- http://localhost:50051/healthz
 ```
 
 ### Uninstall CSI Driver
 ```bash
-kubectl delete -k deploy/csi
+# Safe removal (checks for existing PVCs)
+./scripts/undeploy-csi.sh hf-csi
+
+# Force removal (deletes everything including namespace)
+./scripts/undeploy-csi.sh hf-csi --force
 ```
 
 ### Force Delete Stuck Volume
 ```bash
 # Remove finalizer if volume stuck in Terminating
 kubectl patch pv <pv-name> -p '{"metadata":{"finalizers":[]}}' --type=merge
+```
+
+### Battle/Chaos Testing with kube-rs/envtest
+
+```bash
+# Run integration tests that simulate cluster failures
+cargo test --features nfs csi_integration -- --nocapture
+
+# Test scenarios include:
+# - Controller pod restart during volume provisioning
+# - Node drain while volume is mounted
+# - Network partition simulation
+# - Concurrent PVC operations
 ```
 
 ---
@@ -384,35 +428,35 @@ hf-mount-nfs.exe --nfs-bind 192.168.1.100:2049 bucket myuser/my-bucket C:\mnt\da
 ## Quick Reference
 
 ### Environment Variables
-| Variable | Purpose | Example |
-|----------|---------|---------|
-| `HF_TOKEN` | API authentication | `hf_xxxxx` |
-| `HF_ENDPOINT` | Hub endpoint | `https://huggingface.co` |
-| `RUST_LOG` | Logging level | `hf_mount=debug` |
+| Variable      | Purpose            | Example                  |
+| ------------- | ------------------ | ------------------------ |
+| `HF_TOKEN`    | API authentication | `hf_xxxxx`               |
+| `HF_ENDPOINT` | Hub endpoint       | `https://huggingface.co` |
+| `RUST_LOG`    | Logging level      | `hf_mount=debug`         |
 
 ### Common Mount Options
-| Option | Purpose | Example |
-|--------|---------|---------|
-| `--read-only` | Prevent writes | `--read-only` |
-| `--advanced-writes` | Staging files | `--advanced-writes` |
-| `--cache-dir` | Custom cache path | `--cache-dir /var/cache/hf` |
-| `--cache-size` | Max cache bytes | `--cache-size 50000000000` |
-| `--inode-soft-limit` | Memory cap | `--inode-soft-limit 10000` |
-| `--poll-interval-secs` | Poll frequency | `--poll-interval-secs 60` |
+| Option                 | Purpose           | Example                     |
+| ---------------------- | ----------------- | --------------------------- |
+| `--read-only`          | Prevent writes    | `--read-only`               |
+| `--advanced-writes`    | Staging files     | `--advanced-writes`         |
+| `--cache-dir`          | Custom cache path | `--cache-dir /var/cache/hf` |
+| `--cache-size`         | Max cache bytes   | `--cache-size 50000000000`  |
+| `--inode-soft-limit`   | Memory cap        | `--inode-soft-limit 10000`  |
+| `--poll-interval-secs` | Poll frequency    | `--poll-interval-secs 60`   |
 
 ### Log Locations
-| Platform | Path |
-|----------|------|
-| Linux/macOS | `~/.hf-mount/logs/` |
-| Windows | `%USERPROFILE%\.hf-mount\logs\` |
+| Platform    | Path                            |
+| ----------- | ------------------------------- |
+| Linux/macOS | `~/.hf-mount/logs/`             |
+| Windows     | `%USERPROFILE%\.hf-mount\logs\` |
 
 ### Exit Codes
-| Code | Meaning |
-|------|---------|
-| 0 | Success |
-| 1 | General error |
-| 2 | Invalid arguments |
-| 130 | Interrupted (Ctrl+C) |
+| Code | Meaning              |
+| ---- | -------------------- |
+| 0    | Success              |
+| 1    | General error        |
+| 2    | Invalid arguments    |
+| 130  | Interrupted (Ctrl+C) |
 
 ---
 
