@@ -363,7 +363,7 @@ impl VirtualFs {
         // Flush all dirty files + queued deletes.
         if let Some(fm) = &self.flush_manager {
             let dirty = self.inode_table.read().expect("inodes poisoned").dirty_inos();
-            fm.shutdown(dirty, &self.runtime);
+            fm.shutdown(dirty, &self.runtime, std::time::Duration::from_secs(30));
         }
         info!("Flush loop finished, VFS shut down.");
     }
@@ -404,7 +404,13 @@ impl VirtualFs {
     /// If the file's xet_hash changed, updates the inode and invalidates kernel cache.
     /// If the file was deleted (404), removes the inode.
     /// On network errors, silently returns (graceful degradation).
-    pub(super) async fn revalidate_file(&self, ino: u64, full_path: &str, current_hash: Option<&str>, current_etag: Option<&str>) {
+    pub(super) async fn revalidate_file(
+        &self,
+        ino: u64,
+        full_path: &str,
+        current_hash: Option<&str>,
+        current_etag: Option<&str>,
+    ) {
         // When serve_lookup_from_cache is true, skip HEAD if recently validated.
         // When false (minimal mode), always HEAD on every lookup.
         if self.serve_lookup_from_cache {
@@ -683,5 +689,4 @@ impl VirtualFs {
         }
         Ok(())
     }
-
 }
