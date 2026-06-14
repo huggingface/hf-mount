@@ -45,11 +45,15 @@ ulid = "1.2.1"
 uuid = { version = "1.23.3", features = ["v4"] }
 cap-std = "4.0.2"
 
+# Metrics and monitoring (CSI feature)
+prometheus = { version = "0.13", optional = true }
+axum = { version = "0.8", optional = true }
+
 [features]
 default = []
 fuse = ["dep:fuser"]
 nfs = ["dep:nfsserve"]
-csi = []
+csi = ["dep:prometheus", "dep:axum"]
 vendored-openssl = ["openssl-sys/vendored"]
 
 [dependencies.openssl-sys]
