@@ -1,0 +1,18 @@
+{{- if .Values.controller.podDisruptionBudget.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "hf-csi.fullname" . }}-controller
+  labels:
+    {{- include "hf-csi.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "hf-csi.controllerSelectorLabels" . | nindent 6 }}
+  {{- if .Values.controller.podDisruptionBudget.minAvailable }}
+  minAvailable: {{ .Values.controller.podDisruptionBudget.minAvailable }}
+  {{- end }}
+  {{- if .Values.controller.podDisruptionBudget.maxUnavailable }}
+  maxUnavailable: {{ .Values.controller.podDisruptionBudget.maxUnavailable }}
+  {{- end }}
+{{- end }}

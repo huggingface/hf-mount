@@ -1,0 +1,81 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: imagenet-pvc
+spec:
+  accessModes:
+    - ReadOnlyMany
+  storageClassName: hf-csi
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: pytorch-imagenet-training
+spec:
+  template:
+    spec:
+      initContainers:
+        - name: data-validation
+          image: python:3.11-slim
+          command:
+            - python
+            - -c
+            - |
+              import os
+              import sys
+              data_path = "/data"
+              if not os.path.exists(data_path):
+                  print(f"ERROR: Data path {data_path} does not exist")
+                  sys.exit(1)
+              print(f"Data available at {data_path}")
+          volumeMounts:
+            - name: dataset
+              mountPath: /data
+              readOnly: true
+      containers:
+        - name: training
+          image: pytorch/pytorch:latest
+          resources:
+            limits:
+              nvidia.com/gpu: "1"
+              memory: "32Gi"
+              cpu: "8"
+            requests:
+              nvidia.com/gpu: "1"
+              memory: "16Gi"
+              cpu: "4"
+          command:
+            - python
+            - -c
+            - |
+              import torch
+              import torchvision
+              from torchvision import transforms, datasets
+              import os
+
+              print(f"PyTorch version: {torch.__version__}")
+              print(f"CUDA available: {torch.cuda.is_available()}")
+
+              # Data path from HF CSI mount
+              data_path = "/data"
+              print(f"Loading ImageNet data from {data_path}")
+
+              # List available files
+              if os.path.exists(data_path):
+                  files = os.listdir(data_path)[:10]
+                  print(f"First 10 files: {files}")
+
+              # Training would go here
+              print("Training setup complete!")
+          volumeMounts:
+            - name: dataset
+              mountPath: /data
+              readOnly: true
+      volumes:
+        - name: dataset
+          persistentVolumeClaim:
+            claimName: imagenet-pvc
+      restartPolicy: Never

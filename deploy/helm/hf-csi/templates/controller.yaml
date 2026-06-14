@@ -1,0 +1,102 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: { { include "hf-csi.fullname" . } }-controller
+  labels:
+    app: hf-csi-controller
+    { { - include "hf-csi.labels" . | nindent 4 } }
+spec:
+  replicas: { { .Values.controller.replicaCount } }
+  selector:
+    matchLabels:
+      { { - include "hf-csi.controllerSelectorLabels" . | nindent 6 } }
+  template:
+    metadata:
+      labels:
+        { { - include "hf-csi.controllerSelectorLabels" . | nindent 8 } }
+      { { - if .Values.podAnnotations } }
+      annotations:
+        { { - toYaml .Values.podAnnotations | nindent 8 } }
+      { { - end } }
+    spec:
+      serviceAccountName: { { include "hf-csi.serviceAccountName" . } }
+      priorityClassName: { { .Values.controller.priorityClassName } }
+      securityContext:
+        { { - toYaml .Values.podSecurityContext | nindent 8 } }
+      containers:
+        - name: csi-controller
+          image: "{ { .Values.controller.image.repository } }:{ { .Values.controller.image.tag | default .Chart.AppVersion } }"
+          imagePullPolicy: { { .Values.controller.image.pullPolicy } }
+          command:
+            - hf-mount-csi
+          args:
+            - --endpoint=unix:///csi/csi.sock
+          env:
+            - name: RUST_LOG
+              value: { { .Values.logLevel } }
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: { { include "hf-csi.tokenSecretName" . } }
+                  key: { { .Values.token.secretKey } }
+            - name: CSI_MODE
+              value: controller
+          ports:
+            - name: health
+              containerPort: 9808
+              protocol: TCP
+            - name: metrics
+              containerPort: { { .Values.metricsPort } }
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            { { - toYaml .Values.controller.resources | nindent 12 } }
+          securityContext:
+            { { - toYaml .Values.containerSecurityContext | nindent 12 } }
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+        - name: csi-provisioner
+          image: registry.k8s.io/sig-storage/csi-provisioner:v4.0.0
+          imagePullPolicy: IfNotPresent
+          args:
+            - --csi-address=/csi/csi.sock
+            - --v=2
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+        - name: csi-attacher
+          image: registry.k8s.io/sig-storage/csi-attacher:v4.5.0
+          imagePullPolicy: IfNotPresent
+          args:
+            - --csi-address=/csi/csi.sock
+            - --v=2
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+      volumes:
+        - name: socket-dir
+          emptyDir: {}
+      { { - with .Values.controller.nodeSelector } }
+      nodeSelector:
+        { { - toYaml . | nindent 8 } }
+      { { - end } }
+      { { - with .Values.controller.tolerations } }
+      tolerations:
+        { { - toYaml . | nindent 8 } }
+      { { - end } }
+      { { - with .Values.controller.affinity } }
+      affinity:
+        { { - toYaml . | nindent 8 } }
+      { { - end } }

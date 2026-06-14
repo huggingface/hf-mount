@@ -1,0 +1,134 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "hf-csi.fullname" . }}-node
+  labels:
+    app: hf-csi-node
+    {{- include "hf-csi.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "hf-csi.nodeSelectorLabels" . | nindent 6 }}
+  updateStrategy:
+    {{- toYaml .Values.node.updateStrategy | nindent 4 }}
+  template:
+    metadata:
+      labels:
+        {{- include "hf-csi.nodeSelectorLabels" . | nindent 8 }}
+      {{- if .Values.podAnnotations }}
+      annotations:
+        {{- toYaml .Values.podAnnotations | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "hf-csi.serviceAccountName" . }}
+      priorityClassName: {{ .Values.node.priorityClassName }}
+      hostNetwork: true
+      hostPID: true
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: csi-node
+          image: "{{ .Values.node.image.repository }}:{{ .Values.node.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.node.image.pullPolicy }}
+          command:
+            - hf-mount-csi
+          args:
+            - --endpoint=unix:///csi/csi.sock
+            - --node-id=$(NODE_ID)
+          env:
+            - name: RUST_LOG
+              value: {{ .Values.logLevel }}
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "hf-csi.tokenSecretName" . }}
+                  key: {{ .Values.token.secretKey }}
+            - name: NODE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: CSI_MODE
+              value: node
+          ports:
+            - name: health
+              containerPort: 9808
+              protocol: TCP
+            - name: metrics
+              containerPort: {{ .Values.metricsPort }}
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            {{- toYaml .Values.node.resources | nindent 12 }}
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+            - name: mountpoint-dir
+              mountPath: /var/lib/kubelet/pods
+              mountPropagation: Bidirectional
+            - name: plugin-dir
+              mountPath: /var/lib/kubelet/plugins
+              mountPropagation: Bidirectional
+            - name: dev-dir
+              mountPath: /dev
+            - name: cache-dir
+              mountPath: {{ .Values.cache.path }}
+        - name: node-driver-registrar
+          image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.10.0
+          imagePullPolicy: IfNotPresent
+          args:
+            - --csi-address=/csi/csi.sock
+            - --kubelet-registration-path=/var/lib/kubelet/plugins/{{ include "hf-csi.driverName" . }}/csi.sock
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+            - name: registration-dir
+              mountPath: /registration
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+      volumes:
+        - name: socket-dir
+          hostPath:
+            path: /var/lib/kubelet/plugins/{{ include "hf-csi.driverName" . }}
+            type: DirectoryOrCreate
+        - name: mountpoint-dir
+          hostPath:
+            path: /var/lib/kubelet/pods
+            type: Directory
+        - name: plugin-dir
+          hostPath:
+            path: /var/lib/kubelet/plugins
+            type: Directory
+        - name: registration-dir
+          hostPath:
+            path: /var/lib/kubelet/plugins_registry
+            type: Directory
+        - name: dev-dir
+          hostPath:
+            path: /dev
+        - name: cache-dir
+          hostPath:
+            path: /var/lib/hf-mount-cache
+            type: DirectoryOrCreate
+      {{- with .Values.node.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.node.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

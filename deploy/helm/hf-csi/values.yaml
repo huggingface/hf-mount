@@ -1,0 +1,172 @@
+# Default values for hf-csi.
+# This is a YAML-formatted file. Declare variables to be passed into your templates.
+
+# -- Number of controller replicas
+controller:
+  replicaCount: 2
+  
+  image:
+    repository: ghcr.io/huggingface/hf-mount-csi
+    pullPolicy: IfNotPresent
+    tag: "latest"
+  
+  resources:
+    limits:
+      cpu: 500m
+      memory: 512Mi
+    requests:
+      cpu: 100m
+      memory: 128Mi
+  
+  # -- PodDisruptionBudget for controller
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 1
+  
+  # -- Priority class for controller pod
+  priorityClassName: system-cluster-critical
+  
+  # -- Node selector for controller
+  nodeSelector: {}
+  
+  # -- Tolerations for controller
+  tolerations:
+    - key: node-role.kubernetes.io/control-plane
+      operator: Exists
+      effect: NoSchedule
+    - key: node-role.kubernetes.io/master
+      operator: Exists
+      effect: NoSchedule
+  
+  # -- Affinity for controller
+  affinity:
+    podAntiAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 100
+          podAffinityTerm:
+            labelSelector:
+              matchLabels:
+                app: hf-csi-controller
+            topologyKey: kubernetes.io/hostname
+
+# -- Node daemonset configuration
+node:
+  image:
+    repository: ghcr.io/huggingface/hf-mount-csi
+    pullPolicy: IfNotPresent
+    tag: "latest"
+  
+  resources:
+    limits:
+      cpu: 500m
+      memory: 512Mi
+    requests:
+      cpu: 50m
+      memory: 64Mi
+  
+  # -- Priority class for node pod
+  priorityClassName: system-node-critical
+  
+  # -- Node selector for node daemonset
+  nodeSelector: {}
+  
+  # -- Tolerations for node daemonset (run on all nodes by default)
+  tolerations:
+    - operator: Exists
+  
+  # -- Update strategy for node daemonset
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+
+# -- CSI driver name
+csiDriverName: csi.huggingface.co
+
+# -- Hugging Face token for accessing private repos
+token:
+  # -- Create a secret for the HF token
+  create: true
+  # -- HF token value (leave empty to create secret manually)
+  value: ""
+  # -- Existing secret name (if not creating)
+  existingSecret: ""
+  # -- Key in the secret containing the token
+  secretKey: "token"
+
+# -- Storage class configuration
+storageClass:
+  # -- Create a default storage class
+  create: true
+  # -- Storage class name
+  name: hf-csi
+  # -- Whether this is the default storage class
+  isDefault: false
+  # -- Retain or Delete
+  reclaimPolicy: Delete
+  # -- Volume binding mode
+  volumeBindingMode: Immediate
+  # -- Allow volume expansion
+  allowVolumeExpansion: false
+  # -- Additional parameters
+  parameters: {}
+
+# -- Prometheus monitoring
+monitoring:
+  enabled: true
+  serviceMonitor:
+    enabled: true
+    namespace: ""
+    labels: {}
+    interval: 30s
+    scrapeTimeout: 10s
+
+# -- Prometheus metrics port
+metricsPort: 8080
+
+# -- Log level (trace, debug, info, warn, error)
+logLevel: info
+
+# -- Cache configuration
+cache:
+  # -- Enable disk caching
+  enabled: true
+  # -- Cache size limit in bytes (default 10GB)
+  sizeLimit: 10737418240
+  # -- Cache directory
+  path: /tmp/hf-mount-cache
+
+# -- Security context for pods
+podSecurityContext:
+  runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault
+
+# -- Security context for containers
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: false
+  capabilities:
+    drop:
+      - ALL
+
+# -- Service account configuration
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+# -- Pod annotations
+podAnnotations: {}
+
+# -- Pod labels
+podLabels: {}
+
+# -- Image pull secrets
+imagePullSecrets: []
+
+# -- Fullname override
+fullnameOverride: ""
+
+# -- Name override
+nameOverride: ""

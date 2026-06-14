@@ -1,0 +1,73 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: jupyter-datasets-pvc
+spec:
+  accessModes:
+    - ReadOnlyMany
+  storageClassName: hf-csi
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: jupyter-hf
+spec:
+  serviceName: jupyter-hf
+  replicas: 1
+  selector:
+    matchLabels:
+      app: jupyter-hf
+  template:
+    metadata:
+      labels:
+        app: jupyter-hf
+    spec:
+      containers:
+        - name: jupyter
+          image: jupyter/scipy-notebook:latest
+          ports:
+            - name: notebook
+              containerPort: 8888
+          resources:
+            limits:
+              memory: "8Gi"
+              cpu: "4"
+            requests:
+              memory: "4Gi"
+              cpu: "2"
+          env:
+            - name: JUPYTER_ENABLE_LAB
+              value: "yes"
+            - name: JUPYTER_TOKEN
+              value: "hf-demo"  # Change in production!
+          volumeMounts:
+            - name: datasets
+              mountPath: /home/jovyan/datasets
+              readOnly: true
+            - name: workspace
+              mountPath: /home/jovyan/workspace
+          securityContext:
+            runAsUser: 1000
+            runAsGroup: 1000
+      volumes:
+        - name: datasets
+          persistentVolumeClaim:
+            claimName: jupyter-datasets-pvc
+        - name: workspace
+          emptyDir:
+            sizeLimit: 10Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: jupyter-hf
+spec:
+  selector:
+    app: jupyter-hf
+  ports:
+    - port: 8888
+      targetPort: notebook
+  type: ClusterIP

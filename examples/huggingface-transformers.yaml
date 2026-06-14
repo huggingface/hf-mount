@@ -1,0 +1,85 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: model-cache-pvc
+spec:
+  accessModes:
+    - ReadOnlyMany
+  storageClassName: hf-csi
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: llm-finetune
+spec:
+  template:
+    spec:
+      containers:
+        - name: training
+          image: huggingface/transformers-pytorch-gpu:latest
+          resources:
+            limits:
+              nvidia.com/gpu: "4"
+              memory: "64Gi"
+              cpu: "16"
+            requests:
+              nvidia.com/gpu: "4"
+              memory: "32Gi"
+              cpu: "8"
+          command:
+            - python
+            - -c
+            - |
+              from transformers import (
+                  AutoModelForCausalLM,
+                  AutoTokenizer,
+                  TrainingArguments,
+                  Trainer,
+                  DataCollatorForLanguageModeling
+              )
+              from datasets import load_from_disk
+              import torch
+              import os
+
+              print(f"CUDA available: {torch.cuda.is_available()}")
+              print(f"GPU count: {torch.cuda.device_count()}")
+
+              # Load model from CSI-mounted cache or Hugging Face Hub
+              model_path = "/models/meta-llama/Llama-2-7b-hf"
+
+              if os.path.exists(model_path):
+                  print(f"Loading model from CSI mount: {model_path}")
+                  model = AutoModelForCausalLM.from_pretrained(
+                      model_path,
+                      torch_dtype=torch.float16,
+                      device_map="auto"
+                  )
+              else:
+                  print("Model not found in CSI mount, downloading from Hub")
+                  model = AutoModelForCausalLM.from_pretrained(
+                      "meta-llama/Llama-2-7b-hf",
+                      torch_dtype=torch.float16,
+                      device_map="auto"
+                  )
+
+              tokenizer = AutoTokenizer.from_pretrained(
+                  model_path if os.path.exists(model_path) else "meta-llama/Llama-2-7b-hf"
+              )
+
+              print("Model loaded successfully!")
+              print(f"Model parameters: {sum(p.numel() for p in model.parameters()) / 1e6:.1f}M")
+
+              # Fine-tuning setup would continue here
+              print("Fine-tuning job ready!")
+          volumeMounts:
+            - name: models
+              mountPath: /models
+              readOnly: true
+      volumes:
+        - name: models
+          persistentVolumeClaim:
+            claimName: model-cache-pvc
+      restartPolicy: Never

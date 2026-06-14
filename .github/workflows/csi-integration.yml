@@ -1,0 +1,174 @@
+name: CSI Integration Tests
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/csi/**'
+      - 'src/bin/hf-mount-csi.rs'
+      - 'deploy/csi/**'
+      - 'tests/csi_*.rs'
+      - '.github/workflows/csi-integration.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'src/csi/**'
+      - 'src/bin/hf-mount-csi.rs'
+      - 'deploy/csi/**'
+      - 'tests/csi_*.rs'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  helm-lint:
+    name: Lint Helm Charts
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.14.0
+
+      - name: Lint Helm chart
+        run: |
+          helm lint deploy/helm/hf-csi
+
+      - name: Template Helm chart
+        run: |
+          helm template test deploy/helm/hf-csi --debug
+
+  integration-test:
+    name: CSI Integration Tests
+    runs-on: ubuntu-latest
+    needs: helm-lint
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Install kind
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: csi-test
+          wait_for_ready: true
+
+      - name: Install CSI driver
+        run: |
+          kubectl create namespace hf-csi
+          kubectl apply -f deploy/csi/csi-driver.yaml
+          kubectl apply -f deploy/csi/rbac.yaml
+          kubectl apply -f deploy/csi/storageclass.yaml
+          kubectl apply -f deploy/csi/controller.yaml
+          kubectl apply -f deploy/csi/node.yaml
+          kubectl wait --for=condition=ready pod -l app=hf-csi-controller -n hf-csi --timeout=120s
+          kubectl wait --for=condition=ready pod -l app=hf-csi-node -n hf-csi --timeout=120s
+
+      - name: Run unit tests
+        run: |
+          cargo test --features nfs csi_unit -- --nocapture
+
+      - name: Run conformance tests
+        run: |
+          cargo test --features nfs csi_conformance -- --nocapture
+
+      - name: Run basic integration tests
+        run: |
+          kubectl apply -f deploy/csi/secret.yaml -n hf-csi
+          cargo test --features nfs test_csi_driver_installed -- --nocapture || true
+
+      - name: Collect logs on failure
+        if: failure()
+        run: |
+          kubectl logs -n hf-csi -l app=hf-csi-controller --tail=100 || true
+          kubectl logs -n hf-csi -l app=hf-csi-node --tail=100 || true
+          kubectl describe pods -n hf-csi || true
+
+  chaos-test:
+    name: CSI Chaos Tests
+    runs-on: ubuntu-latest
+    needs: integration-test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install kind
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: csi-chaos
+          wait_for_ready: true
+
+      - name: Install CSI driver
+        run: |
+          kubectl create namespace hf-csi
+          kubectl apply -f deploy/csi/
+          kubectl wait --for=condition=ready pod -l app=hf-csi-controller -n hf-csi --timeout=120s
+          kubectl wait --for=condition=ready pod -l app=hf-csi-node -n hf-csi --timeout=120s
+
+      - name: Run chaos tests
+        run: |
+          cargo test --features nfs chaos_ -- --nocapture
+
+      - name: Collect logs on failure
+        if: failure()
+        run: |
+          kubectl logs -n hf-csi -l app=hf-csi-controller --tail=100 || true
+          kubectl logs -n hf-csi -l app=hf-csi-node --tail=100 || true
+
+  docker-build-test:
+    name: Test CSI Docker Build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build CSI Docker image
+        run: |
+          docker build -f Dockerfile.csi -t hf-csi:test .
+
+      - name: Test image
+        run: |
+          docker run --rm hf-csi:test --version
+          docker run --rm hf-csi:test --help
+
+  helm-chart-test:
+    name: Test Helm Chart
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+
+      - name: Set up kind
+        uses: helm/kind-action@v1
+
+      - name: Install chart
+        run: |
+          helm install hf-csi-test deploy/helm/hf-csi \
+            --namespace hf-csi --create-namespace \
+            --set token.value=test-token \
+            --wait --timeout=120s
+
+      - name: Verify installation
+        run: |
+          kubectl get pods -n hf-csi
+          kubectl get csidriver csi.huggingface.co

@@ -1,0 +1,132 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": "-- Grafana --",
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "description": "Hugging Face CSI Driver monitoring dashboard",
+  "editable": true,
+  "gnetId": null,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "datasource": "${datasource}",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "axisLabel": "", "axisPlacement": "auto" }
+        }
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "id": 1,
+      "options": {},
+      "pluginVersion": "8.0.0",
+      "targets": [
+        {
+          "expr": "hf_csi_volumes_total",
+          "legendFormat": "Total Volumes",
+          "refId": "A"
+        }
+      ],
+      "title": "Managed Volumes",
+      "type": "stat"
+    },
+    {
+      "datasource": "${datasource}",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        }
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "id": 2,
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, rate(hf_csi_volume_operations_duration_seconds_bucket[5m]))",
+          "legendFormat": "P99 Latency",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.95, rate(hf_csi_volume_operations_duration_seconds_bucket[5m]))",
+          "legendFormat": "P95 Latency",
+          "refId": "B"
+        }
+      ],
+      "title": "Volume Operation Latency",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "${datasource}",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "id": 3,
+      "targets": [
+        {
+          "expr": "rate(hf_csi_hub_requests_total[5m])",
+          "legendFormat": "{{ status }} - {{ method }}",
+          "refId": "A"
+        }
+      ],
+      "title": "HF Hub Request Rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "${datasource}",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes"
+        }
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "id": 4,
+      "targets": [
+        {
+          "expr": "hf_csi_cache_size_bytes",
+          "legendFormat": "Cache Size",
+          "refId": "A"
+        },
+        {
+          "expr": "hf_csi_cache_limit_bytes",
+          "legendFormat": "Cache Limit",
+          "refId": "B"
+        }
+      ],
+      "title": "Cache Utilization",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 27,
+  "style": "dark",
+  "tags": ["hf-mount", "csi", "storage"],
+  "templating": {
+    "list": [
+      {
+        "current": { "text": "Prometheus", "value": "Prometheus" },
+        "hide": 0,
+        "label": "Datasource",
+        "name": "datasource",
+        "options": [],
+        "query": "prometheus",
+        "refresh": 1,
+        "regex": "",
+        "type": "datasource"
+      }
+    ]
+  },
+  "time": { "from": "now-1h", "to": "now" },
+  "timepicker": {},
+  "timezone": "utc",
+  "title": "HF CSI Driver",
+  "uid": "hf-csi-dashboard",
+  "version": 1
+}

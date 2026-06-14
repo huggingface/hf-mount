@@ -1,0 +1,20 @@
+{{- if .Values.storageClass.create }}
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: {{ include "hf-csi.storageClassName" . }}
+  labels:
+    {{- include "hf-csi.labels" . | nindent 4 }}
+  {{- if .Values.storageClass.isDefault }}
+  annotations:
+    storageclass.kubernetes.io/is-default-class: "true"
+  {{- end }}
+provisioner: {{ include "hf-csi.driverName" . }}
+reclaimPolicy: {{ .Values.storageClass.reclaimPolicy }}
+volumeBindingMode: {{ .Values.storageClass.volumeBindingMode }}
+allowVolumeExpansion: {{ .Values.storageClass.allowVolumeExpansion }}
+{{- if .Values.storageClass.parameters }}
+parameters:
+  {{- toYaml .Values.storageClass.parameters | nindent 2 }}
+{{- end }}
+{{- end }}

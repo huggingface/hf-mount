@@ -1,0 +1,63 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: hf-csi-alerts
+  labels:
+    app: hf-csi
+spec:
+  groups:
+    - name: hf-csi
+      rules:
+        - alert: HfCsiVolumeOperationFailures
+          expr: increase(hf_csi_volume_operations_failed_total[5m]) > 0
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "HF CSI volume operations are failing"
+            description: "CSI driver has {{ $value }} failed operations in the last 5 minutes"
+
+        - alert: HfCsiHighLatency
+          expr: histogram_quantile(0.95, rate(hf_csi_volume_operations_duration_seconds_bucket[5m])) > 30
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "HF CSI volume operations are slow"
+            description: "95th percentile latency is {{ $value }}s"
+
+        - alert: HfCsiControllerDown
+          expr: up{job="hf-csi-controller"} == 0
+          for: 2m
+          labels:
+            severity: critical
+          annotations:
+            summary: "HF CSI controller is down"
+            description: "CSI controller pod has been down for more than 2 minutes"
+
+        - alert: HfCsiNodeNotReady
+          expr: up{job="hf-csi-node"} == 0
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "HF CSI node driver not ready"
+            description: "CSI node driver on {{ $labels.instance }} is not responding"
+
+        - alert: HfCsiHubRequestFailures
+          expr: rate(hf_csi_hub_requests_total{status=~"4..|5.."}[5m]) > 0.1
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "HF Hub API request failures elevated"
+            description: "Hub API error rate is {{ $value }} req/s"
+
+        - alert: HfCsiCachePressure
+          expr: hf_csi_cache_size_bytes / hf_csi_cache_limit_bytes > 0.9
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "HF CSI cache is nearly full"
+            description: "Cache utilization is {{ $value | humanizePercentage }}"

@@ -1,0 +1,22 @@
+apiVersion: v2
+name: hf-csi
+description: A Helm chart for the Hugging Face CSI Driver - Mount HF Hub datasets and models as Kubernetes volumes
+type: application
+version: 0.1.0
+appVersion: "0.7.0"
+home: https://github.com/huggingface/hf-mount
+sources:
+  - https://github.com/huggingface/hf-mount
+maintainers:
+  - name: Hugging Face
+    url: https://huggingface.co
+keywords:
+  - csi
+  - storage
+  - huggingface
+  - ml
+  - ai
+  - datasets
+annotations:
+  artifacthub.io/category: storage
+  artifacthub.io/license: Apache-2.0
