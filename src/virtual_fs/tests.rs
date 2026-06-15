@@ -3364,6 +3364,45 @@ fn shutdown_flushes_dirty() {
     assert!(!logs.is_empty());
 }
 
+/// The kernel-cache invalidator must stop firing once shutdown begins. This
+/// mirrors the flag-gated closure installed in `fuse.rs::mount_fuse` and guards
+/// the unkillable-pod regression: an `inval_inode` writev issued during teardown
+/// can wedge a thread in uninterruptible D-state.
+#[test]
+fn invalidator_disarmed_on_shutdown() {
+    use std::sync::atomic::Ordering;
+
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    let (_rt, vfs) = vfs_advanced(&hub, &xet);
+
+    let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u64>::new()));
+    // Build the same flag-gated closure shape used in production.
+    let flag = vfs.shutdown_flag();
+    let rec = calls.clone();
+    vfs.set_invalidator(Box::new(move |ino| {
+        if flag.load(Ordering::SeqCst) {
+            return;
+        }
+        rec.lock().unwrap().push(ino);
+    }));
+
+    let invalidate = vfs.invalidator.get().expect("invalidator set");
+
+    // Before shutdown: invalidations go through.
+    invalidate(42);
+    assert_eq!(*calls.lock().unwrap(), vec![42]);
+
+    // After signalling shutdown: invalidations are no-ops.
+    vfs.signal_shutting_down();
+    invalidate(43);
+    assert_eq!(
+        *calls.lock().unwrap(),
+        vec![42],
+        "invalidator must be disarmed during shutdown"
+    );
+}
+
 /// Helper: create VFS with advanced writes + staging GC enabled (low limit).
 fn vfs_advanced_with_gc(
     hub: &std::sync::Arc<MockHub>,
