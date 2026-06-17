@@ -689,12 +689,25 @@ pub fn mount_fuse(
     };
     let notifier = session.notifier();
     let notifier_for_inode = notifier.clone();
+    // Both invalidator closures short-circuit once shutdown begins. `inval_inode`
+    // / `inval_entry` issue synchronous writevs to /dev/fuse; during teardown
+    // those can block uninterruptibly in the kernel (folio writeback wait) and
+    // leave a D-state thread that `exit_group` can't reap → unkillable pod.
+    let shutdown_flag_inode = setup.virtual_fs.shutdown_flag();
+    let shutdown_flag_entry = setup.virtual_fs.shutdown_flag();
     setup.virtual_fs.set_invalidator(Box::new(move |ino| {
+        if shutdown_flag_inode.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
         if let Err(e) = notifier_for_inode.inval_inode(fuser::INodeNo(ino), 0, -1) {
             tracing::debug!("inval_inode({}) failed: {}", ino, e);
         }
     }));
     setup.virtual_fs.set_entry_invalidator(Box::new(move |parent, name| {
+        if shutdown_flag_entry.load(std::sync::atomic::Ordering::SeqCst) {
+            // Stop the sweep; we're tearing down.
+            return false;
+        }
         let name_os = std::ffi::OsStr::new(name);
         match notifier.inval_entry(fuser::INodeNo(parent), name_os) {
             Ok(()) => true,

@@ -205,6 +205,10 @@ fusermount -u /tmp/data          # FUSE (Linux)
 hf-mount stop /tmp/data          # daemon mounts
 ```
 
+### Graceful shutdown (SIGTERM / CSI sidecar)
+
+On `SIGTERM` the sidecar bounds the dirty-data flush (`--flush-shutdown-timeout-ms`) and **disarms the kernel-cache invalidators** before draining. This is deliberate: a `FUSE_NOTIFY_INVAL_INODE` writev issued during teardown can block uninterruptibly in the kernel (waiting on a folio under writeback the exiting daemon can no longer complete), leaving a `D`-state thread that even `exit_group` can't reap — an unkillable pod. Disarming the invalidator avoids creating that wedge; the CSI driver aborting the FUSE connection on `NodeUnpublishVolume` is the kernel-level backstop for any already-in-flight notify.
+
 ### Options
 
 | Flag | Default | Description |

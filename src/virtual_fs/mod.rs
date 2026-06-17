@@ -2,7 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -160,6 +160,15 @@ pub struct VirtualFs {
     /// are detected, allowing the kernel page cache to be used instead of DIRECT_IO.
     invalidator: Invalidator,
     entry_invalidator: EntryInvalidator,
+    /// Set once a SIGTERM/shutdown begins. The kernel-cache invalidator
+    /// closures check this and become no-ops, so the poll loop / revalidate
+    /// path stop issuing synchronous `inval_inode` writevs to /dev/fuse during
+    /// teardown. Those writevs can otherwise block uninterruptibly in
+    /// `folio_wait_bit_common` (a folio under writeback the dying server can no
+    /// longer complete), leaving an unreapable D-state thread that `exit_group`
+    /// can't kill — an unkillable pod. See the CSI driver's connection-abort
+    /// for the kernel-level backstop covering any already-in-flight writev.
+    shutting_down: Arc<AtomicBool>,
     /// Background LRU evictor handle, aborted in `shutdown()`.
     lru_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// How long a file's metadata is trusted before re-checking via HEAD.
@@ -269,6 +278,7 @@ impl VirtualFs {
             poll_handle: Mutex::new(poll_handle),
             invalidator,
             entry_invalidator,
+            shutting_down: Arc::new(AtomicBool::new(false)),
             lru_handle: Mutex::new(None),
             metadata_ttl: config.metadata_ttl,
             serve_lookup_from_cache: config.serve_lookup_from_cache,
@@ -416,6 +426,21 @@ impl VirtualFs {
         let _ = self.entry_invalidator.set(f);
     }
 
+    /// Shared shutdown flag. Cloned into the invalidator closures so they can
+    /// short-circuit once teardown starts — without holding an `Arc<VirtualFs>`
+    /// (which would form a reference cycle with the closure stored in the
+    /// `OnceLock`).
+    pub fn shutdown_flag(&self) -> Arc<AtomicBool> {
+        self.shutting_down.clone()
+    }
+
+    /// Mark teardown as started so the invalidator closures stop issuing FUSE
+    /// notifies. Idempotent; called early from the SIGTERM handler and again at
+    /// the top of `shutdown()`.
+    pub fn signal_shutting_down(&self) {
+        self.shutting_down.store(true, Ordering::SeqCst);
+    }
+
     async fn lru_sweep_loop(weak: std::sync::Weak<Self>, soft_limit: usize, interval: Duration) {
         loop {
             tokio::time::sleep(interval).await;
@@ -533,6 +558,9 @@ impl VirtualFs {
     /// Graceful shutdown: abort polling, drain flush queue, wait for completion.
     pub fn shutdown(&self) {
         info!("Shutting down VFS, flushing pending writes...");
+        // Stop the invalidator closures first: any further `inval_inode` writev
+        // to /dev/fuse during teardown risks an unkillable D-state wedge.
+        self.signal_shutting_down();
         // Abort background tasks.
         if let Some(handle) = self.poll_handle.lock().expect("poll_handle poisoned").take() {
             handle.abort();

@@ -91,10 +91,21 @@ fn main() {
                 std::process::exit(0);
             }
             info!("Received shutdown signal, flushing {} mount(s)", vfs_list.len());
-            // Hard watchdog: guarantee the process exits even if the bounded
-            // flush can't make progress (saturated runtime). Without this the
-            // FUSE fd never closes, the kernel keeps the connection alive, and
-            // any process on the mount stays blocked in D-state → unkillable pod.
+            // Disarm the kernel-cache invalidators on every mount immediately,
+            // before the flush drain starts. This stops the poll loop / revalidate
+            // path from issuing `inval_inode` writevs during teardown, which can
+            // wedge a thread in uninterruptible D-state (folio writeback wait) that
+            // not even `exit_group` can reap.
+            for vfs in &vfs_list {
+                vfs.signal_shutting_down();
+            }
+            // Hard watchdog: bound the shutdown so the process exits even if the
+            // flush drain can't make progress (saturated runtime). NOTE: forcing
+            // `exit()` releases the FUSE fd ONLY if no thread is wedged in the
+            // kernel — a D-state thread survives `exit_group` and leaves an
+            // unreapable zombie. The guaranteed connection release for that case
+            // is the CSI driver aborting the FUSE connection on NodeUnpublish;
+            // the disarm above prevents us from creating such a wedge here.
             let watchdog = Duration::from_millis(SHUTDOWN_WATCHDOG_MS.load(Ordering::Relaxed));
             std::thread::spawn(move || {
                 std::thread::sleep(watchdog);
