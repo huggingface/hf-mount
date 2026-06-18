@@ -217,9 +217,12 @@ On `SIGTERM` the sidecar bounds the dirty-data flush (`--flush-shutdown-timeout-
 | `--hub-endpoint` | `https://huggingface.co` | Hub API endpoint |
 | `--cache-dir` | `/tmp/hf-mount-cache` | Local cache directory |
 | `--cache-size` | `10000000000` (~10 GB) | Max on-disk chunk cache size in bytes |
+| `--cache-mode` | `chunk` | Disk cache layer: `chunk` (xet-core xorb-range cache) or `file` (whole-file cache keyed by xet hash, avoids chunk-range fragmentation on warm reloads). Mutually exclusive; `file` disables the chunk cache. |
+| `--max-staging-size` | `0` (unlimited) | Max bytes for advanced-writes staging files before flushed files are garbage-collected (LRU by last-touched). `0` disables GC, so staging files persist as a read-after-write cache. Does not yet cover the HTTP download cache for non-Xet repo files. |
 | `--read-only` | `false` | Mount read-only (always on for repos) |
 | `--advanced-writes` | `false` | Enable staging files + async flush (random writes, seek, overwrite) |
 | `--poll-interval-secs` | `30` | Remote change polling interval (0 to disable) |
+| `--poll-listing-concurrency` | `4` | Max concurrent tree-listing requests per poll round. Main knob to throttle load on the Hub `/api` endpoint; lower it in shared environments where many mounts poll in parallel. |
 | `--max-threads` | `16` | Maximum FUSE worker threads (Linux only) |
 | `--metadata-ttl-ms` | `10000` | How long file metadata is cached before re-checking (ms) |
 | `--metadata-ttl-minimal` | `false` | Re-check on every access (maximum freshness, lower throughput) |
@@ -227,6 +230,7 @@ On `SIGTERM` the sidecar bounds the dirty-data flush (`--flush-shutdown-timeout-
 | `--flush-max-batch-window-ms` | `30000` | Advanced writes: max flush batch window (ms) |
 | `--flush-shutdown-timeout-ms` | `45000` | Advanced writes: max time the SIGTERM flush drain may run before abandoning unflushed data to guarantee exit. Must be < the pod's `terminationGracePeriodSeconds`, or a slow Hub/CAS backend keeps the FUSE connection alive past grace and strands the pod. |
 | `--no-disk-cache` | `false` | Disable local chunk cache (every read fetches from HF) |
+| `--direct-io` | `false` | Bypass the kernel page cache (FOPEN_DIRECT_IO); every read goes through the FUSE handler. For benchmarking; not recommended in production (disables efficient mmap caching). |
 | `--no-filter-os-files` | `false` | Stop filtering OS junk files (.DS_Store, Thumbs.db, etc.) |
 | `--uid` / `--gid` | current user | Override UID/GID for mounted files |
 | `--fuse-owner-only` | `false` | Restrict mount access to the mounting user only (FUSE only; by default all users can access, which requires `user_allow_other` in /etc/fuse.conf) |
