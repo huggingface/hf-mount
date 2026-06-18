@@ -571,25 +571,49 @@ pub async fn mount_nfs(
 
     #[cfg(target_os = "linux")]
     {
+        // mount.nfs (nfs-common on Debian/Ubuntu, nfs-utils on RHEL/Fedora/AL2023)
+        // is required. It conventionally lives in /sbin or /usr/sbin, which aren't
+        // always on PATH for non-login processes, so resolve it explicitly. When it
+        // is missing the bare spawn fails with a cryptic "No such file or directory
+        // (os error 2)" — see issue #101.
+        let Some(mount_nfs) = find_mount_nfs() else {
+            server_handle.abort();
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "mount.nfs not found. Install nfs-common (Debian/Ubuntu) or nfs-utils (RHEL/Fedora/AL2023).",
+            ));
+        };
+
         let mut mount_opts = format!("nolock,vers=3,tcp,rsize=1048576,actimeo={actimeo},port={port},mountport={port}");
         if !read_only {
             mount_opts = format!("{mount_opts},wsize=1048576");
         }
         let output = if unsafe { libc::getuid() } == 0 {
-            std::process::Command::new("mount.nfs")
+            std::process::Command::new(&mount_nfs)
                 .args(["-o", &mount_opts, "127.0.0.1:/", mount_point_str])
                 .output()?
         } else {
             std::process::Command::new("sudo")
-                .args(["-n", "mount.nfs", "-o", &mount_opts, "127.0.0.1:/", mount_point_str])
+                .arg("-n")
+                .arg(&mount_nfs)
+                .args(["-o", &mount_opts, "127.0.0.1:/", mount_point_str])
                 .output()?
         };
         if !output.status.success() {
             server_handle.abort();
             let stderr = String::from_utf8_lossy(&output.stderr);
             let stdout = String::from_utf8_lossy(&output.stdout);
+            // mount.nfs exits 32 with EPERM when the kernel mount() syscall is
+            // denied — typically a container without CAP_SYS_ADMIN. See issue #101.
+            let hint = if stderr.contains("Operation not permitted") {
+                "\nhint: the mount syscall was denied. NFS mounts require CAP_SYS_ADMIN; \
+                 run the container privileged (e.g. `docker run --privileged` or `--cap-add SYS_ADMIN`) \
+                 and ensure seccomp/AppArmor profiles allow the mount syscall."
+            } else {
+                ""
+            };
             return Err(std::io::Error::other(format!(
-                "mount.nfs failed with {}: stdout={stdout} stderr={stderr}",
+                "mount.nfs failed with {}: stdout={stdout} stderr={stderr}{hint}",
                 output.status
             )));
         }
@@ -826,6 +850,25 @@ fn system_time_to_nfstime(t: SystemTime) -> nfstime3 {
         seconds: d.as_secs().min(u32::MAX as u64) as u32,
         nseconds: d.subsec_nanos(),
     }
+}
+
+/// Resolve the `mount.nfs` binary, searching `$PATH` plus the conventional
+/// sbin directories (which are often absent from a non-login process's PATH).
+/// Returns `None` when `nfs-common`/`nfs-utils` is not installed.
+#[cfg(target_os = "linux")]
+fn find_mount_nfs() -> Option<std::path::PathBuf> {
+    let mut dirs: Vec<std::path::PathBuf> = std::env::var_os("PATH")
+        .map(|path| std::env::split_paths(&path).collect())
+        .unwrap_or_default();
+    for fallback in ["/sbin", "/usr/sbin", "/bin", "/usr/bin"] {
+        let dir = std::path::PathBuf::from(fallback);
+        if !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    }
+    dirs.into_iter()
+        .map(|dir| dir.join("mount.nfs"))
+        .find(|candidate| candidate.is_file())
 }
 
 /// Check if a path is still an active mount point.
