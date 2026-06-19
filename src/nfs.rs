@@ -510,7 +510,10 @@ pub async fn mount_nfs(
     let pool = pool_for_shutdown.clone();
     let vfs = vfs_for_shutdown.clone();
     let rt = tokio::runtime::Handle::current();
-    vfs_for_shutdown.set_invalidator(Box::new(move |ino| {
+    // NFS has no kernel page cache to invalidate, so the `InvalKind` page-vs-attr
+    // distinction (a FUSE-only deadlock guard, #195) doesn't apply here: we always
+    // drop the pooled handle so the next read re-opens at the new xet_hash.
+    vfs_for_shutdown.set_invalidator(Box::new(move |ino, _kind| {
         let Some(fh) = pool.lock().expect("handle_pool poisoned").remove(ino) else {
             return;
         };

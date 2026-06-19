@@ -8,8 +8,8 @@ use tracing::{debug, info, warn};
 use crate::error::Error;
 use crate::hub_api::HubOps;
 
-use super::Invalidator;
 use super::inode::{self, InodeTable};
+use super::{InvalKind, Invalidator};
 
 /// Cap on the exponential-backoff multiplier applied to the poll interval
 /// when we keep getting 401s. With `interval = 30s` and `MAX_AUTH_BACKOFF_EXP = 6`,
@@ -214,8 +214,12 @@ impl super::VirtualFs {
             }
         }
 
-        // Phase 2: Apply mutations under lock, collect inodes to invalidate
-        let mut inos_to_invalidate: Vec<u64> = Vec::new();
+        // Phase 2: Apply mutations under lock, collect inodes to invalidate.
+        // An inode with open handles may have an in-flight read holding its
+        // folio locks; a full page invalidation would block in the kernel
+        // waiting on that lock and deadlock against the read (#195), so such
+        // inodes get an attribute-only invalidation that never touches pages.
+        let mut inos_to_invalidate: Vec<(u64, InvalKind)> = Vec::new();
         let dirs_to_invalidate_kernel: Vec<u64>;
         {
             let mut inode_table = inodes.write().expect("inodes poisoned");
@@ -228,7 +232,12 @@ impl super::VirtualFs {
                     update.size,
                     update.mtime,
                 );
-                inos_to_invalidate.push(update.ino);
+                let kind = if inode_table.has_open_handles(update.ino) {
+                    InvalKind::AttrOnly
+                } else {
+                    InvalKind::Pages
+                };
+                inos_to_invalidate.push((update.ino, kind));
             }
 
             for ino in &deletions {
@@ -239,7 +248,7 @@ impl super::VirtualFs {
                     Some(entry) => (entry.parent, entry.name.clone()),
                     None => continue,
                 };
-                if inode_table.has_open_handles(*ino) {
+                let ino_kind = if inode_table.has_open_handles(*ino) {
                     // Unlink the pathname but keep the inode as orphan (nlink=0)
                     // so open handles can still read/fstat. release() will clean
                     // up the orphan. Without this, the file stays visible by name
@@ -249,11 +258,15 @@ impl super::VirtualFs {
                         "Remote deletion of ino={}: unlinked path, kept orphan (open handles)",
                         ino
                     );
+                    // Open handles → an in-flight read may hold this inode's
+                    // folios; never issue a blocking page invalidation against it.
+                    InvalKind::AttrOnly
                 } else {
                     inode_table.remove(*ino);
-                }
-                inos_to_invalidate.push(parent_ino);
-                inos_to_invalidate.push(*ino);
+                    InvalKind::Pages
+                };
+                inos_to_invalidate.push((parent_ino, InvalKind::Pages));
+                inos_to_invalidate.push((*ino, ino_kind));
             }
 
             // Phase 3: New remote entries (files AND directories) -> invalidate parent dir.
@@ -319,11 +332,14 @@ impl super::VirtualFs {
 
         // Phase 4: Invalidate kernel page cache (outside lock scope)
         if let Some(invalidate) = invalidator.get() {
-            for ino in &inos_to_invalidate {
-                invalidate(*ino);
+            for (ino, kind) in &inos_to_invalidate {
+                invalidate(*ino, *kind);
             }
+            // Directories: drop the cached readdir so the next readdir re-fetches.
+            // readdir doesn't hold the folio-read locks that make page drops
+            // deadlock, so a full invalidation is safe here.
             for dir_ino in &dirs_to_invalidate_kernel {
-                invalidate(*dir_ino);
+                invalidate(*dir_ino, InvalKind::Pages);
             }
         }
     }
