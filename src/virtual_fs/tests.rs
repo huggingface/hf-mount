@@ -2825,7 +2825,7 @@ fn poll_calls_invalidator_for_updated_file() {
     let invalidated: Arc<std::sync::Mutex<Vec<u64>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     {
         let sink = invalidated.clone();
-        vfs.set_invalidator(Box::new(move |ino| {
+        vfs.set_invalidator(Box::new(move |ino, _kind| {
             sink.lock().unwrap().push(ino);
         }));
     }
@@ -2934,6 +2934,128 @@ fn poll_skips_deletion_with_open_handles() {
             inodes.get(open_attr.ino).is_none(),
             "orphan should be removed after release"
         );
+    });
+}
+
+/// Regression for #195: a remote deletion of a file with open handles must
+/// invalidate that inode with `AttrOnly` (never a blocking page drop, which
+/// would deadlock against the in-flight read holding the inode's folio lock),
+/// while a file with no open handles is invalidated with `Pages`. The unlinked
+/// parent directory is always invalidated with `Pages`.
+#[test]
+fn poll_deletion_uses_attr_only_for_open_handles() {
+    let hub = MockHub::new_repo();
+    hub.add_file("open.txt", 10, Some("h1"), None);
+    hub.add_file("closed.txt", 20, Some("h2"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_repo(&hub, &xet);
+
+    let calls: Arc<std::sync::Mutex<Vec<(u64, InvalKind)>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    {
+        let sink = calls.clone();
+        vfs.set_invalidator(Box::new(move |ino, kind| {
+            sink.lock().unwrap().push((ino, kind));
+        }));
+    }
+
+    rt.block_on(async {
+        let open_attr = vfs.lookup(ROOT_INODE, "open.txt").await.unwrap();
+        let closed_attr = vfs.lookup(ROOT_INODE, "closed.txt").await.unwrap();
+
+        // Hold an open handle on open.txt; closed.txt has none.
+        let fh = vfs.open(open_attr.ino, false, false, None).await.unwrap();
+
+        hub.remove_file("open.txt");
+        hub.remove_file("closed.txt");
+
+        let prefixes = vfs.inode_table.read().unwrap().loaded_dir_prefixes();
+        let mut remote = Vec::new();
+        for prefix in &prefixes {
+            remote.extend(hub.list_tree(prefix).await.unwrap());
+        }
+        let polled: std::collections::HashSet<String> = prefixes.into_iter().collect();
+        VirtualFs::apply_poll_diff(remote, &polled, &vfs.inode_table, &vfs.negative_cache, &vfs.invalidator);
+
+        // Snapshot (releasing the lock) so the guard isn't held across the await below.
+        let recorded = calls.lock().unwrap().clone();
+        assert!(
+            recorded.contains(&(open_attr.ino, InvalKind::AttrOnly)),
+            "orphaned open inode must be invalidated AttrOnly (got {:?})",
+            recorded,
+        );
+        assert!(
+            !recorded
+                .iter()
+                .any(|&(ino, k)| ino == open_attr.ino && k == InvalKind::Pages),
+            "orphaned open inode must never get a blocking Pages drop (got {:?})",
+            recorded,
+        );
+        assert!(
+            recorded.contains(&(closed_attr.ino, InvalKind::Pages)),
+            "deleted inode without handles must be invalidated Pages (got {:?})",
+            recorded,
+        );
+        assert!(
+            recorded.contains(&(ROOT_INODE, InvalKind::Pages)),
+            "unlinked parent dir must be invalidated Pages (got {:?})",
+            recorded,
+        );
+
+        vfs.release(fh).await.unwrap();
+    });
+}
+
+/// Regression for #195: a remote *update* of a file with open handles must also
+/// use `AttrOnly` — an updated open file deadlocks the same way as a deleted one
+/// if a full page invalidation races the in-flight read. A file with no open
+/// handle gets `Pages` so its stale cache is dropped.
+#[test]
+fn poll_update_uses_attr_only_for_open_handles() {
+    let hub = MockHub::new_repo();
+    hub.add_file("open.txt", 10, Some("old_a"), None);
+    hub.add_file("closed.txt", 10, Some("old_b"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_repo(&hub, &xet);
+
+    let calls: Arc<std::sync::Mutex<Vec<(u64, InvalKind)>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    {
+        let sink = calls.clone();
+        vfs.set_invalidator(Box::new(move |ino, kind| {
+            sink.lock().unwrap().push((ino, kind));
+        }));
+    }
+
+    rt.block_on(async {
+        let open_attr = vfs.lookup(ROOT_INODE, "open.txt").await.unwrap();
+        let closed_attr = vfs.lookup(ROOT_INODE, "closed.txt").await.unwrap();
+        let fh = vfs.open(open_attr.ino, false, false, None).await.unwrap();
+
+        // Remote content changes on both files.
+        hub.add_file("open.txt", 99, Some("new_a"), None);
+        hub.add_file("closed.txt", 99, Some("new_b"), None);
+
+        let prefixes = vfs.inode_table.read().unwrap().loaded_dir_prefixes();
+        let mut remote = Vec::new();
+        for prefix in &prefixes {
+            remote.extend(hub.list_tree(prefix).await.unwrap());
+        }
+        let polled: std::collections::HashSet<String> = prefixes.into_iter().collect();
+        VirtualFs::apply_poll_diff(remote, &polled, &vfs.inode_table, &vfs.negative_cache, &vfs.invalidator);
+
+        // Snapshot (releasing the lock) so the guard isn't held across the await below.
+        let recorded = calls.lock().unwrap().clone();
+        assert!(
+            recorded.contains(&(open_attr.ino, InvalKind::AttrOnly)),
+            "updated open inode must be invalidated AttrOnly (got {:?})",
+            recorded,
+        );
+        assert!(
+            recorded.contains(&(closed_attr.ino, InvalKind::Pages)),
+            "updated inode without handles must be invalidated Pages (got {:?})",
+            recorded,
+        );
+
+        vfs.release(fh).await.unwrap();
     });
 }
 
@@ -3364,6 +3486,22 @@ fn shutdown_flushes_dirty() {
     assert!(!logs.is_empty());
 }
 
+/// Pins the load-bearing `InvalKind → (offset, len)` contract for #195. The
+/// kernel skips page invalidation when `offset < 0`, so `AttrOnly` MUST map to a
+/// negative offset and `Pages` to `offset = 0`. Inverting these would silently
+/// reintroduce the deadlock (a blocking page drop on a busy inode), so lock it
+/// down here — the live mapping has no other unit coverage.
+#[cfg(feature = "fuse")]
+#[test]
+fn inval_kind_offset_len_mapping() {
+    // AttrOnly: negative offset → kernel never touches pages.
+    let (off, _len) = InvalKind::AttrOnly.offset_len();
+    assert!(off < 0, "AttrOnly must use a negative offset, got {}", off);
+
+    // Pages: non-negative offset, full-file length.
+    assert_eq!(InvalKind::Pages.offset_len(), (0, -1));
+}
+
 /// The kernel-cache invalidator must stop firing once shutdown begins. This
 /// mirrors the flag-gated closure installed in `fuse.rs::mount_fuse` and guards
 /// the unkillable-pod regression: an `inval_inode` writev issued during teardown
@@ -3380,7 +3518,7 @@ fn invalidator_disarmed_on_shutdown() {
     // Build the same flag-gated closure shape used in production.
     let flag = vfs.shutdown_flag();
     let rec = calls.clone();
-    vfs.set_invalidator(Box::new(move |ino| {
+    vfs.set_invalidator(Box::new(move |ino, _kind| {
         if flag.load(Ordering::SeqCst) {
             return;
         }
@@ -3390,12 +3528,12 @@ fn invalidator_disarmed_on_shutdown() {
     let invalidate = vfs.invalidator.get().expect("invalidator set");
 
     // Before shutdown: invalidations go through.
-    invalidate(42);
+    invalidate(42, InvalKind::Pages);
     assert_eq!(*calls.lock().unwrap(), vec![42]);
 
     // After signalling shutdown: invalidations are no-ops.
     vfs.signal_shutting_down();
-    invalidate(43);
+    invalidate(43, InvalKind::Pages);
     assert_eq!(
         *calls.lock().unwrap(),
         vec![42],

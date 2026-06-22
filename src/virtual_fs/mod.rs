@@ -44,7 +44,43 @@ const NEG_CACHE_TTL: Duration = Duration::from_secs(30);
 const INVAL_BATCH_SIZE: usize = 64;
 const INVAL_BATCH_PAUSE: Duration = Duration::from_millis(10);
 
-type InvalidatorFn = Box<dyn Fn(u64) + Send + Sync>;
+/// What to drop when invalidating a cached inode.
+///
+/// `Pages` issues a full kernel page-cache invalidation (`inval_inode` with a
+/// non-negative offset), which in-kernel walks `invalidate_inode_pages2_range`
+/// and *blocks on per-folio locks*. If a concurrent `read()` holds a folio lock
+/// while waiting for the daemon to fill it, that blocking writev deadlocks
+/// against the in-flight read (see #195). `AttrOnly` issues `inval_inode` with a
+/// negative offset, which the kernel gates so it drops only cached attributes
+/// and never touches pages — so it can never wait on a folio. Use `AttrOnly`
+/// for any inode with open handles (an in-flight read may be holding its
+/// folios); use `Pages` only when no handle is open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InvalKind {
+    /// Drop attributes and the full page cache (blocking; safe only with no open handles).
+    Pages,
+    /// Drop cached attributes only; never touches pages (non-blocking).
+    AttrOnly,
+}
+
+impl InvalKind {
+    /// The `(offset, len)` pair to pass to `notify_inval_inode`. The kernel
+    /// gates page invalidation on `offset >= 0`, so a negative offset
+    /// (`AttrOnly`) drops attributes only and never waits on a folio, while
+    /// `Pages` (`offset = 0, len = -1`) invalidates the whole page cache. This
+    /// `(-1, 0)` vs `(0, -1)` contract is load-bearing for the #195 fix —
+    /// inverting it would reintroduce the deadlock — so it is unit-tested.
+    /// Only the FUSE backend issues `notify_inval_inode`; NFS ignores the kind.
+    #[cfg(feature = "fuse")]
+    pub(crate) fn offset_len(self) -> (i64, i64) {
+        match self {
+            InvalKind::Pages => (0, -1),
+            InvalKind::AttrOnly => (-1, 0),
+        }
+    }
+}
+
+type InvalidatorFn = Box<dyn Fn(u64, InvalKind) + Send + Sync>;
 /// `(parent, name) -> Ok/Err` maps to `fuse_notify_inval_entry`. Returns
 /// false when the FUSE notify channel is saturated (EAGAIN/ENOMEM) so the
 /// sweep can back off instead of burning CPU on a full queue. Separate
@@ -158,6 +194,10 @@ pub struct VirtualFs {
     /// Kernel cache invalidation callback. Set via `set_invalidator()` after mount.
     /// The poll loop calls this to actively invalidate stale inodes when remote changes
     /// are detected, allowing the kernel page cache to be used instead of DIRECT_IO.
+    /// Callers pass [`InvalKind`] to pick a blocking page-drop vs a non-blocking
+    /// attribute-only drop: an inode with open handles must use `AttrOnly`, since a
+    /// full page invalidation would deadlock against an in-flight `read()` holding
+    /// the same folio lock (#195).
     invalidator: Invalidator,
     entry_invalidator: EntryInvalidator,
     /// Set once a SIGTERM/shutdown begins. The kernel-cache invalidator
@@ -639,15 +679,23 @@ impl VirtualFs {
         // blocks on per-folio waits. Calling it under the global write lock can
         // stall the whole VFS (and has been observed to deadlock production
         // pods). Apply the mutation, drop the lock, then notify.
-        let mut to_invalidate: Vec<u64> = Vec::new();
+        let mut to_invalidate: Vec<(u64, InvalKind)> = Vec::new();
         match remote {
             None => {
                 // File deleted remotely → remove from inode table
                 info!("Remote deletion detected via HEAD: {}", full_path);
                 let mut inodes = self.inode_table.write().expect("inodes poisoned");
                 if let Some(entry) = inodes.get(ino) {
-                    to_invalidate.push(entry.parent);
-                    to_invalidate.push(ino);
+                    let parent = entry.parent;
+                    // A full page drop on an inode with an in-flight read deadlocks
+                    // against the read's folio lock (#195); fall back to attr-only.
+                    let kind = if inodes.has_open_handles(ino) {
+                        InvalKind::AttrOnly
+                    } else {
+                        InvalKind::Pages
+                    };
+                    to_invalidate.push((parent, InvalKind::Pages));
+                    to_invalidate.push((ino, kind));
                 }
                 inodes.remove(ino);
             }
@@ -682,7 +730,12 @@ impl VirtualFs {
                         remote_size,
                         remote_mtime,
                     );
-                    to_invalidate.push(ino);
+                    let kind = if inodes.has_open_handles(ino) {
+                        InvalKind::AttrOnly
+                    } else {
+                        InvalKind::Pages
+                    };
+                    to_invalidate.push((ino, kind));
                 } else {
                     // Update stored etag even when content didn't change,
                     // so future revalidations have the latest value.
@@ -705,8 +758,8 @@ impl VirtualFs {
         if !to_invalidate.is_empty()
             && let Some(invalidate) = self.invalidator.get()
         {
-            for ino in to_invalidate {
-                invalidate(ino);
+            for (ino, kind) in to_invalidate {
+                invalidate(ino, kind);
             }
         }
     }
