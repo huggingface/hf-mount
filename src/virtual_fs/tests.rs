@@ -2950,8 +2950,7 @@ fn poll_deletion_uses_attr_only_for_open_handles() {
     let xet = MockXet::new();
     let (rt, vfs) = vfs_repo(&hub, &xet);
 
-    let calls: Arc<std::sync::Mutex<Vec<(u64, InvalKind)>>> =
-        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let calls: Arc<std::sync::Mutex<Vec<(u64, InvalKind)>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     {
         let sink = calls.clone();
         vfs.set_invalidator(Box::new(move |ino, kind| {
@@ -2977,26 +2976,29 @@ fn poll_deletion_uses_attr_only_for_open_handles() {
         let polled: std::collections::HashSet<String> = prefixes.into_iter().collect();
         VirtualFs::apply_poll_diff(remote, &polled, &vfs.inode_table, &vfs.negative_cache, &vfs.invalidator);
 
-        let recorded = calls.lock().unwrap();
+        // Snapshot (releasing the lock) so the guard isn't held across the await below.
+        let recorded = calls.lock().unwrap().clone();
         assert!(
             recorded.contains(&(open_attr.ino, InvalKind::AttrOnly)),
             "orphaned open inode must be invalidated AttrOnly (got {:?})",
-            *recorded,
+            recorded,
         );
         assert!(
-            !recorded.iter().any(|&(ino, k)| ino == open_attr.ino && k == InvalKind::Pages),
+            !recorded
+                .iter()
+                .any(|&(ino, k)| ino == open_attr.ino && k == InvalKind::Pages),
             "orphaned open inode must never get a blocking Pages drop (got {:?})",
-            *recorded,
+            recorded,
         );
         assert!(
             recorded.contains(&(closed_attr.ino, InvalKind::Pages)),
             "deleted inode without handles must be invalidated Pages (got {:?})",
-            *recorded,
+            recorded,
         );
         assert!(
             recorded.contains(&(ROOT_INODE, InvalKind::Pages)),
             "unlinked parent dir must be invalidated Pages (got {:?})",
-            *recorded,
+            recorded,
         );
 
         vfs.release(fh).await.unwrap();
@@ -3015,8 +3017,7 @@ fn poll_update_uses_attr_only_for_open_handles() {
     let xet = MockXet::new();
     let (rt, vfs) = vfs_repo(&hub, &xet);
 
-    let calls: Arc<std::sync::Mutex<Vec<(u64, InvalKind)>>> =
-        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let calls: Arc<std::sync::Mutex<Vec<(u64, InvalKind)>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     {
         let sink = calls.clone();
         vfs.set_invalidator(Box::new(move |ino, kind| {
@@ -3041,16 +3042,17 @@ fn poll_update_uses_attr_only_for_open_handles() {
         let polled: std::collections::HashSet<String> = prefixes.into_iter().collect();
         VirtualFs::apply_poll_diff(remote, &polled, &vfs.inode_table, &vfs.negative_cache, &vfs.invalidator);
 
-        let recorded = calls.lock().unwrap();
+        // Snapshot (releasing the lock) so the guard isn't held across the await below.
+        let recorded = calls.lock().unwrap().clone();
         assert!(
             recorded.contains(&(open_attr.ino, InvalKind::AttrOnly)),
             "updated open inode must be invalidated AttrOnly (got {:?})",
-            *recorded,
+            recorded,
         );
         assert!(
             recorded.contains(&(closed_attr.ino, InvalKind::Pages)),
             "updated inode without handles must be invalidated Pages (got {:?})",
-            *recorded,
+            recorded,
         );
 
         vfs.release(fh).await.unwrap();
@@ -3482,6 +3484,22 @@ fn shutdown_flushes_dirty() {
     // After shutdown, batch log should show the flush
     let logs = hub.take_batch_log();
     assert!(!logs.is_empty());
+}
+
+/// Pins the load-bearing `InvalKind → (offset, len)` contract for #195. The
+/// kernel skips page invalidation when `offset < 0`, so `AttrOnly` MUST map to a
+/// negative offset and `Pages` to `offset = 0`. Inverting these would silently
+/// reintroduce the deadlock (a blocking page drop on a busy inode), so lock it
+/// down here — the live mapping has no other unit coverage.
+#[cfg(feature = "fuse")]
+#[test]
+fn inval_kind_offset_len_mapping() {
+    // AttrOnly: negative offset → kernel never touches pages.
+    let (off, _len) = InvalKind::AttrOnly.offset_len();
+    assert!(off < 0, "AttrOnly must use a negative offset, got {}", off);
+
+    // Pages: non-negative offset, full-file length.
+    assert_eq!(InvalKind::Pages.offset_len(), (0, -1));
 }
 
 /// The kernel-cache invalidator must stop firing once shutdown begins. This

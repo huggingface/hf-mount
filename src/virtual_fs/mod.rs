@@ -63,6 +63,23 @@ pub enum InvalKind {
     AttrOnly,
 }
 
+impl InvalKind {
+    /// The `(offset, len)` pair to pass to `notify_inval_inode`. The kernel
+    /// gates page invalidation on `offset >= 0`, so a negative offset
+    /// (`AttrOnly`) drops attributes only and never waits on a folio, while
+    /// `Pages` (`offset = 0, len = -1`) invalidates the whole page cache. This
+    /// `(-1, 0)` vs `(0, -1)` contract is load-bearing for the #195 fix —
+    /// inverting it would reintroduce the deadlock — so it is unit-tested.
+    /// Only the FUSE backend issues `notify_inval_inode`; NFS ignores the kind.
+    #[cfg(feature = "fuse")]
+    pub(crate) fn offset_len(self) -> (i64, i64) {
+        match self {
+            InvalKind::Pages => (0, -1),
+            InvalKind::AttrOnly => (-1, 0),
+        }
+    }
+}
+
 type InvalidatorFn = Box<dyn Fn(u64, InvalKind) + Send + Sync>;
 /// `(parent, name) -> Ok/Err` maps to `fuse_notify_inval_entry`. Returns
 /// false when the FUSE notify channel is saturated (EAGAIN/ENOMEM) so the
@@ -672,7 +689,11 @@ impl VirtualFs {
                     let parent = entry.parent;
                     // A full page drop on an inode with an in-flight read deadlocks
                     // against the read's folio lock (#195); fall back to attr-only.
-                    let kind = if inodes.has_open_handles(ino) { InvalKind::AttrOnly } else { InvalKind::Pages };
+                    let kind = if inodes.has_open_handles(ino) {
+                        InvalKind::AttrOnly
+                    } else {
+                        InvalKind::Pages
+                    };
                     to_invalidate.push((parent, InvalKind::Pages));
                     to_invalidate.push((ino, kind));
                 }
@@ -709,7 +730,11 @@ impl VirtualFs {
                         remote_size,
                         remote_mtime,
                     );
-                    let kind = if inodes.has_open_handles(ino) { InvalKind::AttrOnly } else { InvalKind::Pages };
+                    let kind = if inodes.has_open_handles(ino) {
+                        InvalKind::AttrOnly
+                    } else {
+                        InvalKind::Pages
+                    };
                     to_invalidate.push((ino, kind));
                 } else {
                     // Update stored etag even when content didn't change,
