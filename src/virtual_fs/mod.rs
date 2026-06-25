@@ -1120,7 +1120,7 @@ impl VirtualFs {
         // unbounded memory. 32 slots × ~128KB FUSE write = ~4MB max in-flight.
         // blocking_send is safe here: FUSE threads are not tokio workers.
         let (tx, rx) = tokio::sync::mpsc::channel::<WriteMsg>(32);
-        let error: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
+        let error: Arc<std::sync::Mutex<Option<crate::error::Error>>> = Arc::new(std::sync::Mutex::new(None));
         self.runtime
             .spawn(streaming_worker(streaming_writer, rx, error.clone()));
 
@@ -2316,8 +2316,8 @@ impl VirtualFs {
                 channel,
             } => {
                 // Check for previous worker error
-                if channel.error.lock().expect("error poisoned").is_some() {
-                    return Err(libc::EIO);
+                if let Some(err) = channel.error.lock().expect("error poisoned").as_ref() {
+                    return Err(err.to_errno());
                 }
 
                 // Enforce append-only: offset must match bytes written so far
@@ -2362,8 +2362,8 @@ impl VirtualFs {
 
         if let Some(channel) = streaming_channel {
             // Check for worker errors first.
-            if channel.error.lock().expect("error poisoned").is_some() {
-                return Err(libc::EIO);
+            if let Some(err) = channel.error.lock().expect("error poisoned").as_ref() {
+                return Err(err.to_errno());
             }
 
             // Check current commit state.
@@ -2629,7 +2629,7 @@ impl VirtualFs {
                     Ok(Ok(info)) => info,
                     Ok(Err(e)) => {
                         error!("Streaming upload failed for ino={}: {}", ino, e);
-                        return Err(libc::EIO);
+                        return Err(e.to_errno());
                     }
                     Err(_) => {
                         error!("Streaming worker dropped for ino={}", ino);
@@ -2665,7 +2665,7 @@ impl VirtualFs {
             error!("Failed to commit file {}: {}", full_path, e);
             // CAS upload succeeded — preserve file_info for retry in release()
             *channel.pending_info.lock().expect("pending_info poisoned") = Some(file_info);
-            return Err(libc::EIO);
+            return Err(e.to_errno());
         }
 
         let mut inodes = self.inode_table.write().expect("inodes poisoned");
@@ -3837,7 +3837,8 @@ struct StreamingChannel {
     tx: tokio::sync::mpsc::Sender<WriteMsg>,
     bytes_written: AtomicU64,
     /// Set by the background worker if add_data() fails. Shared with worker via Arc.
-    error: Arc<std::sync::Mutex<Option<String>>>,
+    /// Holds the structured error so its HTTP status survives to errno mapping.
+    error: Arc<std::sync::Mutex<Option<crate::error::Error>>>,
     /// Commit lifecycle state machine.
     state: std::sync::Mutex<CommitState>,
     /// CAS upload succeeded but Hub commit failed — stored for retry.
@@ -3904,7 +3905,7 @@ fn same_process(pid_a: u32, pid_b: u32) -> bool {
 async fn streaming_worker(
     mut writer: Box<dyn StreamingWriterOps>,
     mut rx: tokio::sync::mpsc::Receiver<WriteMsg>,
-    error: Arc<std::sync::Mutex<Option<String>>>,
+    error: Arc<std::sync::Mutex<Option<crate::error::Error>>>,
 ) {
     let mut failed = false;
     while let Some(msg) = rx.recv().await {
@@ -3914,13 +3915,21 @@ async fn streaming_worker(
                     continue; // drain remaining messages
                 }
                 if let Err(e) = writer.write(&data).await {
-                    *error.lock().unwrap() = Some(e.to_string());
+                    *error.lock().expect("error poisoned") = Some(e);
                     failed = true;
                 }
             }
             WriteMsg::Finish(reply) => {
                 let result = if failed {
-                    Err(crate::error::Error::hub("streaming write failed"))
+                    // Surface the real error captured on the failing write() instead of a
+                    // hardcoded generic. Keeping the structured Error preserves its HTTP
+                    // status (e.g. 413/507 on a quota reject), which both logs the real
+                    // cause and lets streaming_commit map it to a meaningful errno.
+                    Err(error
+                        .lock()
+                        .expect("error poisoned")
+                        .take()
+                        .unwrap_or_else(|| crate::error::Error::hub("streaming write failed: unknown error")))
                 } else {
                     writer.finish_boxed().await
                 };
