@@ -5418,3 +5418,50 @@ fn overlay_rmdir_remote_dir_eperm() {
         assert_eq!(err, libc::EPERM);
     });
 }
+
+/// Regression: when a streaming write fails, the worker must surface the real Hub
+/// error (including its HTTP status) on Finish, not a hardcoded generic. A quota
+/// reject (HTTP 413) was previously logged as "Hub API error: streaming write failed"
+/// and mapped to a blanket EIO, hiding the actual cause and making the importing app
+/// (Radarr/Sonarr) retry into a quota wall instead of stopping.
+#[test]
+fn streaming_worker_surfaces_real_hub_error_on_failed_write() {
+    struct FailingWriter;
+
+    #[async_trait::async_trait]
+    impl StreamingWriterOps for FailingWriter {
+        async fn write(&mut self, _data: &[u8]) -> crate::error::Result<()> {
+            Err(crate::error::Error::hub_status(413, "storage quota exceeded"))
+        }
+        async fn finish_boxed(self: Box<Self>) -> crate::error::Result<XetFileInfo> {
+            unreachable!("finish must not be called after a failed write");
+        }
+        fn len(&self) -> u64 {
+            0
+        }
+        fn is_empty(&self) -> bool {
+            true
+        }
+    }
+
+    new_runtime().block_on(async {
+        let (tx, rx) = tokio::sync::mpsc::channel::<WriteMsg>(4);
+        let error = Arc::new(std::sync::Mutex::new(None));
+        let worker = tokio::spawn(streaming_worker(Box::new(FailingWriter), rx, error.clone()));
+
+        tx.send(WriteMsg::Data(vec![0u8; 8])).await.unwrap();
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        tx.send(WriteMsg::Finish(result_tx)).await.unwrap();
+
+        let result = result_rx.await.expect("worker dropped reply");
+        let err = result.expect_err("failed write must produce an error");
+        let msg = err.to_string();
+        assert!(msg.contains("413"), "lost HTTP status: {msg}");
+        assert!(msg.contains("storage quota exceeded"), "lost real detail: {msg}");
+        // Structured status must survive so it maps to a meaningful errno, not blanket EIO.
+        assert_eq!(err.status(), Some(413));
+        assert_eq!(err.to_errno(), libc::ENOSPC);
+
+        worker.await.unwrap();
+    });
+}
