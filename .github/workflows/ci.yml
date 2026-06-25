@@ -199,7 +199,7 @@ jobs:
           # Sanitize TABLES content by encoding it as JSON string
           TABLES_JSON=$(jq -Rs . <<< "$TABLES")
           
-          BODY=$(jq -n \
+          BODY=$(jq -rn \
             --arg marker "$MARKER" \
             --argjson tables "$TABLES_JSON" \
             '{marker: $marker, content: ("## POSIX Compliance (pjdfstest)\n\n```\n" + $tables + "\n```")} | .marker + "\n" + .content')
@@ -272,7 +272,7 @@ jobs:
           # Sanitize TABLES content by encoding it as JSON string
           TABLES_JSON=$(jq -Rs . <<< "$TABLES")
           
-          BODY=$(jq -n \
+          BODY=$(jq -rn \
             --arg marker "$MARKER" \
             --argjson tables "$TABLES_JSON" \
             '{marker: $marker, content: ("## Benchmark Results\n\n```\n" + $tables + "\n```")} | .marker + "\n" + .content')
