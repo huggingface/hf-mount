@@ -23,7 +23,7 @@ jobs:
     runs-on:
       group: hf-mount-ci-pub
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Configure internal registries
         run: curl -sSL https://registries.huggingface.tech/setup.sh | bash
@@ -73,7 +73,7 @@ jobs:
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
       HF_ENDPOINT: https://huggingface.co
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Configure internal registries
         run: curl -sSL https://registries.huggingface.tech/setup.sh | bash
@@ -105,7 +105,7 @@ jobs:
     env:
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: Configure internal registries
         run: curl -sSL https://registries.huggingface.tech/setup.sh | bash
       - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
@@ -129,7 +129,7 @@ jobs:
     env:
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: Configure internal registries
         run: curl -sSL https://registries.huggingface.tech/setup.sh | bash
       - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
@@ -154,7 +154,7 @@ jobs:
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
       HF_ENDPOINT: https://huggingface.co
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Configure internal registries
         run: curl -sSL https://registries.huggingface.tech/setup.sh | bash
@@ -225,7 +225,7 @@ jobs:
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
       HF_ENDPOINT: https://huggingface.co
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Configure internal registries
         run: curl -sSL https://registries.huggingface.tech/setup.sh | bash
