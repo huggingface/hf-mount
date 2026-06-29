@@ -125,6 +125,11 @@ pub struct VfsConfig {
     /// grace period. Must be < terminationGracePeriodSeconds, otherwise a slow
     /// Hub/CAS backend wedges the FUSE connection and strands the pod.
     pub flush_shutdown_timeout: Duration,
+    /// Upper bound on a single remote chunk fetch during a read. A stalled
+    /// fetch otherwise parks the FUSE worker thread that issued the `read()`
+    /// indefinitely; once all worker threads are parked the mount silently
+    /// wedges. `Duration::ZERO` disables the bound (legacy behaviour).
+    pub read_fetch_timeout: Duration,
     /// 0 disables the LRU evictor.
     pub inode_soft_limit: usize,
     pub lru_sweep_interval: Duration,
@@ -154,6 +159,8 @@ pub struct VirtualFs {
     runtime: tokio::runtime::Handle,
     /// Upper bound on the SIGTERM flush drain (see `VfsConfig`).
     flush_shutdown_timeout: Duration,
+    /// Upper bound on a single remote chunk fetch during a read (see `VfsConfig`).
+    read_fetch_timeout: Duration,
     hub_client: Arc<dyn HubOps>,
     xet_sessions: Arc<dyn XetOps>,
     /// Staging area + per-inode locks. The per-inode locks are always
@@ -299,6 +306,7 @@ impl VirtualFs {
         let vfs = Arc::new(Self {
             runtime,
             flush_shutdown_timeout: config.flush_shutdown_timeout,
+            read_fetch_timeout: config.read_fetch_timeout,
             hub_client,
             xet_sessions,
             staging,
@@ -2051,7 +2059,36 @@ impl VirtualFs {
                 let mut failed = false;
                 let mut stream_eof = false;
                 while (total as u64) < plan.fetch_size {
-                    match stream.next().await {
+                    // Bound each chunk read. A FUSE `read()` runs on a worker
+                    // thread blocked in `block_on` on this future; if the
+                    // CAS/CDN connection stalls (client-aborted seek, hung
+                    // socket), an unbounded `next()` parks that thread forever.
+                    // Enough stalled reads exhaust all worker threads and the
+                    // mount silently stops serving cold reads. The timeout frees
+                    // the thread, and dropping `stream` on the way out cancels
+                    // the in-flight request.
+                    let next = match self.read_fetch_timeout {
+                        Duration::ZERO => stream.next().await,
+                        timeout => match tokio::time::timeout(timeout, stream.next()).await {
+                            Ok(result) => result,
+                            Err(_elapsed) => {
+                                error!(
+                                    "prefetch: stream read timed out after {:?} at cursor={}, got={}/{}, \
+                                     attempt={}/{}, hash={} — aborting fetch to free the FUSE worker thread",
+                                    timeout,
+                                    cursor,
+                                    total,
+                                    plan.fetch_size,
+                                    attempt + 1,
+                                    MAX_ATTEMPTS,
+                                    prefetch_state.xet_hash,
+                                );
+                                failed = true;
+                                break;
+                            }
+                        },
+                    };
+                    match next {
                         Ok(Some(chunk)) => {
                             total += chunk.len();
                             chunks.push_back(chunk);

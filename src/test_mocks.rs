@@ -288,6 +288,9 @@ pub struct MockXet {
     range_fail_count: AtomicU32,
     /// Number of range download calls that should return empty before succeeding.
     range_empty_count: AtomicU32,
+    /// When true, opened streams hang on `next()` (simulates a stalled CAS/CDN
+    /// connection) so the read-fetch timeout path can be exercised.
+    stall_stream: AtomicBool,
     /// Log of (offset, end) pairs passed to download_stream_boxed.
     pub stream_calls: Mutex<Vec<(u64, Option<u64>)>>,
     /// Count of download_to_file calls (used to assert staging cache reuse).
@@ -317,6 +320,7 @@ impl MockXet {
             writer_fail_after: AtomicU64::new(u64::MAX),
             range_fail_count: AtomicU32::new(0),
             range_empty_count: AtomicU32::new(0),
+            stall_stream: AtomicBool::new(false),
             stream_calls: Mutex::new(Vec::new()),
             download_to_file_calls: AtomicU64::new(0),
             upload_gate: Mutex::new(None),
@@ -360,6 +364,12 @@ impl MockXet {
     /// Make the next N range downloads return Ok(empty) before succeeding.
     pub fn empty_range_downloads(&self, n: u32) {
         self.range_empty_count.store(n, Ordering::SeqCst);
+    }
+
+    /// Make every opened stream hang on `next()`, simulating a stalled CAS/CDN
+    /// connection that neither delivers data nor errors.
+    pub fn stall_stream_reads(&self) {
+        self.stall_stream.store(true, Ordering::SeqCst);
     }
 
     fn next_hash_string(&self) -> String {
@@ -434,6 +444,10 @@ impl XetOps for MockXet {
         end: Option<u64>,
     ) -> Result<Box<dyn DownloadStreamOps>> {
         self.stream_calls.lock().unwrap().push((offset, end));
+
+        if self.stall_stream.load(Ordering::SeqCst) {
+            return Ok(Box::new(StallingDownloadStream));
+        }
 
         let prev_fail = self.range_fail_count.load(Ordering::SeqCst);
         if prev_fail > 0 {
@@ -517,6 +531,19 @@ impl DownloadStreamOps for MockDownloadStream {
     }
 }
 
+/// A stream whose `next()` never resolves, modelling a CAS/CDN connection that
+/// stalls without delivering data or erroring. Used to exercise the read-fetch
+/// timeout: without a bound, awaiting this parks the FUSE worker thread forever.
+pub struct StallingDownloadStream;
+
+#[async_trait::async_trait]
+impl DownloadStreamOps for StallingDownloadStream {
+    async fn next(&mut self) -> Result<Option<Bytes>> {
+        std::future::pending::<()>().await;
+        unreachable!("pending future never resolves")
+    }
+}
+
 // ── Test VFS builder ──────────────────────────────────────────────────
 
 pub struct TestOpts {
@@ -527,6 +554,7 @@ pub struct TestOpts {
     pub metadata_ttl: Duration,
     pub inode_soft_limit: usize,
     pub max_staging_size: u64,
+    pub read_fetch_timeout: Duration,
 }
 
 impl Default for TestOpts {
@@ -539,6 +567,7 @@ impl Default for TestOpts {
             metadata_ttl: Duration::from_secs(1),
             inode_soft_limit: 0,
             max_staging_size: 0,
+            read_fetch_timeout: Duration::from_secs(30),
         }
     }
 }
@@ -621,6 +650,7 @@ pub fn make_test_vfs(
             flush_debounce: Duration::from_millis(100),
             flush_max_batch_window: Duration::from_secs(1),
             flush_shutdown_timeout: Duration::from_secs(5),
+            read_fetch_timeout: opts.read_fetch_timeout,
             inode_soft_limit: opts.inode_soft_limit,
             lru_sweep_interval: Duration::from_millis(50),
         },
@@ -665,6 +695,7 @@ pub fn make_overlay_test_vfs_with_root(
             flush_debounce: Duration::from_millis(100),
             flush_max_batch_window: Duration::from_secs(1),
             flush_shutdown_timeout: Duration::from_secs(5),
+            read_fetch_timeout: Duration::from_secs(30),
             inode_soft_limit: 0,
             lru_sweep_interval: Duration::from_secs(5),
         },
