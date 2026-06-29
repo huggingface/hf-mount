@@ -2463,6 +2463,48 @@ fn read_range_all_retries_exhausted() {
     });
 }
 
+/// A stalled CAS/CDN stream must not park the read forever: the read-fetch
+/// timeout fails it with EIO so the FUSE worker thread is freed. Without the
+/// timeout the worker would block indefinitely and, once every worker is
+/// blocked this way, the whole mount silently wedges (cold reads return
+/// nothing while `ls` still works). The outer `timeout` guard turns a
+/// regression (unbounded wait) into a deterministic test failure instead of a
+/// hung CI run.
+#[test]
+fn read_stalled_stream_times_out_with_eio() {
+    let hub = MockHub::new();
+    let content: Vec<u8> = (0..=255).collect();
+    hub.add_file("data.bin", content.len() as u64, Some("h_stall"), None);
+    let xet = MockXet::new();
+    xet.add_file("h_stall", &content);
+    // Every opened stream hangs on next() (stalled connection).
+    xet.stall_stream_reads();
+
+    let rt = new_runtime();
+    let vfs = make_test_vfs(
+        hub.clone(),
+        xet.clone(),
+        TestOpts {
+            read_fetch_timeout: Duration::from_millis(150),
+            ..Default::default()
+        },
+        &rt,
+    );
+
+    rt.block_on(async {
+        let attr = vfs.lookup(ROOT_INODE, "data.bin").await.unwrap();
+        let fh = vfs.open(attr.ino, false, false, None).await.unwrap();
+
+        // Non-zero offset forces a range download. Bound the whole read so a
+        // regression fails the test deterministically rather than hanging.
+        let result = tokio::time::timeout(Duration::from_secs(10), vfs.read(fh, 64, 32)).await;
+        let read_result = result.expect("read() did not return — fetch was not bounded by the timeout");
+        assert_eq!(read_result.unwrap_err(), libc::EIO);
+
+        vfs.release(fh).await.unwrap();
+    });
+}
+
 // ── advanced write local read/write ─────────────────────────────────
 
 /// Advanced mode write at arbitrary offset (random write).
