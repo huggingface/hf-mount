@@ -458,9 +458,13 @@ fn rename_cycle_detection() {
 #[test]
 fn rename_dirty_file_pending_deletes() {
     let hub = MockHub::new();
-    hub.add_file("old.txt", 100, Some("hash1"), None);
+    // Declared size must match the CAS content length: the write-path download
+    // (download_stream_to_file) enforces a size check, mirroring xet-core's
+    // download_file SizeMismatch.
+    let content = b"original content for download";
+    hub.add_file("old.txt", content.len() as u64, Some("hash1"), None);
     let xet = MockXet::new();
-    xet.add_file("hash1", b"original content for download");
+    xet.add_file("hash1", content);
     let (rt, vfs) = vfs_advanced(&hub, &xet);
 
     rt.block_on(async {
@@ -2505,6 +2509,41 @@ fn read_stalled_stream_times_out_with_eio() {
     });
 }
 
+/// The write-path whole-file download (open-for-write of a remote file in
+/// advanced, non-sparse mode) is also bounded: a stalled stream must fail the
+/// open with EIO rather than parking the FUSE worker thread that runs it. Same
+/// wedge mechanism as reads, different call site (`download_stream_to_file`).
+#[test]
+fn open_for_write_stalled_download_times_out_with_eio() {
+    let hub = MockHub::new();
+    let content: Vec<u8> = (0..=255).collect();
+    hub.add_file("data.bin", content.len() as u64, Some("h_wstall"), None);
+    let xet = MockXet::new();
+    xet.add_file("h_wstall", &content);
+    xet.stall_stream_reads();
+
+    let rt = new_runtime();
+    let vfs = make_test_vfs(
+        hub.clone(),
+        xet.clone(),
+        TestOpts {
+            advanced_writes: true,
+            read_fetch_timeout: Duration::from_millis(150),
+            ..Default::default()
+        },
+        &rt,
+    );
+
+    rt.block_on(async {
+        let ino = vfs.lookup(ROOT_INODE, "data.bin").await.unwrap().ino;
+        // Opening writable triggers the staging download of the original CAS
+        // content. Bound it so a regression fails deterministically.
+        let result = tokio::time::timeout(Duration::from_secs(10), vfs.open(ino, true, false, None)).await;
+        let open_result = result.expect("open() did not return — write-path download was not bounded");
+        assert_eq!(open_result.unwrap_err(), libc::EIO);
+    });
+}
+
 // ── advanced write local read/write ─────────────────────────────────
 
 /// Advanced mode write at arbitrary offset (random write).
@@ -4332,8 +4371,6 @@ fn truncate_open_does_not_flag_staging_current() {
 /// issuing a new download.
 #[test]
 fn open_advanced_write_reuses_staging_cache_after_flush() {
-    use std::sync::atomic::Ordering;
-
     let hub = MockHub::new();
     let xet = MockXet::new();
     let (rt, vfs) = vfs_advanced(&hub, &xet);
@@ -4351,9 +4388,12 @@ fn open_advanced_write_reuses_staging_cache_after_flush() {
         let is_clean = vfs.inode_table.read().unwrap().get(ino).is_some_and(|e| !e.is_dirty());
         assert!(is_clean, "inode should be clean after flush");
 
-        let downloads_before = xet.download_to_file_calls.load(Ordering::SeqCst);
+        // The write-path download now streams via download_stream_boxed, so
+        // count stream opens (not the unused download_to_file counter) to prove
+        // the reopen reused staging instead of re-fetching from CAS.
+        let downloads_before = xet.stream_calls.lock().unwrap().len();
         let fh2 = vfs.open(ino, true, false, None).await.unwrap();
-        let downloads_after = xet.download_to_file_calls.load(Ordering::SeqCst);
+        let downloads_after = xet.stream_calls.lock().unwrap().len();
         assert_eq!(
             downloads_before, downloads_after,
             "re-opening for write should reuse staging cache, not re-download"

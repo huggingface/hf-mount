@@ -31,6 +31,98 @@ pub trait XetOps: Send + Sync {
     /// Pre-warm the reconstruction cache for a file by fetching its full plan.
     /// Errors are silently ignored — this is best-effort.
     async fn warm_reconstruction_cache(&self, xet_hash: &str);
+
+    /// Download a whole CAS object to `dest`, streaming it through
+    /// `download_stream_boxed` and bounding each chunk read with `timeout`.
+    ///
+    /// Unlike `download_to_file` (which calls xet-core's `download_file` and
+    /// awaits it with no ceiling), every chunk read here is bounded: a stalled
+    /// CAS/CDN connection on a write-path download (open-for-write of a remote
+    /// file, flush, or a background file-cache populate) would otherwise park
+    /// the caller — a FUSE worker thread for the synchronous paths, a tokio
+    /// worker for the detached populate task — indefinitely, the same wedge that
+    /// affects reads. `Duration::ZERO` disables the bound. The reconstruction
+    /// still runs ahead concurrently on the stream's own spawned task, so
+    /// streaming the bytes here does not serialize the network.
+    async fn download_to_file_bounded(
+        &self,
+        xet_hash: &str,
+        file_size: u64,
+        dest: &Path,
+        timeout: std::time::Duration,
+    ) -> Result<()> {
+        use tokio::io::AsyncWriteExt;
+
+        // The stream is bounded to `[0, file_size)`, so a CAS object *shorter*
+        // than `file_size` is caught by the size check below. An object *longer*
+        // cannot occur here: `xet_hash` and `file_size` come from the same inode
+        // snapshot and the hash is content-addressed, so the declared size is
+        // exactly the reconstructed size.
+        let file_info = XetFileInfo::new(xet_hash.to_string(), file_size);
+
+        // Stream into a temporary sibling and rename on success: a timeout or
+        // error must never leave a partial file at `dest`. A leftover partial
+        // would later be mistaken for a complete local copy (e.g. setattr's
+        // `local_exists` short-circuit) and flushed as corrupted content.
+        let mut tmp = dest.as_os_str().to_owned();
+        tmp.push(".part");
+        let tmp = PathBuf::from(tmp);
+
+        let result = async {
+            let mut stream = self.download_stream_boxed(&file_info, 0, None)?;
+            let mut file = tokio::fs::File::create(&tmp)
+                .await
+                .map_err(|e| Error::Xet(format!("download_to_file_bounded: create {tmp:?}: {e}")))?;
+
+            let mut written: u64 = 0;
+            loop {
+                let next = if timeout.is_zero() {
+                    stream.next().await
+                } else {
+                    match tokio::time::timeout(timeout, stream.next()).await {
+                        Ok(result) => result,
+                        Err(_elapsed) => {
+                            return Err(Error::Xet(format!(
+                                "download_to_file_bounded stalled after {timeout:?} at {written}/{file_size} bytes \
+                                 (hash={xet_hash}) — aborting to avoid parking the worker indefinitely"
+                            )));
+                        }
+                    }
+                };
+                match next? {
+                    Some(chunk) => {
+                        file.write_all(&chunk)
+                            .await
+                            .map_err(|e| Error::Xet(format!("download_to_file_bounded: write {tmp:?}: {e}")))?;
+                        written += chunk.len() as u64;
+                    }
+                    None => break,
+                }
+            }
+            file.flush()
+                .await
+                .map_err(|e| Error::Xet(format!("download_to_file_bounded: flush {tmp:?}: {e}")))?;
+
+            if written != file_size {
+                return Err(Error::Xet(format!(
+                    "download_to_file_bounded size mismatch: got {written}, expected {file_size} (hash={xet_hash})"
+                )));
+            }
+            Ok(())
+        }
+        .await;
+
+        match result {
+            Ok(()) => tokio::fs::rename(&tmp, dest)
+                .await
+                .map_err(|e| Error::Xet(format!("download_to_file_bounded: rename {tmp:?} -> {dest:?}: {e}"))),
+            Err(e) => {
+                // Best-effort cleanup so no partial file is left behind.
+                let _ = tokio::fs::remove_file(&tmp).await;
+                Err(e)
+            }
+        }
+    }
 }
 
 /// Append-only streaming writer trait (abstracts StreamingWriter for testing).

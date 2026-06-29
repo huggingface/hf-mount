@@ -1182,11 +1182,15 @@ impl VirtualFs {
     fn spawn_populate_file_cache(&self, xet_hash: String, file_size: u64) {
         let Some(fc) = self.file_cache.clone() else { return };
         let xet = self.xet_sessions.clone();
+        let timeout = self.read_fetch_timeout;
         self.runtime.spawn(async move {
             let hash_for_dl = xet_hash.clone();
             let _ = fc
                 .populate(&xet_hash, Some(file_size), move |dest| async move {
-                    xet.download_to_file(&hash_for_dl, file_size, &dest).await
+                    // Bounded so a stalled CAS/CDN connection cannot leak this
+                    // detached tokio task (and its worker) forever.
+                    xet.download_to_file_bounded(&hash_for_dl, file_size, &dest, timeout)
+                        .await
                 })
                 .await;
         });
@@ -1769,7 +1773,7 @@ impl VirtualFs {
                     .path(ino)
                     .expect("staging directory required for advanced writes");
                 self.xet_sessions
-                    .download_to_file(xet_hash, size, &staging_path)
+                    .download_to_file_bounded(xet_hash, size, &staging_path, self.read_fetch_timeout)
                     .await
                     .map_err(|e| {
                         error!("Failed to download file for write: {}", e);
@@ -3665,7 +3669,7 @@ impl VirtualFs {
                         if !xet_hash.is_empty() && file_size > 0 {
                             if let Err(e) = self
                                 .xet_sessions
-                                .download_to_file(&xet_hash, file_size, &staging_path)
+                                .download_to_file_bounded(&xet_hash, file_size, &staging_path, self.read_fetch_timeout)
                                 .await
                             {
                                 error!("Failed to download file for truncate: {}", e);
