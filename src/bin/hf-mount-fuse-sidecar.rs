@@ -36,6 +36,16 @@ type VfsRegistry = Arc<Mutex<Vec<Arc<VirtualFs>>>>;
 /// terminate — the alternative is an unkillable, node-stranding pod.
 static SHUTDOWN_WATCHDOG_MS: AtomicU64 = AtomicU64::new(55_000);
 
+/// Floor for the termination grace handed to us via the
+/// `HF_CSI_TERMINATION_GRACE_SECONDS` env. The injecting CSI webhook always
+/// raises the pod's grace to at least this before passing it down (it mirrors
+/// the webhook's `MinTerminationGracePeriodSeconds`), so any smaller value we
+/// receive is a stale or buggy env. Flooring it stops a bad env from collapsing
+/// the flush drain / hard-exit watchdog to ~0s — which would exit the FUSE
+/// daemon while the workload still has the mount busy and strand the pod in an
+/// unkillable D-state.
+const MIN_TERMINATION_GRACE_SECS: u64 = 60;
+
 #[derive(Parser)]
 #[command(about = "CSI sidecar mounter for HF volumes")]
 struct Args {
@@ -158,7 +168,11 @@ fn main() {
     // (+margin) when the env is absent (dev / direct hf-mount-fuse).
     let grace_secs = std::env::var("HF_CSI_TERMINATION_GRACE_SECONDS")
         .ok()
-        .and_then(|s| s.parse::<u64>().ok());
+        .and_then(|s| s.parse::<u64>().ok())
+        // Defense in depth against a stale/buggy webhook env: never let a value
+        // below the enforced minimum collapse the flush drain / watchdog to ~0s
+        // and exit the daemon while the mount is still busy. See the const.
+        .map(|g| g.max(MIN_TERMINATION_GRACE_SECS));
 
     let watchdog_ms = if let Some(grace) = grace_secs {
         let flush_secs = grace.saturating_sub(10).max(5);
