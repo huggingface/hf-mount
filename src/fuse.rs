@@ -32,6 +32,14 @@ pub struct FuseAdapter {
     advanced_writes: bool,
     /// FOPEN_DIRECT_IO flag on open/create, bypassing kernel page cache.
     direct_io: bool,
+    /// Caps the number of `read()` fetches *actively* running at once. `read` no
+    /// longer blocks a FUSE worker thread (it spawns onto the runtime and
+    /// replies async), so the fixed worker pool can never be wedged by stalled
+    /// fetches. NOTE: this bounds active fetches, not spawned tasks — a burst
+    /// still spawns one task per dispatched read, each waiting on a permit while
+    /// holding its `ReplyData`. A true admission bound (or interrupt-driven
+    /// cancellation of stale reads) is a follow-up; see the PR description.
+    read_concurrency: Arc<tokio::sync::Semaphore>,
 }
 
 impl FuseAdapter {
@@ -42,6 +50,7 @@ impl FuseAdapter {
         read_only: bool,
         advanced_writes: bool,
         direct_io: bool,
+        read_concurrency: usize,
     ) -> Self {
         Self {
             runtime,
@@ -50,6 +59,7 @@ impl FuseAdapter {
             read_only,
             advanced_writes,
             direct_io,
+            read_concurrency: Arc::new(tokio::sync::Semaphore::new(read_concurrency.max(1))),
         }
     }
 
@@ -269,10 +279,30 @@ impl Filesystem for FuseAdapter {
         _lock_owner: Option<fuser::LockOwner>,
         reply: ReplyData,
     ) {
-        match self.runtime.block_on(self.virtual_fs.read(fh.0, offset, size)) {
-            Ok((data, _eof)) => reply.data(&data),
-            Err(e) => reply.error(Errno::from_i32(e)),
-        }
+        // Don't block the FUSE worker thread on a (possibly network-bound) read.
+        // Spawn it onto the runtime and reply asynchronously: the fixed pool of
+        // worker threads only dispatches, so a slow or stalled fetch can never
+        // pin every thread and wedge the mount. The permit caps how many fetches
+        // run at once (not how many tasks are spawned).
+        //
+        // KNOWN GAPS (prototype): the local-cache read path does a synchronous
+        // libc::pread, which now runs on a tokio worker rather than a FUSE
+        // thread and could starve the runtime under slow local I/O — it should
+        // move to spawn_blocking. FUSE_INTERRUPT is also not handled, so an
+        // aborted read still runs to completion/timeout. See the PR description.
+        let virtual_fs = self.virtual_fs.clone();
+        let read_concurrency = self.read_concurrency.clone();
+        let fh = fh.0;
+        self.runtime.spawn(async move {
+            let _permit = read_concurrency
+                .acquire_owned()
+                .await
+                .expect("read concurrency semaphore is never closed");
+            match virtual_fs.read(fh, offset, size).await {
+                Ok((data, _eof)) => reply.data(&data),
+                Err(e) => reply.error(Errno::from_i32(e)),
+            }
+        });
     }
 
     /// Write data to an open file at the given offset.
@@ -600,6 +630,10 @@ pub fn mount_fuse(
         setup.read_only,
         setup.advanced_writes,
         setup.direct_io,
+        // Cap in-flight reads at the former worker-thread count: same
+        // concurrency ceiling the blocking model enforced, but the threads are
+        // now free to keep dispatching instead of being pinned by the fetch.
+        setup.max_threads,
     );
     let mount_point = &setup.mount_point;
 
