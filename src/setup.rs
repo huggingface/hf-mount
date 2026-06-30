@@ -286,9 +286,15 @@ pub fn init_tracing(daemon: bool) {
         ("HF_XET_RECONSTRUCTION_TARGET_BLOCK_COMPLETION_TIME", "30"),
         ("HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_SIZE", "134217728"),
         ("HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT", "268435456"),
-        // Raise read_timeout from 120s default so large shard uploads don't get killed
-        // by the global client read_timeout before the per-request timeout kicks in.
-        ("HF_XET_CLIENT_READ_TIMEOUT", "600"),
+        // Per-read inactivity timeout for CAS/CDN transfers (resets on every byte
+        // received, so slow-but-progressing reads are fine). This governs the
+        // DOWNLOAD/reconstruction path (term fetches and whole-file downloads);
+        // shard uploads use a separate client with no read_timeout, so this no
+        // longer needs to be large for their sake. Keep it short so a stalled
+        // read fails fast and frees the FUSE worker thread instead of pinning it
+        // for minutes — a long value here is what let stalled reads accumulate
+        // and wedge the mount.
+        ("HF_XET_CLIENT_READ_TIMEOUT", "30"),
         // Upload tuning: skip slow adaptive concurrency ramp-up
         ("HF_XET_CLIENT_AC_INITIAL_UPLOAD_CONCURRENCY", "16"),
         // Larger ingestion blocks = fewer CDC calls
