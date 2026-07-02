@@ -1,0 +1,39 @@
+# syntax=docker/dockerfile:1.7
+FROM rust:1.95-bookworm AS dev
+
+USER root
+
+# Development dependencies 
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    ca-certificates \
+    curl \
+    fuse3 \
+    git \
+    libfuse3-dev \
+    perl \
+    pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+# Rust dev tooling required by the lint/format gate.
+RUN rustup component add rustfmt clippy
+
+# Allow non-root FUSE mounts (needed for `cargo test --features fuse` dev runs).
+RUN echo 'user_allow_other' >> /etc/fuse.conf
+
+# Developer user, in a separate layer from apt for cache isolation.
+ARG USERNAME=vscode
+ARG USER_UID=1000
+ARG USER_GID=1000
+RUN groupadd --gid "${USER_GID}" "${USERNAME}" \
+    && useradd --uid "${USER_UID}" --gid "${USER_GID}" --create-home \
+    --shell /bin/bash "${USERNAME}"
+
+# Give the non-root user ownership of the cargo cache and base build tree so
+# `cargo` works without root inside the container.
+ENV CARGO_HOME=/usr/local/cargo
+ENV PATH=${CARGO_HOME}/bin:${PATH}
+# Use the system git client for the git-based crates (xet-core, fuser fork).
+ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
+
+USER ${USERNAME}
