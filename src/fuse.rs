@@ -417,8 +417,16 @@ impl Filesystem for FuseAdapter {
         }
     }
 
-    fn link(&self, _req: &Request, _ino: INodeNo, _newparent: INodeNo, _newname: &OsStr, reply: ReplyEntry) {
-        reply.error(Errno::from_i32(libc::ENOTSUP));
+    /// Hard link, implemented as a server-side copy: a new Hub entry pointing at
+    /// the source's xet hash (no data re-uploaded). The alias gets its own inode,
+    /// so st_ino differs from the source; callers like the *arr import pipelines
+    /// only need the instant copy semantics.
+    fn link(&self, _req: &Request, ino: INodeNo, newparent: INodeNo, newname: &OsStr, reply: ReplyEntry) {
+        let newname = os_to_str!(newname, reply);
+        match self.runtime.block_on(self.virtual_fs.link(ino.0, newparent.0, newname)) {
+            Ok(attr) => self.reply_entry_tracked(reply, &attr),
+            Err(e) => reply.error(Errno::from_i32(e)),
+        }
     }
 
     /// Remove an empty directory.

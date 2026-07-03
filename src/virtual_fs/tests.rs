@@ -4458,6 +4458,101 @@ fn rename_clean_file_remote_and_local() {
     });
 }
 
+// ── link(): server-side copy ─────────────────────────────────────────────
+
+/// link() on a clean remote file commits one AddFile with the source's xet
+/// hash (no data upload) and inserts a separate alias inode locally.
+#[test]
+fn link_clean_file_creates_server_side_copy() {
+    let hub = MockHub::new();
+    hub.add_file("src.txt", 100, Some("hash1"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let src_attr = vfs.lookup(ROOT_INODE, "src.txt").await.unwrap();
+
+        let alias_attr = vfs.link(src_attr.ino, ROOT_INODE, "alias.txt").await.unwrap();
+        assert_ne!(alias_attr.ino, src_attr.ino, "alias gets its own inode");
+        assert_eq!(alias_attr.size, 100);
+
+        let logs = hub.take_batch_log();
+        assert_eq!(logs.len(), 1, "exactly one batch commit");
+        assert_eq!(logs[0].len(), 1, "a single AddFile, no delete");
+        match &logs[0][0] {
+            BatchOp::AddFile { path, xet_hash, .. } => {
+                assert_eq!(path, "alias.txt");
+                assert_eq!(xet_hash, "hash1");
+            }
+            other => panic!("expected AddFile, got {other:?}"),
+        }
+
+        // The alias is a real entry: resolvable, right hash, source untouched.
+        let inodes = vfs.inode_table.read().unwrap();
+        let alias = inodes.get(alias_attr.ino).unwrap();
+        assert_eq!(alias.full_path.as_ref(), "alias.txt");
+        assert_eq!(alias.xet_hash.as_deref(), Some("hash1"));
+        assert!(!alias.is_dirty());
+        let src = inodes.get(src_attr.ino).unwrap();
+        assert_eq!(src.full_path.as_ref(), "src.txt");
+    });
+}
+
+/// link() on a dirty source must not alias a stale hash: ENOTSUP so the
+/// caller falls back to a regular copy.
+#[test]
+fn link_dirty_source_not_supported() {
+    let hub = MockHub::new();
+    hub.add_file("src.txt", 100, Some("hash1"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let src_attr = vfs.lookup(ROOT_INODE, "src.txt").await.unwrap();
+        {
+            let mut inodes = vfs.inode_table.write().unwrap();
+            inodes.get_mut(src_attr.ino).unwrap().set_dirty();
+        }
+
+        let err = vfs.link(src_attr.ino, ROOT_INODE, "alias.txt").await.unwrap_err();
+        assert_eq!(err, libc::ENOTSUP);
+        assert!(hub.take_batch_log().is_empty(), "no remote op for a rejected link");
+    });
+}
+
+/// link() onto an existing name is EEXIST and sends no remote op.
+#[test]
+fn link_existing_target_eexist() {
+    let hub = MockHub::new();
+    hub.add_file("src.txt", 100, Some("hash1"), None);
+    hub.add_file("dst.txt", 50, Some("hash2"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let src_attr = vfs.lookup(ROOT_INODE, "src.txt").await.unwrap();
+        let err = vfs.link(src_attr.ino, ROOT_INODE, "dst.txt").await.unwrap_err();
+        assert_eq!(err, libc::EEXIST);
+        assert!(hub.take_batch_log().is_empty());
+    });
+}
+
+/// link() on a directory is EPERM (POSIX).
+#[test]
+fn link_directory_eperm() {
+    let hub = MockHub::new();
+    hub.add_file("d/x.txt", 10, Some("hash1"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let dir_attr = vfs.lookup(ROOT_INODE, "d").await.unwrap();
+        let err = vfs.link(dir_attr.ino, ROOT_INODE, "d2").await.unwrap_err();
+        assert_eq!(err, libc::EPERM);
+        assert!(hub.take_batch_log().is_empty());
+    });
+}
+
 // ── LRU eviction: end-to-end memory bound ───────────────────────────────
 
 /// End-to-end test of the forget-driven eviction path on a hierarchical
