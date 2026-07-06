@@ -4553,6 +4553,113 @@ fn link_directory_eperm() {
     });
 }
 
+/// link() on a clean file whose committed hash is missing/empty returns
+/// ENOTSUP (we never alias a hashless entry), with no remote op.
+#[test]
+fn link_no_committed_hash_not_supported() {
+    let hub = MockHub::new();
+    hub.add_file("src.txt", 100, Some("hash1"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let src_attr = vfs.lookup(ROOT_INODE, "src.txt").await.unwrap();
+        {
+            let mut inodes = vfs.inode_table.write().unwrap();
+            inodes.get_mut(src_attr.ino).unwrap().xet_hash = None;
+        }
+
+        let err = vfs.link(src_attr.ino, ROOT_INODE, "alias.txt").await.unwrap_err();
+        assert_eq!(err, libc::ENOTSUP);
+        assert!(hub.take_batch_log().is_empty(), "no remote op for a rejected link");
+    });
+}
+
+/// link() into a missing parent directory is ENOENT, with no remote op.
+#[test]
+fn link_missing_parent_enoent() {
+    let hub = MockHub::new();
+    hub.add_file("src.txt", 100, Some("hash1"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let src_attr = vfs.lookup(ROOT_INODE, "src.txt").await.unwrap();
+        let err = vfs.link(src_attr.ino, 999_999, "alias.txt").await.unwrap_err();
+        assert_eq!(err, libc::ENOENT);
+        assert!(hub.take_batch_log().is_empty());
+    });
+}
+
+/// link() into a non-directory parent is ENOTDIR, with no remote op.
+#[test]
+fn link_nondir_parent_enotdir() {
+    let hub = MockHub::new();
+    hub.add_file("src.txt", 100, Some("hash1"), None);
+    hub.add_file("file.txt", 50, Some("hash2"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let src_attr = vfs.lookup(ROOT_INODE, "src.txt").await.unwrap();
+        let file_attr = vfs.lookup(ROOT_INODE, "file.txt").await.unwrap();
+        let err = vfs.link(src_attr.ino, file_attr.ino, "alias.txt").await.unwrap_err();
+        assert_eq!(err, libc::ENOTDIR);
+        assert!(hub.take_batch_log().is_empty());
+    });
+}
+
+/// link() to an OS junk name is rejected with EACCES, with no remote op.
+#[test]
+fn link_os_junk_name_eacces() {
+    let hub = MockHub::new();
+    hub.add_file("src.txt", 100, Some("hash1"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let src_attr = vfs.lookup(ROOT_INODE, "src.txt").await.unwrap();
+        let err = vfs.link(src_attr.ino, ROOT_INODE, ".DS_Store").await.unwrap_err();
+        assert_eq!(err, libc::EACCES);
+        assert!(hub.take_batch_log().is_empty());
+    });
+}
+
+/// link() on a read-only mount is EROFS, with no remote op.
+#[test]
+fn link_read_only_erofs() {
+    let hub = MockHub::new();
+    hub.add_file("src.txt", 100, Some("hash1"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_readonly(&hub, &xet);
+
+    rt.block_on(async {
+        let src_attr = vfs.lookup(ROOT_INODE, "src.txt").await.unwrap();
+        let err = vfs.link(src_attr.ino, ROOT_INODE, "alias.txt").await.unwrap_err();
+        assert_eq!(err, libc::EROFS);
+        assert!(hub.take_batch_log().is_empty());
+    });
+}
+
+/// link() in overlay mode is ENOTSUP (committing an alias would mutate the
+/// remote behind the overlay's back), with no remote op.
+#[test]
+fn link_overlay_not_supported() {
+    let hub = MockHub::new();
+    hub.add_file("src.txt", 100, Some("hash1"), None);
+    let xet = MockXet::new();
+
+    let overlay_root = fresh_overlay_dir("link");
+    let t = make_overlay_test_vfs_with_root(hub.clone(), xet, overlay_root);
+
+    t.runtime.block_on(async {
+        let src_attr = t.vfs.lookup(ROOT_INODE, "src.txt").await.unwrap();
+        let err = t.vfs.link(src_attr.ino, ROOT_INODE, "alias.txt").await.unwrap_err();
+        assert_eq!(err, libc::ENOTSUP);
+        assert!(hub.take_batch_log().is_empty());
+    });
+}
+
 // ── LRU eviction: end-to-end memory bound ───────────────────────────────
 
 /// End-to-end test of the forget-driven eviction path on a hierarchical

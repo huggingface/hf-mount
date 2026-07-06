@@ -2955,12 +2955,11 @@ impl VirtualFs {
 
         debug!("link: ino={}, newparent={}, newname={}", ino, newparent, newname);
 
-        // Load remote children so the EEXIST check below also sees files that
-        // exist remotely but were never looked up (also validates newparent).
-        self.ensure_children_loaded(newparent).await?;
-
-        // Phase 1: validate source + destination under a read lock.
-        let (source_path, xet_hash, size, mode, uid, gid, new_full_path) = {
+        // Phase 1a: validate the source under a read lock, before loading the
+        // destination's remote children. A rejected source (dirty or hashless,
+        // the routine *arr link-then-copy fallback) must not pay for a
+        // list_tree it would throw away.
+        let (source_path, xet_hash, size, mode, uid, gid) = {
             let inodes = self.inode_table.read().expect("inodes poisoned");
             let source = inodes.get(ino).ok_or(libc::ENOENT)?;
             if source.kind != InodeKind::File {
@@ -2969,9 +2968,26 @@ impl VirtualFs {
             if source.is_dirty() {
                 return Err(libc::ENOTSUP);
             }
-            let Some(hash) = source.xet_hash.clone().filter(|hash| !hash.is_empty()) else {
+            let Some(hash) = source.xet_hash.as_ref().filter(|hash| !hash.is_empty()).cloned() else {
                 return Err(libc::ENOTSUP);
             };
+            (
+                source.full_path.clone(),
+                hash,
+                source.size,
+                source.mode,
+                source.uid,
+                source.gid,
+            )
+        };
+
+        // Load remote children so the EEXIST check below also sees files that
+        // exist remotely but were never looked up (also validates newparent).
+        self.ensure_children_loaded(newparent).await?;
+
+        // Phase 1b: validate the destination under a read lock.
+        let new_full_path = {
+            let inodes = self.inode_table.read().expect("inodes poisoned");
             let parent_entry = match inodes.get(newparent) {
                 Some(e) if e.kind == InodeKind::Directory => e,
                 Some(_) => return Err(libc::ENOTDIR),
@@ -2981,22 +2997,12 @@ impl VirtualFs {
             if inodes.lookup_child(newparent, newname).is_some() {
                 return Err(libc::EEXIST);
             }
-            (
-                source.full_path.to_string(),
-                hash,
-                source.size,
-                source.mode,
-                source.uid,
-                source.gid,
-                new_full_path,
-            )
+            new_full_path
         };
 
         // Phase 2: commit the alias to the Hub.
-        let mtime_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
+        let now = SystemTime::now();
+        let mtime_ms = now.duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
         let ops = [BatchOp::AddFile {
             path: new_full_path.clone(),
             xet_hash: xet_hash.clone(),
@@ -3018,7 +3024,6 @@ impl VirtualFs {
         }
 
         // Phase 3: insert the alias into the inode table under the write lock.
-        let now = SystemTime::now();
         let mut inodes = self.inode_table.write().expect("inodes poisoned");
         if inodes.get(newparent).is_none() {
             return Err(libc::ENOENT);
@@ -3028,6 +3033,7 @@ impl VirtualFs {
         if inodes.lookup_child(newparent, newname).is_some() {
             return Err(libc::EEXIST);
         }
+        info!("Linked {} -> {} (server-side copy)", source_path, new_full_path);
         let new_ino = inodes.insert(
             newparent,
             newname.to_string(),
@@ -3043,11 +3049,6 @@ impl VirtualFs {
         inodes.touch_parent(newparent, now);
         inodes.touch(new_ino);
 
-        info!(
-            "Linked {} -> {} (server-side copy)",
-            source_path,
-            inodes.get(new_ino).map(|e| e.full_path.as_ref()).unwrap_or(newname)
-        );
         Ok(self.make_vfs_attr(inodes.get(new_ino).ok_or(libc::EIO)?))
     }
 
