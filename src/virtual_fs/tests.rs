@@ -883,6 +883,31 @@ fn lookup_uses_head_not_list_tree() {
     });
 }
 
+/// A name that is a raw key-prefix of an existing file must not resolve as
+/// a directory: the bucket tree API matches by prefix, so listing
+/// `1.manifest` also returns the sibling `1.manifest#1` (the staging-file
+/// convention of object_store writers like Lance).
+#[test]
+fn lookup_prefix_of_existing_file_is_enoent() {
+    let hub = MockHub::new();
+    hub.add_file("_versions/1.manifest#1", 10, Some("h"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let dir = vfs.lookup(ROOT_INODE, "_versions").await.unwrap();
+        // Load children so the miss goes through the loaded-parent fallback.
+        let _ = vfs.readdir(dir.ino).await.unwrap();
+
+        let err = vfs.lookup(dir.ino, "1.manifest").await.unwrap_err();
+        assert_eq!(err, libc::ENOENT, "prefix of an existing file is not a directory");
+
+        // The sibling itself still resolves as a plain file.
+        let attr = vfs.lookup(dir.ino, "1.manifest#1").await.unwrap();
+        assert_eq!(attr.size, 10);
+    });
+}
+
 /// Missing name under an unloaded parent: HEAD returns 404, list_tree
 /// confirms the name isn't there, negative cache is populated, and the
 /// follow-up lookup short-circuits without re-hitting the Hub.

@@ -828,12 +828,13 @@ impl VirtualFs {
             let rel_path = if prefix.is_empty() {
                 entry.path.clone()
             } else {
-                entry
-                    .path
-                    .strip_prefix(&prefix)
-                    .and_then(|p| p.strip_prefix('/'))
-                    .unwrap_or(&entry.path)
-                    .to_string()
+                // The tree API matches by raw key prefix: listing `a` can also
+                // return a sibling `ab.txt` (or `a` itself). Only paths under
+                // `{prefix}/` are children of this directory.
+                match entry.path.strip_prefix(&prefix).and_then(|p| p.strip_prefix('/')) {
+                    Some(rel) if !rel.is_empty() => rel.to_string(),
+                    _ => continue,
+                }
             };
 
             if let Some(slash_pos) = rel_path.find('/') {
@@ -1371,9 +1372,16 @@ impl VirtualFs {
                 }
                 // The resolve endpoint returns 404 for directories, so a HEAD
                 // miss could still be a remotely-added dir. Targeted listing
-                // catches that; non-empty result means the dir exists.
+                // catches that. The bucket tree API matches by key prefix,
+                // not path segment (listing `a/b.manifest` also returns
+                // `a/b.manifest#1`), so only treat the path as a directory
+                // if an entry actually lives under `full_path/`.
                 if let Ok(entries) = self.hub_client.list_tree(&full_path).await
-                    && !entries.is_empty()
+                    && entries.iter().any(|e| {
+                        e.path
+                            .strip_prefix(&full_path)
+                            .is_some_and(|rest| rest.starts_with('/'))
+                    })
                 {
                     return self.insert_dir(parent, name, &full_path);
                 }
