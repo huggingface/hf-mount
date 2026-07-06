@@ -2357,18 +2357,6 @@ impl VirtualFs {
                     return Err(err.to_errno());
                 }
 
-                // A committed channel already sent Finish to the worker
-                // (flush(), or link() on a dirty source): a racing write
-                // could enqueue after Finish and be silently dropped. Fail
-                // loudly instead.
-                {
-                    let state = channel.state.lock().expect("state poisoned");
-                    if matches!(&*state, CommitState::Committed | CommitState::Failed(_)) {
-                        debug!("streaming write after commit rejected for ino={}", handle_ino);
-                        return Err(libc::EIO);
-                    }
-                }
-
                 // Enforce append-only: offset must match bytes written so far
                 let expected = channel.bytes_written.load(Ordering::Relaxed);
                 if offset != expected {
@@ -2380,10 +2368,26 @@ impl VirtualFs {
                 }
 
                 let len = data.len();
-                channel.tx.blocking_send(WriteMsg::Data(data.to_vec())).map_err(|_| {
-                    error!("streaming channel closed for ino={}", handle_ino);
-                    libc::EIO
-                })?;
+                // Enqueue under the state mutex to serialize against
+                // streaming_commit(), which flips to Committing under the
+                // same mutex before enqueueing Finish: either this Data lands
+                // ahead of Finish (and is included in the commit), or the
+                // write observes Committing/Committed and fails loudly
+                // instead of being silently dropped behind Finish.
+                {
+                    let state = channel.state.lock().expect("state poisoned");
+                    match &*state {
+                        CommitState::Writing | CommitState::Deferred => {}
+                        _ => {
+                            debug!("streaming write after commit rejected for ino={}", handle_ino);
+                            return Err(libc::EIO);
+                        }
+                    }
+                    channel.tx.blocking_send(WriteMsg::Data(data.to_vec())).map_err(|_| {
+                        error!("streaming channel closed for ino={}", handle_ino);
+                        libc::EIO
+                    })?;
+                }
                 channel.bytes_written.fetch_add(len as u64, Ordering::Relaxed);
 
                 let new_size = offset + len as u64;
@@ -2424,7 +2428,7 @@ impl VirtualFs {
                         debug!("flush: already failed for ino={}: {}", ino, msg);
                         return Err(libc::EIO);
                     }
-                    CommitState::Writing | CommitState::Deferred => {}
+                    CommitState::Writing | CommitState::Deferred | CommitState::Committing => {}
                 }
             }
 
@@ -2520,7 +2524,12 @@ impl VirtualFs {
             Some(OpenFile::Streaming { ino, channel }) => {
                 let needs_commit = {
                     let state = channel.state.lock().expect("state poisoned");
-                    matches!(&*state, CommitState::Writing | CommitState::Deferred)
+                    // Committing: an earlier flush()/link() commit failed
+                    // mid-flight (pending_info parked) — release retries it.
+                    matches!(
+                        &*state,
+                        CommitState::Writing | CommitState::Deferred | CommitState::Committing
+                    )
                 };
                 if needs_commit {
                     // If flush() didn't defer (e.g. Writing state from a direct
@@ -2654,6 +2663,17 @@ impl VirtualFs {
         {
             debug!("streaming_commit: skipping unlinked ino={}", ino);
             return Ok(());
+        }
+
+        // Flip to Committing under the state mutex BEFORE enqueueing Finish:
+        // write() enqueues Data under the same mutex, so a racing write either
+        // lands ahead of Finish or observes Committing and is rejected instead
+        // of being silently dropped behind Finish.
+        {
+            let mut state = channel.state.lock().expect("state poisoned");
+            if matches!(&*state, CommitState::Writing | CommitState::Deferred) {
+                *state = CommitState::Committing;
+            }
         }
 
         let file_info = {
@@ -2990,7 +3010,7 @@ impl VirtualFs {
                     debug!("streaming commit already failed for ino={}: {}", ino, msg);
                     return Err(libc::EIO);
                 }
-                CommitState::Writing | CommitState::Deferred => {}
+                CommitState::Writing | CommitState::Deferred | CommitState::Committing => {}
             }
         }
         // Install hook before commit so concurrent open() can wait on us.
@@ -3109,6 +3129,11 @@ impl VirtualFs {
         }
         // A concurrent create may have won the race since phase 1; the remote
         // add already landed, but locally the newer entry owns the name.
+        // Accepted TOCTOU: in this narrow window a failed link leaves the
+        // alias (and, for a dirty source, the source commit) on the Hub —
+        // same trade-off as pre-existing clean-source links. Deterministic
+        // validation failures (EEXIST/ENOTDIR/ENOENT in phase 1b) commit
+        // nothing.
         if inodes.lookup_child(newparent, newname).is_some() {
             return Err(libc::EEXIST);
         }
@@ -4067,6 +4092,10 @@ enum CommitState {
     Writing,
     /// flush() deferred commit (dup'd fd or zero writes). release() will handle it.
     Deferred,
+    /// A commit is in flight: Finish is (about to be) enqueued. Writes are
+    /// rejected from this point — they would land behind Finish and be
+    /// silently dropped by the exiting worker.
+    Committing,
     /// Commit completed successfully.
     Committed,
     /// Unrecoverable error — inode has been reverted.

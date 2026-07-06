@@ -4651,6 +4651,54 @@ fn link_failed_destination_does_not_commit_source() {
     });
 }
 
+/// Writes racing a commit IN FLIGHT are rejected too: streaming_commit flips
+/// the channel to Committing (under the same mutex write() enqueues under)
+/// before sending Finish, so a write can never land behind Finish and be
+/// silently dropped by the exiting worker.
+#[test]
+fn write_during_inflight_commit_is_rejected() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let (attr, fh) = vfs
+            .create(ROOT_INODE, "racing.txt", 0o644, 1000, 1000, Some(42))
+            .await
+            .unwrap();
+        let ino = attr.ino;
+        write_blocking(&vfs, ino, fh, 0, b"payload").await.unwrap();
+
+        // Park the commit at the Hub batch call: the channel is Committing
+        // (Finish already enqueued) while flush() waits on the barrier.
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        hub.set_batch_barrier(barrier.clone());
+        let vfs_flush = vfs.clone();
+        let flush_task = tokio::spawn(async move { vfs_flush.flush(ino, fh, Some(42)).await });
+
+        // Until the flip a write may still legally succeed (it lands ahead of
+        // Finish and joins the commit), so poll until the rejection.
+        let mut offset = 7u64;
+        let mut rejected = false;
+        for _ in 0..200 {
+            match write_blocking(&vfs, ino, fh, offset, b"more").await {
+                Err(err) => {
+                    assert_eq!(err, libc::EIO);
+                    rejected = true;
+                    break;
+                }
+                Ok(written) => offset += written as u64,
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(rejected, "write must be rejected once the commit is in flight");
+
+        barrier.wait().await;
+        flush_task.await.unwrap().unwrap();
+        vfs.release(fh).await.unwrap();
+    });
+}
+
 /// Writes after the streaming channel has committed (flush(), or link() on a
 /// dirty source) are rejected instead of being silently dropped after Finish.
 #[test]
