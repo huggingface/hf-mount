@@ -920,9 +920,10 @@ fn lookup_uses_head_not_list_tree() {
 }
 
 /// A name that is a raw key-prefix of an existing file must not resolve as
-/// a directory: the bucket tree API matches by prefix, so listing
-/// `1.manifest` also returns the sibling `1.manifest#1` (the staging-file
-/// convention of object_store writers like Lance).
+/// a directory (`1.manifest` vs the `1.manifest#1` staging convention of
+/// object_store writers). The raw-prefix filtering itself lives in
+/// `HubApiClient::list_tree` (see `test_is_strict_descendant`); this covers
+/// the consumer side: an empty listing is ENOENT, not a phantom directory.
 #[test]
 fn lookup_prefix_of_existing_file_is_enoent() {
     let hub = MockHub::new();

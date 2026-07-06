@@ -166,28 +166,34 @@ impl HubOps for MockHub {
     async fn list_tree(&self, prefix: &str) -> Result<Vec<TreeEntry>> {
         self.list_tree_calls.fetch_add(1, Ordering::SeqCst);
         let tree = self.tree.lock().unwrap();
+        let prefix_slash = if prefix.is_empty() {
+            String::new()
+        } else {
+            format!("{}/", prefix)
+        };
 
         // Non-recursive: return direct children only, synthesizing directory
-        // entries for intermediate paths. Matching is by RAW key prefix, not
-        // path segment (mirrors the S3-backed bucket tree API, verified
-        // empirically): listing `a/b.manifest` also returns the sibling
-        // `a/b.manifest#1`.
+        // entries for intermediate paths. Strict descendants only — the raw
+        // S3 key-prefix matches of the bucket tree API are filtered out by
+        // `HubApiClient::list_tree` before reaching consumers, so the mock
+        // honors the same contract.
         let mut result = Vec::new();
         let mut seen_dirs = std::collections::HashSet::new();
         for entry in tree.iter() {
-            let Some(rest) = entry.path.strip_prefix(prefix) else {
+            let relative = if prefix.is_empty() {
+                entry.path.as_str()
+            } else if let Some(rest) = entry.path.strip_prefix(&prefix_slash) {
+                rest
+            } else {
                 continue;
             };
-            let (sep, relative) = match rest.strip_prefix('/') {
-                Some(stripped) => ("/", stripped),
-                None => ("", rest),
-            };
-            if relative.is_empty() {
-                result.push(entry.clone()); // exact match: the file itself
-                continue;
-            }
             if let Some(slash) = relative.find('/') {
-                let dir_path = format!("{prefix}{sep}{}", &relative[..slash]);
+                let dir_name = &relative[..slash];
+                let dir_path = if prefix.is_empty() {
+                    dir_name.to_string()
+                } else {
+                    format!("{prefix}/{dir_name}")
+                };
                 if seen_dirs.insert(dir_path.clone()) {
                     result.push(TreeEntry {
                         path: dir_path,

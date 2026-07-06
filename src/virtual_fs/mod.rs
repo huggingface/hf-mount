@@ -828,11 +828,9 @@ impl VirtualFs {
             let rel_path = if prefix.is_empty() {
                 entry.path.clone()
             } else {
-                // The tree API matches by raw key prefix: listing `a` can also
-                // return a sibling `ab.txt` (or `a` itself). Only paths under
-                // `{prefix}/` are children of this directory.
                 match entry.path.strip_prefix(&prefix).and_then(|p| p.strip_prefix('/')) {
                     Some(rel) if !rel.is_empty() => rel.to_string(),
+                    // list_tree guarantees strict descendants; skip defensively.
                     _ => continue,
                 }
             };
@@ -1372,16 +1370,10 @@ impl VirtualFs {
                 }
                 // The resolve endpoint returns 404 for directories, so a HEAD
                 // miss could still be a remotely-added dir. Targeted listing
-                // catches that. The bucket tree API matches by key prefix,
-                // not path segment (listing `a/b.manifest` also returns
-                // `a/b.manifest#1`), so only treat the path as a directory
-                // if an entry actually lives under `full_path/`.
+                // catches that; list_tree only returns strict descendants of
+                // the path, so a non-empty result means the dir exists.
                 if let Ok(entries) = self.hub_client.list_tree(&full_path).await
-                    && entries.iter().any(|e| {
-                        e.path
-                            .strip_prefix(&full_path)
-                            .is_some_and(|rest| rest.starts_with('/'))
-                    })
+                    && !entries.is_empty()
                 {
                     return self.insert_dir(parent, name, &full_path);
                 }
@@ -2938,8 +2930,7 @@ impl VirtualFs {
 
     /// Phase-1a source read for `link()`: `Ok(None)` means the source exists
     /// but has no committed hash yet (dirty, or created and never flushed).
-    #[allow(clippy::type_complexity)]
-    fn link_source(&self, ino: u64) -> VirtualFsResult<Option<(Arc<str>, String, u64, u16, u32, u32)>> {
+    fn link_source(&self, ino: u64) -> VirtualFsResult<Option<LinkSource>> {
         let inodes = self.inode_table.read().expect("inodes poisoned");
         let source = inodes.get(ino).ok_or(libc::ENOENT)?;
         if source.kind != InodeKind::File {
@@ -2951,14 +2942,14 @@ impl VirtualFs {
         let Some(hash) = source.xet_hash.as_ref().filter(|hash| !hash.is_empty()).cloned() else {
             return Ok(None);
         };
-        Ok(Some((
-            source.full_path.clone(),
-            hash,
-            source.size,
-            source.mode,
-            source.uid,
-            source.gid,
-        )))
+        Ok(Some(LinkSource {
+            path: source.full_path.clone(),
+            xet_hash: hash,
+            size: source.size,
+            mode: source.mode,
+            uid: source.uid,
+            gid: source.gid,
+        }))
     }
 
     /// Find the open streaming channel for `ino`, if any.
@@ -2970,11 +2961,12 @@ impl VirtualFs {
         })
     }
 
-    /// Synchronously commit an open streaming handle so `link()` can alias its
-    /// committed hash. Mirrors the flush() commit sequence, including the
-    /// failure contract: on error, pending_info is preserved for the release()
-    /// retry and the commit hook stays active so concurrent opens wait on it.
-    async fn commit_streaming_for_link(&self, ino: u64, channel: &Arc<StreamingChannel>) -> VirtualFsResult<()> {
+    /// Terminal streaming-commit sequence, shared by `flush()` and `link()`:
+    /// error check → state check → install hook → commit → mark Committed →
+    /// fulfill hook. On error the hook stays active and pending_info is
+    /// preserved so release() retries and publishes the final outcome;
+    /// concurrent open(O_TRUNC) waits on the hook instead of racing the retry.
+    async fn commit_streaming_now(&self, ino: u64, channel: &Arc<StreamingChannel>) -> VirtualFsResult<()> {
         if let Some(err) = channel.error.lock().expect("error poisoned").as_ref() {
             return Err(err.to_errno());
         }
@@ -2983,12 +2975,13 @@ impl VirtualFs {
             match &*state {
                 CommitState::Committed => return Ok(()),
                 CommitState::Failed(msg) => {
-                    debug!("link: streaming commit already failed for ino={}: {}", ino, msg);
+                    debug!("streaming commit already failed for ino={}: {}", ino, msg);
                     return Err(libc::EIO);
                 }
                 CommitState::Writing | CommitState::Deferred => {}
             }
         }
+        // Install hook before commit so concurrent open() can wait on us.
         self.install_commit_hook(ino, channel);
         self.streaming_commit(ino, channel).await?;
         *channel.state.lock().expect("state poisoned") = CommitState::Committed;
@@ -3036,10 +3029,10 @@ impl VirtualFs {
         if source.is_none()
             && let Some(channel) = self.streaming_channel_for(ino)
         {
-            self.commit_streaming_for_link(ino, &channel).await?;
+            self.commit_streaming_now(ino, &channel).await?;
             source = self.link_source(ino)?;
         }
-        let Some((source_path, xet_hash, size, mode, uid, gid)) = source else {
+        let Some(source) = source else {
             return Err(libc::ENOTSUP);
         };
 
@@ -3067,14 +3060,14 @@ impl VirtualFs {
         let mtime_ms = now.duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
         let ops = [BatchOp::AddFile {
             path: new_full_path.clone(),
-            xet_hash: xet_hash.clone(),
+            xet_hash: source.xet_hash.clone(),
             mtime: mtime_ms,
             content_type: None,
         }];
         if let Err(e) = self.hub_client.batch_operations(&ops).await {
             error!(
                 "link: failed to commit {} as alias of {}: {}",
-                new_full_path, source_path, e
+                new_full_path, source.path, e
             );
             return Err(libc::EIO);
         }
@@ -3095,18 +3088,18 @@ impl VirtualFs {
         if inodes.lookup_child(newparent, newname).is_some() {
             return Err(libc::EEXIST);
         }
-        info!("Linked {} -> {} (server-side copy)", source_path, new_full_path);
+        info!("Linked {} -> {} (server-side copy)", source.path, new_full_path);
         let new_ino = inodes.insert(
             newparent,
             newname.to_string(),
             new_full_path,
             InodeKind::File,
-            size,
+            source.size,
             now,
-            Some(xet_hash),
-            mode,
-            uid,
-            gid,
+            Some(source.xet_hash),
+            source.mode,
+            source.uid,
+            source.gid,
         );
         inodes.touch_parent(newparent, now);
         inodes.touch(new_ino);
@@ -4084,6 +4077,16 @@ struct StreamingChannel {
 }
 
 /// An open file handle — either a local fd, lazy remote reference, or streaming writer.
+/// Committed source attributes read under lock for `link()`.
+struct LinkSource {
+    path: Arc<str>,
+    xet_hash: String,
+    size: u64,
+    mode: u16,
+    uid: u32,
+    gid: u32,
+}
+
 enum OpenFile {
     /// Local file (staging for writes, or dirty reads).
     Local { ino: u64, file: Arc<File>, writable: bool },
