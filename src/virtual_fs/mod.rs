@@ -3123,7 +3123,7 @@ impl VirtualFs {
 
         self.ensure_children_loaded(parent).await?;
 
-        let (ino, full_path, needs_remote_delete) = {
+        let (ino, full_path, needs_remote_delete, dirty) = {
             let inodes = self.inode_table.read().expect("inodes poisoned");
             let entry = match inodes.lookup_child(parent, name) {
                 Some(entry) if entry.kind != InodeKind::Directory => entry,
@@ -3138,15 +3138,25 @@ impl VirtualFs {
             // Remote delete only when last link is removed and file exists on the hub.
             // Skipped in overlay mode (writes never propagate to remote).
             let needs_remote = !self.overlay() && entry.xet_hash.is_some() && entry.nlink <= 1;
-            (entry.inode, entry.full_path.to_string(), needs_remote)
+            (entry.inode, entry.full_path.to_string(), needs_remote, entry.is_dirty())
         };
 
-        // In streaming mode, block unlink while the file has any open handles.
-        // This prevents editors (vim) from deleting a file they can't rewrite
-        // (streaming mode returns EPERM for O_RDWR without O_TRUNC), which
-        // would cause silent data loss. Same approach as mountpoint-s3.
-        if !self.advanced_writes && self.has_open_handles(ino) {
-            debug!("unlink: blocked for ino={} (has open handles in streaming mode)", ino);
+        // In streaming mode, block unlink while the file has open handles AND
+        // uncommitted changes: deleting out from under an editor mid-rewrite
+        // (vim can't rewrite in place in streaming mode and may fall back to
+        // unlink + recreate) would silently lose the un-committed bytes. Same
+        // approach as mountpoint-s3.
+        //
+        // Clean inodes get POSIX unlink-while-open semantics instead: the
+        // entry goes away now and open handles keep reading via the committed
+        // hash / staging file until release() reaps the orphan. This is what
+        // object_store-based writers (Lance, Delta) rely on for staging
+        // cleanup and recursive dataset deletes.
+        if !self.advanced_writes && dirty && self.has_open_handles(ino) {
+            debug!(
+                "unlink: blocked for ino={} (dirty with open handles in streaming mode)",
+                ino
+            );
             return Err(libc::EPERM);
         }
 

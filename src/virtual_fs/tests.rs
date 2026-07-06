@@ -134,31 +134,67 @@ fn streaming_write_happy_path() {
     assert_eq!(logs.len(), 1);
 }
 
-/// In streaming mode, unlink is blocked while the file has open handles.
-/// This prevents editors (vim) from deleting files they can't rewrite.
+/// In streaming mode, unlink of a CLEAN file with open handles follows POSIX
+/// unlink-while-open semantics: the entry goes away immediately (remote
+/// delete included) and the open handle keeps working until release().
+/// This is what object_store writers (Lance, Delta) rely on for staging
+/// cleanup and recursive dataset deletes.
 #[test]
-fn unlink_blocked_with_open_handles_streaming() {
+fn unlink_clean_file_with_open_handle_is_posix() {
     let hub = MockHub::new();
-    hub.add_file("guarded.txt", 100, Some("hash1"), None);
+    hub.add_file("clean.txt", 100, Some("hash1"), None);
     let xet = MockXet::new();
     let (rt, vfs) = vfs_simple(&hub, &xet);
 
     rt.block_on(async {
-        let attr = vfs.lookup(ROOT_INODE, "guarded.txt").await.unwrap();
+        let attr = vfs.lookup(ROOT_INODE, "clean.txt").await.unwrap();
         let ino = attr.ino;
-
-        // Open read-only (like vim does before trying to save)
         let fh = vfs.open(ino, false, false, Some(42)).await.unwrap();
 
-        // Unlink should be blocked (has open handles in streaming mode)
-        let err = vfs.unlink(ROOT_INODE, "guarded.txt").await.unwrap_err();
-        assert_eq!(err, libc::EPERM, "unlink must be blocked with open handles");
+        vfs.unlink(ROOT_INODE, "clean.txt").await.unwrap();
 
-        // Close the handle
+        // Entry is gone, remote delete was sent, handle still open.
+        {
+            let inodes = vfs.inode_table.read().unwrap();
+            assert!(inodes.lookup_child(ROOT_INODE, "clean.txt").is_none());
+        }
+        let logs = hub.take_batch_log();
+        let has_delete = logs
+            .iter()
+            .flatten()
+            .any(|op| matches!(op, BatchOp::DeleteFile { path } if path == "clean.txt"));
+        assert!(has_delete, "remote delete sent at unlink time");
+        assert!(vfs.has_open_handles(ino), "open handle survives the unlink");
+
         vfs.release(fh).await.unwrap();
+        assert!(!vfs.has_open_handles(ino));
+    });
+}
 
-        // Now unlink should succeed
-        vfs.unlink(ROOT_INODE, "guarded.txt").await.unwrap();
+/// In streaming mode, unlink of a DIRTY file with open handles stays blocked:
+/// deleting out from under an editor mid-rewrite would silently lose the
+/// un-committed bytes (the vim unlink+recreate fallback).
+#[test]
+fn unlink_blocked_dirty_with_open_handles_streaming() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let (attr, fh) = vfs
+            .create(ROOT_INODE, "editing.txt", 0o644, 1000, 1000, Some(42))
+            .await
+            .unwrap();
+        let ino = attr.ino;
+        write_blocking(&vfs, ino, fh, 0, b"uncommitted").await.unwrap();
+
+        let err = vfs.unlink(ROOT_INODE, "editing.txt").await.unwrap_err();
+        assert_eq!(err, libc::EPERM, "dirty file with open handle stays protected");
+
+        // Commit + close, then the unlink goes through.
+        vfs.flush(ino, fh, Some(42)).await.unwrap();
+        vfs.release(fh).await.unwrap();
+        vfs.unlink(ROOT_INODE, "editing.txt").await.unwrap();
     });
 }
 
@@ -4559,13 +4595,11 @@ fn link_dirty_streaming_source_commits_then_aliases() {
             );
         }
 
-        // The staging unlink is EPERM while the handle is open (streaming-mode
-        // policy); object_store treats that cleanup as best-effort. After
-        // release the staging file can be removed normally.
-        let err = vfs.unlink(ROOT_INODE, "staging#1").await.unwrap_err();
-        assert_eq!(err, libc::EPERM);
-        vfs.release(fh).await.unwrap();
+        // The staging unlink lands while the handle is still open, but the
+        // link() above committed the source, so the clean-file POSIX path
+        // applies: entry gone now, handle valid until release.
         vfs.unlink(ROOT_INODE, "staging#1").await.unwrap();
+        vfs.release(fh).await.unwrap();
 
         let inodes = vfs.inode_table.read().unwrap();
         assert!(inodes.lookup_child(ROOT_INODE, "final.manifest").is_some());
