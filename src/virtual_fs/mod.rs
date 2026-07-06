@@ -2936,6 +2936,66 @@ impl VirtualFs {
         Ok(self.make_vfs_attr(inodes.get(ino).ok_or(libc::ENOENT)?))
     }
 
+    /// Phase-1a source read for `link()`: `Ok(None)` means the source exists
+    /// but has no committed hash yet (dirty, or created and never flushed).
+    #[allow(clippy::type_complexity)]
+    fn link_source(&self, ino: u64) -> VirtualFsResult<Option<(Arc<str>, String, u64, u16, u32, u32)>> {
+        let inodes = self.inode_table.read().expect("inodes poisoned");
+        let source = inodes.get(ino).ok_or(libc::ENOENT)?;
+        if source.kind != InodeKind::File {
+            return Err(libc::EPERM);
+        }
+        if source.is_dirty() {
+            return Ok(None);
+        }
+        let Some(hash) = source.xet_hash.as_ref().filter(|hash| !hash.is_empty()).cloned() else {
+            return Ok(None);
+        };
+        Ok(Some((
+            source.full_path.clone(),
+            hash,
+            source.size,
+            source.mode,
+            source.uid,
+            source.gid,
+        )))
+    }
+
+    /// Find the open streaming channel for `ino`, if any.
+    fn streaming_channel_for(&self, ino: u64) -> Option<Arc<StreamingChannel>> {
+        let files = self.open_files.read().expect("open_files poisoned");
+        files.values().find_map(|open| match open {
+            OpenFile::Streaming { ino: open_ino, channel } if *open_ino == ino => Some(Arc::clone(channel)),
+            _ => None,
+        })
+    }
+
+    /// Synchronously commit an open streaming handle so `link()` can alias its
+    /// committed hash. Mirrors the flush() commit sequence, including the
+    /// failure contract: on error, pending_info is preserved for the release()
+    /// retry and the commit hook stays active so concurrent opens wait on it.
+    async fn commit_streaming_for_link(&self, ino: u64, channel: &Arc<StreamingChannel>) -> VirtualFsResult<()> {
+        if let Some(err) = channel.error.lock().expect("error poisoned").as_ref() {
+            return Err(err.to_errno());
+        }
+        {
+            let state = channel.state.lock().expect("state poisoned");
+            match &*state {
+                CommitState::Committed => return Ok(()),
+                CommitState::Failed(msg) => {
+                    debug!("link: streaming commit already failed for ino={}: {}", ino, msg);
+                    return Err(libc::EIO);
+                }
+                CommitState::Writing | CommitState::Deferred => {}
+            }
+        }
+        self.install_commit_hook(ino, channel);
+        self.streaming_commit(ino, channel).await?;
+        *channel.state.lock().expect("state poisoned") = CommitState::Committed;
+        self.fulfill_commit_hook(ino, channel, Ok(()));
+        Ok(())
+    }
+
     /// Hard-link `ino` at `newparent/newname` as a server-side copy: a new Hub
     /// file entry referencing the source's xet hash, so no bytes move through
     /// CAS. The alias gets its own inode (writes to one path never affect the
@@ -2967,26 +3027,20 @@ impl VirtualFs {
         // destination's remote children. A rejected source (dirty or hashless,
         // the routine *arr link-then-copy fallback) must not pay for a
         // list_tree it would throw away.
-        let (source_path, xet_hash, size, mode, uid, gid) = {
-            let inodes = self.inode_table.read().expect("inodes poisoned");
-            let source = inodes.get(ino).ok_or(libc::ENOENT)?;
-            if source.kind != InodeKind::File {
-                return Err(libc::EPERM);
-            }
-            if source.is_dirty() {
-                return Err(libc::ENOTSUP);
-            }
-            let Some(hash) = source.xet_hash.as_ref().filter(|hash| !hash.is_empty()).cloned() else {
-                return Err(libc::ENOTSUP);
-            };
-            (
-                source.full_path.clone(),
-                hash,
-                source.size,
-                source.mode,
-                source.uid,
-                source.gid,
-            )
+        //
+        // A dirty source with an open streaming handle gets one synchronous
+        // commit first (same sequence as flush()): object_store-based writers
+        // (Lance, Delta) emulate atomic rename as write → hard_link → unlink
+        // → close, so their link() arrives before the close-time commit.
+        let mut source = self.link_source(ino)?;
+        if source.is_none()
+            && let Some(channel) = self.streaming_channel_for(ino)
+        {
+            self.commit_streaming_for_link(ino, &channel).await?;
+            source = self.link_source(ino)?;
+        }
+        let Some((source_path, xet_hash, size, mode, uid, gid)) = source else {
+            return Err(libc::ENOTSUP);
         };
 
         // Load remote children so the EEXIST check below also sees files that

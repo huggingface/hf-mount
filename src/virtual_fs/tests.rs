@@ -4523,6 +4523,56 @@ fn link_clean_file_creates_server_side_copy() {
     });
 }
 
+/// link() on a dirty source with an open streaming handle commits the source
+/// synchronously, then aliases the committed hash. This is the atomic-rename
+/// emulation of object_store writers (Lance, Delta): write → hard_link →
+/// unlink → close, so the link arrives before the close-time commit.
+#[test]
+fn link_dirty_streaming_source_commits_then_aliases() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let (attr, fh) = vfs
+            .create(ROOT_INODE, "staging#1", 0o644, 1000, 1000, Some(42))
+            .await
+            .unwrap();
+        let ino = attr.ino;
+        write_blocking(&vfs, ino, fh, 0, b"manifest bytes").await.unwrap();
+
+        // Hard-link while the handle is still open and the inode dirty.
+        let alias_attr = vfs.link(ino, ROOT_INODE, "final.manifest").await.unwrap();
+        assert_ne!(alias_attr.ino, ino, "alias gets its own inode");
+        assert_eq!(alias_attr.size, 14);
+
+        {
+            let inodes = vfs.inode_table.read().unwrap();
+            let source = inodes.get(ino).unwrap();
+            assert!(!source.is_dirty(), "link must have committed the source");
+            let source_hash = source.xet_hash.clone().expect("source hash set by commit");
+            let alias = inodes.get(alias_attr.ino).unwrap();
+            assert_eq!(
+                alias.xet_hash.as_ref(),
+                Some(&source_hash),
+                "alias points at the committed hash"
+            );
+        }
+
+        // The staging unlink is EPERM while the handle is open (streaming-mode
+        // policy); object_store treats that cleanup as best-effort. After
+        // release the staging file can be removed normally.
+        let err = vfs.unlink(ROOT_INODE, "staging#1").await.unwrap_err();
+        assert_eq!(err, libc::EPERM);
+        vfs.release(fh).await.unwrap();
+        vfs.unlink(ROOT_INODE, "staging#1").await.unwrap();
+
+        let inodes = vfs.inode_table.read().unwrap();
+        assert!(inodes.lookup_child(ROOT_INODE, "final.manifest").is_some());
+        assert!(inodes.lookup_child(ROOT_INODE, "staging#1").is_none());
+    });
+}
+
 /// link() on a dirty source must not alias a stale hash: ENOTSUP so the
 /// caller falls back to a regular copy.
 #[test]
