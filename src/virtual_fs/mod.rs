@@ -2357,6 +2357,18 @@ impl VirtualFs {
                     return Err(err.to_errno());
                 }
 
+                // A committed channel already sent Finish to the worker
+                // (flush(), or link() on a dirty source): a racing write
+                // could enqueue after Finish and be silently dropped. Fail
+                // loudly instead.
+                {
+                    let state = channel.state.lock().expect("state poisoned");
+                    if matches!(&*state, CommitState::Committed | CommitState::Failed(_)) {
+                        debug!("streaming write after commit rejected for ino={}", handle_ino);
+                        return Err(libc::EIO);
+                    }
+                }
+
                 // Enforce append-only: offset must match bytes written so far
                 let expected = channel.bytes_written.load(Ordering::Relaxed);
                 if offset != expected {
@@ -3022,18 +3034,22 @@ impl VirtualFs {
         // list_tree it would throw away.
         //
         // A dirty source with an open streaming handle gets one synchronous
-        // commit first (same sequence as flush()): object_store-based writers
+        // commit (same sequence as flush()): object_store-based writers
         // (Lance, Delta) emulate atomic rename as write → hard_link → unlink
-        // → close, so their link() arrives before the close-time commit.
+        // → close, so their link() arrives before the close-time commit. The
+        // commit itself waits until the destination has validated — a link
+        // that fails EEXIST/ENOTDIR must not leave remote mutation behind.
         let mut source = self.link_source(ino)?;
-        if source.is_none()
-            && let Some(channel) = self.streaming_channel_for(ino)
-        {
-            self.commit_streaming_now(ino, &channel).await?;
-            source = self.link_source(ino)?;
-        }
-        let Some(source) = source else {
-            return Err(libc::ENOTSUP);
+        let dirty_channel = if source.is_none() {
+            match self.streaming_channel_for(ino) {
+                Some(channel) => Some(channel),
+                // Dirty with no committable handle (the routine *arr
+                // link-then-copy fallback): reject before paying for the
+                // destination list_tree below.
+                None => return Err(libc::ENOTSUP),
+            }
+        } else {
+            None
         };
 
         // Load remote children so the EEXIST check below also sees files that
@@ -3053,6 +3069,14 @@ impl VirtualFs {
                 return Err(libc::EEXIST);
             }
             new_full_path
+        };
+
+        if let Some(channel) = dirty_channel {
+            self.commit_streaming_now(ino, &channel).await?;
+            source = self.link_source(ino)?;
+        }
+        let Some(source) = source else {
+            return Err(libc::ENOTSUP);
         };
 
         // Phase 2: commit the alias to the Hub.

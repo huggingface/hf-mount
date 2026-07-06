@@ -4615,6 +4615,66 @@ fn link_dirty_streaming_source_commits_then_aliases() {
     });
 }
 
+/// A link() that fails destination validation must not have committed the
+/// dirty source: a failed syscall must leave no observable remote mutation.
+#[test]
+fn link_failed_destination_does_not_commit_source() {
+    let hub = MockHub::new();
+    hub.add_file("taken.txt", 5, Some("hash0"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let (attr, fh) = vfs
+            .create(ROOT_INODE, "staging#1", 0o644, 1000, 1000, Some(42))
+            .await
+            .unwrap();
+        let ino = attr.ino;
+        write_blocking(&vfs, ino, fh, 0, b"manifest bytes").await.unwrap();
+        hub.take_batch_log();
+
+        let err = vfs.link(ino, ROOT_INODE, "taken.txt").await.unwrap_err();
+        assert_eq!(err, libc::EEXIST);
+        assert!(
+            hub.take_batch_log().is_empty(),
+            "failed link must not commit the source"
+        );
+        {
+            let inodes = vfs.inode_table.read().unwrap();
+            assert!(
+                inodes.get(ino).unwrap().is_dirty(),
+                "source stays dirty for the close-time commit"
+            );
+        }
+
+        vfs.release(fh).await.unwrap();
+    });
+}
+
+/// Writes after the streaming channel has committed (flush(), or link() on a
+/// dirty source) are rejected instead of being silently dropped after Finish.
+#[test]
+fn write_after_streaming_commit_is_rejected() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let (attr, fh) = vfs
+            .create(ROOT_INODE, "once.txt", 0o644, 1000, 1000, Some(42))
+            .await
+            .unwrap();
+        let ino = attr.ino;
+        write_blocking(&vfs, ino, fh, 0, b"payload").await.unwrap();
+        vfs.flush(ino, fh, Some(42)).await.unwrap();
+
+        let err = write_blocking(&vfs, ino, fh, 7, b"more").await.unwrap_err();
+        assert_eq!(err, libc::EIO);
+
+        vfs.release(fh).await.unwrap();
+    });
+}
+
 /// When the synchronous commit inside link() fails, the error propagates and
 /// no alias is committed — pending_info stays parked for the release() retry
 /// (same failure contract as flush()).
