@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
@@ -9,6 +10,35 @@ use tracing::{info, warn};
 use xet_client::cas_client::auth::{AuthError, TokenInfo, TokenRefresher};
 
 use crate::error::{Error, Result, is_retryable_status};
+
+/// Characters that must be percent-encoded when a file path is interpolated
+/// into a URL path: `#` starts a fragment, `?` a query string, `%` corrupts
+/// decoding, and the rest are not valid in URL paths. `/` is intentionally
+/// kept so multi-segment paths stay multi-segment.
+const URL_PATH_ESCAPE: &AsciiSet = &CONTROLS
+    .add(b' ')
+    .add(b'"')
+    .add(b'#')
+    .add(b'%')
+    .add(b'?')
+    .add(b'<')
+    .add(b'>')
+    .add(b'`')
+    .add(b'{')
+    .add(b'}')
+    .add(b'|')
+    .add(b'\\')
+    .add(b'^');
+
+/// Percent-encode a file path for use in a URL path, preserving `/`.
+///
+/// Filenames with URL-reserved characters are routine: object_store-based
+/// writers (Lance, Delta) stage uploads as `name#1`, `name#2`, … — without
+/// encoding, everything after `#` is parsed as a fragment and every such
+/// file resolves to the same truncated URL.
+fn encode_url_path(path: &str) -> String {
+    utf8_percent_encode(path, URL_PATH_ESCAPE).to_string()
+}
 
 // ── HubOps trait ──────────────────────────────────────────────────────
 
@@ -656,7 +686,9 @@ impl HubApiClient {
         } else {
             format!(
                 "{}/api/buckets/{}/tree/{}{recursive_param}",
-                self.endpoint, bucket_id, prefix
+                self.endpoint,
+                bucket_id,
+                encode_url_path(prefix)
             )
         };
 
@@ -705,7 +737,7 @@ impl HubApiClient {
                 repo_type.api_prefix(),
                 repo_id,
                 revision,
-                prefix,
+                encode_url_path(prefix),
             )
         };
 
@@ -750,7 +782,7 @@ impl HubApiClient {
     /// Fetch metadata for a single file via HEAD on the resolve endpoint.
     /// Returns `None` if 404 (file does not exist remotely).
     pub async fn head_file(&self, path: &str) -> Result<Option<HeadFileInfo>> {
-        let api_path = self.prefixed_path(path);
+        let api_path = encode_url_path(&self.prefixed_path(path));
         let url = match &self.source {
             // Buckets: /buckets/{id}/resolve/{path} (no /api/ prefix)
             SourceKind::Bucket { bucket_id } => {
@@ -910,7 +942,7 @@ impl HubApiClient {
     /// sidecar `{dest}.etag` file is present, sends `If-None-Match`. On 304 the
     /// existing cached file is kept as-is.
     pub async fn download_file_http(&self, path: &str, dest: &Path) -> Result<()> {
-        let api_path = self.prefixed_path(path);
+        let api_path = encode_url_path(&self.prefixed_path(path));
         let url = match &self.source {
             SourceKind::Bucket { bucket_id } => {
                 format!("{}/buckets/{}/resolve/{}", self.endpoint, bucket_id, api_path)
@@ -1306,6 +1338,22 @@ mod tests {
             last_modified: UNIX_EPOCH,
             path_prefix: prefix.to_string(),
         }
+    }
+
+    #[test]
+    fn test_encode_url_path_passthrough() {
+        assert_eq!(encode_url_path("file.txt"), "file.txt");
+        assert_eq!(encode_url_path("a/b/c.lance"), "a/b/c.lance");
+        assert_eq!(encode_url_path(""), "");
+    }
+
+    #[test]
+    fn test_encode_url_path_reserved_chars() {
+        // object_store staging suffix: the `#` must not become a URL fragment
+        assert_eq!(encode_url_path("_versions/1.manifest#1"), "_versions/1.manifest%231");
+        assert_eq!(encode_url_path("a?b.txt"), "a%3Fb.txt");
+        assert_eq!(encode_url_path("100%.txt"), "100%25.txt");
+        assert_eq!(encode_url_path("a b/c d.txt"), "a%20b/c%20d.txt");
     }
 
     #[test]
