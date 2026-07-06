@@ -1363,6 +1363,20 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_url_prefixes_and_encodes() {
+        let c = make_test_client("", None);
+        assert_eq!(
+            c.resolve_url("_versions/1.manifest#1"),
+            "https://huggingface.co/buckets/user/bucket/resolve/_versions/1.manifest%231"
+        );
+        let c = make_test_client("sub/dir", None);
+        assert_eq!(
+            c.resolve_url("a b.txt"),
+            "https://huggingface.co/buckets/user/bucket/resolve/sub/dir/a%20b.txt"
+        );
+    }
+
+    #[test]
     fn test_is_strict_descendant() {
         // Real children (any depth) are in.
         assert!(is_strict_descendant("a/b.txt", "a"));

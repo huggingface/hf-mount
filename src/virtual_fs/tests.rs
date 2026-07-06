@@ -142,8 +142,10 @@ fn streaming_write_happy_path() {
 #[test]
 fn unlink_clean_file_with_open_handle_is_posix() {
     let hub = MockHub::new();
-    hub.add_file("clean.txt", 100, Some("hash1"), None);
+    let content = b"still readable after unlink";
+    hub.add_file("clean.txt", content.len() as u64, Some("hash1"), None);
     let xet = MockXet::new();
+    xet.add_file("hash1", content);
     let (rt, vfs) = vfs_simple(&hub, &xet);
 
     rt.block_on(async {
@@ -165,6 +167,11 @@ fn unlink_clean_file_with_open_handle_is_posix() {
             .any(|op| matches!(op, BatchOp::DeleteFile { path } if path == "clean.txt"));
         assert!(has_delete, "remote delete sent at unlink time");
         assert!(vfs.has_open_handles(ino), "open handle survives the unlink");
+
+        // The POSIX promise: the open handle still reads the content.
+        let (data, eof) = vfs.read(fh, 0, 100).await.unwrap();
+        assert_eq!(&data[..], content);
+        assert!(eof);
 
         vfs.release(fh).await.unwrap();
         assert!(!vfs.has_open_handles(ino));
@@ -4605,6 +4612,42 @@ fn link_dirty_streaming_source_commits_then_aliases() {
         let inodes = vfs.inode_table.read().unwrap();
         assert!(inodes.lookup_child(ROOT_INODE, "final.manifest").is_some());
         assert!(inodes.lookup_child(ROOT_INODE, "staging#1").is_none());
+    });
+}
+
+/// When the synchronous commit inside link() fails, the error propagates and
+/// no alias is committed — pending_info stays parked for the release() retry
+/// (same failure contract as flush()).
+#[test]
+fn link_commit_failure_leaves_no_alias() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let (attr, fh) = vfs
+            .create(ROOT_INODE, "staging#1", 0o644, 1000, 1000, Some(42))
+            .await
+            .unwrap();
+        let ino = attr.ino;
+        write_blocking(&vfs, ino, fh, 0, b"manifest bytes").await.unwrap();
+
+        hub.fail_next_batch(1);
+        assert!(vfs.link(ino, ROOT_INODE, "final.manifest").await.is_err());
+
+        let logs = hub.take_batch_log();
+        let has_alias = logs
+            .iter()
+            .flatten()
+            .any(|op| matches!(op, BatchOp::AddFile { path, .. } if path == "final.manifest"));
+        assert!(!has_alias, "no alias committed after a failed source commit");
+        {
+            let inodes = vfs.inode_table.read().unwrap();
+            assert!(inodes.lookup_child(ROOT_INODE, "final.manifest").is_none());
+        }
+
+        // release() retries the commit (hub no longer failing) and succeeds.
+        vfs.release(fh).await.unwrap();
     });
 }
 
