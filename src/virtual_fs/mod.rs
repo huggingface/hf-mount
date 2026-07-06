@@ -2928,6 +2928,130 @@ impl VirtualFs {
         Ok(self.make_vfs_attr(inodes.get(ino).ok_or(libc::ENOENT)?))
     }
 
+    /// Hard-link `ino` at `newparent/newname` as a server-side copy: a new Hub
+    /// file entry referencing the source's xet hash, so no bytes move through
+    /// CAS. The alias gets its own inode (writes to one path never affect the
+    /// other), which diverges from POSIX same-inode semantics but matches what
+    /// link() callers like the *arr import pipelines need: an instant,
+    /// storage-free copy. Re-uploading the content instead would shred its
+    /// layout (dedup against the existing xorbs runs into xet-core's defrag
+    /// prevention, re-storing a large share of the bytes in fragments).
+    ///
+    /// Sources without a committed hash (dirty, or created and never flushed)
+    /// return ENOTSUP so callers fall back to a regular copy.
+    pub async fn link(&self, ino: u64, newparent: u64, newname: &str) -> VirtualFsResult<VirtualFsAttr> {
+        if self.read_only {
+            return Err(libc::EROFS);
+        }
+        // Overlay keeps writes local; committing an alias to the Hub would
+        // mutate the remote behind the overlay's back.
+        if self.overlay() {
+            return Err(libc::ENOTSUP);
+        }
+        if self.filter_os_files && is_os_junk(newname) {
+            debug!("link: rejecting OS junk name: {}", newname);
+            return Err(libc::EACCES);
+        }
+
+        debug!("link: ino={}, newparent={}, newname={}", ino, newparent, newname);
+
+        // Phase 1a: validate the source under a read lock, before loading the
+        // destination's remote children. A rejected source (dirty or hashless,
+        // the routine *arr link-then-copy fallback) must not pay for a
+        // list_tree it would throw away.
+        let (source_path, xet_hash, size, mode, uid, gid) = {
+            let inodes = self.inode_table.read().expect("inodes poisoned");
+            let source = inodes.get(ino).ok_or(libc::ENOENT)?;
+            if source.kind != InodeKind::File {
+                return Err(libc::EPERM);
+            }
+            if source.is_dirty() {
+                return Err(libc::ENOTSUP);
+            }
+            let Some(hash) = source.xet_hash.as_ref().filter(|hash| !hash.is_empty()).cloned() else {
+                return Err(libc::ENOTSUP);
+            };
+            (
+                source.full_path.clone(),
+                hash,
+                source.size,
+                source.mode,
+                source.uid,
+                source.gid,
+            )
+        };
+
+        // Load remote children so the EEXIST check below also sees files that
+        // exist remotely but were never looked up (also validates newparent).
+        self.ensure_children_loaded(newparent).await?;
+
+        // Phase 1b: validate the destination under a read lock.
+        let new_full_path = {
+            let inodes = self.inode_table.read().expect("inodes poisoned");
+            let parent_entry = match inodes.get(newparent) {
+                Some(e) if e.kind == InodeKind::Directory => e,
+                Some(_) => return Err(libc::ENOTDIR),
+                None => return Err(libc::ENOENT),
+            };
+            let new_full_path = inode::child_path(&parent_entry.full_path, newname);
+            if inodes.lookup_child(newparent, newname).is_some() {
+                return Err(libc::EEXIST);
+            }
+            new_full_path
+        };
+
+        // Phase 2: commit the alias to the Hub.
+        let now = SystemTime::now();
+        let mtime_ms = now.duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+        let ops = [BatchOp::AddFile {
+            path: new_full_path.clone(),
+            xet_hash: xet_hash.clone(),
+            mtime: mtime_ms,
+            content_type: None,
+        }];
+        if let Err(e) = self.hub_client.batch_operations(&ops).await {
+            error!(
+                "link: failed to commit {} as alias of {}: {}",
+                new_full_path, source_path, e
+            );
+            return Err(libc::EIO);
+        }
+
+        self.negative_cache_remove(&new_full_path);
+        // Cancel any queued remote delete for the destination path (rm b && ln a b).
+        if let Some(fm) = &self.flush_manager {
+            fm.cancel_delete(&new_full_path);
+        }
+
+        // Phase 3: insert the alias into the inode table under the write lock.
+        let mut inodes = self.inode_table.write().expect("inodes poisoned");
+        if inodes.get(newparent).is_none() {
+            return Err(libc::ENOENT);
+        }
+        // A concurrent create may have won the race since phase 1; the remote
+        // add already landed, but locally the newer entry owns the name.
+        if inodes.lookup_child(newparent, newname).is_some() {
+            return Err(libc::EEXIST);
+        }
+        info!("Linked {} -> {} (server-side copy)", source_path, new_full_path);
+        let new_ino = inodes.insert(
+            newparent,
+            newname.to_string(),
+            new_full_path,
+            InodeKind::File,
+            size,
+            now,
+            Some(xet_hash),
+            mode,
+            uid,
+            gid,
+        );
+        inodes.touch_parent(newparent, now);
+        inodes.touch(new_ino);
+
+        Ok(self.make_vfs_attr(inodes.get(new_ino).ok_or(libc::EIO)?))
+    }
+
     pub async fn unlink(&self, parent: u64, name: &str) -> VirtualFsResult<()> {
         if self.read_only {
             return Err(libc::EROFS);
@@ -3089,12 +3213,6 @@ impl VirtualFs {
             Some(_) => Err(libc::EINVAL),
             None => Err(libc::ENOENT),
         }
-    }
-
-    pub async fn link(&self, _ino: u64, _new_parent: u64, _new_name: &str) -> VirtualFsResult<VirtualFsAttr> {
-        // Hard links are not supported — they are ephemeral (in-memory only) and never
-        // persisted to the hub, which makes them a source of subtle bugs with no benefit.
-        Err(libc::ENOTSUP)
     }
 
     pub async fn rmdir(&self, parent: u64, name: &str) -> VirtualFsResult<()> {
