@@ -155,17 +155,16 @@ fn unlink_clean_file_with_open_handle_is_posix() {
 
         vfs.unlink(ROOT_INODE, "clean.txt").await.unwrap();
 
-        // Entry is gone, remote delete was sent, handle still open.
+        // Entry is gone; the remote delete is DEFERRED while the handle is
+        // open (a racing recreate must be able to cancel it).
         {
             let inodes = vfs.inode_table.read().unwrap();
             assert!(inodes.lookup_child(ROOT_INODE, "clean.txt").is_none());
         }
-        let logs = hub.take_batch_log();
-        let has_delete = logs
-            .iter()
-            .flatten()
-            .any(|op| matches!(op, BatchOp::DeleteFile { path } if path == "clean.txt"));
-        assert!(has_delete, "remote delete sent at unlink time");
+        assert!(
+            hub.take_batch_log().is_empty(),
+            "remote delete must wait for the last release"
+        );
         assert!(vfs.has_open_handles(ino), "open handle survives the unlink");
 
         // The POSIX promise: the open handle still reads the content.
@@ -173,8 +172,104 @@ fn unlink_clean_file_with_open_handle_is_posix() {
         assert_eq!(&data[..], content);
         assert!(eof);
 
+        // Last close fires the deferred remote delete.
         vfs.release(fh).await.unwrap();
         assert!(!vfs.has_open_handles(ino));
+        let logs = hub.take_batch_log();
+        let has_delete = logs
+            .iter()
+            .flatten()
+            .any(|op| matches!(op, BatchOp::DeleteFile { path } if path == "clean.txt"));
+        assert!(has_delete, "deferred remote delete sent on last release");
+    });
+}
+
+/// Recreating the path cancels the deferred delete: the editor save pattern
+/// (open original → unlink → recreate) must never lose the replacement.
+#[test]
+fn deferred_delete_cancelled_by_recreate() {
+    let hub = MockHub::new();
+    hub.add_file("doc.txt", 8, Some("old_hash"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let attr = vfs.lookup(ROOT_INODE, "doc.txt").await.unwrap();
+        let old_ino = attr.ino;
+        let old_fh = vfs.open(old_ino, false, false, Some(42)).await.unwrap();
+
+        vfs.unlink(ROOT_INODE, "doc.txt").await.unwrap();
+
+        // Recreate the same name (the editor writes the replacement).
+        let (new_attr, new_fh) = vfs
+            .create(ROOT_INODE, "doc.txt", 0o644, 1000, 1000, Some(42))
+            .await
+            .unwrap();
+        write_blocking(&vfs, new_attr.ino, new_fh, 0, b"replaced")
+            .await
+            .unwrap();
+        vfs.flush(new_attr.ino, new_fh, Some(42)).await.unwrap();
+        vfs.release(new_fh).await.unwrap();
+
+        // Closing the OLD handle must not delete the replacement.
+        vfs.release(old_fh).await.unwrap();
+        let logs = hub.take_batch_log();
+        let has_delete = logs
+            .iter()
+            .flatten()
+            .any(|op| matches!(op, BatchOp::DeleteFile { path } if path == "doc.txt"));
+        assert!(!has_delete, "recreate must cancel the deferred delete");
+        let inodes = vfs.inode_table.read().unwrap();
+        assert!(inodes.lookup_child(ROOT_INODE, "doc.txt").is_some());
+    });
+}
+
+/// While the deferred delete is pending, the still-existing remote object
+/// must not be re-discovered — even once the negative-cache TTL entry is
+/// gone (handles can stay open far longer than the 30s TTL).
+#[test]
+fn deferred_delete_suppresses_rediscovery() {
+    let hub = MockHub::new();
+    hub.add_file("held.txt", 4, Some("h1"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let attr = vfs.lookup(ROOT_INODE, "held.txt").await.unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open(ino, false, false, Some(42)).await.unwrap();
+        vfs.unlink(ROOT_INODE, "held.txt").await.unwrap();
+
+        // Simulate the negative-cache TTL expiring (clear the raw map,
+        // bypassing negative_cache_remove which would cancel the deferral).
+        vfs.negative_cache.write().unwrap().clear();
+
+        // lookup: still hidden (the remote HEAD would find the file otherwise).
+        let err = vfs.lookup(ROOT_INODE, "held.txt").await.unwrap_err();
+        assert_eq!(err, libc::ENOENT);
+
+        // poll diff: the remote entry must not resurrect the inode.
+        let remote = vec![crate::hub_api::TreeEntry {
+            path: "held.txt".to_string(),
+            entry_type: "file".to_string(),
+            size: Some(4),
+            xet_hash: Some("h1".to_string()),
+            oid: None,
+            mtime: None,
+        }];
+        let polled: std::collections::HashSet<String> = [String::new()].into_iter().collect();
+        VirtualFs::apply_poll_diff(
+            remote,
+            &polled,
+            &vfs.inode_table,
+            &vfs.negative_cache,
+            &vfs.deferred_deletes,
+            &vfs.invalidator,
+        );
+        let err = vfs.lookup(ROOT_INODE, "held.txt").await.unwrap_err();
+        assert_eq!(err, libc::ENOENT);
+
+        vfs.release(fh).await.unwrap();
     });
 }
 
@@ -2669,7 +2764,7 @@ fn poll_skips_list_tree_when_revision_unchanged() {
         let handle = tokio::spawn(async move {
             tokio::select! {
                 _ = VirtualFs::poll_remote_changes(
-                    hub_dyn, inodes, neg, inv,
+                    hub_dyn, inodes, neg, vfs.deferred_deletes.clone(), inv,
                     Duration::from_millis(10), 4,
                 ) => {}
                 _ = stop_clone.notified() => {}
@@ -2839,7 +2934,14 @@ fn poll_skips_unloaded_directories() {
             remote.extend(hub.list_tree(prefix).await.unwrap());
         }
         let polled: std::collections::HashSet<String> = prefixes.into_iter().collect();
-        VirtualFs::apply_poll_diff(remote, &polled, &vfs.inode_table, &vfs.negative_cache, &vfs.invalidator);
+        VirtualFs::apply_poll_diff(
+            remote,
+            &polled,
+            &vfs.inode_table,
+            &vfs.negative_cache,
+            &vfs.deferred_deletes,
+            &vfs.invalidator,
+        );
 
         // Dir "a" should still NOT have children_loaded set (unchanged).
         // Root should still be loaded (not invalidated).
@@ -2879,7 +2981,14 @@ fn poll_invalidates_loaded_dir_with_new_file() {
             remote.extend(hub.list_tree(prefix).await.unwrap());
         }
         let polled: std::collections::HashSet<String> = prefixes.into_iter().collect();
-        VirtualFs::apply_poll_diff(remote, &polled, &vfs.inode_table, &vfs.negative_cache, &vfs.invalidator);
+        VirtualFs::apply_poll_diff(
+            remote,
+            &polled,
+            &vfs.inode_table,
+            &vfs.negative_cache,
+            &vfs.deferred_deletes,
+            &vfs.invalidator,
+        );
 
         // Root should be invalidated because it's loaded and has a new file.
         assert!(
@@ -2911,7 +3020,14 @@ fn poll_detects_file_update_in_loaded_dir() {
             remote.extend(hub.list_tree(prefix).await.unwrap());
         }
         let polled: std::collections::HashSet<String> = prefixes.into_iter().collect();
-        VirtualFs::apply_poll_diff(remote, &polled, &vfs.inode_table, &vfs.negative_cache, &vfs.invalidator);
+        VirtualFs::apply_poll_diff(
+            remote,
+            &polled,
+            &vfs.inode_table,
+            &vfs.negative_cache,
+            &vfs.deferred_deletes,
+            &vfs.invalidator,
+        );
 
         let inodes = vfs.inode_table.read().unwrap();
         let entry = inodes.get(ino).unwrap();
@@ -2954,7 +3070,14 @@ fn poll_calls_invalidator_for_updated_file() {
             remote.extend(hub.list_tree(prefix).await.unwrap());
         }
         let polled: std::collections::HashSet<String> = prefixes.into_iter().collect();
-        VirtualFs::apply_poll_diff(remote, &polled, &vfs.inode_table, &vfs.negative_cache, &vfs.invalidator);
+        VirtualFs::apply_poll_diff(
+            remote,
+            &polled,
+            &vfs.inode_table,
+            &vfs.negative_cache,
+            &vfs.deferred_deletes,
+            &vfs.invalidator,
+        );
 
         let calls = invalidated.lock().unwrap();
         assert!(
@@ -2987,7 +3110,14 @@ fn poll_detects_file_deletion_in_loaded_dir() {
             remote.extend(hub.list_tree(prefix).await.unwrap());
         }
         let polled: std::collections::HashSet<String> = prefixes.into_iter().collect();
-        VirtualFs::apply_poll_diff(remote, &polled, &vfs.inode_table, &vfs.negative_cache, &vfs.invalidator);
+        VirtualFs::apply_poll_diff(
+            remote,
+            &polled,
+            &vfs.inode_table,
+            &vfs.negative_cache,
+            &vfs.deferred_deletes,
+            &vfs.invalidator,
+        );
 
         // ephemeral.txt should be gone, keeper.txt should remain.
         assert_eq!(vfs.lookup(ROOT_INODE, "ephemeral.txt").await.unwrap_err(), libc::ENOENT);
@@ -3021,7 +3151,14 @@ fn poll_skips_deletion_with_open_handles() {
             remote.extend(hub.list_tree(prefix).await.unwrap());
         }
         let polled: std::collections::HashSet<String> = prefixes.into_iter().collect();
-        VirtualFs::apply_poll_diff(remote, &polled, &vfs.inode_table, &vfs.negative_cache, &vfs.invalidator);
+        VirtualFs::apply_poll_diff(
+            remote,
+            &polled,
+            &vfs.inode_table,
+            &vfs.negative_cache,
+            &vfs.deferred_deletes,
+            &vfs.invalidator,
+        );
 
         // closed.txt should be deleted (no open handles)
         assert_eq!(vfs.lookup(ROOT_INODE, "closed.txt").await.unwrap_err(), libc::ENOENT);
@@ -3085,7 +3222,14 @@ fn poll_deletion_uses_attr_only_for_open_handles() {
             remote.extend(hub.list_tree(prefix).await.unwrap());
         }
         let polled: std::collections::HashSet<String> = prefixes.into_iter().collect();
-        VirtualFs::apply_poll_diff(remote, &polled, &vfs.inode_table, &vfs.negative_cache, &vfs.invalidator);
+        VirtualFs::apply_poll_diff(
+            remote,
+            &polled,
+            &vfs.inode_table,
+            &vfs.negative_cache,
+            &vfs.deferred_deletes,
+            &vfs.invalidator,
+        );
 
         // Snapshot (releasing the lock) so the guard isn't held across the await below.
         let recorded = calls.lock().unwrap().clone();
@@ -3151,7 +3295,14 @@ fn poll_update_uses_attr_only_for_open_handles() {
             remote.extend(hub.list_tree(prefix).await.unwrap());
         }
         let polled: std::collections::HashSet<String> = prefixes.into_iter().collect();
-        VirtualFs::apply_poll_diff(remote, &polled, &vfs.inode_table, &vfs.negative_cache, &vfs.invalidator);
+        VirtualFs::apply_poll_diff(
+            remote,
+            &polled,
+            &vfs.inode_table,
+            &vfs.negative_cache,
+            &vfs.deferred_deletes,
+            &vfs.invalidator,
+        );
 
         // Snapshot (releasing the lock) so the guard isn't held across the await below.
         let recorded = calls.lock().unwrap().clone();
@@ -3207,7 +3358,14 @@ fn poll_multiple_loaded_dirs() {
             remote.extend(hub.list_tree(prefix).await.unwrap());
         }
         let polled: std::collections::HashSet<String> = prefixes.into_iter().collect();
-        VirtualFs::apply_poll_diff(remote, &polled, &vfs.inode_table, &vfs.negative_cache, &vfs.invalidator);
+        VirtualFs::apply_poll_diff(
+            remote,
+            &polled,
+            &vfs.inode_table,
+            &vfs.negative_cache,
+            &vfs.deferred_deletes,
+            &vfs.invalidator,
+        );
 
         // sub/nested.txt should be updated.
         let nested_ino = vfs.lookup(sub.ino, "nested.txt").await.unwrap().ino;
@@ -3241,6 +3399,7 @@ fn poll_failed_prefix_no_spurious_deletion() {
             &polled,
             &vfs.inode_table,
             &vfs.negative_cache,
+            &vfs.deferred_deletes,
             &vfs.invalidator,
         );
 
@@ -3270,7 +3429,14 @@ fn poll_after_invalidation_no_spurious_deletion() {
             remote.extend(hub.list_tree(prefix).await.unwrap());
         }
         let polled: std::collections::HashSet<String> = prefixes.into_iter().collect();
-        VirtualFs::apply_poll_diff(remote, &polled, &vfs.inode_table, &vfs.negative_cache, &vfs.invalidator);
+        VirtualFs::apply_poll_diff(
+            remote,
+            &polled,
+            &vfs.inode_table,
+            &vfs.negative_cache,
+            &vfs.deferred_deletes,
+            &vfs.invalidator,
+        );
 
         // Root is now invalidated (children_loaded=false).
         // Second poll: root is NOT in loaded_dir_prefixes anymore.
@@ -3285,6 +3451,7 @@ fn poll_after_invalidation_no_spurious_deletion() {
             &polled2,
             &vfs.inode_table,
             &vfs.negative_cache,
+            &vfs.deferred_deletes,
             &vfs.invalidator,
         );
 
@@ -3328,6 +3495,7 @@ fn poll_detects_deleted_subdirectory() {
             &polled,
             &vfs.inode_table,
             &vfs.negative_cache,
+            &vfs.deferred_deletes,
             &vfs.invalidator,
         );
 

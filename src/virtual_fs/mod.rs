@@ -182,6 +182,12 @@ pub struct VirtualFs {
     gid: u32,
     /// Negative lookup cache: paths known to not exist (TTL-based).
     negative_cache: Arc<RwLock<HashMap<String, Instant>>>,
+    /// Remote deletes deferred by POSIX unlink-while-open: path → owning ino.
+    /// Fired on the last release(); cancelled when the path is recreated
+    /// (negative_cache_remove). While pending, the path is hidden from remote
+    /// re-discovery (lookup, listings, poll) so the not-yet-deleted remote
+    /// object cannot resurrect locally.
+    deferred_deletes: Arc<Mutex<HashMap<String, u64>>>,
     /// Per-directory loading locks: serializes concurrent ensure_children_loaded() calls
     /// for the same directory so only one HTTP request is made (prevents thundering herd
     /// when Finder/Spotlight send many lookups on mount).
@@ -281,10 +287,12 @@ impl VirtualFs {
 
         // Spawn remote change polling task (if interval > 0)
         let invalidator: Invalidator = Arc::new(OnceLock::new());
+        let deferred_deletes: Arc<Mutex<HashMap<String, u64>>> = Arc::new(Mutex::new(HashMap::new()));
         let poll_handle = if config.poll_interval_secs > 0 {
             let bg_hub = hub_client.clone();
             let bg_inodes = inodes.clone();
             let bg_neg_cache = negative_cache.clone();
+            let bg_deferred = deferred_deletes.clone();
             let bg_invalidator = invalidator.clone();
             let interval = Duration::from_secs(config.poll_interval_secs);
             // Clamp to >= 1 in case a caller (library use) constructs VfsConfig directly.
@@ -294,6 +302,7 @@ impl VirtualFs {
                 bg_hub,
                 bg_inodes,
                 bg_neg_cache,
+                bg_deferred,
                 bg_invalidator,
                 interval,
                 listing_concurrency,
@@ -320,6 +329,7 @@ impl VirtualFs {
             uid: config.uid,
             gid: config.gid,
             negative_cache,
+            deferred_deletes,
             dir_loading_locks: Mutex::new(HashMap::new()),
             pending_commits: Mutex::new(HashMap::new()),
             flush_manager,
@@ -804,13 +814,17 @@ impl VirtualFs {
             }
         };
 
-        let entries = match self.hub_client.list_tree(&prefix).await {
+        let mut entries = match self.hub_client.list_tree(&prefix).await {
             Ok(entries) => entries,
             Err(e) => {
                 error!("Failed to list tree for prefix '{}': {}", prefix, e);
                 return Err(libc::EIO);
             }
         };
+        // Unlinked locally, remote delete pending on last release: hide.
+        // (Filtered before taking the inode lock: deferred_deletes must never
+        // be acquired while holding the inode table lock.)
+        entries.retain(|entry| !self.deferred_delete_pending(&entry.path));
 
         let mut inodes = self.inode_table.write().expect("inodes poisoned");
         match inodes.get(parent_ino) {
@@ -1193,13 +1207,61 @@ impl VirtualFs {
 
     /// Check if a path is in the negative cache (and not expired).
     fn negative_cache_check(&self, path: &str) -> bool {
+        // A pending deferred delete hides the path for its whole lifetime —
+        // the remote object still exists until the last release(), and the
+        // 30s TTL alone would let a lookup resurrect it.
+        if self.deferred_delete_pending(path) {
+            return true;
+        }
         let cache = self.negative_cache.read().expect("negative_cache poisoned");
         matches!(cache.get(path), Some(inserted) if inserted.elapsed() < NEG_CACHE_TTL)
     }
 
     /// Remove a path from the negative cache (e.g. after create/rename).
+    /// The path exists (again), so a deferred unlink delete for it must not
+    /// fire and remove the successor: cancel it.
     fn negative_cache_remove(&self, path: &str) {
+        self.deferred_deletes
+            .lock()
+            .expect("deferred_deletes poisoned")
+            .remove(path);
         self.negative_cache.write().expect("neg_cache poisoned").remove(path);
+    }
+
+    /// True when `path` has a remote delete deferred by unlink-while-open.
+    fn deferred_delete_pending(&self, path: &str) -> bool {
+        self.deferred_deletes
+            .lock()
+            .expect("deferred_deletes poisoned")
+            .contains_key(path)
+    }
+
+    /// Claim the deferred delete for `path` if `ino` still owns it. Claiming
+    /// by (path, ino) token means a recreation (which replaced or removed the
+    /// entry) can never have its successor deleted by the old inode's release.
+    fn claim_deferred_delete(&self, path: &str, ino: u64) -> bool {
+        let mut map = self.deferred_deletes.lock().expect("deferred_deletes poisoned");
+        if map.get(path) == Some(&ino) {
+            map.remove(path);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Send (or queue) the remote DeleteFile for `path`.
+    async fn send_remote_delete(&self, path: &str) -> VirtualFsResult<()> {
+        if let Some(fm) = &self.flush_manager {
+            fm.enqueue_delete(path.to_string());
+            return Ok(());
+        }
+        self.hub_client
+            .batch_operations(&[BatchOp::DeleteFile { path: path.to_string() }])
+            .await
+            .map_err(|e| {
+                error!("Remote delete failed for {}: {}", path, e);
+                libc::EIO
+            })
     }
 
     /// Insert a path into the negative cache, evicting if at capacity.
@@ -2585,7 +2647,7 @@ impl VirtualFs {
         if let Some(ino) = released_ino
             && !self.has_open_handles(ino)
         {
-            let (removed, is_clean, overlay_path) = {
+            let (removed, is_clean, overlay_path, unlinked_path) = {
                 let mut inodes = self.inode_table.write().expect("inodes poisoned");
                 // Capture path before removal so we can clean up the overlay
                 // backing file for an unlink-while-open case (POSIX delete on
@@ -2596,12 +2658,24 @@ impl VirtualFs {
                     .is_some()
                     .then(|| inodes.get(ino).map(|e| e.full_path.clone()))
                     .flatten();
+                // Path of an unlinked-while-open inode: its deferred remote
+                // delete fires below, once this last handle is gone.
+                let unlinked_path = inodes
+                    .get(ino)
+                    .filter(|e| e.nlink == 0)
+                    .map(|e| e.full_path.to_string());
                 let orphan = inodes.remove_orphan(ino);
                 let evicted = inodes.take_evict_pending(ino) && inodes.evict_if_safe(ino);
                 let removed = orphan || evicted;
                 let is_clean = !removed && inodes.get(ino).is_some_and(|entry| !entry.is_dirty());
-                (removed, is_clean, overlay_path.filter(|_| removed))
+                (removed, is_clean, overlay_path.filter(|_| removed), unlinked_path)
             };
+            if let Some(path) = unlinked_path
+                && self.claim_deferred_delete(&path, ino)
+                && let Err(e) = self.send_remote_delete(&path).await
+            {
+                warn!("Deferred remote delete failed for {} on release: errno={}", path, e);
+            }
             if removed {
                 if let Some(path) = overlay_path {
                     if let Err(e) = self.remove_local_backing_file(ino, &path)
@@ -3202,21 +3276,21 @@ impl VirtualFs {
             return Err(libc::EPERM);
         }
 
-        // Advanced writes: queue delete for batched flush in the flush_loop.
-        // Simple mode: delete synchronously (one HTTP call per unlink).
-        if needs_remote_delete {
-            if let Some(fm) = &self.flush_manager {
-                fm.enqueue_delete(full_path.clone());
-            } else if let Err(e) = self
-                .hub_client
-                .batch_operations(&[BatchOp::DeleteFile {
-                    path: full_path.clone(),
-                }])
-                .await
-            {
-                error!("Remote delete failed for {}: {}", full_path, e);
-                return Err(libc::EIO);
-            }
+        // POSIX unlink-while-open (streaming mode, clean file, open handles):
+        // the remote delete is DEFERRED to the last release(). Recreating the
+        // path meanwhile cancels it (negative_cache_remove), so an editor's
+        // unlink → recreate save pattern can never lose the replacement, and
+        // readers keep the remote object alive until they close.
+        let defer_remote_delete = needs_remote_delete && !self.advanced_writes && self.has_open_handles(ino);
+        if defer_remote_delete {
+            self.deferred_deletes
+                .lock()
+                .expect("deferred_deletes poisoned")
+                .insert(full_path.clone(), ino);
+        } else if needs_remote_delete {
+            // Advanced writes: queue delete for batched flush in the flush_loop.
+            // Simple mode: delete synchronously (one HTTP call per unlink).
+            self.send_remote_delete(&full_path).await?;
         }
 
         // Remote succeeded (or no remote needed) — now unlink locally.
@@ -3241,6 +3315,14 @@ impl VirtualFs {
             }
             last_link && no_handles
         };
+
+        // The last handle may have closed between the deferral above and
+        // unlink_one: nobody will release() this inode again, so claim the
+        // deferred delete back and send it now. Best-effort — the local
+        // unlink already succeeded.
+        if defer_remote_delete && inode_fully_removed && self.claim_deferred_delete(&full_path, ino) {
+            let _ = self.send_remote_delete(&full_path).await;
+        }
 
         // Seed the negative cache before any await: with the inode already
         // gone from the table, a concurrent lookup under a stale parent would
