@@ -29,7 +29,7 @@ impl super::VirtualFs {
         hub_client: Arc<dyn HubOps>,
         inodes: Arc<RwLock<InodeTable>>,
         negative_cache: Arc<RwLock<HashMap<String, Instant>>>,
-        deferred_deletes: Arc<std::sync::Mutex<HashMap<String, u64>>>,
+        deferred_deletes: Arc<super::DeferredDeletes>,
         invalidator: Invalidator,
         interval: Duration,
         listing_concurrency: usize,
@@ -150,23 +150,14 @@ impl super::VirtualFs {
         polled_prefixes: &HashSet<String>,
         inodes: &Arc<RwLock<InodeTable>>,
         negative_cache: &Arc<RwLock<HashMap<String, Instant>>>,
-        deferred_deletes: &Arc<std::sync::Mutex<HashMap<String, u64>>>,
+        deferred_deletes: &Arc<super::DeferredDeletes>,
         invalidator: &Invalidator,
     ) {
         // Paths with a deferred unlink delete are locally gone but still
         // exist remotely until the last release(): hide them from the diff
         // so the poll cannot resurrect them.
-        let remote_entries: Vec<_> = {
-            let deferred = deferred_deletes.lock().expect("deferred_deletes poisoned");
-            if deferred.is_empty() {
-                remote_entries
-            } else {
-                remote_entries
-                    .into_iter()
-                    .filter(|e| !deferred.contains_key(&e.path))
-                    .collect()
-            }
-        };
+        let mut remote_entries = remote_entries;
+        deferred_deletes.filter_entries(&mut remote_entries);
         let remote_map: HashMap<String, _> = remote_entries
             .iter()
             .filter(|e| e.entry_type == "file")

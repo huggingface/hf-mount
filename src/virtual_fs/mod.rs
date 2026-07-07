@@ -2,7 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -155,6 +155,71 @@ pub struct VfsConfig {
 /// Exception: setattr(truncate) holds inode_table.write() across File::create
 /// / set_len syscalls (microseconds) to prevent write() from updating
 /// inode.size between the file truncation and the metadata update.
+/// Remote deletes deferred by POSIX unlink-while-open: path → owning inode.
+/// The delete fires on the last release() and is cancelled when the path is
+/// recreated. While pending, the path is hidden from remote re-discovery
+/// (lookup, listings, poll) so the not-yet-deleted remote object cannot
+/// resurrect locally. The atomic count keeps the empty case — the norm —
+/// lock-free on hot paths (every lookup consults `pending`).
+#[derive(Default)]
+struct DeferredDeletes {
+    map: Mutex<HashMap<String, u64>>,
+    count: AtomicUsize,
+}
+
+impl DeferredDeletes {
+    fn insert(&self, path: String, ino: u64) {
+        let mut map = self.map.lock().expect("deferred_deletes poisoned");
+        if map.insert(path, ino).is_none() {
+            self.count.fetch_add(1, Ordering::Release);
+        }
+    }
+
+    /// The path exists (again): a pending delete must not fire on the successor.
+    fn cancel(&self, path: &str) {
+        if self.count.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        let mut map = self.map.lock().expect("deferred_deletes poisoned");
+        if map.remove(path).is_some() {
+            self.count.fetch_sub(1, Ordering::Release);
+        }
+    }
+
+    /// Claim the delete for `path` if `ino` still owns it. Claiming by
+    /// (path, ino) token means a recreation (which replaced or removed the
+    /// entry) can never have its successor deleted by the old inode's release.
+    fn claim(&self, path: &str, ino: u64) -> bool {
+        if self.count.load(Ordering::Acquire) == 0 {
+            return false;
+        }
+        let mut map = self.map.lock().expect("deferred_deletes poisoned");
+        if map.get(path) == Some(&ino) {
+            map.remove(path);
+            self.count.fetch_sub(1, Ordering::Release);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// True when `path` has a pending deferred delete.
+    fn pending(&self, path: &str) -> bool {
+        self.count.load(Ordering::Acquire) != 0
+            && self.map.lock().expect("deferred_deletes poisoned").contains_key(path)
+    }
+
+    /// Drop listing entries whose path has a pending delete (single lock,
+    /// no-op when nothing is pending).
+    fn filter_entries(&self, entries: &mut Vec<crate::hub_api::TreeEntry>) {
+        if self.count.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        let map = self.map.lock().expect("deferred_deletes poisoned");
+        entries.retain(|entry| !map.contains_key(&entry.path));
+    }
+}
+
 pub struct VirtualFs {
     runtime: tokio::runtime::Handle,
     /// Upper bound on the SIGTERM flush drain (see `VfsConfig`).
@@ -182,12 +247,8 @@ pub struct VirtualFs {
     gid: u32,
     /// Negative lookup cache: paths known to not exist (TTL-based).
     negative_cache: Arc<RwLock<HashMap<String, Instant>>>,
-    /// Remote deletes deferred by POSIX unlink-while-open: path → owning ino.
-    /// Fired on the last release(); cancelled when the path is recreated
-    /// (negative_cache_remove). While pending, the path is hidden from remote
-    /// re-discovery (lookup, listings, poll) so the not-yet-deleted remote
-    /// object cannot resurrect locally.
-    deferred_deletes: Arc<Mutex<HashMap<String, u64>>>,
+    /// Remote deletes deferred by POSIX unlink-while-open (see `unlink`).
+    deferred_deletes: Arc<DeferredDeletes>,
     /// Per-directory loading locks: serializes concurrent ensure_children_loaded() calls
     /// for the same directory so only one HTTP request is made (prevents thundering herd
     /// when Finder/Spotlight send many lookups on mount).
@@ -287,7 +348,7 @@ impl VirtualFs {
 
         // Spawn remote change polling task (if interval > 0)
         let invalidator: Invalidator = Arc::new(OnceLock::new());
-        let deferred_deletes: Arc<Mutex<HashMap<String, u64>>> = Arc::new(Mutex::new(HashMap::new()));
+        let deferred_deletes = Arc::new(DeferredDeletes::default());
         let poll_handle = if config.poll_interval_secs > 0 {
             let bg_hub = hub_client.clone();
             let bg_inodes = inodes.clone();
@@ -824,7 +885,7 @@ impl VirtualFs {
         // Unlinked locally, remote delete pending on last release: hide.
         // (Filtered before taking the inode lock: deferred_deletes must never
         // be acquired while holding the inode table lock.)
-        entries.retain(|entry| !self.deferred_delete_pending(&entry.path));
+        self.deferred_deletes.filter_entries(&mut entries);
 
         let mut inodes = self.inode_table.write().expect("inodes poisoned");
         match inodes.get(parent_ino) {
@@ -1210,7 +1271,7 @@ impl VirtualFs {
         // A pending deferred delete hides the path for its whole lifetime —
         // the remote object still exists until the last release(), and the
         // 30s TTL alone would let a lookup resurrect it.
-        if self.deferred_delete_pending(path) {
+        if self.deferred_deletes.pending(path) {
             return true;
         }
         let cache = self.negative_cache.read().expect("negative_cache poisoned");
@@ -1221,32 +1282,8 @@ impl VirtualFs {
     /// The path exists (again), so a deferred unlink delete for it must not
     /// fire and remove the successor: cancel it.
     fn negative_cache_remove(&self, path: &str) {
-        self.deferred_deletes
-            .lock()
-            .expect("deferred_deletes poisoned")
-            .remove(path);
+        self.deferred_deletes.cancel(path);
         self.negative_cache.write().expect("neg_cache poisoned").remove(path);
-    }
-
-    /// True when `path` has a remote delete deferred by unlink-while-open.
-    fn deferred_delete_pending(&self, path: &str) -> bool {
-        self.deferred_deletes
-            .lock()
-            .expect("deferred_deletes poisoned")
-            .contains_key(path)
-    }
-
-    /// Claim the deferred delete for `path` if `ino` still owns it. Claiming
-    /// by (path, ino) token means a recreation (which replaced or removed the
-    /// entry) can never have its successor deleted by the old inode's release.
-    fn claim_deferred_delete(&self, path: &str, ino: u64) -> bool {
-        let mut map = self.deferred_deletes.lock().expect("deferred_deletes poisoned");
-        if map.get(path) == Some(&ino) {
-            map.remove(path);
-            true
-        } else {
-            false
-        }
     }
 
     /// Send (or queue) the remote DeleteFile for `path`.
@@ -2430,12 +2467,7 @@ impl VirtualFs {
                 }
 
                 let len = data.len();
-                // Enqueue under the state mutex to serialize against
-                // streaming_commit(), which flips to Committing under the
-                // same mutex before enqueueing Finish: either this Data lands
-                // ahead of Finish (and is included in the commit), or the
-                // write observes Committing/Committed and fails loudly
-                // instead of being silently dropped behind Finish.
+                // Enqueue under the state mutex — see `CommitState::Committing`.
                 {
                     let state = channel.state.lock().expect("state poisoned");
                     match &*state {
@@ -2653,17 +2685,15 @@ impl VirtualFs {
                 // backing file for an unlink-while-open case (POSIX delete on
                 // last close): unlink() saw open handles and skipped the
                 // overlay-side remove, so we have to do it here.
+                let entry = inodes.get(ino);
                 let overlay_path = self
                     .overlay_backing
                     .is_some()
-                    .then(|| inodes.get(ino).map(|e| e.full_path.clone()))
+                    .then(|| entry.as_ref().map(|e| e.full_path.clone()))
                     .flatten();
                 // Path of an unlinked-while-open inode: its deferred remote
                 // delete fires below, once this last handle is gone.
-                let unlinked_path = inodes
-                    .get(ino)
-                    .filter(|e| e.nlink == 0)
-                    .map(|e| e.full_path.to_string());
+                let unlinked_path = entry.as_ref().filter(|e| e.nlink == 0).map(|e| e.full_path.to_string());
                 let orphan = inodes.remove_orphan(ino);
                 let evicted = inodes.take_evict_pending(ino) && inodes.evict_if_safe(ino);
                 let removed = orphan || evicted;
@@ -2671,7 +2701,7 @@ impl VirtualFs {
                 (removed, is_clean, overlay_path.filter(|_| removed), unlinked_path)
             };
             if let Some(path) = unlinked_path
-                && self.claim_deferred_delete(&path, ino)
+                && self.deferred_deletes.claim(&path, ino)
                 && let Err(e) = self.send_remote_delete(&path).await
             {
                 warn!("Deferred remote delete failed for {} on release: errno={}", path, e);
@@ -2739,10 +2769,7 @@ impl VirtualFs {
             return Ok(());
         }
 
-        // Flip to Committing under the state mutex BEFORE enqueueing Finish:
-        // write() enqueues Data under the same mutex, so a racing write either
-        // lands ahead of Finish or observes Committing and is rejected instead
-        // of being silently dropped behind Finish.
+        // Flip under the state mutex, before Finish — see `CommitState::Committing`.
         {
             let mut state = channel.state.lock().expect("state poisoned");
             if matches!(&*state, CommitState::Writing | CommitState::Deferred) {
@@ -3283,10 +3310,7 @@ impl VirtualFs {
         // readers keep the remote object alive until they close.
         let defer_remote_delete = needs_remote_delete && !self.advanced_writes && self.has_open_handles(ino);
         if defer_remote_delete {
-            self.deferred_deletes
-                .lock()
-                .expect("deferred_deletes poisoned")
-                .insert(full_path.clone(), ino);
+            self.deferred_deletes.insert(full_path.clone(), ino);
         } else if needs_remote_delete {
             // Advanced writes: queue delete for batched flush in the flush_loop.
             // Simple mode: delete synchronously (one HTTP call per unlink).
@@ -3320,7 +3344,7 @@ impl VirtualFs {
         // unlink_one: nobody will release() this inode again, so claim the
         // deferred delete back and send it now. Best-effort — the local
         // unlink already succeeded.
-        if defer_remote_delete && inode_fully_removed && self.claim_deferred_delete(&full_path, ino) {
+        if defer_remote_delete && inode_fully_removed && self.deferred_deletes.claim(&full_path, ino) {
             let _ = self.send_remote_delete(&full_path).await;
         }
 
@@ -4174,9 +4198,11 @@ enum CommitState {
     Writing,
     /// flush() deferred commit (dup'd fd or zero writes). release() will handle it.
     Deferred,
-    /// A commit is in flight: Finish is (about to be) enqueued. Writes are
-    /// rejected from this point — they would land behind Finish and be
-    /// silently dropped by the exiting worker.
+    /// A commit is in flight. The flip to Committing and every Data enqueue
+    /// happen under the state mutex, BEFORE Finish is enqueued: a racing
+    /// write either lands ahead of Finish (and joins the commit) or observes
+    /// Committing and is rejected — it can never be silently dropped behind
+    /// Finish by the exiting worker.
     Committing,
     /// Commit completed successfully.
     Committed,
