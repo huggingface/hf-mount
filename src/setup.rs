@@ -387,15 +387,6 @@ pub fn build_with_runtime(
         .unwrap_or_else(|e| panic!("Failed to initialize Hub client: {e}"))
     });
 
-    // Validate that the subfolder exists on the remote.
-    if !hub_client.path_prefix().is_empty() {
-        runtime.block_on(async {
-            hub_client.validate_path_prefix().await.unwrap_or_else(|e| {
-                panic!("{e}");
-            });
-        });
-    }
-
     if options.overlay && options.read_only {
         panic!(
             "--overlay with --read-only is pointless: overlay enables local writes, --read-only disables them. Use --read-only alone instead."
@@ -405,6 +396,21 @@ pub fn build_with_runtime(
     let read_only = (options.read_only || hub_client.is_repo()) && !options.overlay;
     if hub_client.is_repo() && !options.read_only && !options.overlay {
         info!("Repo mounts are always read-only");
+    }
+
+    // Validate that the subfolder exists on the remote, but only for read-only
+    // mounts. A bucket subfolder cannot be distinguished from a non-existent
+    // one (both list as empty), so failing here would block the legitimate
+    // case of mounting an empty/new subfolder to write into it. For write
+    // mounts the folder is created by writing, so we skip the check entirely.
+    // For read-only mounts a missing prefix just yields an empty mount, so we
+    // warn instead of panicking the sidecar.
+    if read_only && !hub_client.path_prefix().is_empty() {
+        runtime.block_on(async {
+            if let Err(e) = hub_client.validate_path_prefix().await {
+                warn!("{e}");
+            }
+        });
     }
 
     // Overlay: local writes allowed, but no remote write token/upload.
