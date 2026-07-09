@@ -3,7 +3,7 @@ FROM rust:1.95-bookworm AS dev
 
 USER root
 
-# Development dependencies 
+# Development dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     ca-certificates \
@@ -11,8 +11,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     fuse3 \
     git \
     libfuse3-dev \
+    nfs-common \
     perl \
     pkg-config \
+    sudo \
     && rm -rf /var/lib/apt/lists/*
 
 # Rust dev tooling required by the lint/format gate.
@@ -26,8 +28,10 @@ ARG USERNAME=vscode
 ARG USER_UID=1000
 ARG USER_GID=1000
 RUN groupadd --gid "${USER_GID}" "${USERNAME}" \
-    && useradd --uid "${USER_UID}" --gid "${USER_GID}" --create-home \
-    --shell /bin/bash "${USERNAME}"
+    && useradd --uid "${USER_UID}" --gid "${USER_GID}" --create-home --shell /bin/bash "${USERNAME}" \
+    && usermod -aG sudo "${USERNAME}" \
+    && echo "${USERNAME} ALL=(ALL) NOPASSWD:ALL" > "/etc/sudoers.d/${USERNAME}" \
+    && chmod 0440 "/etc/sudoers.d/${USERNAME}"
 
 # Ensure the non-root user can write to the cargo cache so `cargo` works without root inside the container.
 ENV CARGO_HOME=/usr/local/cargo
