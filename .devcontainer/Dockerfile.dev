@@ -29,10 +29,10 @@ RUN groupadd --gid "${USER_GID}" "${USERNAME}" \
     && useradd --uid "${USER_UID}" --gid "${USER_GID}" --create-home \
     --shell /bin/bash "${USERNAME}"
 
-# Give the non-root user ownership of the cargo cache and base build tree so
-# `cargo` works without root inside the container.
+# Ensure the non-root user can write to the cargo cache so `cargo` works without root inside the container.
 ENV CARGO_HOME=/usr/local/cargo
 ENV PATH=${CARGO_HOME}/bin:${PATH}
+RUN mkdir -p "${CARGO_HOME}" && chown -R "${USERNAME}:${USERNAME}" "${CARGO_HOME}"
 # Use the system git client for the git-based crates (xet-core, fuser fork).
 ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
 
