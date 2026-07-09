@@ -172,8 +172,11 @@ impl HubOps for MockHub {
             format!("{}/", prefix)
         };
 
-        // Non-recursive: return direct children only, synthesizing directory entries
-        // for intermediate paths (mirrors real Hub API behavior).
+        // Non-recursive: return direct children only, synthesizing directory
+        // entries for intermediate paths. Strict descendants only — the raw
+        // S3 key-prefix matches of the bucket tree API are filtered out by
+        // `HubApiClient::list_tree` before reaching consumers, so the mock
+        // honors the same contract.
         let mut result = Vec::new();
         let mut seen_dirs = std::collections::HashSet::new();
         for entry in tree.iter() {

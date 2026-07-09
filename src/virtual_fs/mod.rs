@@ -2,7 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -155,6 +155,71 @@ pub struct VfsConfig {
 /// Exception: setattr(truncate) holds inode_table.write() across File::create
 /// / set_len syscalls (microseconds) to prevent write() from updating
 /// inode.size between the file truncation and the metadata update.
+/// Remote deletes deferred by POSIX unlink-while-open: path → owning inode.
+/// The delete fires on the last release() and is cancelled when the path is
+/// recreated. While pending, the path is hidden from remote re-discovery
+/// (lookup, listings, poll) so the not-yet-deleted remote object cannot
+/// resurrect locally. The atomic count keeps the empty case — the norm —
+/// lock-free on hot paths (every lookup consults `pending`).
+#[derive(Default)]
+struct DeferredDeletes {
+    map: Mutex<HashMap<String, u64>>,
+    count: AtomicUsize,
+}
+
+impl DeferredDeletes {
+    fn insert(&self, path: String, ino: u64) {
+        let mut map = self.map.lock().expect("deferred_deletes poisoned");
+        if map.insert(path, ino).is_none() {
+            self.count.fetch_add(1, Ordering::Release);
+        }
+    }
+
+    /// The path exists (again): a pending delete must not fire on the successor.
+    fn cancel(&self, path: &str) {
+        if self.count.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        let mut map = self.map.lock().expect("deferred_deletes poisoned");
+        if map.remove(path).is_some() {
+            self.count.fetch_sub(1, Ordering::Release);
+        }
+    }
+
+    /// Claim the delete for `path` if `ino` still owns it. Claiming by
+    /// (path, ino) token means a recreation (which replaced or removed the
+    /// entry) can never have its successor deleted by the old inode's release.
+    fn claim(&self, path: &str, ino: u64) -> bool {
+        if self.count.load(Ordering::Acquire) == 0 {
+            return false;
+        }
+        let mut map = self.map.lock().expect("deferred_deletes poisoned");
+        if map.get(path) == Some(&ino) {
+            map.remove(path);
+            self.count.fetch_sub(1, Ordering::Release);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// True when `path` has a pending deferred delete.
+    fn pending(&self, path: &str) -> bool {
+        self.count.load(Ordering::Acquire) != 0
+            && self.map.lock().expect("deferred_deletes poisoned").contains_key(path)
+    }
+
+    /// Drop listing entries whose path has a pending delete (single lock,
+    /// no-op when nothing is pending).
+    fn filter_entries(&self, entries: &mut Vec<crate::hub_api::TreeEntry>) {
+        if self.count.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        let map = self.map.lock().expect("deferred_deletes poisoned");
+        entries.retain(|entry| !map.contains_key(&entry.path));
+    }
+}
+
 pub struct VirtualFs {
     runtime: tokio::runtime::Handle,
     /// Upper bound on the SIGTERM flush drain (see `VfsConfig`).
@@ -182,6 +247,8 @@ pub struct VirtualFs {
     gid: u32,
     /// Negative lookup cache: paths known to not exist (TTL-based).
     negative_cache: Arc<RwLock<HashMap<String, Instant>>>,
+    /// Remote deletes deferred by POSIX unlink-while-open (see `unlink`).
+    deferred_deletes: Arc<DeferredDeletes>,
     /// Per-directory loading locks: serializes concurrent ensure_children_loaded() calls
     /// for the same directory so only one HTTP request is made (prevents thundering herd
     /// when Finder/Spotlight send many lookups on mount).
@@ -281,10 +348,12 @@ impl VirtualFs {
 
         // Spawn remote change polling task (if interval > 0)
         let invalidator: Invalidator = Arc::new(OnceLock::new());
+        let deferred_deletes = Arc::new(DeferredDeletes::default());
         let poll_handle = if config.poll_interval_secs > 0 {
             let bg_hub = hub_client.clone();
             let bg_inodes = inodes.clone();
             let bg_neg_cache = negative_cache.clone();
+            let bg_deferred = deferred_deletes.clone();
             let bg_invalidator = invalidator.clone();
             let interval = Duration::from_secs(config.poll_interval_secs);
             // Clamp to >= 1 in case a caller (library use) constructs VfsConfig directly.
@@ -294,6 +363,7 @@ impl VirtualFs {
                 bg_hub,
                 bg_inodes,
                 bg_neg_cache,
+                bg_deferred,
                 bg_invalidator,
                 interval,
                 listing_concurrency,
@@ -320,6 +390,7 @@ impl VirtualFs {
             uid: config.uid,
             gid: config.gid,
             negative_cache,
+            deferred_deletes,
             dir_loading_locks: Mutex::new(HashMap::new()),
             pending_commits: Mutex::new(HashMap::new()),
             flush_manager,
@@ -804,13 +875,17 @@ impl VirtualFs {
             }
         };
 
-        let entries = match self.hub_client.list_tree(&prefix).await {
+        let mut entries = match self.hub_client.list_tree(&prefix).await {
             Ok(entries) => entries,
             Err(e) => {
                 error!("Failed to list tree for prefix '{}': {}", prefix, e);
                 return Err(libc::EIO);
             }
         };
+        // Unlinked locally, remote delete pending on last release: hide.
+        // (Filtered before taking the inode lock: deferred_deletes must never
+        // be acquired while holding the inode table lock.)
+        self.deferred_deletes.filter_entries(&mut entries);
 
         let mut inodes = self.inode_table.write().expect("inodes poisoned");
         match inodes.get(parent_ino) {
@@ -828,12 +903,11 @@ impl VirtualFs {
             let rel_path = if prefix.is_empty() {
                 entry.path.clone()
             } else {
-                entry
-                    .path
-                    .strip_prefix(&prefix)
-                    .and_then(|p| p.strip_prefix('/'))
-                    .unwrap_or(&entry.path)
-                    .to_string()
+                match entry.path.strip_prefix(&prefix).and_then(|p| p.strip_prefix('/')) {
+                    Some(rel) if !rel.is_empty() => rel.to_string(),
+                    // list_tree guarantees strict descendants; skip defensively.
+                    _ => continue,
+                }
             };
 
             if let Some(slash_pos) = rel_path.find('/') {
@@ -1194,13 +1268,37 @@ impl VirtualFs {
 
     /// Check if a path is in the negative cache (and not expired).
     fn negative_cache_check(&self, path: &str) -> bool {
+        // A pending deferred delete hides the path for its whole lifetime —
+        // the remote object still exists until the last release(), and the
+        // 30s TTL alone would let a lookup resurrect it.
+        if self.deferred_deletes.pending(path) {
+            return true;
+        }
         let cache = self.negative_cache.read().expect("negative_cache poisoned");
         matches!(cache.get(path), Some(inserted) if inserted.elapsed() < NEG_CACHE_TTL)
     }
 
     /// Remove a path from the negative cache (e.g. after create/rename).
+    /// The path exists (again), so a deferred unlink delete for it must not
+    /// fire and remove the successor: cancel it.
     fn negative_cache_remove(&self, path: &str) {
+        self.deferred_deletes.cancel(path);
         self.negative_cache.write().expect("neg_cache poisoned").remove(path);
+    }
+
+    /// Send (or queue) the remote DeleteFile for `path`.
+    async fn send_remote_delete(&self, path: &str) -> VirtualFsResult<()> {
+        if let Some(fm) = &self.flush_manager {
+            fm.enqueue_delete(path.to_string());
+            return Ok(());
+        }
+        self.hub_client
+            .batch_operations(&[BatchOp::DeleteFile { path: path.to_string() }])
+            .await
+            .map_err(|e| {
+                error!("Remote delete failed for {}: {}", path, e);
+                libc::EIO
+            })
     }
 
     /// Insert a path into the negative cache, evicting if at capacity.
@@ -1371,7 +1469,8 @@ impl VirtualFs {
                 }
                 // The resolve endpoint returns 404 for directories, so a HEAD
                 // miss could still be a remotely-added dir. Targeted listing
-                // catches that; non-empty result means the dir exists.
+                // catches that; list_tree only returns strict descendants of
+                // the path, so a non-empty result means the dir exists.
                 if let Ok(entries) = self.hub_client.list_tree(&full_path).await
                     && !entries.is_empty()
                 {
@@ -2368,10 +2467,21 @@ impl VirtualFs {
                 }
 
                 let len = data.len();
-                channel.tx.blocking_send(WriteMsg::Data(data.to_vec())).map_err(|_| {
-                    error!("streaming channel closed for ino={}", handle_ino);
-                    libc::EIO
-                })?;
+                // Enqueue under the state mutex — see `CommitState::Committing`.
+                {
+                    let state = channel.state.lock().expect("state poisoned");
+                    match &*state {
+                        CommitState::Writing | CommitState::Deferred => {}
+                        _ => {
+                            debug!("streaming write after commit rejected for ino={}", handle_ino);
+                            return Err(libc::EIO);
+                        }
+                    }
+                    channel.tx.blocking_send(WriteMsg::Data(data.to_vec())).map_err(|_| {
+                        error!("streaming channel closed for ino={}", handle_ino);
+                        libc::EIO
+                    })?;
+                }
                 channel.bytes_written.fetch_add(len as u64, Ordering::Relaxed);
 
                 let new_size = offset + len as u64;
@@ -2412,7 +2522,7 @@ impl VirtualFs {
                         debug!("flush: already failed for ino={}: {}", ino, msg);
                         return Err(libc::EIO);
                     }
-                    CommitState::Writing | CommitState::Deferred => {}
+                    CommitState::Writing | CommitState::Deferred | CommitState::Committing => {}
                 }
             }
 
@@ -2508,7 +2618,12 @@ impl VirtualFs {
             Some(OpenFile::Streaming { ino, channel }) => {
                 let needs_commit = {
                     let state = channel.state.lock().expect("state poisoned");
-                    matches!(&*state, CommitState::Writing | CommitState::Deferred)
+                    // Committing: an earlier flush()/link() commit failed
+                    // mid-flight (pending_info parked) — release retries it.
+                    matches!(
+                        &*state,
+                        CommitState::Writing | CommitState::Deferred | CommitState::Committing
+                    )
                 };
                 if needs_commit {
                     // If flush() didn't defer (e.g. Writing state from a direct
@@ -2564,23 +2679,33 @@ impl VirtualFs {
         if let Some(ino) = released_ino
             && !self.has_open_handles(ino)
         {
-            let (removed, is_clean, overlay_path) = {
+            let (removed, is_clean, overlay_path, unlinked_path) = {
                 let mut inodes = self.inode_table.write().expect("inodes poisoned");
                 // Capture path before removal so we can clean up the overlay
                 // backing file for an unlink-while-open case (POSIX delete on
                 // last close): unlink() saw open handles and skipped the
                 // overlay-side remove, so we have to do it here.
+                let entry = inodes.get(ino);
                 let overlay_path = self
                     .overlay_backing
                     .is_some()
-                    .then(|| inodes.get(ino).map(|e| e.full_path.clone()))
+                    .then(|| entry.as_ref().map(|e| e.full_path.clone()))
                     .flatten();
+                // Path of an unlinked-while-open inode: its deferred remote
+                // delete fires below, once this last handle is gone.
+                let unlinked_path = entry.as_ref().filter(|e| e.nlink == 0).map(|e| e.full_path.to_string());
                 let orphan = inodes.remove_orphan(ino);
                 let evicted = inodes.take_evict_pending(ino) && inodes.evict_if_safe(ino);
                 let removed = orphan || evicted;
                 let is_clean = !removed && inodes.get(ino).is_some_and(|entry| !entry.is_dirty());
-                (removed, is_clean, overlay_path.filter(|_| removed))
+                (removed, is_clean, overlay_path.filter(|_| removed), unlinked_path)
             };
+            if let Some(path) = unlinked_path
+                && self.deferred_deletes.claim(&path, ino)
+                && let Err(e) = self.send_remote_delete(&path).await
+            {
+                warn!("Deferred remote delete failed for {} on release: errno={}", path, e);
+            }
             if removed {
                 if let Some(path) = overlay_path {
                     if let Err(e) = self.remove_local_backing_file(ino, &path)
@@ -2642,6 +2767,14 @@ impl VirtualFs {
         {
             debug!("streaming_commit: skipping unlinked ino={}", ino);
             return Ok(());
+        }
+
+        // Flip under the state mutex, before Finish — see `CommitState::Committing`.
+        {
+            let mut state = channel.state.lock().expect("state poisoned");
+            if matches!(&*state, CommitState::Writing | CommitState::Deferred) {
+                *state = CommitState::Committing;
+            }
         }
 
         let file_info = {
@@ -2928,6 +3061,67 @@ impl VirtualFs {
         Ok(self.make_vfs_attr(inodes.get(ino).ok_or(libc::ENOENT)?))
     }
 
+    /// Phase-1a source read for `link()`: `Ok(None)` means the source exists
+    /// but has no committed hash yet (dirty, or created and never flushed).
+    fn link_source(&self, ino: u64) -> VirtualFsResult<Option<LinkSource>> {
+        let inodes = self.inode_table.read().expect("inodes poisoned");
+        let source = inodes.get(ino).ok_or(libc::ENOENT)?;
+        if source.kind != InodeKind::File {
+            return Err(libc::EPERM);
+        }
+        if source.is_dirty() {
+            return Ok(None);
+        }
+        let Some(hash) = source.xet_hash.as_ref().filter(|hash| !hash.is_empty()).cloned() else {
+            return Ok(None);
+        };
+        Ok(Some(LinkSource {
+            path: source.full_path.clone(),
+            xet_hash: hash,
+            size: source.size,
+            mode: source.mode,
+            uid: source.uid,
+            gid: source.gid,
+        }))
+    }
+
+    /// Find the open streaming channel for `ino`, if any.
+    fn streaming_channel_for(&self, ino: u64) -> Option<Arc<StreamingChannel>> {
+        let files = self.open_files.read().expect("open_files poisoned");
+        files.values().find_map(|open| match open {
+            OpenFile::Streaming { ino: open_ino, channel } if *open_ino == ino => Some(Arc::clone(channel)),
+            _ => None,
+        })
+    }
+
+    /// Terminal streaming-commit sequence, shared by `flush()` and `link()`:
+    /// error check → state check → install hook → commit → mark Committed →
+    /// fulfill hook. On error the hook stays active and pending_info is
+    /// preserved so release() retries and publishes the final outcome;
+    /// concurrent open(O_TRUNC) waits on the hook instead of racing the retry.
+    async fn commit_streaming_now(&self, ino: u64, channel: &Arc<StreamingChannel>) -> VirtualFsResult<()> {
+        if let Some(err) = channel.error.lock().expect("error poisoned").as_ref() {
+            return Err(err.to_errno());
+        }
+        {
+            let state = channel.state.lock().expect("state poisoned");
+            match &*state {
+                CommitState::Committed => return Ok(()),
+                CommitState::Failed(msg) => {
+                    debug!("streaming commit already failed for ino={}: {}", ino, msg);
+                    return Err(libc::EIO);
+                }
+                CommitState::Writing | CommitState::Deferred | CommitState::Committing => {}
+            }
+        }
+        // Install hook before commit so concurrent open() can wait on us.
+        self.install_commit_hook(ino, channel);
+        self.streaming_commit(ino, channel).await?;
+        *channel.state.lock().expect("state poisoned") = CommitState::Committed;
+        self.fulfill_commit_hook(ino, channel, Ok(()));
+        Ok(())
+    }
+
     /// Hard-link `ino` at `newparent/newname` as a server-side copy: a new Hub
     /// file entry referencing the source's xet hash, so no bytes move through
     /// CAS. The alias gets its own inode (writes to one path never affect the
@@ -2959,26 +3153,24 @@ impl VirtualFs {
         // destination's remote children. A rejected source (dirty or hashless,
         // the routine *arr link-then-copy fallback) must not pay for a
         // list_tree it would throw away.
-        let (source_path, xet_hash, size, mode, uid, gid) = {
-            let inodes = self.inode_table.read().expect("inodes poisoned");
-            let source = inodes.get(ino).ok_or(libc::ENOENT)?;
-            if source.kind != InodeKind::File {
-                return Err(libc::EPERM);
+        //
+        // A dirty source with an open streaming handle gets one synchronous
+        // commit (same sequence as flush()): object_store-based writers
+        // (Lance, Delta) emulate atomic rename as write → hard_link → unlink
+        // → close, so their link() arrives before the close-time commit. The
+        // commit itself waits until the destination has validated — a link
+        // that fails EEXIST/ENOTDIR must not leave remote mutation behind.
+        let mut source = self.link_source(ino)?;
+        let dirty_channel = if source.is_none() {
+            match self.streaming_channel_for(ino) {
+                Some(channel) => Some(channel),
+                // Dirty with no committable handle (the routine *arr
+                // link-then-copy fallback): reject before paying for the
+                // destination list_tree below.
+                None => return Err(libc::ENOTSUP),
             }
-            if source.is_dirty() {
-                return Err(libc::ENOTSUP);
-            }
-            let Some(hash) = source.xet_hash.as_ref().filter(|hash| !hash.is_empty()).cloned() else {
-                return Err(libc::ENOTSUP);
-            };
-            (
-                source.full_path.clone(),
-                hash,
-                source.size,
-                source.mode,
-                source.uid,
-                source.gid,
-            )
+        } else {
+            None
         };
 
         // Load remote children so the EEXIST check below also sees files that
@@ -3000,19 +3192,27 @@ impl VirtualFs {
             new_full_path
         };
 
+        if let Some(channel) = dirty_channel {
+            self.commit_streaming_now(ino, &channel).await?;
+            source = self.link_source(ino)?;
+        }
+        let Some(source) = source else {
+            return Err(libc::ENOTSUP);
+        };
+
         // Phase 2: commit the alias to the Hub.
         let now = SystemTime::now();
         let mtime_ms = now.duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
         let ops = [BatchOp::AddFile {
             path: new_full_path.clone(),
-            xet_hash: xet_hash.clone(),
+            xet_hash: source.xet_hash.clone(),
             mtime: mtime_ms,
             content_type: None,
         }];
         if let Err(e) = self.hub_client.batch_operations(&ops).await {
             error!(
                 "link: failed to commit {} as alias of {}: {}",
-                new_full_path, source_path, e
+                new_full_path, source.path, e
             );
             return Err(libc::EIO);
         }
@@ -3030,21 +3230,26 @@ impl VirtualFs {
         }
         // A concurrent create may have won the race since phase 1; the remote
         // add already landed, but locally the newer entry owns the name.
+        // Accepted TOCTOU: in this narrow window a failed link leaves the
+        // alias (and, for a dirty source, the source commit) on the Hub —
+        // same trade-off as pre-existing clean-source links. Deterministic
+        // validation failures (EEXIST/ENOTDIR/ENOENT in phase 1b) commit
+        // nothing.
         if inodes.lookup_child(newparent, newname).is_some() {
             return Err(libc::EEXIST);
         }
-        info!("Linked {} -> {} (server-side copy)", source_path, new_full_path);
+        info!("Linked {} -> {} (server-side copy)", source.path, new_full_path);
         let new_ino = inodes.insert(
             newparent,
             newname.to_string(),
             new_full_path,
             InodeKind::File,
-            size,
+            source.size,
             now,
-            Some(xet_hash),
-            mode,
-            uid,
-            gid,
+            Some(source.xet_hash),
+            source.mode,
+            source.uid,
+            source.gid,
         );
         inodes.touch_parent(newparent, now);
         inodes.touch(new_ino);
@@ -3061,7 +3266,7 @@ impl VirtualFs {
 
         self.ensure_children_loaded(parent).await?;
 
-        let (ino, full_path, needs_remote_delete) = {
+        let (ino, full_path, needs_remote_delete, dirty) = {
             let inodes = self.inode_table.read().expect("inodes poisoned");
             let entry = match inodes.lookup_child(parent, name) {
                 Some(entry) if entry.kind != InodeKind::Directory => entry,
@@ -3076,33 +3281,40 @@ impl VirtualFs {
             // Remote delete only when last link is removed and file exists on the hub.
             // Skipped in overlay mode (writes never propagate to remote).
             let needs_remote = !self.overlay() && entry.xet_hash.is_some() && entry.nlink <= 1;
-            (entry.inode, entry.full_path.to_string(), needs_remote)
+            (entry.inode, entry.full_path.to_string(), needs_remote, entry.is_dirty())
         };
 
-        // In streaming mode, block unlink while the file has any open handles.
-        // This prevents editors (vim) from deleting a file they can't rewrite
-        // (streaming mode returns EPERM for O_RDWR without O_TRUNC), which
-        // would cause silent data loss. Same approach as mountpoint-s3.
-        if !self.advanced_writes && self.has_open_handles(ino) {
-            debug!("unlink: blocked for ino={} (has open handles in streaming mode)", ino);
+        // In streaming mode, block unlink while the file has open handles AND
+        // uncommitted changes: deleting out from under an editor mid-rewrite
+        // (vim can't rewrite in place in streaming mode and may fall back to
+        // unlink + recreate) would silently lose the un-committed bytes. Same
+        // approach as mountpoint-s3.
+        //
+        // Clean inodes get POSIX unlink-while-open semantics instead: the
+        // entry goes away now and open handles keep reading via the committed
+        // hash / staging file until release() reaps the orphan. This is what
+        // object_store-based writers (Lance, Delta) rely on for staging
+        // cleanup and recursive dataset deletes.
+        if !self.advanced_writes && dirty && self.has_open_handles(ino) {
+            debug!(
+                "unlink: blocked for ino={} (dirty with open handles in streaming mode)",
+                ino
+            );
             return Err(libc::EPERM);
         }
 
-        // Advanced writes: queue delete for batched flush in the flush_loop.
-        // Simple mode: delete synchronously (one HTTP call per unlink).
-        if needs_remote_delete {
-            if let Some(fm) = &self.flush_manager {
-                fm.enqueue_delete(full_path.clone());
-            } else if let Err(e) = self
-                .hub_client
-                .batch_operations(&[BatchOp::DeleteFile {
-                    path: full_path.clone(),
-                }])
-                .await
-            {
-                error!("Remote delete failed for {}: {}", full_path, e);
-                return Err(libc::EIO);
-            }
+        // POSIX unlink-while-open (streaming mode, clean file, open handles):
+        // the remote delete is DEFERRED to the last release(). Recreating the
+        // path meanwhile cancels it (negative_cache_remove), so an editor's
+        // unlink → recreate save pattern can never lose the replacement, and
+        // readers keep the remote object alive until they close.
+        let defer_remote_delete = needs_remote_delete && !self.advanced_writes && self.has_open_handles(ino);
+        if defer_remote_delete {
+            self.deferred_deletes.insert(full_path.clone(), ino);
+        } else if needs_remote_delete {
+            // Advanced writes: queue delete for batched flush in the flush_loop.
+            // Simple mode: delete synchronously (one HTTP call per unlink).
+            self.send_remote_delete(&full_path).await?;
         }
 
         // Remote succeeded (or no remote needed) — now unlink locally.
@@ -3127,6 +3339,14 @@ impl VirtualFs {
             }
             last_link && no_handles
         };
+
+        // The last handle may have closed between the deferral above and
+        // unlink_one: nobody will release() this inode again, so claim the
+        // deferred delete back and send it now. Best-effort — the local
+        // unlink already succeeded.
+        if defer_remote_delete && inode_fully_removed && self.deferred_deletes.claim(&full_path, ino) {
+            let _ = self.send_remote_delete(&full_path).await;
+        }
 
         // Seed the negative cache before any await: with the inode already
         // gone from the table, a concurrent lookup under a stale parent would
@@ -3978,6 +4198,12 @@ enum CommitState {
     Writing,
     /// flush() deferred commit (dup'd fd or zero writes). release() will handle it.
     Deferred,
+    /// A commit is in flight. The flip to Committing and every Data enqueue
+    /// happen under the state mutex, BEFORE Finish is enqueued: a racing
+    /// write either lands ahead of Finish (and joins the commit) or observes
+    /// Committing and is rejected — it can never be silently dropped behind
+    /// Finish by the exiting worker.
+    Committing,
     /// Commit completed successfully.
     Committed,
     /// Unrecoverable error — inode has been reverted.
@@ -4012,6 +4238,16 @@ struct StreamingChannel {
 }
 
 /// An open file handle — either a local fd, lazy remote reference, or streaming writer.
+/// Committed source attributes read under lock for `link()`.
+struct LinkSource {
+    path: Arc<str>,
+    xet_hash: String,
+    size: u64,
+    mode: u16,
+    uid: u32,
+    gid: u32,
+}
+
 enum OpenFile {
     /// Local file (staging for writes, or dirty reads).
     Local { ino: u64, file: Arc<File>, writable: bool },

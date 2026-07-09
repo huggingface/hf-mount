@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
@@ -9,6 +10,45 @@ use tracing::{info, warn};
 use xet_client::cas_client::auth::{AuthError, TokenInfo, TokenRefresher};
 
 use crate::error::{Error, Result, is_retryable_status};
+
+/// Characters that must be percent-encoded when a file path is interpolated
+/// into a URL path: `#` starts a fragment, `?` a query string, `%` corrupts
+/// decoding, and the rest are not valid in URL paths. `/` is intentionally
+/// kept so multi-segment paths stay multi-segment.
+const URL_PATH_ESCAPE: &AsciiSet = &CONTROLS
+    .add(b' ')
+    .add(b'"')
+    .add(b'#')
+    .add(b'%')
+    .add(b'?')
+    .add(b'<')
+    .add(b'>')
+    .add(b'`')
+    .add(b'{')
+    .add(b'}')
+    .add(b'|')
+    .add(b'\\')
+    .add(b'^');
+
+/// Percent-encode a file path for use in a URL path, preserving `/`.
+/// Borrows (no allocation) when nothing needs escaping — the common case.
+///
+/// Filenames with URL-reserved characters are routine: object_store-based
+/// writers (Lance, Delta) stage uploads as `name#1`, `name#2`, … — without
+/// encoding, everything after `#` is parsed as a fragment and every such
+/// file resolves to the same truncated URL.
+fn encode_url_path(path: &str) -> std::borrow::Cow<'_, str> {
+    utf8_percent_encode(path, URL_PATH_ESCAPE).into()
+}
+
+/// True when `path` lives strictly under the directory `prefix` (i.e. under
+/// `{prefix}/`), as opposed to merely sharing `prefix` as a raw key prefix
+/// (`a/1.manifest#1` vs `a/1.manifest`) or being `prefix` itself.
+fn is_strict_descendant(path: &str, prefix: &str) -> bool {
+    path.strip_prefix(prefix)
+        .and_then(|rest| rest.strip_prefix('/'))
+        .is_some_and(|rel| !rel.is_empty())
+}
 
 // ── HubOps trait ──────────────────────────────────────────────────────
 
@@ -621,6 +661,12 @@ impl HubApiClient {
     /// List tree entries at the given prefix (single directory level).
     /// Follows `Link` header pagination. For repos, includes `expand=true`
     /// to get per-file lastCommit (mtime). For buckets, passes `recursive=false`.
+    ///
+    /// Only entries strictly under `{prefix}/` are returned: the bucket tree
+    /// API matches by raw S3 key prefix (listing `a/1.manifest` also returns
+    /// the sibling `a/1.manifest#1`), so raw-prefix matches are filtered out
+    /// here, at the boundary where that server behavior originates. Consumers
+    /// can rely on every entry being a descendant of `prefix`.
     pub async fn list_tree(&self, prefix: &str) -> Result<Vec<TreeEntry>> {
         let api_prefix = self.prefixed_path(prefix);
         let mut entries = match &self.source {
@@ -631,6 +677,9 @@ impl HubApiClient {
                 revision,
             } => self.list_tree_repo(repo_id, *repo_type, revision, &api_prefix).await?,
         };
+        if !api_prefix.is_empty() {
+            entries.retain(|e| is_strict_descendant(&e.path, &api_prefix));
+        }
 
         // Strip path prefix from returned entries and filter out the prefix dir itself.
         if !self.path_prefix.is_empty() {
@@ -656,7 +705,9 @@ impl HubApiClient {
         } else {
             format!(
                 "{}/api/buckets/{}/tree/{}{recursive_param}",
-                self.endpoint, bucket_id, prefix
+                self.endpoint,
+                bucket_id,
+                encode_url_path(prefix)
             )
         };
 
@@ -705,7 +756,7 @@ impl HubApiClient {
                 repo_type.api_prefix(),
                 repo_id,
                 revision,
-                prefix,
+                encode_url_path(prefix),
             )
         };
 
@@ -749,9 +800,11 @@ impl HubApiClient {
 
     /// Fetch metadata for a single file via HEAD on the resolve endpoint.
     /// Returns `None` if 404 (file does not exist remotely).
-    pub async fn head_file(&self, path: &str) -> Result<Option<HeadFileInfo>> {
-        let api_path = self.prefixed_path(path);
-        let url = match &self.source {
+    /// Build the resolve-endpoint URL for `path` (prefixed and URL-encoded).
+    fn resolve_url(&self, path: &str) -> String {
+        let prefixed = self.prefixed_path(path);
+        let api_path = encode_url_path(&prefixed);
+        match &self.source {
             // Buckets: /buckets/{id}/resolve/{path} (no /api/ prefix)
             SourceKind::Bucket { bucket_id } => {
                 format!("{}/buckets/{}/resolve/{}", self.endpoint, bucket_id, api_path)
@@ -771,7 +824,11 @@ impl HubApiClient {
                     api_path,
                 )
             }
-        };
+        }
+    }
+
+    pub async fn head_file(&self, path: &str) -> Result<Option<HeadFileInfo>> {
+        let url = self.resolve_url(path);
         let resp = send_with_retry(|| self.auth(self.head_client.head(&url)), "head_file", true).await;
         let resp = match resp {
             Ok(r) => r,
@@ -910,26 +967,7 @@ impl HubApiClient {
     /// sidecar `{dest}.etag` file is present, sends `If-None-Match`. On 304 the
     /// existing cached file is kept as-is.
     pub async fn download_file_http(&self, path: &str, dest: &Path) -> Result<()> {
-        let api_path = self.prefixed_path(path);
-        let url = match &self.source {
-            SourceKind::Bucket { bucket_id } => {
-                format!("{}/buckets/{}/resolve/{}", self.endpoint, bucket_id, api_path)
-            }
-            SourceKind::Repo {
-                repo_id,
-                repo_type,
-                revision,
-            } => {
-                format!(
-                    "{}/{}{}/resolve/{}/{}",
-                    self.endpoint,
-                    repo_type.resolve_prefix(),
-                    repo_id,
-                    revision,
-                    api_path,
-                )
-            }
-        };
+        let url = self.resolve_url(path);
 
         // Read cached ETag only if dest exists — otherwise an orphan sidecar
         // (e.g. user manually deleted dest) could trick us into a 304 and
@@ -1306,6 +1344,50 @@ mod tests {
             last_modified: UNIX_EPOCH,
             path_prefix: prefix.to_string(),
         }
+    }
+
+    #[test]
+    fn test_encode_url_path_passthrough() {
+        assert_eq!(encode_url_path("file.txt"), "file.txt");
+        assert_eq!(encode_url_path("a/b/c.lance"), "a/b/c.lance");
+        assert_eq!(encode_url_path(""), "");
+    }
+
+    #[test]
+    fn test_encode_url_path_reserved_chars() {
+        // object_store staging suffix: the `#` must not become a URL fragment
+        assert_eq!(encode_url_path("_versions/1.manifest#1"), "_versions/1.manifest%231");
+        assert_eq!(encode_url_path("a?b.txt"), "a%3Fb.txt");
+        assert_eq!(encode_url_path("100%.txt"), "100%25.txt");
+        assert_eq!(encode_url_path("a b/c d.txt"), "a%20b/c%20d.txt");
+    }
+
+    #[test]
+    fn test_resolve_url_prefixes_and_encodes() {
+        let c = make_test_client("", None);
+        assert_eq!(
+            c.resolve_url("_versions/1.manifest#1"),
+            "https://huggingface.co/buckets/user/bucket/resolve/_versions/1.manifest%231"
+        );
+        let c = make_test_client("sub/dir", None);
+        assert_eq!(
+            c.resolve_url("a b.txt"),
+            "https://huggingface.co/buckets/user/bucket/resolve/sub/dir/a%20b.txt"
+        );
+    }
+
+    #[test]
+    fn test_is_strict_descendant() {
+        // Real children (any depth) are in.
+        assert!(is_strict_descendant("a/b.txt", "a"));
+        assert!(is_strict_descendant("a/b/c.txt", "a"));
+        // Raw S3 key-prefix matches are NOT children: the sibling staging
+        // files of object_store writers (`1.manifest#1`) must not make
+        // `1.manifest` look like a directory.
+        assert!(!is_strict_descendant("a/1.manifest#1", "a/1.manifest"));
+        assert!(!is_strict_descendant("ab.txt", "a"));
+        // The path itself is not its own descendant.
+        assert!(!is_strict_descendant("a", "a"));
     }
 
     #[test]

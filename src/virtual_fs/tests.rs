@@ -134,31 +134,169 @@ fn streaming_write_happy_path() {
     assert_eq!(logs.len(), 1);
 }
 
-/// In streaming mode, unlink is blocked while the file has open handles.
-/// This prevents editors (vim) from deleting files they can't rewrite.
+/// In streaming mode, unlink of a CLEAN file with open handles follows POSIX
+/// unlink-while-open semantics: the entry goes away immediately (remote
+/// delete included) and the open handle keeps working until release().
+/// This is what object_store writers (Lance, Delta) rely on for staging
+/// cleanup and recursive dataset deletes.
 #[test]
-fn unlink_blocked_with_open_handles_streaming() {
+fn unlink_clean_file_with_open_handle_is_posix() {
     let hub = MockHub::new();
-    hub.add_file("guarded.txt", 100, Some("hash1"), None);
+    let content = b"still readable after unlink";
+    hub.add_file("clean.txt", content.len() as u64, Some("hash1"), None);
+    let xet = MockXet::new();
+    xet.add_file("hash1", content);
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let attr = vfs.lookup(ROOT_INODE, "clean.txt").await.unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open(ino, false, false, Some(42)).await.unwrap();
+
+        vfs.unlink(ROOT_INODE, "clean.txt").await.unwrap();
+
+        // Entry is gone; the remote delete is DEFERRED while the handle is
+        // open (a racing recreate must be able to cancel it).
+        {
+            let inodes = vfs.inode_table.read().unwrap();
+            assert!(inodes.lookup_child(ROOT_INODE, "clean.txt").is_none());
+        }
+        assert!(
+            hub.take_batch_log().is_empty(),
+            "remote delete must wait for the last release"
+        );
+        assert!(vfs.has_open_handles(ino), "open handle survives the unlink");
+
+        // The POSIX promise: the open handle still reads the content.
+        let (data, eof) = vfs.read(fh, 0, 100).await.unwrap();
+        assert_eq!(&data[..], content);
+        assert!(eof);
+
+        // Last close fires the deferred remote delete.
+        vfs.release(fh).await.unwrap();
+        assert!(!vfs.has_open_handles(ino));
+        let logs = hub.take_batch_log();
+        let has_delete = logs
+            .iter()
+            .flatten()
+            .any(|op| matches!(op, BatchOp::DeleteFile { path } if path == "clean.txt"));
+        assert!(has_delete, "deferred remote delete sent on last release");
+    });
+}
+
+/// Recreating the path cancels the deferred delete: the editor save pattern
+/// (open original → unlink → recreate) must never lose the replacement.
+#[test]
+fn deferred_delete_cancelled_by_recreate() {
+    let hub = MockHub::new();
+    hub.add_file("doc.txt", 8, Some("old_hash"), None);
     let xet = MockXet::new();
     let (rt, vfs) = vfs_simple(&hub, &xet);
 
     rt.block_on(async {
-        let attr = vfs.lookup(ROOT_INODE, "guarded.txt").await.unwrap();
+        let attr = vfs.lookup(ROOT_INODE, "doc.txt").await.unwrap();
+        let old_ino = attr.ino;
+        let old_fh = vfs.open(old_ino, false, false, Some(42)).await.unwrap();
+
+        vfs.unlink(ROOT_INODE, "doc.txt").await.unwrap();
+
+        // Recreate the same name (the editor writes the replacement).
+        let (new_attr, new_fh) = vfs
+            .create(ROOT_INODE, "doc.txt", 0o644, 1000, 1000, Some(42))
+            .await
+            .unwrap();
+        write_blocking(&vfs, new_attr.ino, new_fh, 0, b"replaced")
+            .await
+            .unwrap();
+        vfs.flush(new_attr.ino, new_fh, Some(42)).await.unwrap();
+        vfs.release(new_fh).await.unwrap();
+
+        // Closing the OLD handle must not delete the replacement.
+        vfs.release(old_fh).await.unwrap();
+        let logs = hub.take_batch_log();
+        let has_delete = logs
+            .iter()
+            .flatten()
+            .any(|op| matches!(op, BatchOp::DeleteFile { path } if path == "doc.txt"));
+        assert!(!has_delete, "recreate must cancel the deferred delete");
+        let inodes = vfs.inode_table.read().unwrap();
+        assert!(inodes.lookup_child(ROOT_INODE, "doc.txt").is_some());
+    });
+}
+
+/// While the deferred delete is pending, the still-existing remote object
+/// must not be re-discovered — even once the negative-cache TTL entry is
+/// gone (handles can stay open far longer than the 30s TTL).
+#[test]
+fn deferred_delete_suppresses_rediscovery() {
+    let hub = MockHub::new();
+    hub.add_file("held.txt", 4, Some("h1"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let attr = vfs.lookup(ROOT_INODE, "held.txt").await.unwrap();
         let ino = attr.ino;
-
-        // Open read-only (like vim does before trying to save)
         let fh = vfs.open(ino, false, false, Some(42)).await.unwrap();
+        vfs.unlink(ROOT_INODE, "held.txt").await.unwrap();
 
-        // Unlink should be blocked (has open handles in streaming mode)
-        let err = vfs.unlink(ROOT_INODE, "guarded.txt").await.unwrap_err();
-        assert_eq!(err, libc::EPERM, "unlink must be blocked with open handles");
+        // Simulate the negative-cache TTL expiring (clear the raw map,
+        // bypassing negative_cache_remove which would cancel the deferral).
+        vfs.negative_cache.write().unwrap().clear();
 
-        // Close the handle
+        // lookup: still hidden (the remote HEAD would find the file otherwise).
+        let err = vfs.lookup(ROOT_INODE, "held.txt").await.unwrap_err();
+        assert_eq!(err, libc::ENOENT);
+
+        // poll diff: the remote entry must not resurrect the inode.
+        let remote = vec![crate::hub_api::TreeEntry {
+            path: "held.txt".to_string(),
+            entry_type: "file".to_string(),
+            size: Some(4),
+            xet_hash: Some("h1".to_string()),
+            oid: None,
+            mtime: None,
+        }];
+        let polled: std::collections::HashSet<String> = [String::new()].into_iter().collect();
+        VirtualFs::apply_poll_diff(
+            remote,
+            &polled,
+            &vfs.inode_table,
+            &vfs.negative_cache,
+            &vfs.deferred_deletes,
+            &vfs.invalidator,
+        );
+        let err = vfs.lookup(ROOT_INODE, "held.txt").await.unwrap_err();
+        assert_eq!(err, libc::ENOENT);
+
         vfs.release(fh).await.unwrap();
+    });
+}
 
-        // Now unlink should succeed
-        vfs.unlink(ROOT_INODE, "guarded.txt").await.unwrap();
+/// In streaming mode, unlink of a DIRTY file with open handles stays blocked:
+/// deleting out from under an editor mid-rewrite would silently lose the
+/// un-committed bytes (the vim unlink+recreate fallback).
+#[test]
+fn unlink_blocked_dirty_with_open_handles_streaming() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let (attr, fh) = vfs
+            .create(ROOT_INODE, "editing.txt", 0o644, 1000, 1000, Some(42))
+            .await
+            .unwrap();
+        let ino = attr.ino;
+        write_blocking(&vfs, ino, fh, 0, b"uncommitted").await.unwrap();
+
+        let err = vfs.unlink(ROOT_INODE, "editing.txt").await.unwrap_err();
+        assert_eq!(err, libc::EPERM, "dirty file with open handle stays protected");
+
+        // Commit + close, then the unlink goes through.
+        vfs.flush(ino, fh, Some(42)).await.unwrap();
+        vfs.release(fh).await.unwrap();
+        vfs.unlink(ROOT_INODE, "editing.txt").await.unwrap();
     });
 }
 
@@ -880,6 +1018,32 @@ fn lookup_uses_head_not_list_tree() {
             pre_len + 1,
             "only the requested file should be materialized"
         );
+    });
+}
+
+/// A name that is a raw key-prefix of an existing file must not resolve as
+/// a directory (`1.manifest` vs the `1.manifest#1` staging convention of
+/// object_store writers). The raw-prefix filtering itself lives in
+/// `HubApiClient::list_tree` (see `test_is_strict_descendant`); this covers
+/// the consumer side: an empty listing is ENOENT, not a phantom directory.
+#[test]
+fn lookup_prefix_of_existing_file_is_enoent() {
+    let hub = MockHub::new();
+    hub.add_file("_versions/1.manifest#1", 10, Some("h"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let dir = vfs.lookup(ROOT_INODE, "_versions").await.unwrap();
+        // Load children so the miss goes through the loaded-parent fallback.
+        let _ = vfs.readdir(dir.ino).await.unwrap();
+
+        let err = vfs.lookup(dir.ino, "1.manifest").await.unwrap_err();
+        assert_eq!(err, libc::ENOENT, "prefix of an existing file is not a directory");
+
+        // The sibling itself still resolves as a plain file.
+        let attr = vfs.lookup(dir.ino, "1.manifest#1").await.unwrap();
+        assert_eq!(attr.size, 10);
     });
 }
 
@@ -2600,7 +2764,7 @@ fn poll_skips_list_tree_when_revision_unchanged() {
         let handle = tokio::spawn(async move {
             tokio::select! {
                 _ = VirtualFs::poll_remote_changes(
-                    hub_dyn, inodes, neg, inv,
+                    hub_dyn, inodes, neg, vfs.deferred_deletes.clone(), inv,
                     Duration::from_millis(10), 4,
                 ) => {}
                 _ = stop_clone.notified() => {}
@@ -2770,7 +2934,14 @@ fn poll_skips_unloaded_directories() {
             remote.extend(hub.list_tree(prefix).await.unwrap());
         }
         let polled: std::collections::HashSet<String> = prefixes.into_iter().collect();
-        VirtualFs::apply_poll_diff(remote, &polled, &vfs.inode_table, &vfs.negative_cache, &vfs.invalidator);
+        VirtualFs::apply_poll_diff(
+            remote,
+            &polled,
+            &vfs.inode_table,
+            &vfs.negative_cache,
+            &vfs.deferred_deletes,
+            &vfs.invalidator,
+        );
 
         // Dir "a" should still NOT have children_loaded set (unchanged).
         // Root should still be loaded (not invalidated).
@@ -2810,7 +2981,14 @@ fn poll_invalidates_loaded_dir_with_new_file() {
             remote.extend(hub.list_tree(prefix).await.unwrap());
         }
         let polled: std::collections::HashSet<String> = prefixes.into_iter().collect();
-        VirtualFs::apply_poll_diff(remote, &polled, &vfs.inode_table, &vfs.negative_cache, &vfs.invalidator);
+        VirtualFs::apply_poll_diff(
+            remote,
+            &polled,
+            &vfs.inode_table,
+            &vfs.negative_cache,
+            &vfs.deferred_deletes,
+            &vfs.invalidator,
+        );
 
         // Root should be invalidated because it's loaded and has a new file.
         assert!(
@@ -2842,7 +3020,14 @@ fn poll_detects_file_update_in_loaded_dir() {
             remote.extend(hub.list_tree(prefix).await.unwrap());
         }
         let polled: std::collections::HashSet<String> = prefixes.into_iter().collect();
-        VirtualFs::apply_poll_diff(remote, &polled, &vfs.inode_table, &vfs.negative_cache, &vfs.invalidator);
+        VirtualFs::apply_poll_diff(
+            remote,
+            &polled,
+            &vfs.inode_table,
+            &vfs.negative_cache,
+            &vfs.deferred_deletes,
+            &vfs.invalidator,
+        );
 
         let inodes = vfs.inode_table.read().unwrap();
         let entry = inodes.get(ino).unwrap();
@@ -2885,7 +3070,14 @@ fn poll_calls_invalidator_for_updated_file() {
             remote.extend(hub.list_tree(prefix).await.unwrap());
         }
         let polled: std::collections::HashSet<String> = prefixes.into_iter().collect();
-        VirtualFs::apply_poll_diff(remote, &polled, &vfs.inode_table, &vfs.negative_cache, &vfs.invalidator);
+        VirtualFs::apply_poll_diff(
+            remote,
+            &polled,
+            &vfs.inode_table,
+            &vfs.negative_cache,
+            &vfs.deferred_deletes,
+            &vfs.invalidator,
+        );
 
         let calls = invalidated.lock().unwrap();
         assert!(
@@ -2918,7 +3110,14 @@ fn poll_detects_file_deletion_in_loaded_dir() {
             remote.extend(hub.list_tree(prefix).await.unwrap());
         }
         let polled: std::collections::HashSet<String> = prefixes.into_iter().collect();
-        VirtualFs::apply_poll_diff(remote, &polled, &vfs.inode_table, &vfs.negative_cache, &vfs.invalidator);
+        VirtualFs::apply_poll_diff(
+            remote,
+            &polled,
+            &vfs.inode_table,
+            &vfs.negative_cache,
+            &vfs.deferred_deletes,
+            &vfs.invalidator,
+        );
 
         // ephemeral.txt should be gone, keeper.txt should remain.
         assert_eq!(vfs.lookup(ROOT_INODE, "ephemeral.txt").await.unwrap_err(), libc::ENOENT);
@@ -2952,7 +3151,14 @@ fn poll_skips_deletion_with_open_handles() {
             remote.extend(hub.list_tree(prefix).await.unwrap());
         }
         let polled: std::collections::HashSet<String> = prefixes.into_iter().collect();
-        VirtualFs::apply_poll_diff(remote, &polled, &vfs.inode_table, &vfs.negative_cache, &vfs.invalidator);
+        VirtualFs::apply_poll_diff(
+            remote,
+            &polled,
+            &vfs.inode_table,
+            &vfs.negative_cache,
+            &vfs.deferred_deletes,
+            &vfs.invalidator,
+        );
 
         // closed.txt should be deleted (no open handles)
         assert_eq!(vfs.lookup(ROOT_INODE, "closed.txt").await.unwrap_err(), libc::ENOENT);
@@ -3016,7 +3222,14 @@ fn poll_deletion_uses_attr_only_for_open_handles() {
             remote.extend(hub.list_tree(prefix).await.unwrap());
         }
         let polled: std::collections::HashSet<String> = prefixes.into_iter().collect();
-        VirtualFs::apply_poll_diff(remote, &polled, &vfs.inode_table, &vfs.negative_cache, &vfs.invalidator);
+        VirtualFs::apply_poll_diff(
+            remote,
+            &polled,
+            &vfs.inode_table,
+            &vfs.negative_cache,
+            &vfs.deferred_deletes,
+            &vfs.invalidator,
+        );
 
         // Snapshot (releasing the lock) so the guard isn't held across the await below.
         let recorded = calls.lock().unwrap().clone();
@@ -3082,7 +3295,14 @@ fn poll_update_uses_attr_only_for_open_handles() {
             remote.extend(hub.list_tree(prefix).await.unwrap());
         }
         let polled: std::collections::HashSet<String> = prefixes.into_iter().collect();
-        VirtualFs::apply_poll_diff(remote, &polled, &vfs.inode_table, &vfs.negative_cache, &vfs.invalidator);
+        VirtualFs::apply_poll_diff(
+            remote,
+            &polled,
+            &vfs.inode_table,
+            &vfs.negative_cache,
+            &vfs.deferred_deletes,
+            &vfs.invalidator,
+        );
 
         // Snapshot (releasing the lock) so the guard isn't held across the await below.
         let recorded = calls.lock().unwrap().clone();
@@ -3138,7 +3358,14 @@ fn poll_multiple_loaded_dirs() {
             remote.extend(hub.list_tree(prefix).await.unwrap());
         }
         let polled: std::collections::HashSet<String> = prefixes.into_iter().collect();
-        VirtualFs::apply_poll_diff(remote, &polled, &vfs.inode_table, &vfs.negative_cache, &vfs.invalidator);
+        VirtualFs::apply_poll_diff(
+            remote,
+            &polled,
+            &vfs.inode_table,
+            &vfs.negative_cache,
+            &vfs.deferred_deletes,
+            &vfs.invalidator,
+        );
 
         // sub/nested.txt should be updated.
         let nested_ino = vfs.lookup(sub.ino, "nested.txt").await.unwrap().ino;
@@ -3172,6 +3399,7 @@ fn poll_failed_prefix_no_spurious_deletion() {
             &polled,
             &vfs.inode_table,
             &vfs.negative_cache,
+            &vfs.deferred_deletes,
             &vfs.invalidator,
         );
 
@@ -3201,7 +3429,14 @@ fn poll_after_invalidation_no_spurious_deletion() {
             remote.extend(hub.list_tree(prefix).await.unwrap());
         }
         let polled: std::collections::HashSet<String> = prefixes.into_iter().collect();
-        VirtualFs::apply_poll_diff(remote, &polled, &vfs.inode_table, &vfs.negative_cache, &vfs.invalidator);
+        VirtualFs::apply_poll_diff(
+            remote,
+            &polled,
+            &vfs.inode_table,
+            &vfs.negative_cache,
+            &vfs.deferred_deletes,
+            &vfs.invalidator,
+        );
 
         // Root is now invalidated (children_loaded=false).
         // Second poll: root is NOT in loaded_dir_prefixes anymore.
@@ -3216,6 +3451,7 @@ fn poll_after_invalidation_no_spurious_deletion() {
             &polled2,
             &vfs.inode_table,
             &vfs.negative_cache,
+            &vfs.deferred_deletes,
             &vfs.invalidator,
         );
 
@@ -3259,6 +3495,7 @@ fn poll_detects_deleted_subdirectory() {
             &polled,
             &vfs.inode_table,
             &vfs.negative_cache,
+            &vfs.deferred_deletes,
             &vfs.invalidator,
         );
 
@@ -4495,6 +4732,198 @@ fn link_clean_file_creates_server_side_copy() {
         assert!(!alias.is_dirty());
         let src = inodes.get(src_attr.ino).unwrap();
         assert_eq!(src.full_path.as_ref(), "src.txt");
+    });
+}
+
+/// link() on a dirty source with an open streaming handle commits the source
+/// synchronously, then aliases the committed hash. This is the atomic-rename
+/// emulation of object_store writers (Lance, Delta): write → hard_link →
+/// unlink → close, so the link arrives before the close-time commit.
+#[test]
+fn link_dirty_streaming_source_commits_then_aliases() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let (attr, fh) = vfs
+            .create(ROOT_INODE, "staging#1", 0o644, 1000, 1000, Some(42))
+            .await
+            .unwrap();
+        let ino = attr.ino;
+        write_blocking(&vfs, ino, fh, 0, b"manifest bytes").await.unwrap();
+
+        // Hard-link while the handle is still open and the inode dirty.
+        let alias_attr = vfs.link(ino, ROOT_INODE, "final.manifest").await.unwrap();
+        assert_ne!(alias_attr.ino, ino, "alias gets its own inode");
+        assert_eq!(alias_attr.size, 14);
+
+        {
+            let inodes = vfs.inode_table.read().unwrap();
+            let source = inodes.get(ino).unwrap();
+            assert!(!source.is_dirty(), "link must have committed the source");
+            let source_hash = source.xet_hash.clone().expect("source hash set by commit");
+            let alias = inodes.get(alias_attr.ino).unwrap();
+            assert_eq!(
+                alias.xet_hash.as_ref(),
+                Some(&source_hash),
+                "alias points at the committed hash"
+            );
+        }
+
+        // The staging unlink lands while the handle is still open, but the
+        // link() above committed the source, so the clean-file POSIX path
+        // applies: entry gone now, handle valid until release.
+        vfs.unlink(ROOT_INODE, "staging#1").await.unwrap();
+        vfs.release(fh).await.unwrap();
+
+        let inodes = vfs.inode_table.read().unwrap();
+        assert!(inodes.lookup_child(ROOT_INODE, "final.manifest").is_some());
+        assert!(inodes.lookup_child(ROOT_INODE, "staging#1").is_none());
+    });
+}
+
+/// A link() that fails destination validation must not have committed the
+/// dirty source: a failed syscall must leave no observable remote mutation.
+#[test]
+fn link_failed_destination_does_not_commit_source() {
+    let hub = MockHub::new();
+    hub.add_file("taken.txt", 5, Some("hash0"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let (attr, fh) = vfs
+            .create(ROOT_INODE, "staging#1", 0o644, 1000, 1000, Some(42))
+            .await
+            .unwrap();
+        let ino = attr.ino;
+        write_blocking(&vfs, ino, fh, 0, b"manifest bytes").await.unwrap();
+        hub.take_batch_log();
+
+        let err = vfs.link(ino, ROOT_INODE, "taken.txt").await.unwrap_err();
+        assert_eq!(err, libc::EEXIST);
+        assert!(
+            hub.take_batch_log().is_empty(),
+            "failed link must not commit the source"
+        );
+        {
+            let inodes = vfs.inode_table.read().unwrap();
+            assert!(
+                inodes.get(ino).unwrap().is_dirty(),
+                "source stays dirty for the close-time commit"
+            );
+        }
+
+        vfs.release(fh).await.unwrap();
+    });
+}
+
+/// Writes racing a commit IN FLIGHT are rejected too: streaming_commit flips
+/// the channel to Committing (under the same mutex write() enqueues under)
+/// before sending Finish, so a write can never land behind Finish and be
+/// silently dropped by the exiting worker.
+#[test]
+fn write_during_inflight_commit_is_rejected() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let (attr, fh) = vfs
+            .create(ROOT_INODE, "racing.txt", 0o644, 1000, 1000, Some(42))
+            .await
+            .unwrap();
+        let ino = attr.ino;
+        write_blocking(&vfs, ino, fh, 0, b"payload").await.unwrap();
+
+        // Park the commit at the Hub batch call: the channel is Committing
+        // (Finish already enqueued) while flush() waits on the barrier.
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        hub.set_batch_barrier(barrier.clone());
+        let vfs_flush = vfs.clone();
+        let flush_task = tokio::spawn(async move { vfs_flush.flush(ino, fh, Some(42)).await });
+
+        // Until the flip a write may still legally succeed (it lands ahead of
+        // Finish and joins the commit), so poll until the rejection.
+        let mut offset = 7u64;
+        let mut rejected = false;
+        for _ in 0..200 {
+            match write_blocking(&vfs, ino, fh, offset, b"more").await {
+                Err(err) => {
+                    assert_eq!(err, libc::EIO);
+                    rejected = true;
+                    break;
+                }
+                Ok(written) => offset += written as u64,
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(rejected, "write must be rejected once the commit is in flight");
+
+        barrier.wait().await;
+        flush_task.await.unwrap().unwrap();
+        vfs.release(fh).await.unwrap();
+    });
+}
+
+/// Writes after the streaming channel has committed (flush(), or link() on a
+/// dirty source) are rejected instead of being silently dropped after Finish.
+#[test]
+fn write_after_streaming_commit_is_rejected() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let (attr, fh) = vfs
+            .create(ROOT_INODE, "once.txt", 0o644, 1000, 1000, Some(42))
+            .await
+            .unwrap();
+        let ino = attr.ino;
+        write_blocking(&vfs, ino, fh, 0, b"payload").await.unwrap();
+        vfs.flush(ino, fh, Some(42)).await.unwrap();
+
+        let err = write_blocking(&vfs, ino, fh, 7, b"more").await.unwrap_err();
+        assert_eq!(err, libc::EIO);
+
+        vfs.release(fh).await.unwrap();
+    });
+}
+
+/// When the synchronous commit inside link() fails, the error propagates and
+/// no alias is committed — pending_info stays parked for the release() retry
+/// (same failure contract as flush()).
+#[test]
+fn link_commit_failure_leaves_no_alias() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let (attr, fh) = vfs
+            .create(ROOT_INODE, "staging#1", 0o644, 1000, 1000, Some(42))
+            .await
+            .unwrap();
+        let ino = attr.ino;
+        write_blocking(&vfs, ino, fh, 0, b"manifest bytes").await.unwrap();
+
+        hub.fail_next_batch(1);
+        assert!(vfs.link(ino, ROOT_INODE, "final.manifest").await.is_err());
+
+        let logs = hub.take_batch_log();
+        let has_alias = logs
+            .iter()
+            .flatten()
+            .any(|op| matches!(op, BatchOp::AddFile { path, .. } if path == "final.manifest"));
+        assert!(!has_alias, "no alias committed after a failed source commit");
+        {
+            let inodes = vfs.inode_table.read().unwrap();
+            assert!(inodes.lookup_child(ROOT_INODE, "final.manifest").is_none());
+        }
+
+        // release() retries the commit (hub no longer failing) and succeeds.
+        vfs.release(fh).await.unwrap();
     });
 }
 

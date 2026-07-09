@@ -29,6 +29,7 @@ impl super::VirtualFs {
         hub_client: Arc<dyn HubOps>,
         inodes: Arc<RwLock<InodeTable>>,
         negative_cache: Arc<RwLock<HashMap<String, Instant>>>,
+        deferred_deletes: Arc<super::DeferredDeletes>,
         invalidator: Invalidator,
         interval: Duration,
         listing_concurrency: usize,
@@ -126,7 +127,14 @@ impl super::VirtualFs {
                     }
                 }
             }
-            Self::apply_poll_diff(all_entries, &polled_prefixes, &inodes, &negative_cache, &invalidator);
+            Self::apply_poll_diff(
+                all_entries,
+                &polled_prefixes,
+                &inodes,
+                &negative_cache,
+                &deferred_deletes,
+                &invalidator,
+            );
         }
     }
 
@@ -142,8 +150,14 @@ impl super::VirtualFs {
         polled_prefixes: &HashSet<String>,
         inodes: &Arc<RwLock<InodeTable>>,
         negative_cache: &Arc<RwLock<HashMap<String, Instant>>>,
+        deferred_deletes: &Arc<super::DeferredDeletes>,
         invalidator: &Invalidator,
     ) {
+        // Paths with a deferred unlink delete are locally gone but still
+        // exist remotely until the last release(): hide them from the diff
+        // so the poll cannot resurrect them.
+        let mut remote_entries = remote_entries;
+        deferred_deletes.filter_entries(&mut remote_entries);
         let remote_map: HashMap<String, _> = remote_entries
             .iter()
             .filter(|e| e.entry_type == "file")
