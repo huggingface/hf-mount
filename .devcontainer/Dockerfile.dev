@@ -6,16 +6,20 @@ USER root
 # Development dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
+    bash-completion \
     ca-certificates \
     curl \
     fuse3 \
     git \
+    libfuse3-3 \
     libfuse3-dev \
+    make \
     nfs-common \
     perl \
     pkg-config \
     sudo \
-    && rm -rf /var/lib/apt/lists/*
+    xfslibs-dev \
+    && rm -rf /tmp/* /var/lib/apt/lists/*
 
 # Rust dev tooling required by the lint/format gate.
 RUN rustup component add rustfmt clippy
@@ -39,5 +43,6 @@ ENV PATH=${CARGO_HOME}/bin:${PATH}
 RUN mkdir -p "${CARGO_HOME}" && chown -R "${USERNAME}:${USERNAME}" "${CARGO_HOME}"
 # Use the system git client for the git-based crates (xet-core, fuser fork).
 ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
+ENV RUST_BACKTRACE=full
 
 USER ${USERNAME}
