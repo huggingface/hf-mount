@@ -137,7 +137,7 @@ pub struct VfsConfig {
 
 /// Lock ordering (acquire in this order to prevent deadlocks):
 ///
-///   dir_loading_locks[ino]      (tokio::sync::Mutex, per-directory)
+///   dir_loading_locks\[ino\]      (tokio::sync::Mutex, per-directory)
 ///     → inode_table             (RwLock, read or write)
 ///
 ///   staging.lock(ino)           (tokio::sync::Mutex, per-inode)
