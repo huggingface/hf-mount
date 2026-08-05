@@ -53,6 +53,14 @@ impl super::VirtualFs {
 
             match hub_client.probe_revision().await {
                 Ok(rev) => {
+                    // A successful probe means the Hub recovered: reset the
+                    // backoff even when the revision is unchanged, otherwise a
+                    // healthy-but-quiet mount stays at the max poll interval
+                    // until the next remote change.
+                    if backoff_exp > 0 {
+                        info!("Revision probe recovered, resetting backoff");
+                        backoff_exp = 0;
+                    }
                     if last_revision.as_ref() == Some(&rev) {
                         debug!("Revision unchanged ({rev}); skipping tree fan-out");
                         continue;

@@ -196,6 +196,12 @@ pub struct VirtualFs {
     /// Batched flush pipeline: dirty file writes + remote delete queue.
     /// Only present in advanced_writes mode.
     flush_manager: Option<flush::FlushManager>,
+    /// Ensures the streaming shutdown drain runs exactly once. shutdown() is
+    /// called multiple times by design (FUSE destroy, post-join safety net,
+    /// sidecar SIGTERM), and a drain aborted by its timeout leaves handles in
+    /// open_files — without this guard the second call would drain them for
+    /// another full timeout, doubling the advertised shutdown deadline.
+    streaming_drain_once: std::sync::Once,
     /// Background poll task handle, aborted in shutdown().
     poll_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Kernel cache invalidation callback. Set via `set_invalidator()` after mount.
@@ -306,6 +312,7 @@ impl VirtualFs {
         let vfs = Arc::new(Self {
             runtime,
             flush_shutdown_timeout: config.flush_shutdown_timeout,
+            streaming_drain_once: std::sync::Once::new(),
             read_fetch_timeout: config.read_fetch_timeout,
             hub_client,
             xet_sessions,
@@ -637,6 +644,11 @@ impl VirtualFs {
     /// each handle from `open_files`, which also makes a second `shutdown`
     /// call (destroy + signal-handler safety net) a natural no-op.
     fn drain_streaming_writes(&self) {
+        self.streaming_drain_once
+            .call_once(|| self.drain_streaming_writes_inner());
+    }
+
+    fn drain_streaming_writes_inner(&self) {
         let streaming: Vec<(u64, u64)> = {
             let files = self.open_files.read().expect("open_files poisoned");
             files
@@ -1434,28 +1446,20 @@ impl VirtualFs {
                 // errno — NOT be swallowed into ENOENT: caching a false
                 // negative here hides a freshly committed path (e.g. a _READY
                 // marker) for NEG_CACHE_TTL even after the Hub recovers.
-                let head = self
-                    .hub_client
-                    .head_file(&full_path)
-                    .await
-                    .map_err(|e| {
-                        debug!("HEAD miss-probe {} failed: {}", full_path, e);
-                        e.to_errno()
-                    })?;
+                let head = self.hub_client.head_file(&full_path).await.map_err(|e| {
+                    debug!("HEAD miss-probe {} failed: {}", full_path, e);
+                    e.to_errno()
+                })?;
                 if let Some(head) = head.filter(|h| h.size.is_some()) {
                     return self.insert_file_from_head(parent, name, &full_path, head);
                 }
                 // The resolve endpoint returns 404 for directories, so a HEAD
                 // miss could still be a remotely-added dir. Targeted listing
                 // catches that; non-empty result means the dir exists.
-                let entries = self
-                    .hub_client
-                    .list_tree(&full_path)
-                    .await
-                    .map_err(|e| {
-                        debug!("list miss-probe {} failed: {}", full_path, e);
-                        e.to_errno()
-                    })?;
+                let entries = self.hub_client.list_tree(&full_path).await.map_err(|e| {
+                    debug!("list miss-probe {} failed: {}", full_path, e);
+                    e.to_errno()
+                })?;
                 if !entries.is_empty() {
                     return self.insert_dir(parent, name, &full_path);
                 }

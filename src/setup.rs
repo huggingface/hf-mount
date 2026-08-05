@@ -308,6 +308,12 @@ pub fn init_tracing(daemon: bool) {
         // Larger ingestion blocks = fewer CDC calls
         ("HF_XET_DATA_INGESTION_BLOCK_SIZE", "16777216"),
     ] {
+        // xet-runtime consults HF_XET_FIXED_UPLOAD_CONCURRENCY only when the
+        // canonical AC variables are absent — defaulting the canonical names
+        // would silently turn a user-fixed concurrency into an adaptive one.
+        if k.contains("UPLOAD_CONCURRENCY") && std::env::var("HF_XET_FIXED_UPLOAD_CONCURRENCY").is_ok() {
+            continue;
+        }
         if std::env::var(k).is_err() {
             // SAFETY: called before any threads are spawned.
             unsafe { std::env::set_var(k, v) };
@@ -475,6 +481,14 @@ pub fn build_with_runtime(
 
     let advanced_writes = options.advanced_writes || options.overlay || (is_nfs && !read_only);
 
+    // A previous FUSE daemon may have died (OOM kill, crash) leaving a dead
+    // mount at the mount point: every stat() on it returns ENOTCONN, which
+    // would fail create_dir_all (below and in the overlay block) and the
+    // mount itself, crash-looping the restarted container until someone
+    // cleans the corpse up. Detach it so a fresh session can mount over a
+    // clean path. Must run before the overlay pre-mount fd is opened.
+    detach_dead_mount(&mount_point);
+
     // Overlay: open a pre-mount fd to the mount point directory. The fd is
     // held by OverlayBacking so overlay-local filesystem ops can stay rooted
     // at the covered directory after mount.
@@ -501,13 +515,6 @@ pub fn build_with_runtime(
 
     let uid = options.uid.unwrap_or_else(|| unsafe { libc::getuid() });
     let gid = options.gid.unwrap_or_else(|| unsafe { libc::getgid() });
-
-    // A previous FUSE daemon may have died (OOM kill, crash) leaving a dead
-    // mount at the mount point: every stat() on it returns ENOTCONN, which
-    // would fail create_dir_all and the mount itself, crash-looping the
-    // restarted container until someone cleans the corpse up. Detach it so a
-    // fresh session can mount over a clean path (incident 2026-08-05).
-    detach_dead_mount(&mount_point);
 
     // Ignore EEXIST: the directory may already exist from a previous (possibly
     // stale) mount. FUSE/NFS will fail at mount time if it's actually busy.
@@ -655,7 +662,10 @@ fn detach_dead_mount(path: &Path) {
     if !matches!(e.raw_os_error(), Some(libc::ENOTCONN) | Some(libc::EIO)) {
         return;
     }
-    warn!("Dead mount detected at {:?} ({}); detaching it before mounting", path, e);
+    warn!(
+        "Dead mount detected at {:?} ({}); detaching it before mounting",
+        path, e
+    );
     if !unmount_fuse(path) {
         warn!("Failed to detach dead mount at {:?}; mount may fail", path);
     }

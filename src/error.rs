@@ -41,9 +41,10 @@ impl Error {
             // so the client stops retrying into a quota wall instead of looping.
             Some(413 | 507) => libc::ENOSPC,
             Some(403) => libc::EACCES,
-            // Transient (rate limit, server timeout, 5xx overload): signal
-            // "try again" instead of a hard I/O failure.
-            Some(s) if is_retryable_status(s) => libc::EAGAIN,
+            // Transient (rate limit, server timeout, 5xx overload, transport
+            // connect/timeout): signal "try again" instead of a hard I/O
+            // failure.
+            _ if self.is_transient() => libc::EAGAIN,
             _ => libc::EIO,
         }
     }

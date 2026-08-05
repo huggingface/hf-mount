@@ -440,27 +440,28 @@ impl HubApiClient {
             SourceKind::Bucket { bucket_id } => {
                 let url = format!("{}/api/buckets/{}", endpoint, bucket_id);
                 let context = format!("resolve bucket {bucket_id}");
-                let resp = match send_with_retry(|| init_auth_get(&client, &url, token, &token_file), &context, false)
-                    .await
-                {
-                    Ok(r) => r,
-                    Err(err) => {
-                        // Common mistake: user passed a repo id to `bucket`. Probe the
-                        // repo APIs and, if one matches, surface a hint instead of the
-                        // raw 401 from the bucket endpoint. Skip the probe on transient
-                        // failures (rate limit, 5xx): it cannot succeed while the user
-                        // is being throttled, and startup retries would multiply its 3
-                        // extra requests into the very storm being waited out.
-                        if !err.is_transient()
-                            && let Some(repo_type) = probe_repo(&client, &endpoint, &bucket_id, token, &token_file).await {
-                            return Err(Error::hub(format!(
-                                "{bucket_id} is not a bucket, but it exists as a {repo_type}. \
+                let resp =
+                    match send_with_retry(|| init_auth_get(&client, &url, token, &token_file), &context, false).await {
+                        Ok(r) => r,
+                        Err(err) => {
+                            // Common mistake: user passed a repo id to `bucket`. Probe the
+                            // repo APIs and, if one matches, surface a hint instead of the
+                            // raw 401 from the bucket endpoint. Skip the probe on transient
+                            // failures (rate limit, 5xx): it cannot succeed while the user
+                            // is being throttled, and startup retries would multiply its 3
+                            // extra requests into the very storm being waited out.
+                            if !err.is_transient()
+                                && let Some(repo_type) =
+                                    probe_repo(&client, &endpoint, &bucket_id, token, &token_file).await
+                            {
+                                return Err(Error::hub(format!(
+                                    "{bucket_id} is not a bucket, but it exists as a {repo_type}. \
                                  Use `repo {bucket_id}` (read-only) instead of `bucket {bucket_id}`."
-                            )));
+                                )));
+                            }
+                            return Err(err);
                         }
-                        return Err(err);
-                    }
-                };
+                    };
                 let body: serde_json::Value = resp.json().await?;
                 let last_modified = body["updatedAt"].as_str().map(mtime_from_str).unwrap_or(UNIX_EPOCH);
                 (SourceKind::Bucket { bucket_id }, last_modified)

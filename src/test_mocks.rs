@@ -168,7 +168,11 @@ impl HubOps for MockHub {
         {
             let mut fail = self.list_tree_fail.lock().unwrap();
             if let Some((remaining, status)) = *fail {
-                *fail = if remaining > 1 { Some((remaining - 1, status)) } else { None };
+                *fail = if remaining > 1 {
+                    Some((remaining - 1, status))
+                } else {
+                    None
+                };
                 return Err(match status {
                     Some(s) => Error::hub_status(s, "mock list_tree failure"),
                     None => Error::hub("mock list_tree failure"),
