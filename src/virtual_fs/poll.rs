@@ -12,8 +12,10 @@ use super::inode::{self, InodeTable};
 use super::{InvalKind, Invalidator};
 
 /// Cap on the exponential-backoff multiplier applied to the poll interval
-/// when we keep getting 401s. With `interval = 30s` and `MAX_AUTH_BACKOFF_EXP = 6`,
-/// the max delay between polls becomes `30s * 2^6 = 32 min`.
+/// when we keep getting 401s (token expired) or 429s (rate limited — polling
+/// harder only feeds the storm and starves interactive lookups of quota).
+/// With `interval = 30s` and `MAX_AUTH_BACKOFF_EXP = 6`, the max delay
+/// between polls becomes `30s * 2^6 = 32 min`.
 const MAX_AUTH_BACKOFF_EXP: u32 = 6;
 
 impl super::VirtualFs {
@@ -52,10 +54,11 @@ impl super::VirtualFs {
                     last_revision = Some(rev);
                 }
                 Err(e) => {
-                    if matches!(e, Error::Hub { status: Some(401), .. }) {
+                    if matches!(e, Error::Hub { status: Some(401 | 429), .. }) {
                         auth_backoff_exp = (auth_backoff_exp + 1).min(MAX_AUTH_BACKOFF_EXP);
                         warn!(
-                            "Revision probe saw 401 Unauthorized; backing off next poll to {:?}",
+                            "Revision probe saw {}; backing off next poll to {:?}",
+                            e,
                             interval.saturating_mul(1u32 << auth_backoff_exp)
                         );
                         continue;
@@ -91,7 +94,7 @@ impl super::VirtualFs {
                         all_entries.extend(entries);
                     }
                     Err(e) => {
-                        if matches!(e, Error::Hub { status: Some(401), .. }) {
+                        if matches!(e, Error::Hub { status: Some(401 | 429), .. }) {
                             saw_auth_failure = true;
                         }
                         warn!("Remote poll failed for prefix '{prefix}': {e}");
@@ -102,7 +105,7 @@ impl super::VirtualFs {
             if saw_auth_failure {
                 auth_backoff_exp = (auth_backoff_exp + 1).min(MAX_AUTH_BACKOFF_EXP);
                 warn!(
-                    "Remote poll saw 401 Unauthorized; backing off next poll to {:?}",
+                    "Remote poll saw 401/429; backing off next poll to {:?}",
                     interval.saturating_mul(1u32 << auth_backoff_exp)
                 );
             } else if auth_backoff_exp > 0 {
