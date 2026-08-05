@@ -620,6 +620,49 @@ impl VirtualFs {
         if let Some(fm) = &self.flush_manager {
             let dirty = self.inode_table.read().expect("inodes poisoned").dirty_inos();
             fm.shutdown(dirty, &self.runtime, self.flush_shutdown_timeout);
+        } else if !self.read_only {
+            // Streaming mode has no flush manager, but an application killed
+            // by the same SIGTERM may still have open write handles with data
+            // already accepted by write(). Commit them (parity with the
+            // advanced-mode drain above) instead of exiting and silently
+            // dropping the bytes — the exit closes /dev/fuse, which aborts the
+            // FUSE connection under the writer.
+            let streaming: Vec<(u64, Arc<StreamingChannel>)> = {
+                let files = self.open_files.read().expect("open_files poisoned");
+                files
+                    .values()
+                    .filter_map(|f| match f {
+                        OpenFile::Streaming { ino, channel } => Some((*ino, channel.clone())),
+                        _ => None,
+                    })
+                    .collect()
+            };
+            if !streaming.is_empty() {
+                info!(
+                    "Draining {} in-flight streaming write(s) before shutdown (timeout {:?})",
+                    streaming.len(),
+                    self.flush_shutdown_timeout
+                );
+                let deadline = self.flush_shutdown_timeout;
+                flush::run_blocking(|| {
+                    self.runtime.block_on(async {
+                        let drain = async {
+                            for (ino, channel) in &streaming {
+                                if let Err(errno) = self.streaming_commit(*ino, channel).await {
+                                    error!("Shutdown drain failed for ino={}: errno {}", ino, errno);
+                                }
+                            }
+                        };
+                        if tokio::time::timeout(deadline, drain).await.is_err() {
+                            warn!(
+                                "Streaming drain exceeded shutdown timeout ({:?}); \
+                                 abandoning remaining in-flight write(s). Unflushed data is lost.",
+                                deadline
+                            );
+                        }
+                    });
+                });
+            }
         }
         info!("Flush loop finished, VFS shut down.");
     }
@@ -808,7 +851,11 @@ impl VirtualFs {
             Ok(entries) => entries,
             Err(e) => {
                 error!("Failed to list tree for prefix '{}': {}", prefix, e);
-                return Err(libc::EIO);
+                // Preserve the error semantics: a 429 after client-side retries
+                // must surface as EAGAIN (transient), not EIO — one rate-limited
+                // stat() aborting a whole distributed job because EIO reads as
+                // hard data loss (incident 2026-08-05).
+                return Err(e.to_errno());
             }
         };
 
@@ -1125,9 +1172,15 @@ impl VirtualFs {
         })?;
 
         // Bounded channel provides backpressure so a fast writer doesn't queue
-        // unbounded memory. 32 slots × ~128KB FUSE write = ~4MB max in-flight.
-        // blocking_send is safe here: FUSE threads are not tokio workers.
-        let (tx, rx) = tokio::sync::mpsc::channel::<WriteMsg>(32);
+        // unbounded memory. Slots are sized by the negotiated FUSE max_write
+        // (16 MiB, see fuse.rs set_max_write), NOT the typical ~128KB write:
+        // 8 slots × 16 MiB = 128 MiB ceiling per open write handle. Keep this
+        // small — under a stalled CAS the mount pod's RSS is this backlog plus
+        // xet-core's in-flight xorbs, and blowing past the pod's memory
+        // request gets the FUSE daemon OOM-killed mid-write (incident
+        // 2026-08-05). blocking_send is safe here: FUSE threads are not tokio
+        // workers.
+        let (tx, rx) = tokio::sync::mpsc::channel::<WriteMsg>(8);
         let error: Arc<std::sync::Mutex<Option<crate::error::Error>>> = Arc::new(std::sync::Mutex::new(None));
         self.runtime
             .spawn(streaming_worker(streaming_writer, rx, error.clone()));
@@ -1363,19 +1416,33 @@ impl VirtualFs {
                         .map(|e| self.make_vfs_attr(e))
                         .ok_or(libc::ENOENT);
                 }
-                // HEAD probe catches files added remotely.
-                if let Ok(Some(head)) = self.hub_client.head_file(&full_path).await
-                    && head.size.is_some()
-                {
-                    return self.insert_file_from_head(parent, name, &full_path, head);
+                // HEAD probe catches files added remotely. A transient probe
+                // failure (429 rate limit, 5xx, network) must surface as its
+                // errno — NOT be swallowed into ENOENT: caching a false
+                // negative here hides a freshly committed path (e.g. a _READY
+                // marker) for NEG_CACHE_TTL even after the Hub recovers.
+                match self.hub_client.head_file(&full_path).await {
+                    Ok(Some(head)) if head.size.is_some() => {
+                        return self.insert_file_from_head(parent, name, &full_path, head);
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        debug!("HEAD miss-probe {} failed: {}", full_path, e);
+                        return Err(e.to_errno());
+                    }
                 }
                 // The resolve endpoint returns 404 for directories, so a HEAD
                 // miss could still be a remotely-added dir. Targeted listing
                 // catches that; non-empty result means the dir exists.
-                if let Ok(entries) = self.hub_client.list_tree(&full_path).await
-                    && !entries.is_empty()
-                {
-                    return self.insert_dir(parent, name, &full_path);
+                match self.hub_client.list_tree(&full_path).await {
+                    Ok(entries) if !entries.is_empty() => {
+                        return self.insert_dir(parent, name, &full_path);
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        debug!("list miss-probe {} failed: {}", full_path, e);
+                        return Err(e.to_errno());
+                    }
                 }
                 self.negative_cache_insert(full_path);
                 return Err(libc::ENOENT);

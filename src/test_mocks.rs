@@ -22,6 +22,9 @@ pub struct MockHub {
     pub batch_log: Mutex<Vec<Vec<BatchOp>>>,
     batch_fail_count: AtomicU32,
     batch_barrier: Mutex<Option<Arc<tokio::sync::Barrier>>>,
+    /// Number of list_tree calls to fail, with the HTTP status carried by the error.
+    list_tree_fail_count: AtomicU32,
+    list_tree_fail_status: Mutex<Option<u16>>,
     head_fail: AtomicBool,
     download_fail: AtomicBool,
     source: SourceKind,
@@ -43,6 +46,8 @@ impl MockHub {
             batch_log: Mutex::new(Vec::new()),
             batch_fail_count: AtomicU32::new(0),
             batch_barrier: Mutex::new(None),
+            list_tree_fail_count: AtomicU32::new(0),
+            list_tree_fail_status: Mutex::new(None),
             head_fail: AtomicBool::new(false),
             download_fail: AtomicBool::new(false),
             source: SourceKind::Bucket {
@@ -63,6 +68,8 @@ impl MockHub {
             batch_log: Mutex::new(Vec::new()),
             batch_fail_count: AtomicU32::new(0),
             batch_barrier: Mutex::new(None),
+            list_tree_fail_count: AtomicU32::new(0),
+            list_tree_fail_status: Mutex::new(None),
             head_fail: AtomicBool::new(false),
             download_fail: AtomicBool::new(false),
             source: SourceKind::Repo {
@@ -128,6 +135,14 @@ impl MockHub {
         self.head_fail.store(true, Ordering::SeqCst);
     }
 
+    /// Make the next `n` list_tree calls fail. When `status` is set the error
+    /// carries that HTTP status (e.g. 429 to simulate Hub rate limiting after
+    /// client-side retries are exhausted).
+    pub fn fail_next_list_tree(&self, n: u32, status: Option<u16>) {
+        self.list_tree_fail_count.store(n, Ordering::SeqCst);
+        *self.list_tree_fail_status.lock().unwrap() = status;
+    }
+
     pub fn list_tree_call_count(&self) -> u32 {
         self.list_tree_calls.load(Ordering::SeqCst)
     }
@@ -165,6 +180,14 @@ impl MockHub {
 impl HubOps for MockHub {
     async fn list_tree(&self, prefix: &str) -> Result<Vec<TreeEntry>> {
         self.list_tree_calls.fetch_add(1, Ordering::SeqCst);
+        if self.list_tree_fail_count.load(Ordering::SeqCst) > 0 {
+            self.list_tree_fail_count.fetch_sub(1, Ordering::SeqCst);
+            let status = *self.list_tree_fail_status.lock().unwrap();
+            return Err(match status {
+                Some(s) => Error::hub_status(s, "mock list_tree failure"),
+                None => Error::hub("mock list_tree failure"),
+            });
+        }
         let tree = self.tree.lock().unwrap();
         let prefix_slash = if prefix.is_empty() {
             String::new()
@@ -284,6 +307,9 @@ pub struct MockXet {
     upload_fail: AtomicBool,
     download_fail: AtomicBool,
     writer_fail_after: AtomicU64,
+    /// When true, streaming writers stall forever in finish() (simulates a
+    /// CAS xorb upload that never completes, e.g. server 408-kills the body).
+    stall_writer_finish: AtomicBool,
     /// Number of range download calls that should fail before succeeding.
     range_fail_count: AtomicU32,
     /// Number of range download calls that should return empty before succeeding.
@@ -318,6 +344,7 @@ impl MockXet {
             upload_fail: AtomicBool::new(false),
             download_fail: AtomicBool::new(false),
             writer_fail_after: AtomicU64::new(u64::MAX),
+            stall_writer_finish: AtomicBool::new(false),
             range_fail_count: AtomicU32::new(0),
             range_empty_count: AtomicU32::new(0),
             stall_stream: AtomicBool::new(false),
@@ -356,6 +383,11 @@ impl MockXet {
         self.writer_fail_after.store(bytes, Ordering::SeqCst);
     }
 
+    /// Make all streaming writers stall forever in finish().
+    pub fn stall_writer_finish(&self) {
+        self.stall_writer_finish.store(true, Ordering::SeqCst);
+    }
+
     /// Make the next N range downloads return Err before succeeding.
     pub fn fail_range_downloads(&self, n: u32) {
         self.range_fail_count.store(n, Ordering::SeqCst);
@@ -388,6 +420,7 @@ impl XetOps for MockXet {
             data: Vec::new(),
             hash: self.next_hash_string(),
             fail_after,
+            stall_finish: self.stall_writer_finish.load(Ordering::SeqCst),
         }))
     }
 
@@ -482,6 +515,7 @@ pub struct MockStreamingWriter {
     data: Vec<u8>,
     hash: String,
     fail_after: u64,
+    stall_finish: bool,
 }
 
 #[async_trait::async_trait]
@@ -495,6 +529,10 @@ impl StreamingWriterOps for MockStreamingWriter {
     }
 
     async fn finish_boxed(self: Box<Self>) -> Result<XetFileInfo> {
+        if self.stall_finish {
+            // Simulate a CAS upload that never completes.
+            std::future::pending::<()>().await;
+        }
         let size = self.data.len() as u64;
         Ok(XetFileInfo::new(self.hash.clone(), size))
     }
