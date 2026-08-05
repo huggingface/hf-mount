@@ -1,6 +1,7 @@
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use clap::Parser;
 use tracing::{info, warn};
@@ -295,8 +296,15 @@ pub fn init_tracing(daemon: bool) {
         // for minutes — a long value here is what let stalled reads accumulate
         // and wedge the mount.
         ("HF_XET_CLIENT_READ_TIMEOUT", "30"),
-        // Upload tuning: skip slow adaptive concurrency ramp-up
-        ("HF_XET_CLIENT_AC_INITIAL_UPLOAD_CONCURRENCY", "16"),
+        // Upload tuning: skip slow adaptive concurrency ramp-up, but CAP the
+        // adaptive controller's upper bound. Each in-flight upload pins one
+        // serialized ~64MiB xorb in memory and permits are acquired only
+        // after serialization, so xet-core's default max of 64 lets a stalled
+        // CAS pin up to ~4GiB — which OOM-kills the FUSE daemon mid-write
+        // (incident 2026-08-05). 8 × 64MiB bounds that backlog at ~512MiB
+        // while still saturating healthy links.
+        ("HF_XET_CLIENT_AC_INITIAL_UPLOAD_CONCURRENCY", "8"),
+        ("HF_XET_CLIENT_AC_MAX_UPLOAD_CONCURRENCY", "8"),
         // Larger ingestion blocks = fewer CDC calls
         ("HF_XET_DATA_INGESTION_BLOCK_SIZE", "16777216"),
     ] {
@@ -375,14 +383,16 @@ pub fn build_with_runtime(
 
     let backend = if is_nfs { "nfs" } else { "fuse" };
     let hub_client = runtime.block_on(async {
-        HubApiClient::from_source(
-            &options.hub_endpoint,
-            options.hf_token.as_deref(),
-            options.token_file.clone(),
-            source_kind,
-            path_prefix,
-            backend,
-        )
+        retry_startup("Hub client init", || {
+            HubApiClient::from_source(
+                &options.hub_endpoint,
+                options.hf_token.as_deref(),
+                options.token_file.clone(),
+                source_kind.clone(),
+                path_prefix.clone(),
+                backend,
+            )
+        })
         .await
         .unwrap_or_else(|e| panic!("Failed to initialize Hub client: {e}"))
     });
@@ -491,6 +501,13 @@ pub fn build_with_runtime(
 
     let uid = options.uid.unwrap_or_else(|| unsafe { libc::getuid() });
     let gid = options.gid.unwrap_or_else(|| unsafe { libc::getgid() });
+
+    // A previous FUSE daemon may have died (OOM kill, crash) leaving a dead
+    // mount at the mount point: every stat() on it returns ENOTCONN, which
+    // would fail create_dir_all and the mount itself, crash-looping the
+    // restarted container until someone cleans the corpse up. Detach it so a
+    // fresh session can mount over a clean path (incident 2026-08-05).
+    detach_dead_mount(&mount_point);
 
     // Ignore EEXIST: the directory may already exist from a previous (possibly
     // stale) mount. FUSE/NFS will fail at mount time if it's actually busy.
@@ -628,13 +645,75 @@ pub fn raise_fd_limit() {
     }
 }
 
+/// Detect and lazily detach a dead FUSE mount left at `path` by a crashed
+/// predecessor. A healthy path stats fine; a dead FUSE mountpoint fails with
+/// ENOTCONN (or EIO). MNT_DETACH is safe here: bind mounts made from this
+/// path elsewhere reference the superblock directly and are unaffected.
+#[cfg(target_os = "linux")]
+fn detach_dead_mount(path: &Path) {
+    let Err(e) = std::fs::metadata(path) else { return };
+    if !matches!(e.raw_os_error(), Some(libc::ENOTCONN) | Some(libc::EIO)) {
+        return;
+    }
+    warn!("Dead mount detected at {:?} ({}); detaching it before mounting", path, e);
+    let Ok(cpath) = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()) else {
+        return;
+    };
+    // SAFETY: plain libc call with a valid NUL-terminated path.
+    if unsafe { libc::umount2(cpath.as_ptr(), libc::MNT_DETACH) } != 0 {
+        warn!(
+            "umount2(MNT_DETACH) failed for {:?}: {}",
+            path,
+            std::io::Error::last_os_error()
+        );
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn detach_dead_mount(_path: &Path) {}
+
+/// Retry window for Hub calls made during mount startup, before the FUSE
+/// mount exists. Under a per-user 429 storm a single `send_with_retry` (2
+/// tries, RateLimit hint capped at 30s) can be outlasted by the storm;
+/// panicking here crash-loops the mount pod/sidecar and resets all startup
+/// progress. Keep retrying transient failures for up to this window instead.
+const STARTUP_RETRY_DEADLINE: Duration = Duration::from_secs(300);
+
+async fn retry_startup<T, Fut>(what: &str, mut attempt: impl FnMut() -> Fut) -> crate::error::Result<T>
+where
+    Fut: std::future::Future<Output = crate::error::Result<T>>,
+{
+    let start = std::time::Instant::now();
+    let mut delay = Duration::from_secs(2);
+    loop {
+        match attempt().await {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                let transient = match e.status() {
+                    Some(s) => crate::error::is_retryable_status(s),
+                    None => matches!(e, crate::error::Error::Http(_)),
+                };
+                if !transient || start.elapsed() >= STARTUP_RETRY_DEADLINE {
+                    return Err(e);
+                }
+                warn!(
+                    "{what}: transient startup failure ({e}); retrying for up to {:?} more",
+                    STARTUP_RETRY_DEADLINE.saturating_sub(start.elapsed())
+                );
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(Duration::from_secs(30));
+            }
+        }
+    }
+}
+
 fn build_cas_config(
     ctx: &XetContext,
     runtime: &tokio::runtime::Handle,
     refresher: &Arc<HubTokenRefresher>,
 ) -> Arc<TranslatorConfig> {
     let jwt = runtime
-        .block_on(refresher.fetch_initial())
+        .block_on(retry_startup("storage token", || refresher.fetch_initial()))
         .unwrap_or_else(|e| panic!("Failed to get storage token: {e}"));
     info!("Got storage token for endpoint: {}", jwt.cas_url);
     Arc::new(
