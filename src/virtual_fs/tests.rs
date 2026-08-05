@@ -5818,18 +5818,25 @@ fn repro_streaming_flush_has_no_timeout_when_cas_stalls() {
     });
 }
 
-/// Failure 1 (incident 2026-08-05, mechanism part 2): on SIGTERM the sidecar
-/// calls `vfs.shutdown()` then `exit(0)`. Both write modes must drain data
-/// the application already wrote before the process exits — otherwise
-/// exit(0) aborts the FUSE connection under the writer and silently drops
-/// the bytes.
-#[test]
-fn shutdown_drains_inflight_streaming_write() {
-    // Streaming mode (the incident config: advanced_writes=false).
+/// On SIGTERM the sidecar calls `vfs.shutdown()` then `exit(0)`. Both write
+/// modes must drain data the application already wrote before the process
+/// exits — otherwise exit(0) aborts the FUSE connection under the writer and
+/// silently drops the bytes. Exercises open-but-unclosed handles (the app is
+/// killed by the same signal and never calls close()).
+fn assert_shutdown_drains_inflight_write(advanced: bool) {
     let hub = MockHub::new();
     hub.add_file("ckpt.distcp", 100, Some("hash1"), None);
     let xet = MockXet::new();
-    let (rt, vfs) = vfs_simple(&hub, &xet);
+    let rt = new_runtime();
+    let vfs = make_test_vfs(
+        hub.clone(),
+        xet.clone(),
+        TestOpts {
+            advanced_writes: advanced,
+            ..Default::default()
+        },
+        &rt,
+    );
     rt.block_on(async {
         let ino = vfs.lookup(ROOT_INODE, "ckpt.distcp").await.unwrap().ino;
         let fh = vfs.open(ino, true, true, Some(1)).await.unwrap();
@@ -5838,23 +5845,16 @@ fn shutdown_drains_inflight_streaming_write() {
     vfs.shutdown();
     assert!(
         !hub.take_batch_log().is_empty(),
-        "streaming shutdown must commit the in-flight write"
+        "shutdown (advanced={advanced}) must commit the in-flight write"
     );
-    drop(rt);
+}
 
-    // Advanced mode: identical application behavior, shutdown drains.
-    let hub2 = MockHub::new();
-    hub2.add_file("ckpt.distcp", 100, Some("hash1"), None);
-    let xet2 = MockXet::new();
-    let (rt2, vfs2) = vfs_advanced(&hub2, &xet2);
-    rt2.block_on(async {
-        let ino = vfs2.lookup(ROOT_INODE, "ckpt.distcp").await.unwrap().ino;
-        let fh = vfs2.open(ino, true, true, Some(1)).await.unwrap();
-        write_blocking(&vfs2, ino, fh, 0, b"checkpoint bytes").await.unwrap();
-    });
-    vfs2.shutdown();
-    assert!(
-        !hub2.take_batch_log().is_empty(),
-        "advanced-mode shutdown should drain and commit the dirty file"
-    );
+#[test]
+fn shutdown_drains_inflight_streaming_write() {
+    assert_shutdown_drains_inflight_write(false);
+}
+
+#[test]
+fn shutdown_drains_inflight_advanced_write() {
+    assert_shutdown_drains_inflight_write(true);
 }

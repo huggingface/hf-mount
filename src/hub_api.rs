@@ -267,7 +267,7 @@ pub fn split_path_prefix(raw: &str) -> std::result::Result<(&str, &str), &'stati
     }
 }
 
-fn retry_delay(attempt: u32) -> std::time::Duration {
+pub(crate) fn retry_delay(attempt: u32) -> std::time::Duration {
     debug_assert!(attempt > 0, "retry_delay called with attempt=0");
     std::time::Duration::from_millis(500 * 2u64.pow(attempt - 1))
 }
@@ -447,8 +447,12 @@ impl HubApiClient {
                     Err(err) => {
                         // Common mistake: user passed a repo id to `bucket`. Probe the
                         // repo APIs and, if one matches, surface a hint instead of the
-                        // raw 401 from the bucket endpoint.
-                        if let Some(repo_type) = probe_repo(&client, &endpoint, &bucket_id, token, &token_file).await {
+                        // raw 401 from the bucket endpoint. Skip the probe on transient
+                        // failures (rate limit, 5xx): it cannot succeed while the user
+                        // is being throttled, and startup retries would multiply its 3
+                        // extra requests into the very storm being waited out.
+                        if !err.is_transient()
+                            && let Some(repo_type) = probe_repo(&client, &endpoint, &bucket_id, token, &token_file).await {
                             return Err(Error::hub(format!(
                                 "{bucket_id} is not a bucket, but it exists as a {repo_type}. \
                                  Use `repo {bucket_id}` (read-only) instead of `bucket {bucket_id}`."

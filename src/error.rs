@@ -41,10 +41,22 @@ impl Error {
             // so the client stops retrying into a quota wall instead of looping.
             Some(413 | 507) => libc::ENOSPC,
             Some(403) => libc::EACCES,
-            // Rate-limited / server request timeout: transient, signal "try
-            // again" instead of a hard I/O failure (matches is_retryable_status).
-            Some(408 | 429) => libc::EAGAIN,
+            // Transient (rate limit, server timeout, 5xx overload): signal
+            // "try again" instead of a hard I/O failure.
+            Some(s) if is_retryable_status(s) => libc::EAGAIN,
             _ => libc::EIO,
+        }
+    }
+
+    /// Whether retrying this error can plausibly succeed. Single source of
+    /// truth for "transient": HTTP statuses defer to `is_retryable_status`;
+    /// transport errors are transient only for connect/timeout failures
+    /// (mirrors `send_with_retry` — decode or TLS failures are permanent).
+    pub fn is_transient(&self) -> bool {
+        match self {
+            Self::Hub { status: Some(s), .. } => is_retryable_status(*s),
+            Self::Http(e) => e.is_timeout() || e.is_connect(),
+            _ => false,
         }
     }
 }
@@ -122,8 +134,9 @@ mod tests {
         assert_eq!(Error::hub_status(403, "forbidden").to_errno(), libc::EACCES);
         assert_eq!(Error::hub_status(429, "rate limited").to_errno(), libc::EAGAIN);
         assert_eq!(Error::hub_status(408, "request timeout").to_errno(), libc::EAGAIN);
-        // Unknown status and statusless errors stay generic.
-        assert_eq!(Error::hub_status(500, "server error").to_errno(), libc::EIO);
+        assert_eq!(Error::hub_status(503, "overloaded").to_errno(), libc::EAGAIN);
+        // Non-retryable status and statusless errors stay generic.
+        assert_eq!(Error::hub_status(501, "not implemented").to_errno(), libc::EIO);
         assert_eq!(Error::hub("no status").to_errno(), libc::EIO);
         assert_eq!(Error::Xet("opaque".into()).to_errno(), libc::EIO);
     }

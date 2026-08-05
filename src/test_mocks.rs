@@ -22,9 +22,8 @@ pub struct MockHub {
     pub batch_log: Mutex<Vec<Vec<BatchOp>>>,
     batch_fail_count: AtomicU32,
     batch_barrier: Mutex<Option<Arc<tokio::sync::Barrier>>>,
-    /// Number of list_tree calls to fail, with the HTTP status carried by the error.
-    list_tree_fail_count: AtomicU32,
-    list_tree_fail_status: Mutex<Option<u16>>,
+    /// Remaining list_tree calls to fail + the HTTP status carried by the error.
+    list_tree_fail: Mutex<Option<(u32, Option<u16>)>>,
     head_fail: AtomicBool,
     download_fail: AtomicBool,
     source: SourceKind,
@@ -39,20 +38,17 @@ pub struct MockHub {
 
 #[allow(dead_code)]
 impl MockHub {
-    pub fn new() -> Arc<Self> {
+    fn with_source(source: SourceKind) -> Arc<Self> {
         Arc::new(Self {
             tree: Mutex::new(Vec::new()),
             head_responses: Mutex::new(HashMap::new()),
             batch_log: Mutex::new(Vec::new()),
             batch_fail_count: AtomicU32::new(0),
             batch_barrier: Mutex::new(None),
-            list_tree_fail_count: AtomicU32::new(0),
-            list_tree_fail_status: Mutex::new(None),
+            list_tree_fail: Mutex::new(None),
             head_fail: AtomicBool::new(false),
             download_fail: AtomicBool::new(false),
-            source: SourceKind::Bucket {
-                bucket_id: "test-bucket".to_string(),
-            },
+            source,
             default_mtime: UNIX_EPOCH,
             list_tree_calls: AtomicU32::new(0),
             head_file_calls: AtomicU32::new(0),
@@ -61,27 +57,17 @@ impl MockHub {
         })
     }
 
+    pub fn new() -> Arc<Self> {
+        Self::with_source(SourceKind::Bucket {
+            bucket_id: "test-bucket".to_string(),
+        })
+    }
+
     pub fn new_repo() -> Arc<Self> {
-        Arc::new(Self {
-            tree: Mutex::new(Vec::new()),
-            head_responses: Mutex::new(HashMap::new()),
-            batch_log: Mutex::new(Vec::new()),
-            batch_fail_count: AtomicU32::new(0),
-            batch_barrier: Mutex::new(None),
-            list_tree_fail_count: AtomicU32::new(0),
-            list_tree_fail_status: Mutex::new(None),
-            head_fail: AtomicBool::new(false),
-            download_fail: AtomicBool::new(false),
-            source: SourceKind::Repo {
-                repo_id: "test/repo".to_string(),
-                repo_type: crate::hub_api::RepoType::Model,
-                revision: "main".to_string(),
-            },
-            default_mtime: UNIX_EPOCH,
-            list_tree_calls: AtomicU32::new(0),
-            head_file_calls: AtomicU32::new(0),
-            probe_revision_calls: AtomicU32::new(0),
-            revision: Mutex::new(Ok("rev-0".to_string())),
+        Self::with_source(SourceKind::Repo {
+            repo_id: "test/repo".to_string(),
+            repo_type: crate::hub_api::RepoType::Model,
+            revision: "main".to_string(),
         })
     }
 
@@ -139,8 +125,7 @@ impl MockHub {
     /// carries that HTTP status (e.g. 429 to simulate Hub rate limiting after
     /// client-side retries are exhausted).
     pub fn fail_next_list_tree(&self, n: u32, status: Option<u16>) {
-        self.list_tree_fail_count.store(n, Ordering::SeqCst);
-        *self.list_tree_fail_status.lock().unwrap() = status;
+        *self.list_tree_fail.lock().unwrap() = Some((n, status));
     }
 
     pub fn list_tree_call_count(&self) -> u32 {
@@ -180,13 +165,15 @@ impl MockHub {
 impl HubOps for MockHub {
     async fn list_tree(&self, prefix: &str) -> Result<Vec<TreeEntry>> {
         self.list_tree_calls.fetch_add(1, Ordering::SeqCst);
-        if self.list_tree_fail_count.load(Ordering::SeqCst) > 0 {
-            self.list_tree_fail_count.fetch_sub(1, Ordering::SeqCst);
-            let status = *self.list_tree_fail_status.lock().unwrap();
-            return Err(match status {
-                Some(s) => Error::hub_status(s, "mock list_tree failure"),
-                None => Error::hub("mock list_tree failure"),
-            });
+        {
+            let mut fail = self.list_tree_fail.lock().unwrap();
+            if let Some((remaining, status)) = *fail {
+                *fail = if remaining > 1 { Some((remaining - 1, status)) } else { None };
+                return Err(match status {
+                    Some(s) => Error::hub_status(s, "mock list_tree failure"),
+                    None => Error::hub("mock list_tree failure"),
+                });
+            }
         }
         let tree = self.tree.lock().unwrap();
         let prefix_slash = if prefix.is_empty() {

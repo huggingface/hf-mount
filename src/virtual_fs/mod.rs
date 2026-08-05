@@ -621,50 +621,63 @@ impl VirtualFs {
             let dirty = self.inode_table.read().expect("inodes poisoned").dirty_inos();
             fm.shutdown(dirty, &self.runtime, self.flush_shutdown_timeout);
         } else if !self.read_only {
-            // Streaming mode has no flush manager, but an application killed
-            // by the same SIGTERM may still have open write handles with data
-            // already accepted by write(). Commit them (parity with the
-            // advanced-mode drain above) instead of exiting and silently
-            // dropping the bytes — the exit closes /dev/fuse, which aborts the
-            // FUSE connection under the writer.
-            let streaming: Vec<(u64, Arc<StreamingChannel>)> = {
-                let files = self.open_files.read().expect("open_files poisoned");
-                files
-                    .values()
-                    .filter_map(|f| match f {
-                        OpenFile::Streaming { ino, channel } => Some((*ino, channel.clone())),
-                        _ => None,
-                    })
-                    .collect()
-            };
-            if !streaming.is_empty() {
-                info!(
-                    "Draining {} in-flight streaming write(s) before shutdown (timeout {:?})",
-                    streaming.len(),
-                    self.flush_shutdown_timeout
-                );
-                let deadline = self.flush_shutdown_timeout;
-                flush::run_blocking(|| {
-                    self.runtime.block_on(async {
-                        let drain = async {
-                            for (ino, channel) in &streaming {
-                                if let Err(errno) = self.streaming_commit(*ino, channel).await {
-                                    error!("Shutdown drain failed for ino={}: errno {}", ino, errno);
-                                }
-                            }
-                        };
-                        if tokio::time::timeout(deadline, drain).await.is_err() {
-                            warn!(
-                                "Streaming drain exceeded shutdown timeout ({:?}); \
-                                 abandoning remaining in-flight write(s). Unflushed data is lost.",
-                                deadline
-                            );
-                        }
-                    });
-                });
-            }
+            self.drain_streaming_writes();
         }
         info!("Flush loop finished, VFS shut down.");
+    }
+
+    /// Streaming mode has no flush manager, but an application killed by the
+    /// same SIGTERM may still have open write handles with data already
+    /// accepted by write(). Commit them (parity with the advanced-mode drain
+    /// in `shutdown`) instead of exiting and silently dropping the bytes —
+    /// the exit closes /dev/fuse, which aborts the FUSE connection under the
+    /// writer. Goes through `flush` + `release` so the normal commit-state
+    /// bookkeeping applies (already-committed handles are no-ops, failures
+    /// revert the inode), mirroring the NFS shutdown drain. `release` removes
+    /// each handle from `open_files`, which also makes a second `shutdown`
+    /// call (destroy + signal-handler safety net) a natural no-op.
+    fn drain_streaming_writes(&self) {
+        let streaming: Vec<(u64, u64)> = {
+            let files = self.open_files.read().expect("open_files poisoned");
+            files
+                .iter()
+                .filter_map(|(fh, f)| match f {
+                    OpenFile::Streaming { ino, .. } => Some((*ino, *fh)),
+                    _ => None,
+                })
+                .collect()
+        };
+        if streaming.is_empty() {
+            return;
+        }
+        info!(
+            "Draining {} in-flight streaming write(s) before shutdown (timeout {:?})",
+            streaming.len(),
+            self.flush_shutdown_timeout
+        );
+        let deadline = self.flush_shutdown_timeout;
+        flush::run_blocking(|| {
+            self.runtime.block_on(async {
+                // Handles are independent (one worker + CAS session each):
+                // drain them concurrently so N handles fit the same deadline
+                // as one.
+                let drain = futures::future::join_all(streaming.iter().map(|&(ino, fh)| async move {
+                    if let Err(errno) = self.flush(ino, fh, None).await {
+                        error!("Shutdown drain flush failed for ino={}: errno {}", ino, errno);
+                    }
+                    if let Err(errno) = self.release(fh).await {
+                        error!("Shutdown drain release failed for fh={}: errno {}", fh, errno);
+                    }
+                }));
+                if tokio::time::timeout(deadline, drain).await.is_err() {
+                    warn!(
+                        "Streaming drain exceeded shutdown timeout ({:?}); \
+                         abandoning remaining in-flight write(s). Unflushed data is lost.",
+                        deadline
+                    );
+                }
+            });
+        });
     }
 
     // ── Helpers ─────────────────────────────────────────────────────────
@@ -1421,28 +1434,30 @@ impl VirtualFs {
                 // errno — NOT be swallowed into ENOENT: caching a false
                 // negative here hides a freshly committed path (e.g. a _READY
                 // marker) for NEG_CACHE_TTL even after the Hub recovers.
-                match self.hub_client.head_file(&full_path).await {
-                    Ok(Some(head)) if head.size.is_some() => {
-                        return self.insert_file_from_head(parent, name, &full_path, head);
-                    }
-                    Ok(_) => {}
-                    Err(e) => {
+                let head = self
+                    .hub_client
+                    .head_file(&full_path)
+                    .await
+                    .map_err(|e| {
                         debug!("HEAD miss-probe {} failed: {}", full_path, e);
-                        return Err(e.to_errno());
-                    }
+                        e.to_errno()
+                    })?;
+                if let Some(head) = head.filter(|h| h.size.is_some()) {
+                    return self.insert_file_from_head(parent, name, &full_path, head);
                 }
                 // The resolve endpoint returns 404 for directories, so a HEAD
                 // miss could still be a remotely-added dir. Targeted listing
                 // catches that; non-empty result means the dir exists.
-                match self.hub_client.list_tree(&full_path).await {
-                    Ok(entries) if !entries.is_empty() => {
-                        return self.insert_dir(parent, name, &full_path);
-                    }
-                    Ok(_) => {}
-                    Err(e) => {
+                let entries = self
+                    .hub_client
+                    .list_tree(&full_path)
+                    .await
+                    .map_err(|e| {
                         debug!("list miss-probe {} failed: {}", full_path, e);
-                        return Err(e.to_errno());
-                    }
+                        e.to_errno()
+                    })?;
+                if !entries.is_empty() {
+                    return self.insert_dir(parent, name, &full_path);
                 }
                 self.negative_cache_insert(full_path);
                 return Err(libc::ENOENT);
@@ -1478,6 +1493,7 @@ impl VirtualFs {
         // Resolve the single requested path via HEAD instead of listing the
         // whole parent — for point-access workloads (no `readdir`) this keeps
         // the inode table scoped to what the caller actually touches.
+        let mut head_probe_errored = false;
         match self.hub_client.head_file(&full_path).await {
             // Without size, `open_readonly` would take the empty-file shortcut
             // and expose a zero-byte file. Fall back to list_tree which has
@@ -1488,7 +1504,10 @@ impl VirtualFs {
             // 404 may mean "doesn't exist" or "it's a directory" (the resolve
             // endpoint only handles files), so the listing has the final word.
             Ok(_) => {}
-            Err(e) => debug!("HEAD lookup {} failed, falling back to list: {}", full_path, e),
+            Err(e) => {
+                debug!("HEAD lookup {} failed, falling back to list: {}", full_path, e);
+                head_probe_errored = true;
+            }
         }
 
         self.ensure_children_loaded(parent).await?;
@@ -1498,7 +1517,15 @@ impl VirtualFs {
             Some(entry) => Ok(self.make_vfs_attr(entry)),
             None => {
                 drop(inodes);
-                self.negative_cache_insert(full_path);
+                // Only cache the negative result when the HEAD probe was
+                // authoritative. If it errored (e.g. rate limited) and
+                // ensure_children_loaded returned early because a concurrent
+                // task had already loaded the listing, the miss may predate a
+                // remote commit — caching it would hide the path for
+                // NEG_CACHE_TTL after the Hub recovers.
+                if !head_probe_errored {
+                    self.negative_cache_insert(full_path);
+                }
                 Err(libc::ENOENT)
             }
         }
@@ -3081,7 +3108,7 @@ impl VirtualFs {
                 "link: failed to commit {} as alias of {}: {}",
                 new_full_path, source_path, e
             );
-            return Err(libc::EIO);
+            return Err(e.to_errno());
         }
 
         self.negative_cache_remove(&new_full_path);
@@ -3168,7 +3195,7 @@ impl VirtualFs {
                 .await
             {
                 error!("Remote delete failed for {}: {}", full_path, e);
-                return Err(libc::EIO);
+                return Err(e.to_errno());
             }
         }
 
@@ -3653,7 +3680,7 @@ impl VirtualFs {
         );
         if let Err(e) = self.hub_client.batch_operations(&ops).await {
             error!("Failed to rename {} -> {}: {}", info.old_path, info.new_full_path, e);
-            return Err(libc::EIO);
+            return Err(e.to_errno());
         }
         debug!("rename_remote: success");
         Ok(true)

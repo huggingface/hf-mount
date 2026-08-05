@@ -647,30 +647,19 @@ pub fn raise_fd_limit() {
 
 /// Detect and lazily detach a dead FUSE mount left at `path` by a crashed
 /// predecessor. A healthy path stats fine; a dead FUSE mountpoint fails with
-/// ENOTCONN (or EIO). MNT_DETACH is safe here: bind mounts made from this
-/// path elsewhere reference the superblock directly and are unaffected.
-#[cfg(target_os = "linux")]
+/// ENOTCONN (or EIO). Detaching is safe for consumers: bind mounts made from
+/// this path reference the superblock directly and keep working (validated
+/// e2e — app-pod binds survive the detach and receive the repaired mount).
 fn detach_dead_mount(path: &Path) {
     let Err(e) = std::fs::metadata(path) else { return };
     if !matches!(e.raw_os_error(), Some(libc::ENOTCONN) | Some(libc::EIO)) {
         return;
     }
     warn!("Dead mount detected at {:?} ({}); detaching it before mounting", path, e);
-    let Ok(cpath) = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()) else {
-        return;
-    };
-    // SAFETY: plain libc call with a valid NUL-terminated path.
-    if unsafe { libc::umount2(cpath.as_ptr(), libc::MNT_DETACH) } != 0 {
-        warn!(
-            "umount2(MNT_DETACH) failed for {:?}: {}",
-            path,
-            std::io::Error::last_os_error()
-        );
+    if !unmount_fuse(path) {
+        warn!("Failed to detach dead mount at {:?}; mount may fail", path);
     }
 }
-
-#[cfg(not(target_os = "linux"))]
-fn detach_dead_mount(_path: &Path) {}
 
 /// Retry window for Hub calls made during mount startup, before the FUSE
 /// mount exists. Under a per-user 429 storm a single `send_with_retry` (2
@@ -679,29 +668,25 @@ fn detach_dead_mount(_path: &Path) {}
 /// progress. Keep retrying transient failures for up to this window instead.
 const STARTUP_RETRY_DEADLINE: Duration = Duration::from_secs(300);
 
-async fn retry_startup<T, Fut>(what: &str, mut attempt: impl FnMut() -> Fut) -> crate::error::Result<T>
+async fn retry_startup<T, Fut>(what: &str, attempt: impl Fn() -> Fut) -> crate::error::Result<T>
 where
     Fut: std::future::Future<Output = crate::error::Result<T>>,
 {
     let start = std::time::Instant::now();
-    let mut delay = Duration::from_secs(2);
+    let mut attempt_no: u32 = 0;
     loop {
         match attempt().await {
             Ok(v) => return Ok(v),
             Err(e) => {
-                let transient = match e.status() {
-                    Some(s) => crate::error::is_retryable_status(s),
-                    None => matches!(e, crate::error::Error::Http(_)),
-                };
-                if !transient || start.elapsed() >= STARTUP_RETRY_DEADLINE {
+                if !e.is_transient() || start.elapsed() >= STARTUP_RETRY_DEADLINE {
                     return Err(e);
                 }
+                attempt_no += 1;
                 warn!(
                     "{what}: transient startup failure ({e}); retrying for up to {:?} more",
                     STARTUP_RETRY_DEADLINE.saturating_sub(start.elapsed())
                 );
-                tokio::time::sleep(delay).await;
-                delay = (delay * 2).min(Duration::from_secs(30));
+                tokio::time::sleep(crate::hub_api::retry_delay(attempt_no).min(Duration::from_secs(30))).await;
             }
         }
     }
@@ -726,4 +711,52 @@ fn build_cas_config(
         )
         .unwrap_or_else(|e| panic!("Failed to build TranslatorConfig: {e}")),
     )
+}
+
+use std::process::Command;
+
+pub(crate) fn unmount_fuse(mount_point: &Path) -> bool {
+    use std::ffi::CString;
+
+    let c_path = CString::new(mount_point.to_string_lossy().as_bytes()).ok();
+
+    // Try libc unmount first.
+    if let Some(ref c_path) = c_path {
+        #[cfg(target_os = "linux")]
+        {
+            // MNT_DETACH: lazy unmount, detaches immediately.
+            if unsafe { libc::umount2(c_path.as_ptr(), libc::MNT_DETACH) } == 0 {
+                return true;
+            }
+        }
+        #[cfg(target_os = "macos")]
+        {
+            // MNT_FORCE: force unmount even with open files.
+            if unsafe { libc::unmount(c_path.as_ptr(), libc::MNT_FORCE) } == 0 {
+                return true;
+            }
+        }
+    }
+
+    // Fallback: external command. Try fusermount3 first (FUSE3), then fusermount.
+    #[cfg(target_os = "linux")]
+    let cmd_ok = Command::new("fusermount3")
+        .args(["-u", "-z", &mount_point.to_string_lossy()])
+        .status()
+        .is_ok_and(|s| s.success())
+        || Command::new("fusermount")
+            .args(["-u", "-z", &mount_point.to_string_lossy()])
+            .status()
+            .is_ok_and(|s| s.success());
+    #[cfg(target_os = "macos")]
+    let cmd_ok = Command::new("umount")
+        .arg(mount_point)
+        .status()
+        .is_ok_and(|s| s.success());
+
+    if !cmd_ok {
+        warn!("Failed to unmount {:?}", mount_point);
+        return false;
+    }
+    true
 }
