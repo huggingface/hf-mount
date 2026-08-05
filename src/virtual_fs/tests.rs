@@ -5710,14 +5710,14 @@ fn streaming_worker_surfaces_real_hub_error_on_failed_write() {
     });
 }
 
-// ── Incident repro: cross-cloud checkpoint workload (2026-08-05) ───────
+// ── Cross-cloud checkpoint workload: transient-failure behavior ────────
 //
 // A writer commits PyTorch DCP checkpoints while readers in another cloud
-// stat/load them. The reader's HF user is rate-limited (429) on the tree
-// API. These tests reproduce the two client-side failure modes observed.
+// stat/load them, with the reader's HF user rate-limited (429) on the tree
+// API.
 
-/// Failure 3 (incident 2026-08-05): `stat()` on a non-existent path (DCP
-/// probes `<ckpt>/model/model`, which never exists) under Hub rate limiting.
+/// `stat()` on a non-existent path (DCP probes `<ckpt>/model/model`, which
+/// never exists) under Hub rate limiting.
 ///
 /// The parent directory's children are not loaded (point lookups only, or
 /// invalidated by the poll loop after a remote commit), so lookup takes the
@@ -5748,7 +5748,7 @@ fn lookup_surfaces_eagain_when_tree_listing_rate_limited() {
     });
 }
 
-/// Negative-cache poisoning (incident 2026-08-05): a reader polls for
+/// Negative-cache poisoning: a reader polls for
 /// `_READY` while the Hub is rate-limiting. The lookup miss path must NOT
 /// cache the transient failure as "does not exist" — once the writer commits
 /// `_READY` and the Hub recovers, the marker must be visible immediately,
@@ -5790,11 +5790,11 @@ fn transient_429_does_not_poison_negative_cache() {
     });
 }
 
-/// Failure 1 repro (mechanism, part 1): the write/flush path has no
-/// deadline. When the CAS stalls mid-upload (the incident showed xorb POSTs
-/// hanging 120-377s before the server 408-killed them), `close(2)` blocks
-/// forever — there is no write-side equivalent of `read_fetch_timeout`.
-/// In the FUSE layer this parks a worker thread unboundedly.
+/// The write/flush path has no deadline: when the CAS stalls mid-upload
+/// (xorb POSTs can hang for minutes before the server 408-kills them),
+/// `close(2)` blocks until the transfer errors out — there is no write-side
+/// equivalent of `read_fetch_timeout`. In the FUSE layer this parks a worker
+/// thread unboundedly.
 #[test]
 fn repro_streaming_flush_has_no_timeout_when_cas_stalls() {
     let hub = MockHub::new();

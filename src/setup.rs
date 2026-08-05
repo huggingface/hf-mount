@@ -298,10 +298,9 @@ pub fn init_tracing(daemon: bool) {
         ("HF_XET_CLIENT_READ_TIMEOUT", "30"),
         // Upload tuning: skip slow adaptive concurrency ramp-up, but CAP the
         // adaptive controller's upper bound. Each in-flight upload pins one
-        // serialized ~64MiB xorb in memory and permits are acquired only
-        // after serialization, so xet-core's default max of 64 lets a stalled
-        // CAS pin up to ~4GiB — which OOM-kills the FUSE daemon mid-write
-        // (incident 2026-08-05). 8 × 64MiB bounds that backlog at ~512MiB
+        // serialized ~64MiB xorb in memory, so xet-core's default max of 64
+        // lets a stalled CAS pin up to ~4GiB and get the FUSE daemon
+        // OOM-killed mid-write. 8 × 64MiB bounds that backlog at ~512MiB
         // while still saturating healthy links.
         ("HF_XET_CLIENT_AC_INITIAL_UPLOAD_CONCURRENCY", "8"),
         ("HF_XET_CLIENT_AC_MAX_UPLOAD_CONCURRENCY", "8"),

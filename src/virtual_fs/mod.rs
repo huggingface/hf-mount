@@ -877,9 +877,9 @@ impl VirtualFs {
             Err(e) => {
                 error!("Failed to list tree for prefix '{}': {}", prefix, e);
                 // Preserve the error semantics: a 429 after client-side retries
-                // must surface as EAGAIN (transient), not EIO — one rate-limited
-                // stat() aborting a whole distributed job because EIO reads as
-                // hard data loss (incident 2026-08-05).
+                // must surface as EAGAIN (transient), not EIO — EIO reads as
+                // hard data loss and aborts whole distributed jobs on a single
+                // rate-limited stat().
                 return Err(e.to_errno());
             }
         };
@@ -1200,11 +1200,9 @@ impl VirtualFs {
         // unbounded memory. Slots are sized by the negotiated FUSE max_write
         // (16 MiB, see fuse.rs set_max_write), NOT the typical ~128KB write:
         // 8 slots × 16 MiB = 128 MiB ceiling per open write handle. Keep this
-        // small — under a stalled CAS the mount pod's RSS is this backlog plus
-        // xet-core's in-flight xorbs, and blowing past the pod's memory
-        // request gets the FUSE daemon OOM-killed mid-write (incident
-        // 2026-08-05). blocking_send is safe here: FUSE threads are not tokio
-        // workers.
+        // small — under a stalled CAS the daemon's RSS is this backlog plus
+        // xet-core's in-flight xorbs. blocking_send is safe here: FUSE
+        // threads are not tokio workers.
         let (tx, rx) = tokio::sync::mpsc::channel::<WriteMsg>(8);
         let error: Arc<std::sync::Mutex<Option<crate::error::Error>>> = Arc::new(std::sync::Mutex::new(None));
         self.runtime
