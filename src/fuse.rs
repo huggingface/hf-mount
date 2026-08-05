@@ -1,8 +1,7 @@
 use std::ffi::OsStr;
 use std::io;
 use std::os::fd::OwnedFd;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
