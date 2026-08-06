@@ -1,8 +1,7 @@
 use std::ffi::OsStr;
 use std::io;
 use std::os::fd::OwnedFd;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
@@ -798,50 +797,6 @@ async fn wait_for_signal() {
     }
 }
 
-/// Trigger FUSE unmount. Returns `true` on success. Uses libc as primary
-/// method (no external process dependency), then falls back to fusermount/umount.
-fn unmount_fuse(mount_point: &Path) -> bool {
-    use std::ffi::CString;
-
-    let c_path = CString::new(mount_point.to_string_lossy().as_bytes()).ok();
-
-    // Try libc unmount first.
-    if let Some(ref c_path) = c_path {
-        #[cfg(target_os = "linux")]
-        {
-            // MNT_DETACH: lazy unmount, detaches immediately.
-            if unsafe { libc::umount2(c_path.as_ptr(), libc::MNT_DETACH) } == 0 {
-                return true;
-            }
-        }
-        #[cfg(target_os = "macos")]
-        {
-            // MNT_FORCE: force unmount even with open files.
-            if unsafe { libc::unmount(c_path.as_ptr(), libc::MNT_FORCE) } == 0 {
-                return true;
-            }
-        }
-    }
-
-    // Fallback: external command. Try fusermount3 first (FUSE3), then fusermount.
-    #[cfg(target_os = "linux")]
-    let cmd_ok = Command::new("fusermount3")
-        .args(["-u", "-z", &mount_point.to_string_lossy()])
-        .status()
-        .is_ok_and(|s| s.success())
-        || Command::new("fusermount")
-            .args(["-u", "-z", &mount_point.to_string_lossy()])
-            .status()
-            .is_ok_and(|s| s.success());
-    #[cfg(target_os = "macos")]
-    let cmd_ok = Command::new("umount")
-        .arg(mount_point)
-        .status()
-        .is_ok_and(|s| s.success());
-
-    if !cmd_ok {
-        error!("Failed to unmount {:?}", mount_point);
-        return false;
-    }
-    true
-}
+// Re-exported for the signal path above; lives in setup.rs so it compiles
+// regardless of the enabled backend features.
+pub(crate) use crate::setup::unmount_fuse;

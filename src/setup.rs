@@ -1,6 +1,8 @@
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
+use std::time::Duration;
 
 use clap::Parser;
 use tracing::{info, warn};
@@ -295,11 +297,23 @@ pub fn init_tracing(daemon: bool) {
         // for minutes — a long value here is what let stalled reads accumulate
         // and wedge the mount.
         ("HF_XET_CLIENT_READ_TIMEOUT", "30"),
-        // Upload tuning: skip slow adaptive concurrency ramp-up
-        ("HF_XET_CLIENT_AC_INITIAL_UPLOAD_CONCURRENCY", "16"),
+        // Upload tuning: skip slow adaptive concurrency ramp-up, but CAP the
+        // adaptive controller's upper bound. Each in-flight upload pins one
+        // serialized ~64MiB xorb in memory, so xet-core's default max of 64
+        // lets a stalled CAS pin up to ~4GiB and get the FUSE daemon
+        // OOM-killed mid-write. 8 × 64MiB bounds that backlog at ~512MiB
+        // while still saturating healthy links.
+        ("HF_XET_CLIENT_AC_INITIAL_UPLOAD_CONCURRENCY", "8"),
+        ("HF_XET_CLIENT_AC_MAX_UPLOAD_CONCURRENCY", "8"),
         // Larger ingestion blocks = fewer CDC calls
         ("HF_XET_DATA_INGESTION_BLOCK_SIZE", "16777216"),
     ] {
+        // xet-runtime consults HF_XET_FIXED_UPLOAD_CONCURRENCY only when the
+        // canonical AC variables are absent — defaulting the canonical names
+        // would silently turn a user-fixed concurrency into an adaptive one.
+        if k.contains("UPLOAD_CONCURRENCY") && std::env::var("HF_XET_FIXED_UPLOAD_CONCURRENCY").is_ok() {
+            continue;
+        }
         if std::env::var(k).is_err() {
             // SAFETY: called before any threads are spawned.
             unsafe { std::env::set_var(k, v) };
@@ -375,14 +389,16 @@ pub fn build_with_runtime(
 
     let backend = if is_nfs { "nfs" } else { "fuse" };
     let hub_client = runtime.block_on(async {
-        HubApiClient::from_source(
-            &options.hub_endpoint,
-            options.hf_token.as_deref(),
-            options.token_file.clone(),
-            source_kind,
-            path_prefix,
-            backend,
-        )
+        retry_startup("Hub client init", || {
+            HubApiClient::from_source(
+                &options.hub_endpoint,
+                options.hf_token.as_deref(),
+                options.token_file.clone(),
+                source_kind.clone(),
+                path_prefix.clone(),
+                backend,
+            )
+        })
         .await
         .unwrap_or_else(|e| panic!("Failed to initialize Hub client: {e}"))
     });
@@ -417,6 +433,19 @@ pub fn build_with_runtime(
     let remote_read_only = read_only || options.overlay;
     let refresher = hub_client.token_refresher(remote_read_only);
     let xet_ctx = XetContext::default().expect("Failed to create XetContext");
+    // The memory ceiling of the write path depends on the upload-concurrency
+    // cap set via env in `apply_xet_env_defaults`. The env names are owned by
+    // xet-core: if one is ever renamed upstream, the cap silently stops
+    // applying. Read back the effective value so that drift is loud instead
+    // of resurfacing as unbounded RSS under a stalled CAS.
+    if std::env::var("HF_XET_FIXED_UPLOAD_CONCURRENCY").is_err() && xet_ctx.config.client.ac_max_upload_concurrency > 8
+    {
+        warn!(
+            "xet upload concurrency cap not applied (effective max {}); write-path memory \
+             is not bounded — the HF_XET_CLIENT_AC_* env names may have changed upstream",
+            xet_ctx.config.client.ac_max_upload_concurrency
+        );
+    }
     let cas_config = build_cas_config(&xet_ctx, &runtime, &refresher);
 
     // Ensure cache directory exists and is writable (needed for staging even without chunk cache).
@@ -464,6 +493,14 @@ pub fn build_with_runtime(
     let xet_sessions = XetSessions::new(xet_ctx, download_session, upload_config, cached_client, xorb_cache);
 
     let advanced_writes = options.advanced_writes || options.overlay || (is_nfs && !read_only);
+
+    // A previous FUSE daemon may have died (OOM kill, crash) leaving a dead
+    // mount at the mount point: every stat() on it returns ENOTCONN, which
+    // would fail create_dir_all (below and in the overlay block) and the
+    // mount itself, crash-looping the restarted container until someone
+    // cleans the corpse up. Detach it so a fresh session can mount over a
+    // clean path. Must run before the overlay pre-mount fd is opened.
+    detach_dead_mount(&mount_point);
 
     // Overlay: open a pre-mount fd to the mount point directory. The fd is
     // held by OverlayBacking so overlay-local filesystem ops can stay rooted
@@ -628,13 +665,70 @@ pub fn raise_fd_limit() {
     }
 }
 
+/// Detect and lazily detach a dead FUSE mount left at `path` by a crashed
+/// predecessor. A healthy path stats fine; a dead FUSE mountpoint fails with
+/// ENOTCONN (or EIO — both are "corrupted mount" errnos, matching what
+/// k8s mount-utils treats as corrupted). On a genuinely failing disk the
+/// detach is harmless: umount fails cleanly and the subsequent
+/// create_dir_all fails exactly as it did before this cleanup existed.
+/// Detaching is safe for consumers: bind mounts made from this path
+/// reference the superblock directly and keep working (validated e2e —
+/// app-pod binds survive the detach and receive the repaired mount).
+fn detach_dead_mount(path: &Path) {
+    let Err(e) = std::fs::metadata(path) else { return };
+    if !matches!(e.raw_os_error(), Some(libc::ENOTCONN) | Some(libc::EIO)) {
+        return;
+    }
+    warn!(
+        "Dead mount detected at {:?} ({}); detaching it before mounting",
+        path, e
+    );
+    if !unmount_fuse(path) {
+        warn!("Failed to detach dead mount at {:?}; mount may fail", path);
+    }
+}
+
+/// Retry window for Hub calls made during mount startup, before the FUSE
+/// mount exists. Under a per-user 429 storm a single `send_with_retry` (2
+/// tries, RateLimit hint capped at 30s) can be outlasted by the storm;
+/// panicking here crash-loops the mount pod/sidecar and resets all startup
+/// progress. Keep retrying transient failures for up to this window instead.
+const STARTUP_RETRY_DEADLINE: Duration = Duration::from_secs(300);
+
+async fn retry_startup<T, Fut>(what: &str, attempt: impl Fn() -> Fut) -> crate::error::Result<T>
+where
+    Fut: std::future::Future<Output = crate::error::Result<T>>,
+{
+    let start = std::time::Instant::now();
+    let mut attempt_no: u32 = 0;
+    loop {
+        match attempt().await {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                if !e.is_transient() || start.elapsed() >= STARTUP_RETRY_DEADLINE {
+                    return Err(e);
+                }
+                attempt_no += 1;
+                let remaining = STARTUP_RETRY_DEADLINE.saturating_sub(start.elapsed());
+                warn!("{what}: transient startup failure ({e}); retrying for up to {remaining:?} more");
+                tokio::time::sleep(
+                    crate::hub_api::retry_delay(attempt_no)
+                        .min(Duration::from_secs(30))
+                        .min(remaining),
+                )
+                .await;
+            }
+        }
+    }
+}
+
 fn build_cas_config(
     ctx: &XetContext,
     runtime: &tokio::runtime::Handle,
     refresher: &Arc<HubTokenRefresher>,
 ) -> Arc<TranslatorConfig> {
     let jwt = runtime
-        .block_on(refresher.fetch_initial())
+        .block_on(retry_startup("storage token", || refresher.fetch_initial()))
         .unwrap_or_else(|e| panic!("Failed to get storage token: {e}"));
     info!("Got storage token for endpoint: {}", jwt.cas_url);
     Arc::new(
@@ -647,4 +741,52 @@ fn build_cas_config(
         )
         .unwrap_or_else(|e| panic!("Failed to build TranslatorConfig: {e}")),
     )
+}
+
+/// Trigger FUSE unmount. Returns `true` on success. Uses libc as primary
+/// method (no external process dependency), then falls back to fusermount/umount.
+pub(crate) fn unmount_fuse(mount_point: &Path) -> bool {
+    use std::ffi::CString;
+
+    let c_path = CString::new(mount_point.to_string_lossy().as_bytes()).ok();
+
+    // Try libc unmount first.
+    if let Some(ref c_path) = c_path {
+        #[cfg(target_os = "linux")]
+        {
+            // MNT_DETACH: lazy unmount, detaches immediately.
+            if unsafe { libc::umount2(c_path.as_ptr(), libc::MNT_DETACH) } == 0 {
+                return true;
+            }
+        }
+        #[cfg(target_os = "macos")]
+        {
+            // MNT_FORCE: force unmount even with open files.
+            if unsafe { libc::unmount(c_path.as_ptr(), libc::MNT_FORCE) } == 0 {
+                return true;
+            }
+        }
+    }
+
+    // Fallback: external command. Try fusermount3 first (FUSE3), then fusermount.
+    #[cfg(target_os = "linux")]
+    let cmd_ok = Command::new("fusermount3")
+        .args(["-u", "-z", &mount_point.to_string_lossy()])
+        .status()
+        .is_ok_and(|s| s.success())
+        || Command::new("fusermount")
+            .args(["-u", "-z", &mount_point.to_string_lossy()])
+            .status()
+            .is_ok_and(|s| s.success());
+    #[cfg(target_os = "macos")]
+    let cmd_ok = Command::new("umount")
+        .arg(mount_point)
+        .status()
+        .is_ok_and(|s| s.success());
+
+    if !cmd_ok {
+        warn!("Failed to unmount {:?}", mount_point);
+        return false;
+    }
+    true
 }

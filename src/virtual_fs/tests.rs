@@ -5709,3 +5709,152 @@ fn streaming_worker_surfaces_real_hub_error_on_failed_write() {
         worker.await.unwrap();
     });
 }
+
+// ── Cross-cloud checkpoint workload: transient-failure behavior ────────
+//
+// A writer commits PyTorch DCP checkpoints while readers in another cloud
+// stat/load them, with the reader's HF user rate-limited (429) on the tree
+// API.
+
+/// `stat()` on a non-existent path (DCP probes `<ckpt>/model/model`, which
+/// never exists) under Hub rate limiting.
+///
+/// The parent directory's children are not loaded (point lookups only, or
+/// invalidated by the poll loop after a remote commit), so lookup takes the
+/// slow path: HEAD → 404 (Ok(None)), then ensure_children_loaded →
+/// list_tree → 429. A transient 429 must surface as EAGAIN (Error::to_errno),
+/// never as EIO — EIO reads as hard data loss and aborts distributed jobs.
+#[test]
+fn lookup_surfaces_eagain_when_tree_listing_rate_limited() {
+    let hub = MockHub::new();
+    hub.add_file("ckpt/model/__0_0.distcp", 100, Some("hash1"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        // Resolve .../model via point lookups; its children stay unloaded.
+        let ckpt = vfs.lookup(ROOT_INODE, "ckpt").await.unwrap();
+        let model = vfs.lookup(ckpt.ino, "model").await.unwrap();
+
+        // Hub starts rate-limiting tree listings (send_with_retry exhausted).
+        hub.fail_next_list_tree(1, Some(429));
+
+        let errno = vfs.lookup(model.ino, "model").await.unwrap_err();
+        assert_eq!(errno, libc::EAGAIN, "transient 429 must map to EAGAIN, not EIO");
+
+        // Once the rate limit clears, the same lookup resolves normally.
+        let errno = vfs.lookup(model.ino, "model").await.unwrap_err();
+        assert_eq!(errno, libc::ENOENT, "path truly doesn't exist once Hub is healthy");
+    });
+}
+
+/// Negative-cache poisoning: a reader polls for
+/// `_READY` while the Hub is rate-limiting. The lookup miss path must NOT
+/// cache the transient failure as "does not exist" — once the writer commits
+/// `_READY` and the Hub recovers, the marker must be visible immediately,
+/// not after NEG_CACHE_TTL.
+#[test]
+fn transient_429_does_not_poison_negative_cache() {
+    let hub = MockHub::new();
+    hub.add_file("ckpt/model/__0_0.distcp", 100, Some("hash1"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let ckpt = vfs.lookup(ROOT_INODE, "ckpt").await.unwrap();
+        let model = vfs.lookup(ckpt.ino, "model").await.unwrap();
+        // Reader listed the checkpoint dir → children_loaded = true.
+        vfs.readdir(model.ino).await.unwrap();
+
+        // _READY not committed yet; the reader polls for it while the Hub
+        // rate-limits the miss-path listing probe. The transient failure
+        // surfaces as EAGAIN instead of being cached as a false ENOENT.
+        hub.fail_next_list_tree(1, Some(429));
+        assert_eq!(vfs.lookup(model.ino, "_READY").await.unwrap_err(), libc::EAGAIN);
+
+        // Writer commits _READY; Hub is healthy again.
+        hub.add_file("ckpt/model/_READY", 0, None, Some("etag-ready"));
+        hub.set_head(
+            "ckpt/model/_READY",
+            Some(HeadFileInfo {
+                xet_hash: None,
+                etag: Some("etag-ready".to_string()),
+                size: Some(0),
+                last_modified: None,
+            }),
+        );
+
+        // The committed marker is visible immediately — no poisoned entry.
+        let attr = vfs.lookup(model.ino, "_READY").await.expect("marker must resolve");
+        assert_eq!(attr.size, 0);
+    });
+}
+
+/// The write/flush path has no deadline: when the CAS stalls mid-upload
+/// (xorb POSTs can hang for minutes before the server 408-kills them),
+/// `close(2)` blocks until the transfer errors out — there is no write-side
+/// equivalent of `read_fetch_timeout`. In the FUSE layer this parks a worker
+/// thread unboundedly.
+#[test]
+fn repro_streaming_flush_has_no_timeout_when_cas_stalls() {
+    let hub = MockHub::new();
+    hub.add_file("big.bin", 100, Some("hash1"), None);
+    let xet = MockXet::new();
+    xet.stall_writer_finish();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let ino = vfs.lookup(ROOT_INODE, "big.bin").await.unwrap().ino;
+        let fh = vfs.open(ino, true, true, Some(1)).await.unwrap();
+        write_blocking(&vfs, ino, fh, 0, b"checkpoint bytes").await.unwrap();
+
+        // flush() = close(2). With the CAS stalled it never completes;
+        // 3s stands in for "unbounded" to keep the test fast.
+        let res = tokio::time::timeout(Duration::from_secs(3), vfs.flush(ino, fh, Some(1))).await;
+        assert!(
+            res.is_err(),
+            "flush() completed despite a stalled CAS upload — a write timeout now exists"
+        );
+    });
+}
+
+/// On SIGTERM the sidecar calls `vfs.shutdown()` then `exit(0)`. Both write
+/// modes must drain data the application already wrote before the process
+/// exits — otherwise exit(0) aborts the FUSE connection under the writer and
+/// silently drops the bytes. Exercises open-but-unclosed handles (the app is
+/// killed by the same signal and never calls close()).
+fn assert_shutdown_drains_inflight_write(advanced: bool) {
+    let hub = MockHub::new();
+    hub.add_file("ckpt.distcp", 100, Some("hash1"), None);
+    let xet = MockXet::new();
+    let rt = new_runtime();
+    let vfs = make_test_vfs(
+        hub.clone(),
+        xet.clone(),
+        TestOpts {
+            advanced_writes: advanced,
+            ..Default::default()
+        },
+        &rt,
+    );
+    rt.block_on(async {
+        let ino = vfs.lookup(ROOT_INODE, "ckpt.distcp").await.unwrap().ino;
+        let fh = vfs.open(ino, true, true, Some(1)).await.unwrap();
+        write_blocking(&vfs, ino, fh, 0, b"checkpoint bytes").await.unwrap();
+    });
+    vfs.shutdown();
+    assert!(
+        !hub.take_batch_log().is_empty(),
+        "shutdown (advanced={advanced}) must commit the in-flight write"
+    );
+}
+
+#[test]
+fn shutdown_drains_inflight_streaming_write() {
+    assert_shutdown_drains_inflight_write(false);
+}
+
+#[test]
+fn shutdown_drains_inflight_advanced_write() {
+    assert_shutdown_drains_inflight_write(true);
+}
