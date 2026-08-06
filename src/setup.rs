@@ -1,5 +1,6 @@
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -432,6 +433,19 @@ pub fn build_with_runtime(
     let remote_read_only = read_only || options.overlay;
     let refresher = hub_client.token_refresher(remote_read_only);
     let xet_ctx = XetContext::default().expect("Failed to create XetContext");
+    // The memory ceiling of the write path depends on the upload-concurrency
+    // cap set via env in `apply_xet_env_defaults`. The env names are owned by
+    // xet-core: if one is ever renamed upstream, the cap silently stops
+    // applying. Read back the effective value so that drift is loud instead
+    // of resurfacing as unbounded RSS under a stalled CAS.
+    if std::env::var("HF_XET_FIXED_UPLOAD_CONCURRENCY").is_err() && xet_ctx.config.client.ac_max_upload_concurrency > 8
+    {
+        warn!(
+            "xet upload concurrency cap not applied (effective max {}); write-path memory \
+             is not bounded — the HF_XET_CLIENT_AC_* env names may have changed upstream",
+            xet_ctx.config.client.ac_max_upload_concurrency
+        );
+    }
     let cas_config = build_cas_config(&xet_ctx, &runtime, &refresher);
 
     // Ensure cache directory exists and is writable (needed for staging even without chunk cache).
@@ -653,9 +667,13 @@ pub fn raise_fd_limit() {
 
 /// Detect and lazily detach a dead FUSE mount left at `path` by a crashed
 /// predecessor. A healthy path stats fine; a dead FUSE mountpoint fails with
-/// ENOTCONN (or EIO). Detaching is safe for consumers: bind mounts made from
-/// this path reference the superblock directly and keep working (validated
-/// e2e — app-pod binds survive the detach and receive the repaired mount).
+/// ENOTCONN (or EIO — both are "corrupted mount" errnos, matching what
+/// k8s mount-utils treats as corrupted). On a genuinely failing disk the
+/// detach is harmless: umount fails cleanly and the subsequent
+/// create_dir_all fails exactly as it did before this cleanup existed.
+/// Detaching is safe for consumers: bind mounts made from this path
+/// reference the superblock directly and keep working (validated e2e —
+/// app-pod binds survive the detach and receive the repaired mount).
 fn detach_dead_mount(path: &Path) {
     let Err(e) = std::fs::metadata(path) else { return };
     if !matches!(e.raw_os_error(), Some(libc::ENOTCONN) | Some(libc::EIO)) {
@@ -691,11 +709,14 @@ where
                     return Err(e);
                 }
                 attempt_no += 1;
-                warn!(
-                    "{what}: transient startup failure ({e}); retrying for up to {:?} more",
-                    STARTUP_RETRY_DEADLINE.saturating_sub(start.elapsed())
-                );
-                tokio::time::sleep(crate::hub_api::retry_delay(attempt_no).min(Duration::from_secs(30))).await;
+                let remaining = STARTUP_RETRY_DEADLINE.saturating_sub(start.elapsed());
+                warn!("{what}: transient startup failure ({e}); retrying for up to {remaining:?} more");
+                tokio::time::sleep(
+                    crate::hub_api::retry_delay(attempt_no)
+                        .min(Duration::from_secs(30))
+                        .min(remaining),
+                )
+                .await;
             }
         }
     }
@@ -722,8 +743,8 @@ fn build_cas_config(
     )
 }
 
-use std::process::Command;
-
+/// Trigger FUSE unmount. Returns `true` on success. Uses libc as primary
+/// method (no external process dependency), then falls back to fusermount/umount.
 pub(crate) fn unmount_fuse(mount_point: &Path) -> bool {
     use std::ffi::CString;
 

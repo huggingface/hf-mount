@@ -797,6 +797,6 @@ async fn wait_for_signal() {
     }
 }
 
-/// Trigger FUSE unmount. Returns `true` on success. Uses libc as primary
-/// method (no external process dependency), then falls back to fusermount/umount.
+// Re-exported for the signal path above; lives in setup.rs so it compiles
+// regardless of the enabled backend features.
 pub(crate) use crate::setup::unmount_fuse;
