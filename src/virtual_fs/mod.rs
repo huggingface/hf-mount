@@ -806,8 +806,26 @@ impl VirtualFs {
 
         let entries = match self.hub_client.list_tree(&prefix).await {
             Ok(entries) => entries,
+            Err(e) if e.is_retryable() => {
+                let has_stale = {
+                    let inodes = self.inode_table.read().expect("inodes poisoned");
+                    inodes.has_cached_remote_children(parent_ino)
+                };
+                if has_stale {
+                    warn!(
+                        "list_tree({prefix}) failed ({e}); reusing cached directory listing from before invalidation"
+                    );
+                    let mut inodes = self.inode_table.write().expect("inodes poisoned");
+                    if let Some(entry) = inodes.get_mut(parent_ino) {
+                        entry.children_loaded_at = Some(Instant::now());
+                    }
+                    return Ok(());
+                }
+                error!("Failed to list tree for prefix '{prefix}': {e}");
+                return Err(libc::EIO);
+            }
             Err(e) => {
-                error!("Failed to list tree for prefix '{}': {}", prefix, e);
+                error!("Failed to list tree for prefix '{prefix}': {e}");
                 return Err(libc::EIO);
             }
         };

@@ -32,6 +32,15 @@ impl Error {
         }
     }
 
+    /// True for transient Hub failures where retrying or serving stale metadata is reasonable.
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            Self::Hub { status: Some(s), .. } => is_retryable_status(*s),
+            Self::Http(err) => err.is_timeout() || err.is_connect(),
+            _ => false,
+        }
+    }
+
     /// Errno to surface to FUSE clients. Maps known Hub/CAS HTTP statuses to a
     /// meaningful errno so an importing app (e.g. Radarr/Sonarr) can tell a quota
     /// or storage reject apart from a generic I/O failure. Everything else stays EIO.

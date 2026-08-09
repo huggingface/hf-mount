@@ -732,6 +732,14 @@ impl InodeTable {
         self.inodes.get(&ino).is_some_and(|e| e.children_loaded())
     }
 
+    /// True when a remote-backed directory still has child entries cached locally
+    /// (e.g. after poll invalidation cleared `children_loaded_at` but kept inodes).
+    pub fn has_cached_remote_children(&self, ino: u64) -> bool {
+        self.inodes.get(&ino).is_some_and(|e| {
+            e.kind == InodeKind::Directory && e.children_from_remote && !e.children.is_empty()
+        })
+    }
+
     /// True if the inode or any descendant is either dirty or has an open
     /// FUSE file handle — i.e. evicting the subtree would drop local state.
     pub fn has_dirty_or_open_descendants(&self, ino: u64) -> bool {

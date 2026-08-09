@@ -108,6 +108,20 @@ pub struct MountOptions {
     #[arg(long, default_value_t = 30)]
     pub poll_interval_secs: u64,
 
+    /// Max Hub HTTP retries after the first failed attempt (408/429/5xx/timeouts).
+    /// 4 ⇒ up to 5 tries with longer backoff on 502/503/504 gateway errors.
+    #[arg(long, default_value_t = 4)]
+    pub hub_max_retries: u32,
+
+    /// Per-request Hub GET/list timeout in seconds. 0 keeps the built-in default (60s).
+    /// Raise above the Hub API's Mongo deadline when bucket metadata queries are slow.
+    #[arg(long, default_value_t = 0)]
+    pub hub_request_timeout_secs: u64,
+
+    /// Per-request Hub HEAD timeout in seconds. 0 keeps the built-in default (30s).
+    #[arg(long, default_value_t = 0)]
+    pub hub_head_request_timeout_secs: u64,
+
     /// Maximum number of concurrent tree-listing requests per poll round.
     /// Each loaded directory prefix issues one Hub API request; this cap
     /// prevents thundering-herd bursts on large mounts (e.g. transformers/docs)
@@ -374,6 +388,11 @@ pub fn build_with_runtime(
     };
 
     let backend = if is_nfs { "nfs" } else { "fuse" };
+    let hub_config = crate::hub_api::HubClientConfig {
+        max_retries: options.hub_max_retries,
+        request_timeout_secs: options.hub_request_timeout_secs,
+        head_request_timeout_secs: options.hub_head_request_timeout_secs,
+    };
     let hub_client = runtime.block_on(async {
         HubApiClient::from_source(
             &options.hub_endpoint,
@@ -382,6 +401,7 @@ pub fn build_with_runtime(
             source_kind,
             path_prefix,
             backend,
+            hub_config,
         )
         .await
         .unwrap_or_else(|e| panic!("Failed to initialize Hub client: {e}"))
