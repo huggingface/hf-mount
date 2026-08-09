@@ -773,12 +773,13 @@ impl InodeTable {
         self.inodes.get(&ino).is_some_and(|e| e.children_loaded())
     }
 
-    /// True when a remote-backed directory still has child entries cached locally
-    /// (e.g. after poll invalidation cleared `children_loaded_at` but kept inodes).
+    /// True when a remote-backed directory still has a cached listing locally
+    /// (including legitimately empty dirs). Used after poll invalidation cleared
+    /// `children_loaded_at` but kept inode state.
     pub fn has_cached_remote_children(&self, ino: u64) -> bool {
         self.inodes
             .get(&ino)
-            .is_some_and(|e| e.kind == InodeKind::Directory && e.children_from_remote && !e.children.is_empty())
+            .is_some_and(|e| e.kind == InodeKind::Directory && e.children_from_remote)
     }
 
     /// True if the inode or any descendant is either dirty or has an open
@@ -1576,6 +1577,25 @@ mod tests {
                 .lookup_child(dir_ino, "file.txt")
                 .is_some_and(|e| e.inode == file_ino)
         );
+    }
+
+    #[test]
+    fn test_has_cached_remote_children_includes_empty_dir() {
+        let mut table = InodeTable::new(false);
+        let dir_ino = table.insert(
+            ROOT_INODE,
+            "empty".to_string(),
+            "empty".to_string(),
+            InodeKind::Directory,
+            0,
+            UNIX_EPOCH,
+            None,
+            0o755,
+            0,
+            0,
+        );
+        table.get_mut(dir_ino).unwrap().children_from_remote = true;
+        assert!(table.has_cached_remote_children(dir_ino));
     }
 
     #[test]

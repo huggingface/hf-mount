@@ -225,7 +225,8 @@ pub struct HubClientConfig {
     pub request_timeout_secs: u64,
     /// HEAD timeout. 0 keeps the built-in default (30s).
     pub head_request_timeout_secs: u64,
-    /// Total wall-clock budget for one Hub call including retries/backoff. 0 ⇒ 5s.
+    /// Total wall-clock budget for one Hub call including in-flight requests,
+    /// retries, and backoff. 0 keeps the built-in default (3s).
     pub operation_deadline_ms: u64,
 }
 
@@ -248,6 +249,20 @@ struct HubRetryState {
 }
 
 impl HubRetryState {
+    /// Returns allowed retry count; opens half-open after the cooldown expires.
+    fn effective_max_retries(&self, max_retries: u32) -> u32 {
+        let mut guard = self.circuit_open_until.lock().expect("circuit lock poisoned");
+        match *guard {
+            Some(until) if Instant::now() < until => 0,
+            Some(_) => {
+                *guard = None;
+                self.consecutive_gateway_failures.store(0, Ordering::Relaxed);
+                max_retries
+            }
+            None => max_retries,
+        }
+    }
+
     fn is_circuit_open(&self) -> bool {
         let guard = self.circuit_open_until.lock().expect("circuit lock poisoned");
         guard.is_some_and(|until| Instant::now() < until)
@@ -423,9 +438,17 @@ async fn probe_repo(
     None
 }
 
+fn operation_deadline_exceeded(context: &str, operation_deadline: Duration) -> Error {
+    Error::hub_status(
+        504,
+        format!("{context}: operation deadline {operation_deadline:?} exceeded"),
+    )
+}
+
 /// Send an HTTP request with automatic retry on transient errors (408, 429, 5xx, timeouts).
 /// Uses the IETF RateLimit header's t= parameter when present, falls back to exponential
-/// backoff with full jitter. Stops when `operation_deadline` is exhausted even if retries remain.
+/// backoff with full jitter. Each in-flight request is capped by the remaining operation
+/// deadline (`tokio::time::timeout`); reqwest per-request timeouts are a secondary safety net.
 /// Set `accept_redirects` to treat 3xx as success (needed for HEAD on /resolve/ endpoints
 /// where the redirect response itself carries metadata headers).
 async fn send_with_retry(
@@ -437,27 +460,28 @@ async fn send_with_retry(
     retry_state: Option<&HubRetryState>,
 ) -> Result<reqwest::Response> {
     let started = Instant::now();
-    let effective_max_retries = if retry_state.is_some_and(HubRetryState::is_circuit_open) {
-        0
-    } else {
-        max_retries
-    };
+    let effective_max_retries = retry_state
+        .map(|state| state.effective_max_retries(max_retries))
+        .unwrap_or(max_retries);
     let mut attempt = 0;
     loop {
         attempt += 1;
-        if started.elapsed() >= operation_deadline {
-            return Err(Error::hub(format!(
-                "{context}: operation deadline {operation_deadline:?} exceeded before attempt {attempt}"
-            )));
+        let remaining = operation_deadline.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return Err(operation_deadline_exceeded(context, operation_deadline));
         }
-        match build_request().send().await {
-            Ok(resp) if resp.status().is_success() || (accept_redirects && resp.status().is_redirection()) => {
+
+        let send_result = tokio::time::timeout(remaining, build_request().send()).await;
+        match send_result {
+            Ok(Ok(resp))
+                if resp.status().is_success() || (accept_redirects && resp.status().is_redirection()) =>
+            {
                 if let Some(state) = retry_state {
                     state.record_success();
                 }
                 return Ok(resp);
             }
-            Ok(resp) => {
+            Ok(Ok(resp)) => {
                 let status = resp.status().as_u16();
                 if is_retryable_status(status) && attempt <= effective_max_retries {
                     let base_delay = parse_retry_delay(resp.headers()).unwrap_or_else(|| retry_delay(attempt));
@@ -488,7 +512,7 @@ async fn send_with_retry(
                 let body = resp.text().await.unwrap_or_default();
                 return Err(Error::hub_status(status, format!("{context}: {status} {body}")));
             }
-            Err(err) if (err.is_timeout() || err.is_connect()) && attempt <= effective_max_retries => {
+            Ok(Err(err)) if (err.is_timeout() || err.is_connect()) && attempt <= effective_max_retries => {
                 let delay = jittered_delay(retry_delay(attempt), attempt);
                 if started.elapsed() + delay >= operation_deadline {
                     warn!(
@@ -501,7 +525,23 @@ async fn send_with_retry(
                 );
                 tokio::time::sleep(delay).await;
             }
-            Err(err) => return Err(Error::Http(err)),
+            Ok(Err(err)) => return Err(Error::Http(err)),
+            Err(_elapsed) if attempt <= effective_max_retries => {
+                let delay = jittered_delay(retry_delay(attempt), attempt);
+                if started.elapsed() + delay >= operation_deadline {
+                    warn!(
+                        "{context}: operation deadline {operation_deadline:?} exceeded waiting for in-flight request"
+                    );
+                    return Err(operation_deadline_exceeded(context, operation_deadline));
+                }
+                warn!(
+                    "{context}: in-flight request exceeded remaining deadline, retry {attempt}/{effective_max_retries} in {delay:?}"
+                );
+                tokio::time::sleep(delay).await;
+            }
+            Err(_elapsed) => {
+                return Err(operation_deadline_exceeded(context, operation_deadline));
+            }
         }
     }
 }
@@ -1781,6 +1821,38 @@ mod tests {
         url
     }
 
+    /// HTTP server that waits before responding (tests operation-deadline caps on in-flight requests).
+    async fn mock_slow_server(responses: Vec<(Duration, u16)>) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://{addr}");
+
+        tokio::spawn(async move {
+            for (delay, status) in responses {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut buf = vec![0u8; 4096];
+                let _ = stream.read(&mut buf).await;
+                tokio::time::sleep(delay).await;
+                let reason = match status {
+                    200 => "OK",
+                    504 => "Gateway Timeout",
+                    _ => "Unknown",
+                };
+                let body = format!("status {status}");
+                let response = format!(
+                    "HTTP/1.1 {status} {reason}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.ok();
+                stream.shutdown().await.ok();
+            }
+        });
+
+        url
+    }
+
     #[tokio::test]
     async fn send_with_retry_success_on_first_try() {
         let url = mock_server(vec![200]).await;
@@ -1862,6 +1934,21 @@ mod tests {
         let result = test_send_with_retry(|| client.get(&url), "test", false, DEFAULT_MAX_RETRIES).await;
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), Error::Hub { status: Some(302), .. }));
+    }
+
+    #[tokio::test]
+    async fn send_with_retry_caps_in_flight_request_by_operation_deadline() {
+        let url = mock_slow_server(vec![(Duration::from_secs(5), 200)]).await;
+        let client = Client::builder()
+            .timeout(Duration::from_secs(60))
+            .build()
+            .unwrap();
+        let started = Instant::now();
+        let result =
+            send_with_retry(|| client.get(&url), "test", false, 0, Duration::from_millis(200), None).await;
+        assert!(result.is_err());
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(matches!(result.unwrap_err(), Error::Hub { status: Some(504), .. }));
     }
 
     #[tokio::test]
