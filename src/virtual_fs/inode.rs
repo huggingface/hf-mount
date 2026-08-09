@@ -1617,6 +1617,7 @@ mod tests {
     }
 
     #[test]
+    fn test_pending_deletes() {
         let mut table = InodeTable::new(false);
 
         let ino = table.insert(
