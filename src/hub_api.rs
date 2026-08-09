@@ -263,11 +263,6 @@ impl HubRetryState {
         }
     }
 
-    fn is_circuit_open(&self) -> bool {
-        let guard = self.circuit_open_until.lock().expect("circuit lock poisoned");
-        guard.is_some_and(|until| Instant::now() < until)
-    }
-
     fn record_success(&self) {
         self.consecutive_gateway_failures.store(0, Ordering::Relaxed);
         *self.circuit_open_until.lock().expect("circuit lock poisoned") = None;
