@@ -109,18 +109,24 @@ pub struct MountOptions {
     pub poll_interval_secs: u64,
 
     /// Max Hub HTTP retries after the first failed attempt (408/429/5xx/timeouts).
-    /// 4 ⇒ up to 5 tries with longer backoff on 502/503/504 gateway errors.
-    #[arg(long, default_value_t = 4)]
+    /// 2 ⇒ up to 3 tries with exponential backoff and jitter.
+    #[arg(long, default_value_t = 2)]
     pub hub_max_retries: u32,
 
     /// Per-request Hub GET/list timeout in seconds. 0 keeps the built-in default (60s).
-    /// Raise above the Hub API's Mongo deadline when bucket metadata queries are slow.
+    /// This is the reqwest client timeout for a single HTTP round-trip, not the Hub's
+    /// MongoDB query deadline (that lives in moon-landing RuntimeConfig).
     #[arg(long, default_value_t = 0)]
     pub hub_request_timeout_secs: u64,
 
     /// Per-request Hub HEAD timeout in seconds. 0 keeps the built-in default (30s).
     #[arg(long, default_value_t = 0)]
     pub hub_head_request_timeout_secs: u64,
+
+    /// Wall-clock budget in milliseconds for one Hub operation including retries/backoff.
+    /// After this deadline hf-mount fails fast and may serve stale cached metadata.
+    #[arg(long, default_value_t = 5000)]
+    pub hub_operation_deadline_ms: u64,
 
     /// Maximum number of concurrent tree-listing requests per poll round.
     /// Each loaded directory prefix issues one Hub API request; this cap
@@ -392,6 +398,7 @@ pub fn build_with_runtime(
         max_retries: options.hub_max_retries,
         request_timeout_secs: options.hub_request_timeout_secs,
         head_request_timeout_secs: options.hub_head_request_timeout_secs,
+        operation_deadline_ms: options.hub_operation_deadline_ms,
     };
     let hub_client = runtime.block_on(async {
         HubApiClient::from_source(

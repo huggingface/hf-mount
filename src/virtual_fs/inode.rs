@@ -133,6 +133,10 @@ pub struct InodeEntry {
     /// hot path for write-heavy workloads (tarball extract, xfstests) that
     /// create thousands of unique names under freshly-mkdir'd directories.
     pub children_from_remote: bool,
+    /// When set, the directory listing is served from stale cache after a transient
+    /// Hub failure. Lookups may use cached children via `listing_usable()` without
+    /// treating the listing as freshly validated.
+    pub stale_listing_since: Option<Instant>,
     pub children: Vec<DirChild>,
     /// Name → ino lookup for `lookup_child`. Kept in sync with `children`
     /// via the `add_child` / `remove_child_*` helpers so a directory with
@@ -188,6 +192,17 @@ impl InodeEntry {
     /// meaningful for directories.
     pub fn children_loaded(&self) -> bool {
         self.children_loaded_at.is_some()
+    }
+
+    /// True when cached directory children can be used for lookup/readdir even if
+    /// the listing was not freshly fetched (stale fallback after Hub errors).
+    pub fn listing_usable(&self) -> bool {
+        self.children_loaded_at.is_some() || self.stale_listing_since.is_some()
+    }
+
+    pub fn stale_listing_recent(&self, retry_interval: std::time::Duration) -> bool {
+        self.stale_listing_since
+            .is_some_and(|since| since.elapsed() < retry_interval)
     }
 
     /// Mark the inode as dirty, incrementing the generation counter.
@@ -288,6 +303,7 @@ impl InodeTable {
             dirty_generation: 0,
             children_loaded_at: None,
             children_from_remote: false,
+            stale_listing_since: None,
             children: Vec::new(),
             child_index: HashMap::new(),
             pending_deletes: Vec::new(),
@@ -630,6 +646,7 @@ impl InodeTable {
             // sites). Directories start unloaded until the first list.
             children_loaded_at: None,
             children_from_remote: false,
+            stale_listing_since: None,
             children: Vec::new(),
             child_index: HashMap::new(),
             pending_deletes: Vec::new(),
@@ -724,6 +741,14 @@ impl InodeTable {
     pub fn invalidate_children(&mut self, ino: u64) {
         if let Some(entry) = self.inodes.get_mut(&ino) {
             entry.children_loaded_at = None;
+            entry.stale_listing_since = None;
+        }
+    }
+
+    /// Mark a directory as serving a stale cached listing after a transient Hub failure.
+    pub fn mark_stale_listing(&mut self, ino: u64) {
+        if let Some(entry) = self.inodes.get_mut(&ino) {
+            entry.stale_listing_since = Some(Instant::now());
         }
     }
 
@@ -1493,6 +1518,44 @@ mod tests {
 
         // Invalidating non-existent inode is a no-op
         table.invalidate_children(9999);
+    }
+
+    #[test]
+    fn test_stale_listing_usable_without_fresh_load() {
+        let mut table = InodeTable::new(false);
+        let dir_ino = table.insert(
+            ROOT_INODE,
+            "dir".to_string(),
+            "dir".to_string(),
+            InodeKind::Directory,
+            0,
+            UNIX_EPOCH,
+            None,
+            0o755,
+            0,
+            0,
+        );
+        table.get_mut(dir_ino).unwrap().children_from_remote = true;
+        let file_ino = table.insert(
+            dir_ino,
+            "file.txt".to_string(),
+            "dir/file.txt".to_string(),
+            InodeKind::File,
+            1,
+            UNIX_EPOCH,
+            None,
+            0o644,
+            0,
+            0,
+        );
+        assert!(!table.get(dir_ino).unwrap().children_loaded());
+        assert!(!table.get(dir_ino).unwrap().listing_usable());
+
+        table.mark_stale_listing(dir_ino);
+        let parent = table.get(dir_ino).unwrap();
+        assert!(parent.listing_usable());
+        assert!(!parent.children_loaded());
+        assert!(table.lookup_child(dir_ino, "file.txt").is_some_and(|e| e.inode == file_ino));
     }
 
     #[test]
