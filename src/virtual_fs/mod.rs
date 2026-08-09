@@ -36,8 +36,6 @@ const BLOCK_SIZE: u32 = 512;
 const NEG_CACHE_CAPACITY: usize = 1_000;
 /// How long a negative-cache entry stays valid before being re-checked.
 const NEG_CACHE_TTL: Duration = Duration::from_secs(30);
-/// Minimum interval between Hub list_tree retries while serving a stale listing.
-const STALE_LISTING_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 /// `notify_inval_entry` is a blocking syscall that takes the parent dir's
 /// `i_rwsem` in the kernel and walks the dcache. Issuing thousands per sweep
 /// starves concurrent FUSE ops (lookup/readdir wait on the same lock) and
@@ -787,8 +785,7 @@ impl VirtualFs {
                 Some(e) if e.kind != InodeKind::Directory => return Err(libc::ENOTDIR),
                 Some(e) if e.children_loaded() => return Ok(()),
                 Some(e)
-                    if e.stale_listing_recent(STALE_LISTING_RETRY_INTERVAL)
-                        && inodes.has_cached_remote_children(parent_ino) =>
+                    if e.stale_listing_recent() && inodes.has_cached_remote_children(parent_ino) =>
                 {
                     return Ok(());
                 }
@@ -808,8 +805,7 @@ impl VirtualFs {
                 Some(e) if e.kind != InodeKind::Directory => return Err(libc::ENOTDIR),
                 Some(e) if e.children_loaded() => return Ok(()),
                 Some(e)
-                    if e.stale_listing_recent(STALE_LISTING_RETRY_INTERVAL)
-                        && inodes.has_cached_remote_children(parent_ino) =>
+                    if e.stale_listing_recent() && inodes.has_cached_remote_children(parent_ino) =>
                 {
                     return Ok(());
                 }
@@ -955,6 +951,7 @@ impl VirtualFs {
             // since regrowth on rare child mutations is cheap.
             parent.children.shrink_to_fit();
             parent.stale_listing_since = None;
+            parent.stale_listing_backoff_level = 0;
             parent.children_loaded_at = Some(Instant::now());
             parent.children_from_remote = true;
         }
@@ -1325,7 +1322,9 @@ impl VirtualFs {
                 Some(_) => FastResult::NotLoaded,
                 // No cached entry but the parent listing is authoritative →
                 // the name really doesn't exist; populate the negative cache.
-                None if parent_entry.listing_usable() => {
+                // Only trust misses from a fresh Hub listing — stale snapshots
+                // must not invent 30s negative entries for names we never saw.
+                None if parent_entry.children_loaded() => {
                     let parent_path = &parent_entry.full_path;
                     let full_path = if parent_path.is_empty() {
                         name.to_string()
@@ -1452,7 +1451,7 @@ impl VirtualFs {
             // 404 may mean "doesn't exist" or "it's a directory" (the resolve
             // endpoint only handles files), so the listing has the final word.
             Ok(_) => {}
-            Err(e) if e.is_retryable() => {
+            Err(e) if e.is_retryable() && self.read_only => {
                 let inodes = self.inode_table.read().expect("inodes poisoned");
                 if let Some(entry) = inodes.lookup_child(parent, name) {
                     warn!("HEAD {full_path} failed ({e}), serving cached inode");

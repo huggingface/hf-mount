@@ -124,8 +124,9 @@ pub struct MountOptions {
     pub hub_head_request_timeout_secs: u64,
 
     /// Wall-clock budget in milliseconds for one Hub operation including retries/backoff.
-    /// After this deadline hf-mount fails fast and may serve stale cached metadata.
-    #[arg(long, default_value_t = 5000)]
+    /// Default 3000ms — shorter than the Hub's Mongo tree-listing deadline so 504s
+    /// fail fast to stale cache instead of racing the server timeout.
+    #[arg(long, default_value_t = 3000)]
     pub hub_operation_deadline_ms: u64,
 
     /// Maximum number of concurrent tree-listing requests per poll round.

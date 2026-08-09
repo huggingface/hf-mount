@@ -137,6 +137,8 @@ pub struct InodeEntry {
     /// Hub failure. Lookups may use cached children via `listing_usable()` without
     /// treating the listing as freshly validated.
     pub stale_listing_since: Option<Instant>,
+    /// Escalating backoff between stale listing refresh attempts (5s → 10s → 30s).
+    pub stale_listing_backoff_level: u32,
     pub children: Vec<DirChild>,
     /// Name → ino lookup for `lookup_child`. Kept in sync with `children`
     /// via the `add_child` / `remove_child_*` helpers so a directory with
@@ -200,9 +202,17 @@ impl InodeEntry {
         self.children_loaded_at.is_some() || self.stale_listing_since.is_some()
     }
 
-    pub fn stale_listing_recent(&self, retry_interval: std::time::Duration) -> bool {
+    pub fn stale_listing_retry_interval(&self) -> std::time::Duration {
+        match self.stale_listing_backoff_level.min(2) {
+            0 => std::time::Duration::from_secs(5),
+            1 => std::time::Duration::from_secs(10),
+            _ => std::time::Duration::from_secs(30),
+        }
+    }
+
+    pub fn stale_listing_recent(&self) -> bool {
         self.stale_listing_since
-            .is_some_and(|since| since.elapsed() < retry_interval)
+            .is_some_and(|since| since.elapsed() < self.stale_listing_retry_interval())
     }
 
     /// Mark the inode as dirty, incrementing the generation counter.
@@ -304,6 +314,7 @@ impl InodeTable {
             children_loaded_at: None,
             children_from_remote: false,
             stale_listing_since: None,
+            stale_listing_backoff_level: 0,
             children: Vec::new(),
             child_index: HashMap::new(),
             pending_deletes: Vec::new(),
@@ -647,6 +658,7 @@ impl InodeTable {
             children_loaded_at: None,
             children_from_remote: false,
             stale_listing_since: None,
+            stale_listing_backoff_level: 0,
             children: Vec::new(),
             child_index: HashMap::new(),
             pending_deletes: Vec::new(),
@@ -742,12 +754,16 @@ impl InodeTable {
         if let Some(entry) = self.inodes.get_mut(&ino) {
             entry.children_loaded_at = None;
             entry.stale_listing_since = None;
+            entry.stale_listing_backoff_level = 0;
         }
     }
 
     /// Mark a directory as serving a stale cached listing after a transient Hub failure.
     pub fn mark_stale_listing(&mut self, ino: u64) {
         if let Some(entry) = self.inodes.get_mut(&ino) {
+            if entry.stale_listing_since.is_some() {
+                entry.stale_listing_backoff_level = entry.stale_listing_backoff_level.saturating_add(1).min(2);
+            }
             entry.stale_listing_since = Some(Instant::now());
         }
     }
@@ -1563,7 +1579,44 @@ mod tests {
     }
 
     #[test]
-    fn test_pending_deletes() {
+    fn test_stale_listing_backoff_intervals() {
+        let mut entry = InodeEntry {
+            inode: 2,
+            parent: 1,
+            name: Arc::from("dir"),
+            full_path: Arc::from("dir"),
+            kind: InodeKind::Directory,
+            size: 0,
+            mtime: UNIX_EPOCH,
+            mode: 0o755,
+            uid: 0,
+            gid: 0,
+            atime: UNIX_EPOCH,
+            ctime: UNIX_EPOCH,
+            nlink: 2,
+            symlink_target: None,
+            xet_hash: None,
+            staging_is_current: false,
+            etag: None,
+            dirty_generation: 0,
+            children_loaded_at: None,
+            children_from_remote: true,
+            stale_listing_since: None,
+            stale_listing_backoff_level: 0,
+            children: Vec::new(),
+            child_index: HashMap::new(),
+            pending_deletes: Vec::new(),
+            last_revalidated: None,
+            eviction: EvictionState::default(),
+        };
+        assert_eq!(entry.stale_listing_retry_interval(), std::time::Duration::from_secs(5));
+        entry.stale_listing_backoff_level = 1;
+        assert_eq!(entry.stale_listing_retry_interval(), std::time::Duration::from_secs(10));
+        entry.stale_listing_backoff_level = 2;
+        assert_eq!(entry.stale_listing_retry_interval(), std::time::Duration::from_secs(30));
+    }
+
+    #[test]
         let mut table = InodeTable::new(false);
 
         let ino = table.insert(

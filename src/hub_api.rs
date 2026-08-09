@@ -209,7 +209,9 @@ const DEFAULT_HEAD_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Default retries after the first failed attempt (3 total tries).
 const DEFAULT_MAX_RETRIES: u32 = 2;
 /// Wall-clock budget for a single Hub HTTP operation (all attempts + backoff).
-const DEFAULT_OPERATION_DEADLINE: Duration = Duration::from_secs(5);
+/// Kept shorter than the Hub's Mongo tree-listing deadline so transient 504s
+/// fail fast to stale cache instead of racing the server timeout.
+const DEFAULT_OPERATION_DEADLINE: Duration = Duration::from_secs(3);
 /// Open the circuit after this many consecutive gateway failures (502/503/504).
 const CIRCUIT_FAILURE_THRESHOLD: u32 = 3;
 const CIRCUIT_OPEN_DURATION: Duration = Duration::from_secs(10);
@@ -443,6 +445,11 @@ async fn send_with_retry(
     let mut attempt = 0;
     loop {
         attempt += 1;
+        if started.elapsed() >= operation_deadline {
+            return Err(Error::hub(format!(
+                "{context}: operation deadline {operation_deadline:?} exceeded before attempt {attempt}"
+            )));
+        }
         match build_request().send().await {
             Ok(resp) if resp.status().is_success() || (accept_redirects && resp.status().is_redirection()) => {
                 if let Some(state) = retry_state {
