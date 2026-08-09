@@ -473,9 +473,7 @@ async fn send_with_retry(
 
         let send_result = tokio::time::timeout(remaining, build_request().send()).await;
         match send_result {
-            Ok(Ok(resp))
-                if resp.status().is_success() || (accept_redirects && resp.status().is_redirection()) =>
-            {
+            Ok(Ok(resp)) if resp.status().is_success() || (accept_redirects && resp.status().is_redirection()) => {
                 if let Some(state) = retry_state {
                     state.record_success();
                 }
@@ -493,9 +491,7 @@ async fn send_with_retry(
                         {
                             state.record_gateway_failure();
                         }
-                        warn!(
-                            "{context}: operation deadline {operation_deadline:?} exceeded after attempt {attempt}"
-                        );
+                        warn!("{context}: operation deadline {operation_deadline:?} exceeded after attempt {attempt}");
                         return Err(Error::hub_status(status, format!("{context}: {status} {body}")));
                     }
                     warn!(
@@ -520,9 +516,7 @@ async fn send_with_retry(
                     );
                     return Err(Error::Http(err));
                 }
-                warn!(
-                    "{context}: transient error, retry {attempt}/{effective_max_retries} in {delay:?}: {err}"
-                );
+                warn!("{context}: transient error, retry {attempt}/{effective_max_retries} in {delay:?}: {err}");
                 tokio::time::sleep(delay).await;
             }
             Ok(Err(err)) => return Err(Error::Http(err)),
@@ -567,10 +561,7 @@ fn make_clients(backend: &str, config: HubClientConfig) -> (Client, Client) {
             .tcp_keepalive(Some(Duration::from_secs(60)))
             .connect_timeout(Duration::from_secs(10))
     };
-    let client = base()
-        .timeout(request_timeout)
-        .build()
-        .expect("failed to build client");
+    let client = base().timeout(request_timeout).build().expect("failed to build client");
     let head_client = base()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(head_request_timeout)
@@ -1939,13 +1930,9 @@ mod tests {
     #[tokio::test]
     async fn send_with_retry_caps_in_flight_request_by_operation_deadline() {
         let url = mock_slow_server(vec![(Duration::from_secs(5), 200)]).await;
-        let client = Client::builder()
-            .timeout(Duration::from_secs(60))
-            .build()
-            .unwrap();
+        let client = Client::builder().timeout(Duration::from_secs(60)).build().unwrap();
         let started = Instant::now();
-        let result =
-            send_with_retry(|| client.get(&url), "test", false, 0, Duration::from_millis(200), None).await;
+        let result = send_with_retry(|| client.get(&url), "test", false, 0, Duration::from_millis(200), None).await;
         assert!(result.is_err());
         assert!(started.elapsed() < Duration::from_secs(1));
         assert!(matches!(result.unwrap_err(), Error::Hub { status: Some(504), .. }));

@@ -784,9 +784,7 @@ impl VirtualFs {
             match inodes.get(parent_ino) {
                 Some(e) if e.kind != InodeKind::Directory => return Err(libc::ENOTDIR),
                 Some(e) if e.children_loaded() => return Ok(()),
-                Some(e)
-                    if e.stale_listing_recent() && inodes.has_cached_remote_children(parent_ino) =>
-                {
+                Some(e) if e.stale_listing_recent() && inodes.has_cached_remote_children(parent_ino) => {
                     return Ok(());
                 }
                 None => return Err(libc::ENOENT),
@@ -804,9 +802,7 @@ impl VirtualFs {
             match inodes.get(parent_ino) {
                 Some(e) if e.kind != InodeKind::Directory => return Err(libc::ENOTDIR),
                 Some(e) if e.children_loaded() => return Ok(()),
-                Some(e)
-                    if e.stale_listing_recent() && inodes.has_cached_remote_children(parent_ino) =>
-                {
+                Some(e) if e.stale_listing_recent() && inodes.has_cached_remote_children(parent_ino) => {
                     return Ok(());
                 }
                 Some(e) => e.full_path.to_string(),
