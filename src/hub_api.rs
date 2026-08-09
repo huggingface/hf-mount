@@ -1862,15 +1862,7 @@ mod tests {
         let url = mock_server(vec![503, 503, 503, 503, 503]).await;
         let client = Client::new();
         let started = Instant::now();
-        let result = send_with_retry(
-            || client.get(&url),
-            "test",
-            false,
-            10,
-            Duration::from_millis(250),
-            None,
-        )
-        .await;
+        let result = send_with_retry(|| client.get(&url), "test", false, 10, Duration::from_millis(250), None).await;
         assert!(result.is_err());
         assert!(started.elapsed() < Duration::from_secs(2));
     }
