@@ -16,6 +16,9 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # Integration tests create scratch buckets under this namespace (org), not the
+  # token owner's personal account. The token must have write access to it.
+  HF_BUCKET_NAMESPACE: infra-workloads
 
 jobs:
   lint-test:
