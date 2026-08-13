@@ -1841,13 +1841,31 @@ impl VirtualFs {
         let staging_mutex = self.staging.lock(ino);
         let _staging_guard = staging_mutex.lock().await;
 
-        // Supersede any older streaming writer, under the same per-inode lock
-        // every commit driver holds. The generation bump below makes the old
-        // channel's bytes uncommittable (streaming_commit skips superseded
-        // channels), so fail it loudly NOW: its writes and flush must return
-        // EIO instead of acknowledging bytes that would be silently
-        // discarded. Fulfilling the hook unblocks any open() already waiting
-        // on the old channel's deferred commit.
+        // Capture inode snapshot before mutation (for revert on commit failure)
+        let snapshot = {
+            let inodes = self.inode_table.read().expect("inodes poisoned");
+            let entry = inodes.get(ino).ok_or(libc::ENOENT)?;
+            InodeSnapshot {
+                xet_hash: entry.xet_hash.clone(),
+                size: entry.size,
+                mtime: entry.mtime,
+                pending_deletes: entry.pending_deletes.clone(),
+                existed_before: true,
+            }
+        };
+
+        let (file_handle, channel) = self.setup_streaming_writer(pid, snapshot, 0).await?;
+
+        // The replacement writer is ready — supersede any older streaming
+        // writer, under the same per-inode lock every commit driver holds
+        // (only after setup succeeded: failing the old writer for a stillborn
+        // replacement would strand its acknowledged bytes for nothing). The
+        // generation bump below makes the old channel's bytes uncommittable
+        // (streaming_commit skips superseded channels), so fail it loudly
+        // NOW: its writes and flush must return EIO instead of acknowledging
+        // bytes that would be silently discarded. Fulfilling the hook
+        // unblocks any open() already waiting on the old channel's deferred
+        // commit.
         {
             let files = self.open_files.read().expect("open_files poisoned");
             for open in files.values() {
@@ -1870,21 +1888,6 @@ impl VirtualFs {
                 }
             }
         }
-
-        // Capture inode snapshot before mutation (for revert on commit failure)
-        let snapshot = {
-            let inodes = self.inode_table.read().expect("inodes poisoned");
-            let entry = inodes.get(ino).ok_or(libc::ENOENT)?;
-            InodeSnapshot {
-                xet_hash: entry.xet_hash.clone(),
-                size: entry.size,
-                mtime: entry.mtime,
-                pending_deletes: entry.pending_deletes.clone(),
-                existed_before: true,
-            }
-        };
-
-        let (file_handle, channel) = self.setup_streaming_writer(pid, snapshot, 0).await?;
 
         {
             let mut inodes = self.inode_table.write().expect("inodes poisoned");

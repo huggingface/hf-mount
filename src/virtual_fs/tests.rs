@@ -4769,6 +4769,40 @@ fn otrunc_reopen_supersedes_old_streaming_writer() {
     });
 }
 
+/// A failed O_TRUNC reopen must not supersede the active writer: failing the
+/// old channel for a stillborn replacement would strand its acknowledged
+/// bytes for nothing.
+#[test]
+fn failed_otrunc_reopen_leaves_active_writer_intact() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let (attr, fh) = vfs
+            .create(ROOT_INODE, "keep.txt", 0o644, 1000, 1000, Some(42))
+            .await
+            .unwrap();
+        let ino = attr.ino;
+        write_blocking(&vfs, ino, fh, 0, b"payload").await.unwrap();
+
+        xet.fail_next_writer_create();
+        assert!(vfs.open(ino, true, true, Some(42)).await.is_err());
+
+        // The original writer still works end to end.
+        write_blocking(&vfs, ino, fh, 7, b" more").await.unwrap();
+        vfs.flush(ino, fh, Some(42)).await.unwrap();
+        vfs.release(fh).await.unwrap();
+
+        let committed = hub
+            .take_batch_log()
+            .iter()
+            .flatten()
+            .any(|op| matches!(op, BatchOp::AddFile { path, .. } if path == "keep.txt"));
+        assert!(committed, "original writer's commit must land");
+    });
+}
+
 /// A dup'd-fd flush (PID mismatch) racing a commit IN FLIGHT must not demote
 /// Committing back to Deferred: that would let a subsequent write pass the
 /// Writing|Deferred gate, land behind Finish, and be silently dropped by the
