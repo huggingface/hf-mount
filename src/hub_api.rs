@@ -41,6 +41,18 @@ fn encode_url_path(path: &str) -> std::borrow::Cow<'_, str> {
     utf8_percent_encode(path, URL_PATH_ESCAPE).into()
 }
 
+/// Revisions escape `/` too: a ref like `refs/pr/1` occupies a single path
+/// segment in `/resolve/{revision}/{path}` and `/tree/{revision}/{path}`, so
+/// it must land as `refs%2Fpr%2F1` — unencoded, the Hub parses the extra
+/// segments as part of the file path and returns 404.
+const URL_REVISION_ESCAPE: &AsciiSet = &URL_PATH_ESCAPE.add(b'/');
+
+/// Percent-encode a revision as a single URL path segment (see
+/// `URL_REVISION_ESCAPE`).
+fn encode_url_revision(revision: &str) -> std::borrow::Cow<'_, str> {
+    utf8_percent_encode(revision, URL_REVISION_ESCAPE).into()
+}
+
 /// True when `path` lives strictly under the directory `prefix` (i.e. under
 /// `{prefix}/`), as opposed to merely sharing `prefix` as a raw key prefix
 /// (`a/1.manifest#1` vs `a/1.manifest`) or being `prefix` itself.
@@ -747,7 +759,7 @@ impl HubApiClient {
                 self.endpoint,
                 repo_type.api_prefix(),
                 repo_id,
-                revision,
+                encode_url_revision(revision),
             )
         } else {
             format!(
@@ -755,7 +767,7 @@ impl HubApiClient {
                 self.endpoint,
                 repo_type.api_prefix(),
                 repo_id,
-                revision,
+                encode_url_revision(revision),
                 encode_url_path(prefix),
             )
         };
@@ -798,8 +810,6 @@ impl HubApiClient {
         Ok(all_entries)
     }
 
-    /// Fetch metadata for a single file via HEAD on the resolve endpoint.
-    /// Returns `None` if 404 (file does not exist remotely).
     /// Build the resolve-endpoint URL for `path` (prefixed and URL-encoded).
     fn resolve_url(&self, path: &str) -> String {
         let prefixed = self.prefixed_path(path);
@@ -820,13 +830,15 @@ impl HubApiClient {
                     self.endpoint,
                     repo_type.resolve_prefix(),
                     repo_id,
-                    revision,
+                    encode_url_revision(revision),
                     api_path,
                 )
             }
         }
     }
 
+    /// Fetch metadata for a single file via HEAD on the resolve endpoint.
+    /// Returns `None` if 404 (file does not exist remotely).
     pub async fn head_file(&self, path: &str) -> Result<Option<HeadFileInfo>> {
         let url = self.resolve_url(path);
         let resp = send_with_retry(|| self.auth(self.head_client.head(&url)), "head_file", true).await;
@@ -883,7 +895,7 @@ impl HubApiClient {
                     self.endpoint,
                     repo_type.api_prefix(),
                     repo_id,
-                    revision,
+                    encode_url_revision(revision),
                 )
             }
         };
@@ -1373,6 +1385,30 @@ mod tests {
         assert_eq!(
             c.resolve_url("a b.txt"),
             "https://huggingface.co/buckets/user/bucket/resolve/sub/dir/a%20b.txt"
+        );
+    }
+
+    #[test]
+    fn test_encode_url_revision_single_segment() {
+        // Plain revisions pass through.
+        assert_eq!(encode_url_revision("main"), "main");
+        // Refs must stay a single path segment: the Hub 404s on the
+        // unencoded form (extra segments parse as part of the file path).
+        assert_eq!(encode_url_revision("refs/pr/1"), "refs%2Fpr%2F1");
+        assert_eq!(encode_url_revision("refs/convert/parquet"), "refs%2Fconvert%2Fparquet");
+    }
+
+    #[test]
+    fn test_resolve_url_encodes_revision() {
+        let mut c = make_test_client("", None);
+        c.source = SourceKind::Repo {
+            repo_id: "user/model".to_string(),
+            repo_type: RepoType::Model,
+            revision: "refs/pr/1".to_string(),
+        };
+        assert_eq!(
+            c.resolve_url("config.json"),
+            "https://huggingface.co/user/model/resolve/refs%2Fpr%2F1/config.json"
         );
     }
 
