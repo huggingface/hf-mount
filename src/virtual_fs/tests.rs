@@ -4727,6 +4727,48 @@ fn write_after_streaming_commit_is_rejected() {
     });
 }
 
+/// A second O_TRUNC writer supersedes the first: the old handle's bytes can
+/// never commit (generation mismatch), so its writes and flush must fail
+/// loudly with EIO instead of acknowledging bytes that are then silently
+/// discarded. The new writer commits normally.
+#[test]
+fn otrunc_reopen_supersedes_old_streaming_writer() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let (attr, fh_old) = vfs
+            .create(ROOT_INODE, "super.txt", 0o644, 1000, 1000, Some(42))
+            .await
+            .unwrap();
+        let ino = attr.ino;
+        write_blocking(&vfs, ino, fh_old, 0, b"old bytes").await.unwrap();
+
+        // Second O_TRUNC writer supersedes the first.
+        let fh_new = vfs.open(ino, true, true, Some(42)).await.unwrap();
+
+        let err = write_blocking(&vfs, ino, fh_old, 9, b"more").await.unwrap_err();
+        assert_eq!(err, libc::EIO, "superseded writes must fail loudly");
+        let err = vfs.flush(ino, fh_old, Some(42)).await.unwrap_err();
+        assert_eq!(err, libc::EIO, "superseded flush must fail loudly");
+        vfs.release(fh_old).await.unwrap();
+
+        // The new writer is unaffected and commits its bytes.
+        write_blocking(&vfs, ino, fh_new, 0, b"new bytes").await.unwrap();
+        vfs.flush(ino, fh_new, Some(42)).await.unwrap();
+        vfs.release(fh_new).await.unwrap();
+
+        let committed = hub
+            .take_batch_log()
+            .iter()
+            .flatten()
+            .filter(|op| matches!(op, BatchOp::AddFile { path, .. } if path == "super.txt"))
+            .count();
+        assert_eq!(committed, 1, "only the new writer's commit lands");
+    });
+}
+
 /// A dup'd-fd flush (PID mismatch) racing a commit IN FLIGHT must not demote
 /// Committing back to Deferred: that would let a subsequent write pass the
 /// Writing|Deferred gate, land behind Finish, and be silently dropped by the

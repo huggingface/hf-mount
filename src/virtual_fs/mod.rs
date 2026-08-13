@@ -1841,6 +1841,36 @@ impl VirtualFs {
         let staging_mutex = self.staging.lock(ino);
         let _staging_guard = staging_mutex.lock().await;
 
+        // Supersede any older streaming writer, under the same per-inode lock
+        // every commit driver holds. The generation bump below makes the old
+        // channel's bytes uncommittable (streaming_commit skips superseded
+        // channels), so fail it loudly NOW: its writes and flush must return
+        // EIO instead of acknowledging bytes that would be silently
+        // discarded. Fulfilling the hook unblocks any open() already waiting
+        // on the old channel's deferred commit.
+        {
+            let files = self.open_files.read().expect("open_files poisoned");
+            for open in files.values() {
+                if let OpenFile::Streaming { ino: open_ino, channel } = open
+                    && *open_ino == ino
+                {
+                    let superseded = {
+                        let mut state = channel.state.lock().expect("state poisoned");
+                        match &*state {
+                            CommitState::Committed | CommitState::Failed(_) => false,
+                            _ => {
+                                *state = CommitState::Failed("superseded by O_TRUNC reopen".into());
+                                true
+                            }
+                        }
+                    };
+                    if superseded {
+                        self.fulfill_commit_hook(ino, channel, Err(libc::EIO));
+                    }
+                }
+            }
+        }
+
         // Capture inode snapshot before mutation (for revert on commit failure)
         let snapshot = {
             let inodes = self.inode_table.read().expect("inodes poisoned");
