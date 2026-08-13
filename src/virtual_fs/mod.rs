@@ -2662,16 +2662,25 @@ impl VirtualFs {
     async fn streaming_commit(&self, ino: u64, channel: &StreamingChannel) -> Result<(), i32> {
         assert!(!self.overlay(), "overlay forces advanced_writes; streaming unreachable");
 
-        // Unlinked files (nlink=0) must not be re-committed on close —
-        // user deleted the file, uploading would resurrect it.
-        if self
-            .inode_table
-            .read()
-            .expect("inodes poisoned")
-            .get(ino)
-            .is_some_and(|e| e.nlink == 0)
-        {
-            debug!("streaming_commit: skipping unlinked ino={}", ino);
+        // Unlinked files (nlink=0) must not be re-committed on close — user
+        // deleted the file, uploading would resurrect it. A superseded
+        // channel (a newer O_TRUNC writer bumped the dirty generation, and
+        // may have committed already) must not commit either: its AddFile
+        // would roll the remote back over the successor's bytes. Both checks
+        // run under the per-inode staging lock held by every commit driver,
+        // so they cannot go stale before the Hub call.
+        let skip_commit = {
+            let inodes = self.inode_table.read().expect("inodes poisoned");
+            match inodes.get(ino) {
+                Some(entry) => {
+                    entry.nlink == 0
+                        || entry.dirty_generation != channel.dirty_generation_at_open.load(Ordering::Relaxed)
+                }
+                None => true,
+            }
+        };
+        if skip_commit {
+            debug!("streaming_commit: skipping unlinked or superseded ino={}", ino);
             return Ok(());
         }
 
@@ -3319,6 +3328,11 @@ impl VirtualFs {
         // otherwise HEAD the still-existing remote (the delete is only queued)
         // and resurrect this name locally during the drop_locked await window.
         self.negative_cache_insert(full_path.clone());
+
+        // The commit/creation serialization is complete (remote delete and
+        // local unlink both done); release the per-inode lock before
+        // drop_locked re-acquires it below.
+        drop(_commit_guard);
 
         // Clean up staging file only when the inode is actually gone. With an
         // open fd, drop_staging waits until release() so writes through the
