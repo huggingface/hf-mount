@@ -199,25 +199,28 @@ jobs:
           PR="${{ github.event.pull_request.number }}"
           MARKER="<!-- pjdfstest-results -->"
           
-          # Sanitize TABLES content by encoding it as JSON string
-          TABLES_JSON=$(jq -Rs . <<< "$TABLES")
+          # Write content to temp file to avoid shell interpolation
+          TEMP_FILE=$(mktemp)
+          echo "$TABLES" > "$TEMP_FILE"
           
-          BODY=$(jq -rn \
-            --arg marker "$MARKER" \
-            --argjson tables "$TABLES_JSON" \
-            '{marker: $marker, content: ("## POSIX Compliance (pjdfstest)\n\n```\n" + $tables + "\n```")} | .marker + "\n" + .content')
-
+          # Build comment body using jq with file input to avoid injection
+          jq -Rs --arg marker "$MARKER" \
+            '{marker: $marker, content: ("## POSIX Compliance (pjdfstest)\n\n```\n" + . + "\n```")} | .marker + "\n" + .content' \
+            "$TEMP_FILE" > "${TEMP_FILE}.body"
+          
           COMMENT_ID=$(gh api "repos/${{ github.repository }}/issues/${PR}/comments" \
             --jq ".[] | select(.body | startswith(\"${MARKER}\")) | .id" | head -1)
 
           if [ -n "$COMMENT_ID" ]; then
             gh api "repos/${{ github.repository }}/issues/comments/${COMMENT_ID}" \
-              -X PATCH -F body="$BODY"
+              -X PATCH -F "body=@${TEMP_FILE}.body"
             echo "Updated existing comment $COMMENT_ID"
           else
-            gh pr comment "$PR" --body "$BODY"
+            gh pr comment "$PR" --body-file "${TEMP_FILE}.body"
             echo "Created new comment"
           fi
+          
+          rm -f "$TEMP_FILE" "${TEMP_FILE}.body"
 
   bench:
     name: Benchmarks
@@ -272,23 +275,26 @@ jobs:
           PR="${{ github.event.pull_request.number }}"
           MARKER="<!-- bench-results -->"
           
-          # Sanitize TABLES content by encoding it as JSON string
-          TABLES_JSON=$(jq -Rs . <<< "$TABLES")
+          # Write content to temp file to avoid shell interpolation
+          TEMP_FILE=$(mktemp)
+          echo "$TABLES" > "$TEMP_FILE"
           
-          BODY=$(jq -rn \
-            --arg marker "$MARKER" \
-            --argjson tables "$TABLES_JSON" \
-            '{marker: $marker, content: ("## Benchmark Results\n\n```\n" + $tables + "\n```")} | .marker + "\n" + .content')
-
+          # Build comment body using jq with file input to avoid injection
+          jq -Rs --arg marker "$MARKER" \
+            '{marker: $marker, content: ("## Benchmark Results\n\n```\n" + . + "\n```")} | .marker + "\n" + .content' \
+            "$TEMP_FILE" > "${TEMP_FILE}.body"
+          
           # Find existing comment with our marker
           COMMENT_ID=$(gh api "repos/${{ github.repository }}/issues/${PR}/comments" \
             --jq ".[] | select(.body | startswith(\"${MARKER}\")) | .id" | head -1)
 
           if [ -n "$COMMENT_ID" ]; then
             gh api "repos/${{ github.repository }}/issues/comments/${COMMENT_ID}" \
-              -X PATCH -F body="$BODY"
+              -X PATCH -F "body=@${TEMP_FILE}.body"
             echo "Updated existing comment $COMMENT_ID"
           else
-            gh pr comment "$PR" --body "$BODY"
+            gh pr comment "$PR" --body-file "${TEMP_FILE}.body"
             echo "Created new comment"
           fi
+          
+          rm -f "$TEMP_FILE" "${TEMP_FILE}.body"
