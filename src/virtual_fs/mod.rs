@@ -1141,6 +1141,7 @@ impl VirtualFs {
             snapshot,
             dirty_generation_at_open: AtomicU64::new(dirty_generation_at_open),
             commit_hook: std::sync::Mutex::new(None),
+            commit_lock: tokio::sync::Mutex::new(()),
         });
 
         let file_handle = self.alloc_file_handle();
@@ -2442,7 +2443,7 @@ impl VirtualFs {
                     ino, open_pid, flush_pid
                 );
                 self.install_commit_hook(ino, &channel);
-                *channel.state.lock().expect("state poisoned") = CommitState::Deferred;
+                self.defer_commit(&channel);
                 return Ok(());
             }
 
@@ -2450,28 +2451,11 @@ impl VirtualFs {
             // and zero-write cases like `touch`). release() will handle it.
             if channel.bytes_written.load(Ordering::Relaxed) == 0 {
                 self.install_commit_hook(ino, &channel);
-                *channel.state.lock().expect("state poisoned") = CommitState::Deferred;
+                self.defer_commit(&channel);
                 return Ok(());
             }
 
-            // Install hook before commit so concurrent open() can wait on us.
-            self.install_commit_hook(ino, &channel);
-
-            match self.streaming_commit(ino, &channel).await {
-                Ok(()) => {
-                    *channel.state.lock().expect("state poisoned") = CommitState::Committed;
-                    self.fulfill_commit_hook(ino, &channel, Ok(()));
-                }
-                Err(e) => {
-                    // CAS upload may have succeeded — file_info is preserved
-                    // in pending_info for retry in release(). Don't fulfill the
-                    // hook here: release() will retry and publish the final outcome.
-                    // Keeping the hook active ensures concurrent open(O_TRUNC) waits
-                    // for release() instead of racing with the retry.
-                    return Err(e);
-                }
-            }
-            return Ok(());
+            return self.commit_streaming_now(ino, &channel).await;
         }
 
         // Advanced writes mode: check if a previous async flush failed
@@ -2522,10 +2506,16 @@ impl VirtualFs {
                 }
             }
             Some(OpenFile::Streaming { ino, channel }) => {
+                // Serialize against an in-flight flush()/link() commit: without
+                // the lock, release() would observe `Committing`, re-run the
+                // commit against the in-flight one, and fail with a spurious
+                // EIO plus an inode revert racing the successful commit.
+                let _commit_guard = channel.commit_lock.lock().await;
                 let needs_commit = {
                     let state = channel.state.lock().expect("state poisoned");
-                    // Committing: an earlier flush()/link() commit failed
-                    // mid-flight (pending_info parked) — release retries it.
+                    // Committing under the lock: an earlier flush()/link()
+                    // commit failed mid-flight (pending_info parked) —
+                    // release retries it.
                     matches!(
                         &*state,
                         CommitState::Writing | CommitState::Deferred | CommitState::Committing
@@ -2993,12 +2983,29 @@ impl VirtualFs {
         })
     }
 
+    /// Mark a streaming channel's commit as deferred to release(). Only a
+    /// channel still in `Writing` is demoted: overwriting `Committing` would
+    /// reopen the lost-write race the state exists to close (a write() could
+    /// pass the Writing|Deferred gate and enqueue bytes behind an in-flight
+    /// Finish), and Committed/Failed are terminal.
+    fn defer_commit(&self, channel: &StreamingChannel) {
+        let mut state = channel.state.lock().expect("state poisoned");
+        if matches!(&*state, CommitState::Writing) {
+            *state = CommitState::Deferred;
+        }
+    }
+
     /// Terminal streaming-commit sequence, shared by `flush()` and `link()`:
-    /// error check → state check → install hook → commit → mark Committed →
-    /// fulfill hook. On error the hook stays active and pending_info is
-    /// preserved so release() retries and publishes the final outcome;
-    /// concurrent open(O_TRUNC) waits on the hook instead of racing the retry.
+    /// commit lock → error check → state check → install hook → commit →
+    /// mark Committed → fulfill hook. On error the hook stays active and
+    /// pending_info is preserved so release() retries and publishes the final
+    /// outcome; concurrent open(O_TRUNC) waits on the hook instead of racing
+    /// the retry. The commit lock serializes against release(): without it, a
+    /// release() racing a link()-initiated commit would observe `Committing`,
+    /// re-run the commit against the in-flight one, and fail with a spurious
+    /// EIO (plus an inode revert racing the successful commit).
     async fn commit_streaming_now(&self, ino: u64, channel: &Arc<StreamingChannel>) -> VirtualFsResult<()> {
+        let _commit_guard = channel.commit_lock.lock().await;
         if let Some(err) = channel.error.lock().expect("error poisoned").as_ref() {
             return Err(err.to_errno());
         }
@@ -4068,7 +4075,6 @@ struct FileEntry {
     full_path: String,
 }
 
-/// State machine for streaming writes.
 /// Message sent from the write() caller to the background streaming worker.
 enum WriteMsg {
     Data(Vec<u8>),
@@ -4127,9 +4133,13 @@ struct StreamingChannel {
     /// Watch sender for the pending commit hook. Created in flush() on deferral,
     /// fulfilled in release() when the commit completes (or fails).
     commit_hook: std::sync::Mutex<Option<CommitHookTx>>,
+    /// Serializes commit attempts (flush()/link() via commit_streaming_now,
+    /// and release()): a commit must never run against another one in flight.
+    /// Held across the commit await — safe because it is a tokio Mutex and
+    /// the only lock held at acquisition time.
+    commit_lock: tokio::sync::Mutex<()>,
 }
 
-/// An open file handle — either a local fd, lazy remote reference, or streaming writer.
 /// Committed source attributes read under lock for `link()`.
 struct LinkSource {
     path: Arc<str>,
@@ -4140,6 +4150,7 @@ struct LinkSource {
     gid: u32,
 }
 
+/// An open file handle — either a local fd, lazy remote reference, or streaming writer.
 enum OpenFile {
     /// Local file (staging for writes, or dirty reads).
     Local { ino: u64, file: Arc<File>, writable: bool },

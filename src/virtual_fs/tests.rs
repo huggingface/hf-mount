@@ -4723,6 +4723,121 @@ fn write_after_streaming_commit_is_rejected() {
     });
 }
 
+/// A dup'd-fd flush (PID mismatch) racing a commit IN FLIGHT must not demote
+/// Committing back to Deferred: that would let a subsequent write pass the
+/// Writing|Deferred gate, land behind Finish, and be silently dropped by the
+/// exiting worker.
+#[test]
+fn flush_from_other_pid_does_not_demote_inflight_commit() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let (attr, fh) = vfs
+            .create(ROOT_INODE, "demote.txt", 0o644, 1000, 1000, Some(42))
+            .await
+            .unwrap();
+        let ino = attr.ino;
+        write_blocking(&vfs, ino, fh, 0, b"payload").await.unwrap();
+
+        // Park the commit at the Hub batch call: state is Committing.
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        hub.set_batch_barrier(barrier.clone());
+        let vfs_flush = vfs.clone();
+        let flush_task = tokio::spawn(async move { vfs_flush.flush(ino, fh, Some(42)).await });
+
+        let mut offset = 7u64;
+        let mut rejected = false;
+        for _ in 0..200 {
+            match write_blocking(&vfs, ino, fh, offset, b"more").await {
+                Err(err) => {
+                    assert_eq!(err, libc::EIO);
+                    rejected = true;
+                    break;
+                }
+                Ok(written) => offset += written as u64,
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(rejected, "write must be rejected once the commit is in flight");
+
+        // Dup'd-fd flush while the commit is in flight: defers without
+        // touching the Committing state.
+        vfs.flush(ino, fh, Some(999)).await.unwrap();
+
+        // Still rejected — a Deferred demotion would accept these bytes and
+        // silently drop them behind the in-flight Finish.
+        let err = write_blocking(&vfs, ino, fh, offset, b"lost").await.unwrap_err();
+        assert_eq!(err, libc::EIO);
+
+        barrier.wait().await;
+        flush_task.await.unwrap().unwrap();
+        vfs.release(fh).await.unwrap();
+    });
+}
+
+/// release() racing a link()-initiated commit must wait for it (commit_lock)
+/// instead of re-running the commit against the in-flight one — the re-run
+/// found no worker and no pending_info, returned a spurious EIO at close, and
+/// reverted the inode while the commit was succeeding.
+#[test]
+fn release_waits_for_inflight_link_commit() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let (attr, fh) = vfs
+            .create(ROOT_INODE, "staging#1", 0o644, 1000, 1000, Some(42))
+            .await
+            .unwrap();
+        let ino = attr.ino;
+        write_blocking(&vfs, ino, fh, 0, b"manifest bytes").await.unwrap();
+
+        // Park link()'s synchronous source commit at the Hub batch call.
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        hub.set_batch_barrier(barrier.clone());
+        let vfs_link = vfs.clone();
+        let link_task = tokio::spawn(async move { vfs_link.link(ino, ROOT_INODE, "final.manifest").await });
+
+        // Wait until the commit is in flight (writes rejected).
+        let mut offset = 14u64;
+        let mut in_flight = false;
+        for _ in 0..200 {
+            match write_blocking(&vfs, ino, fh, offset, b"more").await {
+                Err(_) => {
+                    in_flight = true;
+                    break;
+                }
+                Ok(written) => offset += written as u64,
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(in_flight, "link()'s commit must be in flight");
+
+        // release() must block on the commit lock, not re-run the commit.
+        let vfs_release = vfs.clone();
+        let release_task = tokio::spawn(async move { vfs_release.release(fh).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        barrier.wait().await; // unpark the source commit
+        barrier.wait().await; // unpark the alias commit
+        link_task.await.unwrap().unwrap();
+        release_task
+            .await
+            .unwrap()
+            .expect("release must not fail after a successful commit");
+
+        // The source inode survived: no revert raced the commit.
+        {
+            let inodes = vfs.inode_table.read().unwrap();
+            let entry = inodes.get(ino).unwrap();
+            assert!(!entry.is_dirty(), "source stays committed after release");
+        }
+    });
+}
+
 /// When the synchronous commit inside link() fails, the error propagates and
 /// no alias is committed — pending_info stays parked for the release() retry
 /// (same failure contract as flush()).
