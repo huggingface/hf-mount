@@ -53,13 +53,14 @@ fn encode_url_revision(revision: &str) -> std::borrow::Cow<'_, str> {
     utf8_percent_encode(revision, URL_REVISION_ESCAPE).into()
 }
 
-/// True when `path` lives strictly under the directory `prefix` (i.e. under
-/// `{prefix}/`), as opposed to merely sharing `prefix` as a raw key prefix
-/// (`a/1.manifest#1` vs `a/1.manifest`) or being `prefix` itself.
-fn is_strict_descendant(path: &str, prefix: &str) -> bool {
+/// The path of `path` relative to the directory `prefix`, if `path` lives
+/// strictly under `{prefix}/` — as opposed to merely sharing `prefix` as a
+/// raw key prefix (`a/1.manifest#1` vs `a/1.manifest`) or being `prefix`
+/// itself.
+pub(crate) fn strict_descendant_rel<'a>(path: &'a str, prefix: &str) -> Option<&'a str> {
     path.strip_prefix(prefix)
         .and_then(|rest| rest.strip_prefix('/'))
-        .is_some_and(|rel| !rel.is_empty())
+        .filter(|rel| !rel.is_empty())
 }
 
 // ── HubOps trait ──────────────────────────────────────────────────────
@@ -615,8 +616,7 @@ impl HubApiClient {
             // The prefix directory itself — caller should filter this out.
             return Some("");
         }
-        full.strip_prefix(&self.path_prefix)
-            .and_then(|rest| rest.strip_prefix('/'))
+        strict_descendant_rel(full, &self.path_prefix)
     }
 
     /// Validate that the path prefix exists on the remote.
@@ -690,7 +690,7 @@ impl HubApiClient {
             } => self.list_tree_repo(repo_id, *repo_type, revision, &api_prefix).await?,
         };
         if !api_prefix.is_empty() {
-            entries.retain(|e| is_strict_descendant(&e.path, &api_prefix));
+            entries.retain(|e| strict_descendant_rel(&e.path, &api_prefix).is_some());
         }
 
         // Strip path prefix from returned entries and filter out the prefix dir itself.
@@ -1413,17 +1413,17 @@ mod tests {
     }
 
     #[test]
-    fn test_is_strict_descendant() {
-        // Real children (any depth) are in.
-        assert!(is_strict_descendant("a/b.txt", "a"));
-        assert!(is_strict_descendant("a/b/c.txt", "a"));
+    fn test_strict_descendant_rel() {
+        // Real children (any depth) are in, relative path returned.
+        assert_eq!(strict_descendant_rel("a/b.txt", "a"), Some("b.txt"));
+        assert_eq!(strict_descendant_rel("a/b/c.txt", "a"), Some("b/c.txt"));
         // Raw S3 key-prefix matches are NOT children: the sibling staging
         // files of object_store writers (`1.manifest#1`) must not make
         // `1.manifest` look like a directory.
-        assert!(!is_strict_descendant("a/1.manifest#1", "a/1.manifest"));
-        assert!(!is_strict_descendant("ab.txt", "a"));
+        assert_eq!(strict_descendant_rel("a/1.manifest#1", "a/1.manifest"), None);
+        assert_eq!(strict_descendant_rel("ab.txt", "a"), None);
         // The path itself is not its own descendant.
-        assert!(!is_strict_descendant("a", "a"));
+        assert_eq!(strict_descendant_rel("a", "a"), None);
     }
 
     #[test]

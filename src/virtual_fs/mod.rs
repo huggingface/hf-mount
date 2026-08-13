@@ -828,10 +828,10 @@ impl VirtualFs {
             let rel_path = if prefix.is_empty() {
                 entry.path.clone()
             } else {
-                match entry.path.strip_prefix(&prefix).and_then(|p| p.strip_prefix('/')) {
-                    Some(rel) if !rel.is_empty() => rel.to_string(),
+                match crate::hub_api::strict_descendant_rel(&entry.path, &prefix) {
+                    Some(rel) => rel.to_string(),
                     // list_tree guarantees strict descendants; skip defensively.
-                    _ => continue,
+                    None => continue,
                 }
             };
 
@@ -2369,12 +2369,26 @@ impl VirtualFs {
                 }
 
                 let len = data.len();
-                // Enqueue under the state mutex to serialize against
-                // streaming_commit(), which flips to Committing under the
-                // same mutex before enqueueing Finish: either this Data lands
-                // ahead of Finish (and is included in the commit), or the
-                // write observes Committing/Committed and fails loudly
+                // Reserve the channel slot BEFORE taking the state mutex: the
+                // backpressure wait (32-slot channel, worker draining at
+                // network speed) must not run while holding the lock every
+                // commit path contends on. permit.send() cannot block, so the
+                // state check and the enqueue below stay atomic under the
+                // mutex streaming_commit() flips to Committing under: either
+                // this Data lands ahead of Finish (and joins the commit), or
+                // the write observes Committing/Committed and fails loudly
                 // instead of being silently dropped behind Finish.
+                let closed = || {
+                    error!("streaming channel closed for ino={}", handle_ino);
+                    libc::EIO
+                };
+                let permit = match channel.tx.try_reserve() {
+                    Ok(permit) => permit,
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(())) => {
+                        self.runtime.block_on(channel.tx.reserve()).map_err(|_| closed())?
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(())) => return Err(closed()),
+                };
                 {
                     let state = channel.state.lock().expect("state poisoned");
                     match &*state {
@@ -2384,10 +2398,7 @@ impl VirtualFs {
                             return Err(libc::EIO);
                         }
                     }
-                    channel.tx.blocking_send(WriteMsg::Data(data.to_vec())).map_err(|_| {
-                        error!("streaming channel closed for ino={}", handle_ino);
-                        libc::EIO
-                    })?;
+                    permit.send(WriteMsg::Data(data.to_vec()));
                 }
                 channel.bytes_written.fetch_add(len as u64, Ordering::Relaxed);
 
@@ -3066,15 +3077,12 @@ impl VirtualFs {
         // → close, so their link() arrives before the close-time commit. The
         // commit itself waits until the destination has validated — a link
         // that fails EEXIST/ENOTDIR must not leave remote mutation behind.
-        let mut source = self.link_source(ino)?;
+        let source = self.link_source(ino)?;
         let dirty_channel = if source.is_none() {
-            match self.streaming_channel_for(ino) {
-                Some(channel) => Some(channel),
-                // Dirty with no committable handle (the routine *arr
-                // link-then-copy fallback): reject before paying for the
-                // destination list_tree below.
-                None => return Err(libc::ENOTSUP),
-            }
+            // Dirty with no committable handle (the routine *arr
+            // link-then-copy fallback): reject before paying for the
+            // destination list_tree below.
+            Some(self.streaming_channel_for(ino).ok_or(libc::ENOTSUP)?)
         } else {
             None
         };
@@ -3098,12 +3106,12 @@ impl VirtualFs {
             new_full_path
         };
 
-        if let Some(channel) = dirty_channel {
-            self.commit_streaming_now(ino, &channel).await?;
-            source = self.link_source(ino)?;
-        }
-        let Some(source) = source else {
-            return Err(libc::ENOTSUP);
+        let source = match dirty_channel {
+            Some(channel) => {
+                self.commit_streaming_now(ino, &channel).await?;
+                self.link_source(ino)?.ok_or(libc::ENOTSUP)?
+            }
+            None => source.ok_or(libc::ENOTSUP)?,
         };
 
         // Phase 2: commit the alias to the Hub.

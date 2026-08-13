@@ -38,6 +38,25 @@ async fn write_blocking(
         .unwrap()
 }
 
+/// Poll write_blocking until an in-flight commit rejects the write with EIO
+/// (the channel flipped to Committing). Until the flip a write may still
+/// legally succeed (it lands ahead of Finish and joins the commit), so this
+/// keeps writing from `offset` and returns the offset after the accepted
+/// writes.
+async fn wait_for_commit_in_flight(vfs: &std::sync::Arc<VirtualFs>, ino: u64, fh: u64, mut offset: u64) -> u64 {
+    for _ in 0..200 {
+        match write_blocking(vfs, ino, fh, offset, b"more").await {
+            Err(err) => {
+                assert_eq!(err, libc::EIO);
+                return offset;
+            }
+            Ok(written) => offset += written as u64,
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    panic!("commit never went in flight (writes still accepted)");
+}
+
 /// Build a VFS with default settings (simple write mode, bucket source).
 fn vfs_simple(
     hub: &std::sync::Arc<MockHub>,
@@ -929,7 +948,7 @@ fn lookup_uses_head_not_list_tree() {
 /// A name that is a raw key-prefix of an existing file must not resolve as
 /// a directory (`1.manifest` vs the `1.manifest#1` staging convention of
 /// object_store writers). The raw-prefix filtering itself lives in
-/// `HubApiClient::list_tree` (see `test_is_strict_descendant`); this covers
+/// `HubApiClient::list_tree` (see `test_strict_descendant_rel`); this covers
 /// the consumer side: an empty listing is ENOENT, not a phantom directory.
 #[test]
 fn lookup_prefix_of_existing_file_is_enoent() {
@@ -4676,22 +4695,7 @@ fn write_during_inflight_commit_is_rejected() {
         let vfs_flush = vfs.clone();
         let flush_task = tokio::spawn(async move { vfs_flush.flush(ino, fh, Some(42)).await });
 
-        // Until the flip a write may still legally succeed (it lands ahead of
-        // Finish and joins the commit), so poll until the rejection.
-        let mut offset = 7u64;
-        let mut rejected = false;
-        for _ in 0..200 {
-            match write_blocking(&vfs, ino, fh, offset, b"more").await {
-                Err(err) => {
-                    assert_eq!(err, libc::EIO);
-                    rejected = true;
-                    break;
-                }
-                Ok(written) => offset += written as u64,
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        assert!(rejected, "write must be rejected once the commit is in flight");
+        wait_for_commit_in_flight(&vfs, ino, fh, 7).await;
 
         barrier.wait().await;
         flush_task.await.unwrap().unwrap();
@@ -4747,20 +4751,7 @@ fn flush_from_other_pid_does_not_demote_inflight_commit() {
         let vfs_flush = vfs.clone();
         let flush_task = tokio::spawn(async move { vfs_flush.flush(ino, fh, Some(42)).await });
 
-        let mut offset = 7u64;
-        let mut rejected = false;
-        for _ in 0..200 {
-            match write_blocking(&vfs, ino, fh, offset, b"more").await {
-                Err(err) => {
-                    assert_eq!(err, libc::EIO);
-                    rejected = true;
-                    break;
-                }
-                Ok(written) => offset += written as u64,
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        assert!(rejected, "write must be rejected once the commit is in flight");
+        let offset = wait_for_commit_in_flight(&vfs, ino, fh, 7).await;
 
         // Dup'd-fd flush while the commit is in flight: defers without
         // touching the Committing state.
@@ -4802,19 +4793,7 @@ fn release_waits_for_inflight_link_commit() {
         let link_task = tokio::spawn(async move { vfs_link.link(ino, ROOT_INODE, "final.manifest").await });
 
         // Wait until the commit is in flight (writes rejected).
-        let mut offset = 14u64;
-        let mut in_flight = false;
-        for _ in 0..200 {
-            match write_blocking(&vfs, ino, fh, offset, b"more").await {
-                Err(_) => {
-                    in_flight = true;
-                    break;
-                }
-                Ok(written) => offset += written as u64,
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        assert!(in_flight, "link()'s commit must be in flight");
+        wait_for_commit_in_flight(&vfs, ino, fh, 14).await;
 
         // release() must block on the commit lock, not re-run the commit.
         let vfs_release = vfs.clone();
