@@ -140,7 +140,10 @@ pub struct VfsConfig {
 ///   dir_loading_locks[ino]      (tokio::sync::Mutex, per-directory)
 ///     → inode_table             (RwLock, read or write)
 ///
-///   staging.lock(ino)           (tokio::sync::Mutex, per-inode)
+///   staging.lock(ino)           (tokio::sync::Mutex, per-inode — also
+///                                serializes streaming writer creation,
+///                                streaming commits (flush/link/release),
+///                                and streaming-mode unlink)
 ///     → inode_table             (RwLock, read or write)
 ///         → open_files          (RwLock, read only — via has_open_handles)
 ///         → negative_cache      (RwLock, write — in poll_remote_changes)
@@ -1141,7 +1144,6 @@ impl VirtualFs {
             snapshot,
             dirty_generation_at_open: AtomicU64::new(dirty_generation_at_open),
             commit_hook: std::sync::Mutex::new(None),
-            commit_lock: tokio::sync::Mutex::new(()),
         });
 
         let file_handle = self.alloc_file_handle();
@@ -2518,7 +2520,8 @@ impl VirtualFs {
                 // the lock, release() would observe `Committing`, re-run the
                 // commit against the in-flight one, and fail with a spurious
                 // EIO plus an inode revert racing the successful commit.
-                let _commit_guard = channel.commit_lock.lock().await;
+                let staging_mutex = self.staging.lock(ino);
+                let _commit_guard = staging_mutex.lock().await;
                 let needs_commit = {
                     let state = channel.state.lock().expect("state poisoned");
                     // Committing under the lock: an earlier flush()/link()
@@ -3035,16 +3038,19 @@ impl VirtualFs {
     }
 
     /// Terminal streaming-commit sequence, shared by `flush()` and `link()`:
-    /// commit lock → error check → state check → install hook → commit →
+    /// per-inode lock → error check → state check → install hook → commit →
     /// mark Committed → fulfill hook. On error the hook stays active and
     /// pending_info is preserved so release() retries and publishes the final
     /// outcome; concurrent open(O_TRUNC) waits on the hook instead of racing
-    /// the retry. The commit lock serializes against release(): without it, a
-    /// release() racing a link()-initiated commit would observe `Committing`,
-    /// re-run the commit against the in-flight one, and fail with a spurious
-    /// EIO (plus an inode revert racing the successful commit).
+    /// the retry. The per-inode staging lock serializes every streaming
+    /// commit driver (flush/link/release) plus writer creation and unlink:
+    /// without it, a release() racing a link()-initiated commit would observe
+    /// `Committing`, re-run the commit against the in-flight one, and fail
+    /// with a spurious EIO (plus an inode revert racing the successful
+    /// commit).
     async fn commit_streaming_now(&self, ino: u64, channel: &Arc<StreamingChannel>) -> VirtualFsResult<()> {
-        let _commit_guard = channel.commit_lock.lock().await;
+        let staging_mutex = self.staging.lock(ino);
+        let _commit_guard = staging_mutex.lock().await;
         if let Some(err) = channel.error.lock().expect("error poisoned").as_ref() {
             return Err(err.to_errno());
         }
@@ -3217,15 +3223,18 @@ impl VirtualFs {
             }
         };
 
-        // Serialize against an in-flight streaming commit (flush()/link())
-        // before snapshotting: a commit landing between the snapshot and the
-        // local removal would flip the file to committed-with-hash after
-        // needs_remote_delete was computed as false, leaving the freshly
-        // committed remote file undeleted.
-        let inflight_channel = self.streaming_channel_for(target_ino);
-        let _commit_guard = match &inflight_channel {
-            Some(channel) => Some(channel.commit_lock.lock().await),
-            None => None,
+        // Serialize against in-flight streaming commits AND writer creation
+        // (both hold the same per-inode staging lock) before snapshotting: a
+        // commit landing between the snapshot and the local removal would
+        // flip the file to committed-with-hash after needs_remote_delete was
+        // computed as false, leaving the freshly committed remote file
+        // undeleted — and a writer created after a per-channel check would
+        // dodge a channel-scoped lock entirely.
+        let _commit_guard = if !self.advanced_writes {
+            let staging_mutex = self.staging.lock(target_ino);
+            Some(staging_mutex.lock_owned().await)
+        } else {
+            None
         };
 
         let (ino, full_path, needs_remote_delete, dirty) = {
@@ -4189,11 +4198,6 @@ struct StreamingChannel {
     /// Watch sender for the pending commit hook. Created in flush() on deferral,
     /// fulfilled in release() when the commit completes (or fails).
     commit_hook: std::sync::Mutex<Option<CommitHookTx>>,
-    /// Serializes commit attempts (flush()/link() via commit_streaming_now,
-    /// and release()): a commit must never run against another one in flight.
-    /// Held across the commit await — safe because it is a tokio Mutex and
-    /// the only lock held at acquisition time.
-    commit_lock: tokio::sync::Mutex<()>,
 }
 
 /// Committed source attributes read under lock for `link()`.
