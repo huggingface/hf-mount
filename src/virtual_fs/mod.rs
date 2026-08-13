@@ -2992,12 +2992,15 @@ impl VirtualFs {
     }
 
     /// Find the open streaming channel that owns `ino`'s current dirty bytes:
-    /// the one whose `dirty_generation_at_open` matches the inode's current
-    /// dirty generation (the same token streaming_commit uses for
-    /// clear_dirty_if). Multiple streaming handles can coexist on one inode
-    /// (a flushed-but-still-open handle plus a newer O_TRUNC writer), and
-    /// HashMap iteration order is arbitrary — a stale channel must not shadow
-    /// the active writer.
+    /// non-terminal state, and `dirty_generation_at_open` matching the
+    /// inode's current dirty generation (the same token streaming_commit
+    /// uses for clear_dirty_if). Multiple streaming handles can coexist on
+    /// one inode (a flushed-but-still-open handle plus a newer O_TRUNC
+    /// writer), and HashMap iteration order is arbitrary — a stale channel
+    /// must not shadow the active writer. The state filter matters because
+    /// generations are reused: a successful commit resets the inode's
+    /// generation to 0, so a committed-but-open generation-1 channel and the
+    /// next O_TRUNC writer would both match generation 1.
     fn streaming_channel_for(&self, ino: u64) -> Option<Arc<StreamingChannel>> {
         let current_generation = {
             let inodes = self.inode_table.read().expect("inodes poisoned");
@@ -3007,7 +3010,11 @@ impl VirtualFs {
         files.values().find_map(|open| match open {
             OpenFile::Streaming { ino: open_ino, channel }
                 if *open_ino == ino
-                    && channel.dirty_generation_at_open.load(Ordering::Relaxed) == current_generation =>
+                    && channel.dirty_generation_at_open.load(Ordering::Relaxed) == current_generation
+                    && !matches!(
+                        &*channel.state.lock().expect("state poisoned"),
+                        CommitState::Committed | CommitState::Failed(_)
+                    ) =>
             {
                 Some(Arc::clone(channel))
             }
@@ -3200,6 +3207,26 @@ impl VirtualFs {
         debug!("unlink: parent={}, name={}", parent, name);
 
         self.ensure_children_loaded(parent).await?;
+
+        let target_ino = {
+            let inodes = self.inode_table.read().expect("inodes poisoned");
+            match inodes.lookup_child(parent, name) {
+                Some(entry) if entry.kind != InodeKind::Directory => entry.inode,
+                Some(_) => return Err(libc::EISDIR),
+                None => return Err(libc::ENOENT),
+            }
+        };
+
+        // Serialize against an in-flight streaming commit (flush()/link())
+        // before snapshotting: a commit landing between the snapshot and the
+        // local removal would flip the file to committed-with-hash after
+        // needs_remote_delete was computed as false, leaving the freshly
+        // committed remote file undeleted.
+        let inflight_channel = self.streaming_channel_for(target_ino);
+        let _commit_guard = match &inflight_channel {
+            Some(channel) => Some(channel.commit_lock.lock().await),
+            None => None,
+        };
 
         let (ino, full_path, needs_remote_delete, dirty) = {
             let inodes = self.inode_table.read().expect("inodes poisoned");
