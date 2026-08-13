@@ -2494,9 +2494,6 @@ impl VirtualFs {
             | Some(OpenFile::Streaming { ino, .. }) => Some(*ino),
             _ => None,
         };
-        if let Some(ino) = released_ino {
-            self.inode_table.read().expect("inodes poisoned").drop_open_handles(ino);
-        }
 
         let mut release_error: Option<i32> = None;
 
@@ -2581,6 +2578,15 @@ impl VirtualFs {
                 }
             }
             _ => {}
+        }
+
+        // Decrement the handle count only after the commit section above: a
+        // release() parked on commit_lock behind an in-flight link() commit
+        // must keep the inode "open", or a concurrent unlink of the dirty
+        // file passes its open-handles guard and the source AddFile then
+        // resurrects the just-removed path on the Hub.
+        if let Some(ino) = released_ino {
+            self.inode_table.read().expect("inodes poisoned").drop_open_handles(ino);
         }
 
         if let Some(ino) = released_ino
@@ -2985,11 +2991,26 @@ impl VirtualFs {
         }))
     }
 
-    /// Find the open streaming channel for `ino`, if any.
+    /// Find the open streaming channel that owns `ino`'s current dirty bytes:
+    /// the one whose `dirty_generation_at_open` matches the inode's current
+    /// dirty generation (the same token streaming_commit uses for
+    /// clear_dirty_if). Multiple streaming handles can coexist on one inode
+    /// (a flushed-but-still-open handle plus a newer O_TRUNC writer), and
+    /// HashMap iteration order is arbitrary — a stale channel must not shadow
+    /// the active writer.
     fn streaming_channel_for(&self, ino: u64) -> Option<Arc<StreamingChannel>> {
+        let current_generation = {
+            let inodes = self.inode_table.read().expect("inodes poisoned");
+            inodes.get(ino)?.dirty_generation
+        };
         let files = self.open_files.read().expect("open_files poisoned");
         files.values().find_map(|open| match open {
-            OpenFile::Streaming { ino: open_ino, channel } if *open_ino == ino => Some(Arc::clone(channel)),
+            OpenFile::Streaming { ino: open_ino, channel }
+                if *open_ino == ino
+                    && channel.dirty_generation_at_open.load(Ordering::Relaxed) == current_generation =>
+            {
+                Some(Arc::clone(channel))
+            }
             _ => None,
         })
     }
