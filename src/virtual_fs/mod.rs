@@ -1841,8 +1841,16 @@ impl VirtualFs {
         let staging_mutex = self.staging.lock(ino);
         let _staging_guard = staging_mutex.lock().await;
 
-        // Capture inode snapshot before mutation (for revert on commit failure)
-        let snapshot = {
+        // Capture inode snapshot before mutation (for revert on commit failure).
+        // When superseding an active writer, inherit ITS snapshot: the inode
+        // is already dirty (xet_hash stripped by the old writer's open), so
+        // snapshotting it now would make a later failed commit revert to a
+        // hashless ghost state instead of the last committed one. Safe to
+        // read before the supersede below — the per-inode lock is held
+        // across both.
+        let snapshot = if let Some(active) = self.streaming_channel_for(ino) {
+            active.snapshot.clone()
+        } else {
             let inodes = self.inode_table.read().expect("inodes poisoned");
             let entry = inodes.get(ino).ok_or(libc::ENOENT)?;
             InodeSnapshot {
@@ -4195,6 +4203,7 @@ enum WriteMsg {
 
 /// Snapshot of inode state captured when a streaming writer is opened.
 /// Used to revert the inode on commit failure (data loss recovery).
+#[derive(Clone)]
 struct InodeSnapshot {
     xet_hash: Option<String>,
     size: u64,

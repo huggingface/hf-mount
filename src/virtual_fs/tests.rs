@@ -4769,6 +4769,51 @@ fn otrunc_reopen_supersedes_old_streaming_writer() {
     });
 }
 
+/// A superseding writer inherits the superseded writer's rollback snapshot:
+/// its own open sees an already-dirty inode (xet_hash stripped), so a
+/// permanently failed commit must revert to the last committed state, not a
+/// hashless ghost.
+#[test]
+fn superseded_writer_failed_commit_reverts_to_original() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        // Commit v1.
+        let (attr, fh) = vfs
+            .create(ROOT_INODE, "revert.txt", 0o644, 1000, 1000, Some(42))
+            .await
+            .unwrap();
+        let ino = attr.ino;
+        write_blocking(&vfs, ino, fh, 0, b"v1").await.unwrap();
+        vfs.flush(ino, fh, Some(42)).await.unwrap();
+        vfs.release(fh).await.unwrap();
+        let original_hash = {
+            let inodes = vfs.inode_table.read().unwrap();
+            inodes.get(ino).unwrap().xet_hash.clone().unwrap()
+        };
+
+        // Writer A truncates, writer B supersedes A. B's worker fails
+        // mid-write -> its commit fails permanently, and the revert must
+        // restore v1, not a hashless ghost from A's dirty window.
+        let fh_a = vfs.open(ino, true, true, Some(42)).await.unwrap();
+        write_blocking(&vfs, ino, fh_a, 0, b"aaa").await.unwrap();
+        xet.fail_writer_after(1);
+        let fh_b = vfs.open(ino, true, true, Some(42)).await.unwrap();
+        vfs.release(fh_a).await.unwrap();
+
+        let _ = write_blocking(&vfs, ino, fh_b, 0, b"bbb").await;
+        assert!(vfs.release(fh_b).await.is_err());
+
+        let inodes = vfs.inode_table.read().unwrap();
+        let entry = inodes.get(ino).unwrap();
+        assert_eq!(entry.xet_hash.as_deref(), Some(original_hash.as_str()));
+        assert_eq!(entry.size, 2, "reverted to v1's size");
+        assert!(!entry.is_dirty(), "revert clears the dirty flag");
+    });
+}
+
 /// A failed O_TRUNC reopen must not supersede the active writer: failing the
 /// old channel for a stillborn replacement would strand its acknowledged
 /// bytes for nothing.
