@@ -133,6 +133,12 @@ pub struct InodeEntry {
     /// hot path for write-heavy workloads (tarball extract, xfstests) that
     /// create thousands of unique names under freshly-mkdir'd directories.
     pub children_from_remote: bool,
+    /// When set, the directory listing is served from stale cache after a transient
+    /// Hub failure. Lookups may use cached children via `listing_usable()` without
+    /// treating the listing as freshly validated.
+    pub stale_listing_since: Option<Instant>,
+    /// Escalating backoff between stale listing refresh attempts (5s → 10s → 30s).
+    pub stale_listing_backoff_level: u32,
     pub children: Vec<DirChild>,
     /// Name → ino lookup for `lookup_child`. Kept in sync with `children`
     /// via the `add_child` / `remove_child_*` helpers so a directory with
@@ -188,6 +194,25 @@ impl InodeEntry {
     /// meaningful for directories.
     pub fn children_loaded(&self) -> bool {
         self.children_loaded_at.is_some()
+    }
+
+    /// True when cached directory children can be used for lookup/readdir even if
+    /// the listing was not freshly fetched (stale fallback after Hub errors).
+    pub fn listing_usable(&self) -> bool {
+        self.children_loaded_at.is_some() || self.stale_listing_since.is_some()
+    }
+
+    pub fn stale_listing_retry_interval(&self) -> std::time::Duration {
+        match self.stale_listing_backoff_level.min(2) {
+            0 => std::time::Duration::from_secs(5),
+            1 => std::time::Duration::from_secs(10),
+            _ => std::time::Duration::from_secs(30),
+        }
+    }
+
+    pub fn stale_listing_recent(&self) -> bool {
+        self.stale_listing_since
+            .is_some_and(|since| since.elapsed() < self.stale_listing_retry_interval())
     }
 
     /// Mark the inode as dirty, incrementing the generation counter.
@@ -288,6 +313,8 @@ impl InodeTable {
             dirty_generation: 0,
             children_loaded_at: None,
             children_from_remote: false,
+            stale_listing_since: None,
+            stale_listing_backoff_level: 0,
             children: Vec::new(),
             child_index: HashMap::new(),
             pending_deletes: Vec::new(),
@@ -630,6 +657,8 @@ impl InodeTable {
             // sites). Directories start unloaded until the first list.
             children_loaded_at: None,
             children_from_remote: false,
+            stale_listing_since: None,
+            stale_listing_backoff_level: 0,
             children: Vec::new(),
             child_index: HashMap::new(),
             pending_deletes: Vec::new(),
@@ -724,12 +753,33 @@ impl InodeTable {
     pub fn invalidate_children(&mut self, ino: u64) {
         if let Some(entry) = self.inodes.get_mut(&ino) {
             entry.children_loaded_at = None;
+            entry.stale_listing_since = None;
+            entry.stale_listing_backoff_level = 0;
+        }
+    }
+
+    /// Mark a directory as serving a stale cached listing after a transient Hub failure.
+    pub fn mark_stale_listing(&mut self, ino: u64) {
+        if let Some(entry) = self.inodes.get_mut(&ino) {
+            if entry.stale_listing_since.is_some() {
+                entry.stale_listing_backoff_level = entry.stale_listing_backoff_level.saturating_add(1).min(2);
+            }
+            entry.stale_listing_since = Some(Instant::now());
         }
     }
 
     /// Check whether a directory's children have been loaded from the Hub API.
     pub fn is_children_loaded(&self, ino: u64) -> bool {
         self.inodes.get(&ino).is_some_and(|e| e.children_loaded())
+    }
+
+    /// True when a remote-backed directory still has a cached listing locally
+    /// (including legitimately empty dirs). Used after poll invalidation cleared
+    /// `children_loaded_at` but kept inode state.
+    pub fn has_cached_remote_children(&self, ino: u64) -> bool {
+        self.inodes
+            .get(&ino)
+            .is_some_and(|e| e.kind == InodeKind::Directory && e.children_from_remote)
     }
 
     /// True if the inode or any descendant is either dirty or has an open
@@ -1485,6 +1535,105 @@ mod tests {
 
         // Invalidating non-existent inode is a no-op
         table.invalidate_children(9999);
+    }
+
+    #[test]
+    fn test_stale_listing_usable_without_fresh_load() {
+        let mut table = InodeTable::new(false);
+        let dir_ino = table.insert(
+            ROOT_INODE,
+            "dir".to_string(),
+            "dir".to_string(),
+            InodeKind::Directory,
+            0,
+            UNIX_EPOCH,
+            None,
+            0o755,
+            0,
+            0,
+        );
+        table.get_mut(dir_ino).unwrap().children_from_remote = true;
+        let file_ino = table.insert(
+            dir_ino,
+            "file.txt".to_string(),
+            "dir/file.txt".to_string(),
+            InodeKind::File,
+            1,
+            UNIX_EPOCH,
+            None,
+            0o644,
+            0,
+            0,
+        );
+        assert!(!table.get(dir_ino).unwrap().children_loaded());
+        assert!(!table.get(dir_ino).unwrap().listing_usable());
+
+        table.mark_stale_listing(dir_ino);
+        let parent = table.get(dir_ino).unwrap();
+        assert!(parent.listing_usable());
+        assert!(!parent.children_loaded());
+        assert!(
+            table
+                .lookup_child(dir_ino, "file.txt")
+                .is_some_and(|e| e.inode == file_ino)
+        );
+    }
+
+    #[test]
+    fn test_has_cached_remote_children_includes_empty_dir() {
+        let mut table = InodeTable::new(false);
+        let dir_ino = table.insert(
+            ROOT_INODE,
+            "empty".to_string(),
+            "empty".to_string(),
+            InodeKind::Directory,
+            0,
+            UNIX_EPOCH,
+            None,
+            0o755,
+            0,
+            0,
+        );
+        table.get_mut(dir_ino).unwrap().children_from_remote = true;
+        assert!(table.has_cached_remote_children(dir_ino));
+    }
+
+    #[test]
+    fn test_stale_listing_backoff_intervals() {
+        let mut entry = InodeEntry {
+            inode: 2,
+            parent: 1,
+            name: Arc::from("dir"),
+            full_path: Arc::from("dir"),
+            kind: InodeKind::Directory,
+            size: 0,
+            mtime: UNIX_EPOCH,
+            mode: 0o755,
+            uid: 0,
+            gid: 0,
+            atime: UNIX_EPOCH,
+            ctime: UNIX_EPOCH,
+            nlink: 2,
+            symlink_target: None,
+            xet_hash: None,
+            staging_is_current: false,
+            etag: None,
+            dirty_generation: 0,
+            children_loaded_at: None,
+            children_from_remote: true,
+            stale_listing_since: None,
+            stale_listing_backoff_level: 0,
+            children: Vec::new(),
+            child_index: HashMap::new(),
+            pending_deletes: Vec::new(),
+            last_revalidated: None,
+            eviction: EvictionState::default(),
+        };
+        assert_eq!(entry.stale_listing_retry_interval(), std::time::Duration::from_secs(5));
+        entry.stale_listing_backoff_level = 1;
+        assert_eq!(entry.stale_listing_retry_interval(), std::time::Duration::from_secs(10));
+        entry.stale_listing_backoff_level = 2;
+        assert_eq!(entry.stale_listing_retry_interval(), std::time::Duration::from_secs(30));
     }
 
     #[test]

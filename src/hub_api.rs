@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -203,11 +204,90 @@ pub struct CasTokenInfo {
 /// How often the token file is re-read from disk.
 const TOKEN_FILE_REFRESH: std::time::Duration = std::time::Duration::from_secs(30);
 
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+const DEFAULT_HEAD_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// Default retries after the first failed attempt (3 total tries).
+const DEFAULT_MAX_RETRIES: u32 = 2;
+/// Wall-clock budget for a single Hub HTTP operation (all attempts + backoff).
+/// Kept shorter than the Hub's Mongo tree-listing deadline so transient 504s
+/// fail fast to stale cache instead of racing the server timeout.
+const DEFAULT_OPERATION_DEADLINE: Duration = Duration::from_secs(3);
+/// Open the circuit after this many consecutive gateway failures (502/503/504).
+const CIRCUIT_FAILURE_THRESHOLD: u32 = 3;
+const CIRCUIT_OPEN_DURATION: Duration = Duration::from_secs(10);
+
+/// Tunables for Hub HTTP resilience (retries, per-request timeouts).
+#[derive(Clone, Copy, Debug)]
+pub struct HubClientConfig {
+    /// Retry attempts after the first request fails. 2 ⇒ up to 3 tries total.
+    pub max_retries: u32,
+    /// GET/list timeout. 0 keeps the built-in default (60s).
+    pub request_timeout_secs: u64,
+    /// HEAD timeout. 0 keeps the built-in default (30s).
+    pub head_request_timeout_secs: u64,
+    /// Total wall-clock budget for one Hub call including in-flight requests,
+    /// retries, and backoff. 0 keeps the built-in default (3s).
+    pub operation_deadline_ms: u64,
+}
+
+impl Default for HubClientConfig {
+    fn default() -> Self {
+        Self {
+            max_retries: DEFAULT_MAX_RETRIES,
+            request_timeout_secs: 0,
+            head_request_timeout_secs: 0,
+            operation_deadline_ms: DEFAULT_OPERATION_DEADLINE.as_millis() as u64,
+        }
+    }
+}
+
+/// Tracks consecutive gateway failures and briefly skips retries when the Hub is degraded.
+#[derive(Debug, Default)]
+struct HubRetryState {
+    consecutive_gateway_failures: AtomicU32,
+    circuit_open_until: Mutex<Option<Instant>>,
+}
+
+impl HubRetryState {
+    /// Returns allowed retry count; opens half-open after the cooldown expires.
+    fn effective_max_retries(&self, max_retries: u32) -> u32 {
+        let mut guard = self.circuit_open_until.lock().expect("circuit lock poisoned");
+        match *guard {
+            Some(until) if Instant::now() < until => 0,
+            Some(_) => {
+                *guard = None;
+                self.consecutive_gateway_failures.store(0, Ordering::Relaxed);
+                max_retries
+            }
+            None => max_retries,
+        }
+    }
+
+    fn record_success(&self) {
+        self.consecutive_gateway_failures.store(0, Ordering::Relaxed);
+        *self.circuit_open_until.lock().expect("circuit lock poisoned") = None;
+    }
+
+    fn record_gateway_failure(&self) {
+        let failures = self.consecutive_gateway_failures.fetch_add(1, Ordering::Relaxed) + 1;
+        if failures >= CIRCUIT_FAILURE_THRESHOLD {
+            *self.circuit_open_until.lock().expect("circuit lock poisoned") =
+                Some(Instant::now() + CIRCUIT_OPEN_DURATION);
+            warn!(
+                "Hub gateway circuit open for {CIRCUIT_OPEN_DURATION:?} after {failures} consecutive 502/503/504 responses"
+            );
+        }
+    }
+}
+
 pub struct HubApiClient {
     client: Client,
     /// Client that does NOT follow redirects — used for HEAD requests where we
     /// need response headers from the Hub (not from the CAS redirect target).
     head_client: Client,
+    max_retries: u32,
+    operation_deadline: Duration,
+    retry_state: Arc<HubRetryState>,
     endpoint: String,
     token: Option<String>,
     /// Path to a file containing the API token. Re-read periodically so
@@ -267,9 +347,28 @@ pub fn split_path_prefix(raw: &str) -> std::result::Result<(&str, &str), &'stati
     }
 }
 
-fn retry_delay(attempt: u32) -> std::time::Duration {
+fn retry_delay(attempt: u32) -> Duration {
     debug_assert!(attempt > 0, "retry_delay called with attempt=0");
-    std::time::Duration::from_millis(500 * 2u64.pow(attempt - 1))
+    Duration::from_millis(500 * 2u64.pow(attempt - 1))
+}
+
+/// Full jitter: sleep uniformly in [0, base]. Spreads retry waves when many
+/// mounts hit the same transient Hub failure.
+fn jittered_delay(base: Duration, salt: u32) -> Duration {
+    let base_ms = base.as_millis().min(u128::from(u64::MAX)) as u64;
+    if base_ms == 0 {
+        return base;
+    }
+    let jitter_seed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0)
+        .wrapping_add(salt);
+    Duration::from_millis(jitter_seed as u64 % (base_ms + 1))
+}
+
+fn is_gateway_status(status: u16) -> bool {
+    matches!(status, 502..=504)
 }
 
 /// Parse the IETF `RateLimit` header for `t=<seconds>` (time until window reset), capped at 30s.
@@ -334,46 +433,120 @@ async fn probe_repo(
     None
 }
 
+fn operation_deadline_exceeded(context: &str, operation_deadline: Duration) -> Error {
+    Error::hub_status(
+        504,
+        format!("{context}: operation deadline {operation_deadline:?} exceeded"),
+    )
+}
+
 /// Send an HTTP request with automatic retry on transient errors (408, 429, 5xx, timeouts).
-/// Uses the IETF RateLimit header's t= parameter when present, falls back to exponential backoff (2 retries max).
+/// Uses the IETF RateLimit header's t= parameter when present, falls back to exponential
+/// backoff with full jitter. Each in-flight request is capped by the remaining operation
+/// deadline (`tokio::time::timeout`); reqwest per-request timeouts are a secondary safety net.
 /// Set `accept_redirects` to treat 3xx as success (needed for HEAD on /resolve/ endpoints
 /// where the redirect response itself carries metadata headers).
 async fn send_with_retry(
     build_request: impl Fn() -> reqwest::RequestBuilder,
     context: &str,
     accept_redirects: bool,
+    max_retries: u32,
+    operation_deadline: Duration,
+    retry_state: Option<&HubRetryState>,
 ) -> Result<reqwest::Response> {
-    const MAX_RETRIES: u32 = 2;
+    let started = Instant::now();
+    let effective_max_retries = retry_state
+        .map(|state| state.effective_max_retries(max_retries))
+        .unwrap_or(max_retries);
     let mut attempt = 0;
     loop {
         attempt += 1;
-        match build_request().send().await {
-            Ok(resp) if resp.status().is_success() || (accept_redirects && resp.status().is_redirection()) => {
+        let remaining = operation_deadline.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return Err(operation_deadline_exceeded(context, operation_deadline));
+        }
+
+        let send_result = tokio::time::timeout(remaining, build_request().send()).await;
+        match send_result {
+            Ok(Ok(resp)) if resp.status().is_success() || (accept_redirects && resp.status().is_redirection()) => {
+                if let Some(state) = retry_state {
+                    state.record_success();
+                }
                 return Ok(resp);
             }
-            Ok(resp) => {
+            Ok(Ok(resp)) => {
                 let status = resp.status().as_u16();
-                if is_retryable_status(status) && attempt <= MAX_RETRIES {
-                    let delay = parse_retry_delay(resp.headers()).unwrap_or_else(|| retry_delay(attempt));
-                    warn!("{context}: transient error ({status}), retry {attempt}/{MAX_RETRIES} in {delay:?}");
+                if is_retryable_status(status) && attempt <= effective_max_retries {
+                    let base_delay = parse_retry_delay(resp.headers()).unwrap_or_else(|| retry_delay(attempt));
+                    let delay = jittered_delay(base_delay, attempt);
+                    if started.elapsed() + delay >= operation_deadline {
+                        let body = resp.text().await.unwrap_or_default();
+                        if is_gateway_status(status)
+                            && let Some(state) = retry_state
+                        {
+                            state.record_gateway_failure();
+                        }
+                        warn!("{context}: operation deadline {operation_deadline:?} exceeded after attempt {attempt}");
+                        return Err(Error::hub_status(status, format!("{context}: {status} {body}")));
+                    }
+                    warn!(
+                        "{context}: transient error ({status}), retry {attempt}/{effective_max_retries} in {delay:?}"
+                    );
                     tokio::time::sleep(delay).await;
                     continue;
+                }
+                if is_gateway_status(status)
+                    && let Some(state) = retry_state
+                {
+                    state.record_gateway_failure();
                 }
                 let body = resp.text().await.unwrap_or_default();
                 return Err(Error::hub_status(status, format!("{context}: {status} {body}")));
             }
-            Err(err) if (err.is_timeout() || err.is_connect()) && attempt <= MAX_RETRIES => {
-                let delay = retry_delay(attempt);
-                warn!("{context}: transient error, retry {attempt}/{MAX_RETRIES} in {delay:?}: {err}");
+            Ok(Err(err)) if (err.is_timeout() || err.is_connect()) && attempt <= effective_max_retries => {
+                let delay = jittered_delay(retry_delay(attempt), attempt);
+                if started.elapsed() + delay >= operation_deadline {
+                    warn!(
+                        "{context}: operation deadline {operation_deadline:?} exceeded after attempt {attempt}: {err}"
+                    );
+                    return Err(Error::Http(err));
+                }
+                warn!("{context}: transient error, retry {attempt}/{effective_max_retries} in {delay:?}: {err}");
                 tokio::time::sleep(delay).await;
             }
-            Err(err) => return Err(Error::Http(err)),
+            Ok(Err(err)) => return Err(Error::Http(err)),
+            Err(_elapsed) if attempt <= effective_max_retries => {
+                let delay = jittered_delay(retry_delay(attempt), attempt);
+                if started.elapsed() + delay >= operation_deadline {
+                    warn!(
+                        "{context}: operation deadline {operation_deadline:?} exceeded waiting for in-flight request"
+                    );
+                    return Err(operation_deadline_exceeded(context, operation_deadline));
+                }
+                warn!(
+                    "{context}: in-flight request exceeded remaining deadline, retry {attempt}/{effective_max_retries} in {delay:?}"
+                );
+                tokio::time::sleep(delay).await;
+            }
+            Err(_elapsed) => {
+                return Err(operation_deadline_exceeded(context, operation_deadline));
+            }
         }
     }
 }
 
-fn make_clients(backend: &str) -> (Client, Client) {
+fn make_clients(backend: &str, config: HubClientConfig) -> (Client, Client) {
     let user_agent = format!("hf-mount/{}; fs/{}", env!("CARGO_PKG_VERSION"), backend);
+    let request_timeout = if config.request_timeout_secs > 0 {
+        Duration::from_secs(config.request_timeout_secs)
+    } else {
+        DEFAULT_REQUEST_TIMEOUT
+    };
+    let head_request_timeout = if config.head_request_timeout_secs > 0 {
+        Duration::from_secs(config.head_request_timeout_secs)
+    } else {
+        DEFAULT_HEAD_REQUEST_TIMEOUT
+    };
     // Idle pool / keep-alive shared across both clients so a hung Hub doesn't
     // freeze the poll loop and TLS handshakes are amortized across rounds.
     let base = || {
@@ -383,13 +556,10 @@ fn make_clients(backend: &str) -> (Client, Client) {
             .tcp_keepalive(Some(Duration::from_secs(60)))
             .connect_timeout(Duration::from_secs(10))
     };
-    let client = base()
-        .timeout(Duration::from_secs(60))
-        .build()
-        .expect("failed to build client");
+    let client = base().timeout(request_timeout).build().expect("failed to build client");
     let head_client = base()
         .redirect(reqwest::redirect::Policy::none())
-        .timeout(Duration::from_secs(30))
+        .timeout(head_request_timeout)
         .build()
         .expect("failed to build head_client");
     (client, head_client)
@@ -406,8 +576,16 @@ impl HubApiClient {
         source: SourceKind,
         path_prefix: String,
         backend: &str,
+        config: HubClientConfig,
     ) -> Result<Arc<Self>> {
-        let (client, head_client) = make_clients(backend);
+        let max_retries = config.max_retries;
+        let operation_deadline = if config.operation_deadline_ms > 0 {
+            Duration::from_millis(config.operation_deadline_ms)
+        } else {
+            DEFAULT_OPERATION_DEADLINE
+        };
+        let retry_state = Arc::new(HubRetryState::default());
+        let (client, head_client) = make_clients(backend, config);
         let endpoint = endpoint.trim_end_matches('/').to_string();
 
         let (source, last_modified) = match source {
@@ -418,8 +596,15 @@ impl HubApiClient {
             } => {
                 let url = format!("{}/api/{}/{}", endpoint, repo_type.api_prefix(), repo_id);
                 let context = format!("resolve repo {repo_id}");
-                let resp =
-                    send_with_retry(|| init_auth_get(&client, &url, token, &token_file), &context, false).await?;
+                let resp = send_with_retry(
+                    || init_auth_get(&client, &url, token, &token_file),
+                    &context,
+                    false,
+                    max_retries,
+                    operation_deadline,
+                    Some(&retry_state),
+                )
+                .await?;
                 let body: serde_json::Value = resp.json().await?;
                 let resolved_id = body["id"]
                     .as_str()
@@ -440,8 +625,15 @@ impl HubApiClient {
             SourceKind::Bucket { bucket_id } => {
                 let url = format!("{}/api/buckets/{}", endpoint, bucket_id);
                 let context = format!("resolve bucket {bucket_id}");
-                let resp = match send_with_retry(|| init_auth_get(&client, &url, token, &token_file), &context, false)
-                    .await
+                let resp = match send_with_retry(
+                    || init_auth_get(&client, &url, token, &token_file),
+                    &context,
+                    false,
+                    max_retries,
+                    operation_deadline,
+                    Some(&retry_state),
+                )
+                .await
                 {
                     Ok(r) => r,
                     Err(err) => {
@@ -466,6 +658,9 @@ impl HubApiClient {
         Ok(Arc::new(Self {
             client,
             head_client,
+            max_retries,
+            operation_deadline,
+            retry_state,
             endpoint,
             token: token.map(|t| t.to_string()),
             token_file,
@@ -478,10 +673,29 @@ impl HubApiClient {
 
     /// Create a client for a HuggingFace bucket.
     pub fn new(endpoint: &str, token: Option<&str>, bucket_id: &str, backend: &str) -> Arc<Self> {
-        let (client, head_client) = make_clients(backend);
+        Self::new_with_config(endpoint, token, bucket_id, backend, HubClientConfig::default())
+    }
+
+    pub fn new_with_config(
+        endpoint: &str,
+        token: Option<&str>,
+        bucket_id: &str,
+        backend: &str,
+        config: HubClientConfig,
+    ) -> Arc<Self> {
+        let max_retries = config.max_retries;
+        let operation_deadline = if config.operation_deadline_ms > 0 {
+            Duration::from_millis(config.operation_deadline_ms)
+        } else {
+            DEFAULT_OPERATION_DEADLINE
+        };
+        let (client, head_client) = make_clients(backend, config);
         Arc::new(Self {
             client,
             head_client,
+            max_retries,
+            operation_deadline,
+            retry_state: Arc::new(HubRetryState::default()),
             endpoint: endpoint.trim_end_matches('/').to_string(),
             token: token.map(|t| t.to_string()),
             token_file: None,
@@ -492,6 +706,23 @@ impl HubApiClient {
             last_modified: UNIX_EPOCH,
             path_prefix: String::new(),
         })
+    }
+
+    async fn send_hub_request(
+        &self,
+        build_request: impl Fn() -> reqwest::RequestBuilder,
+        context: &str,
+        accept_redirects: bool,
+    ) -> Result<reqwest::Response> {
+        send_with_retry(
+            build_request,
+            context,
+            accept_redirects,
+            self.max_retries,
+            self.operation_deadline,
+            Some(&self.retry_state),
+        )
+        .await
     }
 
     /// Attach bearer auth to a request if a token is configured.
@@ -605,7 +836,9 @@ impl HubApiClient {
                 format!("{}/api/buckets/{}", self.endpoint, bucket_id)
             }
         };
-        let resp = send_with_retry(|| self.auth(self.client.get(&url)), "revision probe", false).await?;
+        let resp = self
+            .send_hub_request(|| self.auth(self.client.get(&url)), "revision probe", false)
+            .await?;
         let probe: RevisionProbe = resp.json().await?;
         match &self.source {
             SourceKind::Repo { .. } => probe
@@ -661,7 +894,9 @@ impl HubApiClient {
         };
 
         loop {
-            let resp = send_with_retry(|| self.auth(self.client.get(&url)), "tree listing", false).await?;
+            let resp = self
+                .send_hub_request(|| self.auth(self.client.get(&url)), "tree listing", false)
+                .await?;
 
             let next_url = resp
                 .headers()
@@ -710,7 +945,9 @@ impl HubApiClient {
         };
 
         loop {
-            let resp = send_with_retry(|| self.auth(self.client.get(&url)), "repo tree listing", false).await?;
+            let resp = self
+                .send_hub_request(|| self.auth(self.client.get(&url)), "repo tree listing", false)
+                .await?;
 
             let next_url = resp
                 .headers()
@@ -772,7 +1009,9 @@ impl HubApiClient {
                 )
             }
         };
-        let resp = send_with_retry(|| self.auth(self.head_client.head(&url)), "head_file", true).await;
+        let resp = self
+            .send_hub_request(|| self.auth(self.head_client.head(&url)), "head_file", true)
+            .await;
         let resp = match resp {
             Ok(r) => r,
             Err(Error::Hub { status: Some(404), .. }) => return Ok(None),
@@ -831,7 +1070,9 @@ impl HubApiClient {
             }
         };
 
-        let resp = send_with_retry(|| self.auth(self.client.get(&url)), "CAS token request", false).await?;
+        let resp = self
+            .send_hub_request(|| self.auth(self.client.get(&url)), "CAS token request", false)
+            .await?;
         let info: CasTokenInfo = resp.json().await?;
         Ok(info)
     }
@@ -846,7 +1087,9 @@ impl HubApiClient {
         };
         let url = format!("{}/api/buckets/{}/xet-write-token", self.endpoint, bucket_id);
 
-        let resp = send_with_retry(|| self.auth(self.client.get(&url)), "CAS write token request", false).await?;
+        let resp = self
+            .send_hub_request(|| self.auth(self.client.get(&url)), "CAS write token request", false)
+            .await?;
         let info: CasTokenInfo = resp.json().await?;
         Ok(info)
     }
@@ -889,7 +1132,7 @@ impl HubApiClient {
         }
 
         let body = bytes::Bytes::from(body);
-        send_with_retry(
+        self.send_hub_request(
             || {
                 self.auth(self.client.post(&url))
                     .header("content-type", "application/x-ndjson")
@@ -942,18 +1185,19 @@ impl HubApiClient {
         };
 
         info!("HTTP download: {} → {:?}", path, dest);
-        let resp = send_with_retry(
-            || {
-                let mut r = self.auth(self.client.get(&url));
-                if let Some(ref etag) = cached_etag {
-                    r = r.header("If-None-Match", format!("\"{}\"", etag.trim()));
-                }
-                r
-            },
-            "HTTP download",
-            false,
-        )
-        .await;
+        let resp = self
+            .send_hub_request(
+                || {
+                    let mut r = self.auth(self.client.get(&url));
+                    if let Some(ref etag) = cached_etag {
+                        r = r.header("If-None-Match", format!("\"{}\"", etag.trim()));
+                    }
+                    r
+                },
+                "HTTP download",
+                false,
+            )
+            .await;
         let resp = match resp {
             Ok(r) => r,
             Err(Error::Hub { status: Some(304), .. }) => {
@@ -1292,10 +1536,14 @@ mod tests {
     // ── prefixed_path / strip_path_prefix tests ───────────────────────
 
     fn make_test_client(prefix: &str, token_file: Option<PathBuf>) -> HubApiClient {
-        let (client, head_client) = make_clients("test");
+        let config = HubClientConfig::default();
+        let (client, head_client) = make_clients("test", config);
         HubApiClient {
             client,
             head_client,
+            max_retries: config.max_retries,
+            operation_deadline: DEFAULT_OPERATION_DEADLINE,
+            retry_state: Arc::new(HubRetryState::default()),
             endpoint: "https://huggingface.co".to_string(),
             token: Some("static-token".to_string()),
             token_file,
@@ -1431,6 +1679,23 @@ mod tests {
     }
 
     #[test]
+    fn jittered_delay_within_bounds() {
+        let base = Duration::from_millis(1000);
+        for salt in 0..100 {
+            let delay = jittered_delay(base, salt);
+            assert!(delay <= base);
+        }
+    }
+
+    #[test]
+    fn is_gateway_status_matches_gateway_codes() {
+        assert!(is_gateway_status(502));
+        assert!(is_gateway_status(503));
+        assert!(is_gateway_status(504));
+        assert!(!is_gateway_status(429));
+    }
+
+    #[test]
     fn is_retryable_status_covers_expected_codes() {
         use crate::error::is_retryable_status;
         assert!(is_retryable_status(408));
@@ -1490,6 +1755,23 @@ mod tests {
 
     // ── send_with_retry integration tests ─────────────────────────────
 
+    async fn test_send_with_retry(
+        build_request: impl Fn() -> reqwest::RequestBuilder,
+        context: &str,
+        accept_redirects: bool,
+        max_retries: u32,
+    ) -> Result<reqwest::Response> {
+        send_with_retry(
+            build_request,
+            context,
+            accept_redirects,
+            max_retries,
+            DEFAULT_OPERATION_DEADLINE,
+            None,
+        )
+        .await
+    }
+
     /// Minimal HTTP server that responds with a given sequence of status codes.
     async fn mock_server(responses: Vec<u16>) -> String {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1525,11 +1807,45 @@ mod tests {
         url
     }
 
+    /// HTTP server that waits before responding (tests operation-deadline caps on in-flight requests).
+    async fn mock_slow_server(responses: Vec<(Duration, u16)>) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://{addr}");
+
+        tokio::spawn(async move {
+            for (delay, status) in responses {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut buf = vec![0u8; 4096];
+                let _ = stream.read(&mut buf).await;
+                tokio::time::sleep(delay).await;
+                let reason = match status {
+                    200 => "OK",
+                    504 => "Gateway Timeout",
+                    _ => "Unknown",
+                };
+                let body = format!("status {status}");
+                let response = format!(
+                    "HTTP/1.1 {status} {reason}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.ok();
+                stream.shutdown().await.ok();
+            }
+        });
+
+        url
+    }
+
     #[tokio::test]
     async fn send_with_retry_success_on_first_try() {
         let url = mock_server(vec![200]).await;
         let client = Client::new();
-        let resp = send_with_retry(|| client.get(&url), "test", false).await.unwrap();
+        let resp = test_send_with_retry(|| client.get(&url), "test", false, DEFAULT_MAX_RETRIES)
+            .await
+            .unwrap();
         assert_eq!(resp.status(), 200);
     }
 
@@ -1537,7 +1853,9 @@ mod tests {
     async fn send_with_retry_retries_on_503_then_succeeds() {
         let url = mock_server(vec![503, 200]).await;
         let client = Client::new();
-        let resp = send_with_retry(|| client.get(&url), "test", false).await.unwrap();
+        let resp = test_send_with_retry(|| client.get(&url), "test", false, DEFAULT_MAX_RETRIES)
+            .await
+            .unwrap();
         assert_eq!(resp.status(), 200);
     }
 
@@ -1545,7 +1863,9 @@ mod tests {
     async fn send_with_retry_retries_on_429_then_succeeds() {
         let url = mock_server(vec![429, 200]).await;
         let client = Client::new();
-        let resp = send_with_retry(|| client.get(&url), "test", false).await.unwrap();
+        let resp = test_send_with_retry(|| client.get(&url), "test", false, DEFAULT_MAX_RETRIES)
+            .await
+            .unwrap();
         assert_eq!(resp.status(), 200);
     }
 
@@ -1553,7 +1873,7 @@ mod tests {
     async fn send_with_retry_gives_up_after_max_retries() {
         let url = mock_server(vec![503, 503, 503]).await;
         let client = Client::new();
-        let result = send_with_retry(|| client.get(&url), "test", false).await;
+        let result = test_send_with_retry(|| client.get(&url), "test", false, 2).await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(matches!(err, Error::Hub { status: Some(503), .. }));
@@ -1563,7 +1883,7 @@ mod tests {
     async fn send_with_retry_no_retry_on_404() {
         let url = mock_server(vec![404]).await;
         let client = Client::new();
-        let result = send_with_retry(|| client.get(&url), "test", false).await;
+        let result = test_send_with_retry(|| client.get(&url), "test", false, DEFAULT_MAX_RETRIES).await;
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), Error::Hub { status: Some(404), .. }));
     }
@@ -1572,7 +1892,7 @@ mod tests {
     async fn send_with_retry_304_returned_as_error() {
         let url = mock_server(vec![304]).await;
         let client = Client::new();
-        let result = send_with_retry(|| client.get(&url), "test", false).await;
+        let result = test_send_with_retry(|| client.get(&url), "test", false, DEFAULT_MAX_RETRIES).await;
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), Error::Hub { status: Some(304), .. }));
     }
@@ -1584,7 +1904,9 @@ mod tests {
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .unwrap();
-        let resp = send_with_retry(|| client.get(&url), "test", true).await.unwrap();
+        let resp = test_send_with_retry(|| client.get(&url), "test", true, DEFAULT_MAX_RETRIES)
+            .await
+            .unwrap();
         assert_eq!(resp.status(), 302);
     }
 
@@ -1595,9 +1917,60 @@ mod tests {
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .unwrap();
-        let result = send_with_retry(|| client.get(&url), "test", false).await;
+        let result = test_send_with_retry(|| client.get(&url), "test", false, DEFAULT_MAX_RETRIES).await;
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), Error::Hub { status: Some(302), .. }));
+    }
+
+    #[tokio::test]
+    async fn send_with_retry_caps_in_flight_request_by_operation_deadline() {
+        let url = mock_slow_server(vec![(Duration::from_secs(5), 200)]).await;
+        let client = Client::builder().timeout(Duration::from_secs(60)).build().unwrap();
+        let started = Instant::now();
+        let result = send_with_retry(|| client.get(&url), "test", false, 0, Duration::from_millis(200), None).await;
+        assert!(result.is_err());
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(matches!(result.unwrap_err(), Error::Hub { status: Some(504), .. }));
+    }
+
+    #[tokio::test]
+    async fn send_with_retry_respects_operation_deadline() {
+        let url = mock_server(vec![503, 503, 503, 503, 503]).await;
+        let client = Client::new();
+        let started = Instant::now();
+        let result = send_with_retry(|| client.get(&url), "test", false, 10, Duration::from_millis(250), None).await;
+        assert!(result.is_err());
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[tokio::test]
+    async fn send_with_retry_circuit_skips_retries_when_open() {
+        let state = HubRetryState::default();
+        let url = mock_server(vec![504; 9]).await;
+        let client = Client::new();
+        for _ in 0..CIRCUIT_FAILURE_THRESHOLD {
+            let _ = send_with_retry(
+                || client.get(&url),
+                "test",
+                false,
+                DEFAULT_MAX_RETRIES,
+                DEFAULT_OPERATION_DEADLINE,
+                Some(&state),
+            )
+            .await;
+        }
+
+        let url2 = mock_server(vec![504, 200]).await;
+        let result = send_with_retry(
+            || client.get(&url2),
+            "test",
+            false,
+            DEFAULT_MAX_RETRIES,
+            DEFAULT_OPERATION_DEADLINE,
+            Some(&state),
+        )
+        .await;
+        assert!(matches!(result, Err(Error::Hub { status: Some(504), .. })));
     }
 
     // ── probe_repo tests ──────────────────────────────────────────────

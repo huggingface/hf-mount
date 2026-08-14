@@ -784,6 +784,9 @@ impl VirtualFs {
             match inodes.get(parent_ino) {
                 Some(e) if e.kind != InodeKind::Directory => return Err(libc::ENOTDIR),
                 Some(e) if e.children_loaded() => return Ok(()),
+                Some(e) if e.stale_listing_recent() && inodes.has_cached_remote_children(parent_ino) => {
+                    return Ok(());
+                }
                 None => return Err(libc::ENOENT),
                 _ => {}
             }
@@ -799,6 +802,9 @@ impl VirtualFs {
             match inodes.get(parent_ino) {
                 Some(e) if e.kind != InodeKind::Directory => return Err(libc::ENOTDIR),
                 Some(e) if e.children_loaded() => return Ok(()),
+                Some(e) if e.stale_listing_recent() && inodes.has_cached_remote_children(parent_ino) => {
+                    return Ok(());
+                }
                 Some(e) => e.full_path.to_string(),
                 None => return Err(libc::ENOENT),
             }
@@ -806,8 +812,24 @@ impl VirtualFs {
 
         let entries = match self.hub_client.list_tree(&prefix).await {
             Ok(entries) => entries,
+            Err(e) if e.is_retryable() => {
+                let has_stale = {
+                    let inodes = self.inode_table.read().expect("inodes poisoned");
+                    inodes.has_cached_remote_children(parent_ino)
+                };
+                if has_stale {
+                    warn!(
+                        "list_tree({prefix}) failed ({e}); reusing cached directory listing from before invalidation"
+                    );
+                    let mut inodes = self.inode_table.write().expect("inodes poisoned");
+                    inodes.mark_stale_listing(parent_ino);
+                    return Ok(());
+                }
+                error!("Failed to list tree for prefix '{prefix}': {e}");
+                return Err(libc::EIO);
+            }
             Err(e) => {
-                error!("Failed to list tree for prefix '{}': {}", prefix, e);
+                error!("Failed to list tree for prefix '{prefix}': {e}");
                 return Err(libc::EIO);
             }
         };
@@ -924,6 +946,8 @@ impl VirtualFs {
             // directory we'd otherwise keep ~50% slack forever. Trim now,
             // since regrowth on rare child mutations is cheap.
             parent.children.shrink_to_fit();
+            parent.stale_listing_since = None;
+            parent.stale_listing_backoff_level = 0;
             parent.children_loaded_at = Some(Instant::now());
             parent.children_from_remote = true;
         }
@@ -1285,7 +1309,7 @@ impl VirtualFs {
                 },
                 // Either a dirty file (local writes win until flushed) or any
                 // entry under a fully-listed parent we can trust as-is.
-                Some(entry) if entry.kind == InodeKind::File || parent_entry.children_loaded() => {
+                Some(entry) if entry.kind == InodeKind::File || parent_entry.listing_usable() => {
                     FastResult::Hit(self.make_vfs_attr(entry))
                 }
                 // Cached non-file under an unloaded parent: we can't HEAD-probe
@@ -1294,6 +1318,8 @@ impl VirtualFs {
                 Some(_) => FastResult::NotLoaded,
                 // No cached entry but the parent listing is authoritative →
                 // the name really doesn't exist; populate the negative cache.
+                // Only trust misses from a fresh Hub listing — stale snapshots
+                // must not invent 30s negative entries for names we never saw.
                 None if parent_entry.children_loaded() => {
                     let parent_path = &parent_entry.full_path;
                     let full_path = if parent_path.is_empty() {
@@ -1421,7 +1447,15 @@ impl VirtualFs {
             // 404 may mean "doesn't exist" or "it's a directory" (the resolve
             // endpoint only handles files), so the listing has the final word.
             Ok(_) => {}
-            Err(e) => debug!("HEAD lookup {} failed, falling back to list: {}", full_path, e),
+            Err(e) if e.is_retryable() && self.read_only => {
+                let inodes = self.inode_table.read().expect("inodes poisoned");
+                if let Some(entry) = inodes.lookup_child(parent, name) {
+                    warn!("HEAD {full_path} failed ({e}), serving cached inode");
+                    return Ok(self.make_vfs_attr(entry));
+                }
+                debug!("HEAD lookup {full_path} failed, falling back to list: {e}");
+            }
+            Err(e) => debug!("HEAD lookup {full_path} failed, falling back to list: {e}"),
         }
 
         self.ensure_children_loaded(parent).await?;
