@@ -9,11 +9,12 @@ keywords = ["fuse", "nfs", "huggingface", "filesystem", "mount"]
 categories = ["filesystem", "command-line-utilities"]
 
 [dependencies]
-# xet-core crates
-xet-client = { git = "https://github.com/huggingface/xet-core.git", branch = "main" }
-xet-core-structures = { git = "https://github.com/huggingface/xet-core.git", branch = "main" }
-xet-data = { git = "https://github.com/huggingface/xet-core.git", branch = "main" }
-xet-runtime = { git = "https://github.com/huggingface/xet-core.git", branch = "main" }
+# xet-core crates, pinned to a fixed rev (not branch = "main") so releases are
+# reproducible. Bump deliberately, adapting cached_xet_client.rs to trait changes.
+xet-client = { git = "https://github.com/huggingface/xet-core.git", rev = "0e4740050f3dc26c263ca3d170c179c78ce16f55" }
+xet-core-structures = { git = "https://github.com/huggingface/xet-core.git", rev = "0e4740050f3dc26c263ca3d170c179c78ce16f55" }
+xet-data = { git = "https://github.com/huggingface/xet-core.git", rev = "0e4740050f3dc26c263ca3d170c179c78ce16f55" }
+xet-runtime = { git = "https://github.com/huggingface/xet-core.git", rev = "0e4740050f3dc26c263ca3d170c179c78ce16f55" }
 
 # External crates
 async-trait = "0.1"
