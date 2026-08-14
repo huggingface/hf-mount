@@ -1076,15 +1076,20 @@ impl VirtualFs {
             .insert(ino, rx);
     }
 
-    /// Fulfill the pending commit hook with a result, then clean up the map.
+    /// Fulfill the pending commit hook with a result, then clean up the map —
+    /// but only the entry that belongs to THIS channel's hook. A replacement
+    /// writer (O_TRUNC supersede) may have installed its own hook under the
+    /// same ino between this channel's install and its fulfill; removing the
+    /// replacement's receiver would let later opens bypass its in-flight
+    /// commit.
     fn fulfill_commit_hook(&self, ino: u64, channel: &StreamingChannel, result: Result<(), i32>) {
         if let Some(tx) = channel.commit_hook.lock().expect("commit_hook poisoned").take() {
             let _ = tx.send(Some(result));
+            let mut pending = self.pending_commits.lock().expect("pending_commits poisoned");
+            if pending.get(&ino).is_some_and(|rx| rx.same_channel(&tx.subscribe())) {
+                pending.remove(&ino);
+            }
         }
-        self.pending_commits
-            .lock()
-            .expect("pending_commits poisoned")
-            .remove(&ino);
     }
 
     /// Wait for any in-flight streaming commit on this inode to complete.
