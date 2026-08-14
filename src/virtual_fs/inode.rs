@@ -947,7 +947,12 @@ impl InodeTable {
         {
             let path = entry.full_path.clone();
             self.inodes.remove(&ino);
-            self.path_to_inode.remove(&path);
+            // The path may already belong to a recreated file (unlink-while-
+            // open, then create at the same name before the last close): only
+            // remove the mapping while it still points at this orphan.
+            if self.path_to_inode.get(&path) == Some(&ino) {
+                self.path_to_inode.remove(&path);
+            }
             true
         } else {
             false

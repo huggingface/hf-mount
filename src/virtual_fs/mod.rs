@@ -1070,10 +1070,17 @@ impl VirtualFs {
         }
         let (tx, rx) = tokio::sync::watch::channel(None);
         *hook = Some(tx);
+        // Register the receiver only if the ino has none yet: a stale
+        // writer's deferred flush racing an O_TRUNC supersede must not
+        // replace the ACTIVE writer's receiver (fulfilled hooks remove their
+        // own entry, so an existing entry always belongs to a live hook).
+        // An unregistered hook is harmless: its fulfill sends to no waiter
+        // and the ownership check skips the map removal.
         self.pending_commits
             .lock()
             .expect("pending_commits poisoned")
-            .insert(ino, rx);
+            .entry(ino)
+            .or_insert(rx);
     }
 
     /// Fulfill the pending commit hook with a result, then clean up the map —
