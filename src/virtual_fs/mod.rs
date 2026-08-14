@@ -2670,9 +2670,15 @@ impl VirtualFs {
             }
         }
 
-        // Per-inode staging locks are intentionally not cleaned up here:
-        // removing while another open() may hold the Arc would break
-        // serialization. Entries are tiny and bounded by inodes ever staged.
+        // Reclaim the per-inode lock entry once nothing else holds its Arc
+        // (strong_count check inside — a held or awaited lock is never
+        // removed, so serialization is preserved). Without this, create-heavy
+        // streaming workloads grow the map by one entry per file created for
+        // the life of the mount (unlink handles the delete-heavy
+        // counterpart).
+        if let Some(ino) = released_ino {
+            self.staging.forget_lock_if_unused(ino);
+        }
 
         match release_error {
             Some(e) => Err(e),
