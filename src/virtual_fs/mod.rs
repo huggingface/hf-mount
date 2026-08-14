@@ -2481,6 +2481,7 @@ impl VirtualFs {
                 );
                 self.install_commit_hook(ino, &channel);
                 self.defer_commit(&channel);
+                self.fulfill_hook_if_terminal(ino, &channel);
                 return Ok(());
             }
 
@@ -2489,6 +2490,7 @@ impl VirtualFs {
             if channel.bytes_written.load(Ordering::Relaxed) == 0 {
                 self.install_commit_hook(ino, &channel);
                 self.defer_commit(&channel);
+                self.fulfill_hook_if_terminal(ino, &channel);
                 return Ok(());
             }
 
@@ -3060,6 +3062,25 @@ impl VirtualFs {
         })
     }
 
+    /// Fulfill a just-installed hook when the channel is already terminal.
+    /// flush()'s deferral paths run without the per-inode staging lock, so an
+    /// O_TRUNC supersede can flip the channel to Failed between the state
+    /// check and the hook installation; nothing else would ever fulfill that
+    /// hook (release fast-paths terminal channels), and its pending_commits
+    /// entry would wedge every later open of the inode. Both sides may
+    /// fulfill in the race; fulfill_commit_hook take()s the sender, so the
+    /// second call is a harmless no-op.
+    fn fulfill_hook_if_terminal(&self, ino: u64, channel: &StreamingChannel) {
+        let outcome = match &*channel.state.lock().expect("state poisoned") {
+            CommitState::Committed => Some(Ok(())),
+            CommitState::Failed(_) => Some(Err(libc::EIO)),
+            _ => None,
+        };
+        if let Some(result) = outcome {
+            self.fulfill_commit_hook(ino, channel, result);
+        }
+    }
+
     /// Mark a streaming channel's commit as deferred to release(). Only a
     /// channel still in `Writing` is demoted: overwriting `Committing` would
     /// reopen the lost-write race the state exists to close (a write() could
@@ -3249,45 +3270,56 @@ impl VirtualFs {
 
         self.ensure_children_loaded(parent).await?;
 
-        let target_ino = {
-            let inodes = self.inode_table.read().expect("inodes poisoned");
-            match inodes.lookup_child(parent, name) {
-                Some(entry) if entry.kind != InodeKind::Directory => entry.inode,
-                Some(_) => return Err(libc::EISDIR),
-                None => return Err(libc::ENOENT),
-            }
-        };
-
         // Serialize against in-flight streaming commits AND writer creation
         // (both hold the same per-inode staging lock) before snapshotting: a
         // commit landing between the snapshot and the local removal would
         // flip the file to committed-with-hash after needs_remote_delete was
         // computed as false, leaving the freshly committed remote file
         // undeleted — and a writer created after a per-channel check would
-        // dodge a channel-scoped lock entirely.
-        let commit_guard = if !self.advanced_writes {
-            let staging_mutex = self.staging.lock(target_ino);
-            Some(staging_mutex.lock_owned().await)
-        } else {
-            None
-        };
-
-        let (ino, full_path, needs_remote_delete, dirty) = {
-            let inodes = self.inode_table.read().expect("inodes poisoned");
-            let entry = match inodes.lookup_child(parent, name) {
-                Some(entry) if entry.kind != InodeKind::Directory => entry,
-                Some(_) => return Err(libc::EISDIR),
-                None => return Err(libc::ENOENT),
+        // dodge a channel-scoped lock entirely. Lock-then-revalidate loop: a
+        // concurrent rename can replace `parent/name` with a different inode
+        // between the lookup and the lock acquisition, and holding the OLD
+        // inode's lock would leave the replacement unserialized.
+        let (ino, full_path, needs_remote_delete, dirty, commit_guard) = loop {
+            let target_ino = {
+                let inodes = self.inode_table.read().expect("inodes poisoned");
+                match inodes.lookup_child(parent, name) {
+                    Some(entry) if entry.kind != InodeKind::Directory => entry.inode,
+                    Some(_) => return Err(libc::EISDIR),
+                    None => return Err(libc::ENOENT),
+                }
             };
-            // Overlay: cannot delete clean remote entries (no whiteout support).
-            // Deleting dirty (local) entries is allowed; remote reappears on remount.
-            if self.is_overlay_immutable(entry) {
-                return Err(libc::EPERM);
+
+            let commit_guard = if !self.advanced_writes {
+                let staging_mutex = self.staging.lock(target_ino);
+                Some(staging_mutex.lock_owned().await)
+            } else {
+                None
+            };
+
+            let snapshot = {
+                let inodes = self.inode_table.read().expect("inodes poisoned");
+                let entry = match inodes.lookup_child(parent, name) {
+                    Some(entry) if entry.kind != InodeKind::Directory => entry,
+                    Some(_) => return Err(libc::EISDIR),
+                    None => return Err(libc::ENOENT),
+                };
+                // Overlay: cannot delete clean remote entries (no whiteout support).
+                // Deleting dirty (local) entries is allowed; remote reappears on remount.
+                if self.is_overlay_immutable(entry) {
+                    return Err(libc::EPERM);
+                }
+                // Remote delete only when last link is removed and file exists on the hub.
+                // Skipped in overlay mode (writes never propagate to remote).
+                let needs_remote = !self.overlay() && entry.xet_hash.is_some() && entry.nlink <= 1;
+                (entry.inode, entry.full_path.to_string(), needs_remote, entry.is_dirty())
+            };
+
+            if snapshot.0 == target_ino {
+                break (snapshot.0, snapshot.1, snapshot.2, snapshot.3, commit_guard);
             }
-            // Remote delete only when last link is removed and file exists on the hub.
-            // Skipped in overlay mode (writes never propagate to remote).
-            let needs_remote = !self.overlay() && entry.xet_hash.is_some() && entry.nlink <= 1;
-            (entry.inode, entry.full_path.to_string(), needs_remote, entry.is_dirty())
+            // The name changed owners while we were acquiring the lock —
+            // release it (scope end) and re-serialize on the new inode.
         };
 
         // In streaming mode, block unlink while the file has open handles AND
@@ -3362,7 +3394,7 @@ impl VirtualFs {
         // map by one entry per deleted file for the life of the mount.
         if commit_guard.is_some() {
             drop(commit_guard);
-            self.staging.forget_lock_if_unused(target_ino);
+            self.staging.forget_lock_if_unused(ino);
         }
 
         // Clean up staging file only when the inode is actually gone. With an
