@@ -1454,10 +1454,17 @@ impl VirtualFs {
                 // The resolve endpoint returns 404 for directories, so a HEAD
                 // miss could still be a remotely-added dir. Targeted listing
                 // catches that; non-empty result means the dir exists.
-                let entries = self.hub_client.list_tree(&full_path).await.map_err(|e| {
-                    debug!("list miss-probe {} failed: {}", full_path, e);
-                    e.to_errno()
-                })?;
+                let entries = match self.hub_client.list_tree(&full_path).await {
+                    Ok(entries) => entries,
+                    // The repo tree endpoint returns 404 for a nonexistent
+                    // path (buckets return an empty listing): that's an
+                    // authoritative miss, not a failure to probe.
+                    Err(e) if e.status() == Some(404) => Vec::new(),
+                    Err(e) => {
+                        debug!("list miss-probe {} failed: {}", full_path, e);
+                        return Err(e.to_errno());
+                    }
+                };
                 if !entries.is_empty() {
                     return self.insert_dir(parent, name, &full_path);
                 }

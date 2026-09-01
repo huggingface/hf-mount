@@ -5858,3 +5858,33 @@ fn shutdown_drains_inflight_streaming_write() {
 fn shutdown_drains_inflight_advanced_write() {
     assert_shutdown_drains_inflight_write(true);
 }
+
+/// The repo tree endpoint returns 404 for a nonexistent path (buckets return
+/// an empty listing). A 404 on the miss-probe listing is an authoritative
+/// "does not exist": it must stay ENOENT and seed the negative cache — not
+/// surface as EIO like other non-transient failures.
+#[test]
+fn miss_probe_404_stays_enoent_and_seeds_negative_cache() {
+    let hub = MockHub::new_repo();
+    hub.add_file("ckpt/model/__0_0.distcp", 100, Some("hash1"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let ckpt = vfs.lookup(ROOT_INODE, "ckpt").await.unwrap();
+        let model = vfs.lookup(ckpt.ino, "model").await.unwrap();
+        vfs.readdir(model.ino).await.unwrap();
+
+        hub.fail_next_list_tree(1, Some(404));
+        assert_eq!(vfs.lookup(model.ino, "missing").await.unwrap_err(), libc::ENOENT);
+
+        // The authoritative miss is negative-cached: no further Hub probes.
+        let listings = hub.list_tree_call_count();
+        assert_eq!(vfs.lookup(model.ino, "missing").await.unwrap_err(), libc::ENOENT);
+        assert_eq!(
+            hub.list_tree_call_count(),
+            listings,
+            "second lookup must hit the negative cache"
+        );
+    });
+}
