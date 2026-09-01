@@ -1439,15 +1439,28 @@ impl VirtualFs {
                         .map(|e| self.make_vfs_attr(e))
                         .ok_or(libc::ENOENT);
                 }
-                // HEAD probe catches files added remotely. A transient probe
+                // HEAD probe catches files added remotely. A TRANSIENT probe
                 // failure (429 rate limit, 5xx, network) must surface as its
                 // errno — NOT be swallowed into ENOENT: caching a false
                 // negative here hides a freshly committed path (e.g. a _READY
                 // marker) for NEG_CACHE_TTL even after the Hub recovers.
-                let head = self.hub_client.head_file(&full_path).await.map_err(|e| {
-                    debug!("HEAD miss-probe {} failed: {}", full_path, e);
-                    e.to_errno()
-                })?;
+                // Permanent failures fall through to the targeted listing
+                // below, which can still resolve the path when it is a
+                // directory (the resolve endpoint is file-only).
+                let head = match self.hub_client.head_file(&full_path).await {
+                    Ok(head) => head,
+                    Err(e) if e.is_transient() => {
+                        debug!("HEAD miss-probe {} failed: {}", full_path, e);
+                        return Err(e.to_errno());
+                    }
+                    Err(e) => {
+                        debug!(
+                            "HEAD miss-probe {} failed permanently, falling back to list: {}",
+                            full_path, e
+                        );
+                        None
+                    }
+                };
                 if let Some(head) = head.filter(|h| h.size.is_some()) {
                     return self.insert_file_from_head(parent, name, &full_path, head);
                 }
@@ -1456,13 +1469,18 @@ impl VirtualFs {
                 // catches that; non-empty result means the dir exists.
                 let entries = match self.hub_client.list_tree(&full_path).await {
                     Ok(entries) => entries,
-                    // The repo tree endpoint returns 404 for a nonexistent
-                    // path (buckets return an empty listing): that's an
-                    // authoritative miss, not a failure to probe.
-                    Err(e) if e.status() == Some(404) => Vec::new(),
-                    Err(e) => {
+                    Err(e) if e.is_transient() => {
                         debug!("list miss-probe {} failed: {}", full_path, e);
                         return Err(e.to_errno());
+                    }
+                    // The repo tree endpoint returns 404 for a nonexistent
+                    // path (buckets return an empty listing): an authoritative
+                    // miss. Other permanent failures also fall through to the
+                    // negative cache — pre-existing behavior, and unlike
+                    // transient ones they won't clear within NEG_CACHE_TTL.
+                    Err(e) => {
+                        debug!("list miss-probe {} failed permanently: {}", full_path, e);
+                        Vec::new()
                     }
                 };
                 if !entries.is_empty() {

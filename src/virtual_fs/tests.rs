@@ -5888,3 +5888,31 @@ fn miss_probe_404_stays_enoent_and_seeds_negative_cache() {
         );
     });
 }
+
+/// A PERMANENT HEAD failure must not kill the lookup: the targeted listing
+/// below can still resolve the path when it is a directory (the resolve
+/// endpoint is file-only). Only transient failures early-return.
+#[test]
+fn miss_probe_permanent_head_failure_still_resolves_dir_via_listing() {
+    let hub = MockHub::new();
+    hub.add_file("ckpt/model/__0_0.distcp", 100, Some("hash1"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let ckpt = vfs.lookup(ROOT_INODE, "ckpt").await.unwrap();
+        let model = vfs.lookup(ckpt.ino, "model").await.unwrap();
+        vfs.readdir(model.ino).await.unwrap();
+
+        // Directory added remotely after the listing was cached.
+        hub.add_file("ckpt/model/step-100/__0_0.distcp", 100, Some("hash2"), None);
+
+        // HEAD fails permanently (statusless error); the listing rescues.
+        hub.fail_next_head();
+        let attr = vfs
+            .lookup(model.ino, "step-100")
+            .await
+            .expect("dir must resolve via listing");
+        assert_eq!(attr.kind, InodeKind::Directory);
+    });
+}
