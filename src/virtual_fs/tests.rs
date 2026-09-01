@@ -5916,3 +5916,28 @@ fn miss_probe_permanent_head_failure_still_resolves_dir_via_listing() {
         assert_eq!(attr.kind, InodeKind::Directory);
     });
 }
+
+/// Two concurrent commit attempts on the same handle (shutdown drain
+/// overlapping a normal flush) must both succeed with a single Hub commit.
+/// The worker replies to a single Finish: without serialization the loser
+/// races a second Finish into a dead channel, reports a false EIO, and the
+/// subsequent release reverts the inode of a successfully committed file.
+#[test]
+fn concurrent_streaming_commits_are_serialized() {
+    let hub = MockHub::new();
+    hub.add_file("ckpt.distcp", 100, Some("hash1"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let ino = vfs.lookup(ROOT_INODE, "ckpt.distcp").await.unwrap().ino;
+        let fh = vfs.open(ino, true, true, Some(1)).await.unwrap();
+        write_blocking(&vfs, ino, fh, 0, b"checkpoint bytes").await.unwrap();
+
+        let (first, second) = tokio::join!(vfs.flush(ino, fh, Some(1)), vfs.flush(ino, fh, Some(1)));
+        assert_eq!(first, Ok(()), "concurrent flush must not race the commit");
+        assert_eq!(second, Ok(()), "concurrent flush must not race the commit");
+        vfs.release(fh).await.unwrap();
+    });
+    assert_eq!(hub.take_batch_log().len(), 1, "exactly one Hub commit");
+}

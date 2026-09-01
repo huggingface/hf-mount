@@ -1218,6 +1218,7 @@ impl VirtualFs {
             snapshot,
             dirty_generation_at_open: AtomicU64::new(dirty_generation_at_open),
             commit_hook: std::sync::Mutex::new(None),
+            commit_lock: tokio::sync::Mutex::new(()),
         });
 
         let file_handle = self.alloc_file_handle();
@@ -2752,6 +2753,15 @@ impl VirtualFs {
     async fn streaming_commit(&self, ino: u64, channel: &StreamingChannel) -> Result<(), i32> {
         assert!(!self.overlay(), "overlay forces advanced_writes; streaming unreachable");
 
+        // Serialize commit attempts: a concurrent caller (shutdown drain vs
+        // normal flush/release) waits here, then sees the winner's Committed
+        // state below instead of racing a second Finish into the worker.
+        let _commit_guard = channel.commit_lock.lock().await;
+        if matches!(&*channel.state.lock().expect("state poisoned"), CommitState::Committed) {
+            debug!("streaming_commit: already committed for ino={}", ino);
+            return Ok(());
+        }
+
         // Unlinked files (nlink=0) must not be re-committed on close —
         // user deleted the file, uploading would resurrect it.
         if self
@@ -2841,6 +2851,11 @@ impl VirtualFs {
             file_info.hash(),
             file_info.file_size().expect("upload returned XetFileInfo without size"),
         );
+
+        // Transition to Committed while still holding the commit lock, so a
+        // waiting concurrent caller observes it. Callers re-set it after we
+        // return (harmless) — they cannot do it under the lock.
+        *channel.state.lock().expect("state poisoned") = CommitState::Committed;
 
         Ok(())
     }
@@ -4130,6 +4145,12 @@ struct StreamingChannel {
     /// Watch sender for the pending commit hook. Created in flush() on deferral,
     /// fulfilled in release() when the commit completes (or fails).
     commit_hook: std::sync::Mutex<Option<CommitHookTx>>,
+    /// Serializes commit attempts. The worker replies to a single Finish, so
+    /// two concurrent streaming_commit calls (e.g. the shutdown drain
+    /// overlapping a normal flush) would leave the loser with a dropped reply
+    /// and a false failure; instead it waits here and observes the winner's
+    /// outcome through `state`.
+    commit_lock: tokio::sync::Mutex<()>,
 }
 
 /// An open file handle — either a local fd, lazy remote reference, or streaming writer.
