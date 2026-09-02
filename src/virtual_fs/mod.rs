@@ -199,12 +199,12 @@ pub struct VirtualFs {
     /// Batched flush pipeline: dirty file writes + remote delete queue.
     /// Only present in advanced_writes mode.
     flush_manager: Option<flush::FlushManager>,
-    /// Ensures the streaming shutdown drain runs exactly once. shutdown() is
-    /// called multiple times by design (FUSE destroy, post-join safety net,
-    /// sidecar SIGTERM), and a drain aborted by its timeout leaves handles in
-    /// open_files — without this guard the second call would drain them for
-    /// another full timeout, doubling the advertised shutdown deadline.
-    streaming_drain_once: std::sync::Once,
+    /// shutdown() is called multiple times by design (FUSE destroy, post-join
+    /// safety net, sidecar SIGTERM); the sequence runs once. In particular a
+    /// streaming drain aborted by its timeout leaves handles in open_files —
+    /// a second drain would wait another full timeout, doubling the
+    /// advertised shutdown deadline.
+    shutdown_once: std::sync::Once,
     /// Background poll task handle, aborted in shutdown().
     poll_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Kernel cache invalidation callback. Set via `set_invalidator()` after mount.
@@ -315,7 +315,7 @@ impl VirtualFs {
         let vfs = Arc::new(Self {
             runtime,
             flush_shutdown_timeout: config.flush_shutdown_timeout,
-            streaming_drain_once: std::sync::Once::new(),
+            shutdown_once: std::sync::Once::new(),
             read_fetch_timeout: config.read_fetch_timeout,
             hub_client,
             xet_sessions,
@@ -615,25 +615,27 @@ impl VirtualFs {
 
     /// Graceful shutdown: abort polling, drain flush queue, wait for completion.
     pub fn shutdown(&self) {
-        info!("Shutting down VFS, flushing pending writes...");
-        // Stop the invalidator closures first: any further `inval_inode` writev
-        // to /dev/fuse during teardown risks an unkillable D-state wedge.
-        self.signal_shutting_down();
-        // Abort background tasks.
-        if let Some(handle) = self.poll_handle.lock().expect("poll_handle poisoned").take() {
-            handle.abort();
-        }
-        if let Some(handle) = self.lru_handle.lock().expect("lru_handle poisoned").take() {
-            handle.abort();
-        }
-        // Flush all dirty files + queued deletes.
-        if let Some(fm) = &self.flush_manager {
-            let dirty = self.inode_table.read().expect("inodes poisoned").dirty_inos();
-            fm.shutdown(dirty, &self.runtime, self.flush_shutdown_timeout);
-        } else if !self.read_only {
-            self.streaming_drain_once.call_once(|| self.drain_streaming_writes());
-        }
-        info!("Flush loop finished, VFS shut down.");
+        self.shutdown_once.call_once(|| {
+            info!("Shutting down VFS, flushing pending writes...");
+            // Stop the invalidator closures first: any further `inval_inode` writev
+            // to /dev/fuse during teardown risks an unkillable D-state wedge.
+            self.signal_shutting_down();
+            // Abort background tasks.
+            if let Some(handle) = self.poll_handle.lock().expect("poll_handle poisoned").take() {
+                handle.abort();
+            }
+            if let Some(handle) = self.lru_handle.lock().expect("lru_handle poisoned").take() {
+                handle.abort();
+            }
+            // Flush all dirty files + queued deletes.
+            if let Some(fm) = &self.flush_manager {
+                let dirty = self.inode_table.read().expect("inodes poisoned").dirty_inos();
+                fm.shutdown(dirty, &self.runtime, self.flush_shutdown_timeout);
+            } else if !self.read_only {
+                self.drain_streaming_writes();
+            }
+            info!("Flush loop finished, VFS shut down.");
+        });
     }
 
     /// Streaming mode has no flush manager, but an application killed by the

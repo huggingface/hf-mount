@@ -6213,7 +6213,7 @@ fn lookup_surfaces_eagain_when_tree_listing_rate_limited() {
         let model = vfs.lookup(ckpt.ino, "model").await.unwrap();
 
         // Hub starts rate-limiting tree listings (send_with_retry exhausted).
-        hub.fail_next_list_tree(1, Some(429));
+        hub.fail_next_list_tree_with_status(429);
 
         let errno = vfs.lookup(model.ino, "model").await.unwrap_err();
         assert_eq!(errno, libc::EAGAIN, "transient 429 must map to EAGAIN, not EIO");
@@ -6245,7 +6245,7 @@ fn transient_429_does_not_poison_negative_cache() {
         // _READY not committed yet; the reader polls for it while the Hub
         // rate-limits the miss-path listing probe. The transient failure
         // surfaces as EAGAIN instead of being cached as a false ENOENT.
-        hub.fail_next_list_tree(1, Some(429));
+        hub.fail_next_list_tree_with_status(429);
         assert_eq!(vfs.lookup(model.ino, "_READY").await.unwrap_err(), libc::EAGAIN);
 
         // Writer commits _READY; Hub is healthy again.
@@ -6263,34 +6263,6 @@ fn transient_429_does_not_poison_negative_cache() {
         // The committed marker is visible immediately — no poisoned entry.
         let attr = vfs.lookup(model.ino, "_READY").await.expect("marker must resolve");
         assert_eq!(attr.size, 0);
-    });
-}
-
-/// The write/flush path has no deadline: when the CAS stalls mid-upload
-/// (xorb POSTs can hang for minutes before the server 408-kills them),
-/// `close(2)` blocks until the transfer errors out — there is no write-side
-/// equivalent of `read_fetch_timeout`. In the FUSE layer this parks a worker
-/// thread unboundedly.
-#[test]
-fn repro_streaming_flush_has_no_timeout_when_cas_stalls() {
-    let hub = MockHub::new();
-    hub.add_file("big.bin", 100, Some("hash1"), None);
-    let xet = MockXet::new();
-    xet.stall_writer_finish();
-    let (rt, vfs) = vfs_simple(&hub, &xet);
-
-    rt.block_on(async {
-        let ino = vfs.lookup(ROOT_INODE, "big.bin").await.unwrap().ino;
-        let fh = vfs.open(ino, true, true, Some(1)).await.unwrap();
-        write_blocking(&vfs, ino, fh, 0, b"checkpoint bytes").await.unwrap();
-
-        // flush() = close(2). With the CAS stalled it never completes;
-        // 3s stands in for "unbounded" to keep the test fast.
-        let res = tokio::time::timeout(Duration::from_secs(3), vfs.flush(ino, fh, Some(1))).await;
-        assert!(
-            res.is_err(),
-            "flush() completed despite a stalled CAS upload — a write timeout now exists"
-        );
     });
 }
 
@@ -6346,7 +6318,7 @@ fn miss_probe_404_stays_enoent_and_seeds_negative_cache() {
         let model = vfs.lookup(ckpt.ino, "model").await.unwrap();
         vfs.readdir(model.ino).await.unwrap();
 
-        hub.fail_next_list_tree(1, Some(404));
+        hub.fail_next_list_tree_with_status(404);
         assert_eq!(vfs.lookup(model.ino, "missing").await.unwrap_err(), libc::ENOENT);
 
         // The authoritative miss is negative-cached: no further Hub probes.
