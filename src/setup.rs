@@ -788,7 +788,9 @@ fn mountinfo_has_hf_mount(mountinfo: &str, target: &str) -> bool {
 /// mount exists. Under a per-user 429 storm a single `send_with_retry` (2
 /// tries, RateLimit hint capped at 30s) can be outlasted by the storm;
 /// panicking here crash-loops the mount pod/sidecar and resets all startup
-/// progress. Keep retrying transient failures for up to this window instead.
+/// progress. Keep retrying transient failures for up to this window instead,
+/// sleeping what the server asked for (`Error::retry_after`) when it said,
+/// so the startup retries don't feed the storm they are waiting out.
 const STARTUP_RETRY_DEADLINE: Duration = Duration::from_secs(300);
 
 async fn retry_startup<T, Fut>(what: &str, attempt: impl Fn() -> Fut) -> crate::error::Result<T>
@@ -809,7 +811,8 @@ where
                 let remaining = STARTUP_RETRY_DEADLINE - elapsed;
                 warn!("{what}: transient startup failure ({e}); retrying for up to {remaining:?} more");
                 tokio::time::sleep(
-                    crate::hub_api::retry_delay(attempt_no)
+                    e.retry_after()
+                        .unwrap_or_else(|| crate::hub_api::retry_delay(attempt_no))
                         .min(crate::hub_api::MAX_RETRY_DELAY)
                         .min(remaining),
                 )

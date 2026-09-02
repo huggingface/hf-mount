@@ -2,7 +2,13 @@ use std::fmt;
 
 #[derive(Debug)]
 pub enum Error {
-    Hub { message: String, status: Option<u16> },
+    Hub {
+        message: String,
+        status: Option<u16>,
+        /// Server-requested wait (IETF `RateLimit` header) on a rate-limited
+        /// response, so outer retry loops honor the Hub's reset time.
+        retry_after: Option<std::time::Duration>,
+    },
     Xet(String),
     Io(std::io::Error),
     Json(serde_json::Error),
@@ -14,6 +20,7 @@ impl Error {
         Self::Hub {
             message: msg.into(),
             status: None,
+            retry_after: None,
         }
     }
 
@@ -21,6 +28,22 @@ impl Error {
         Self::Hub {
             message: msg.into(),
             status: Some(status),
+            retry_after: None,
+        }
+    }
+
+    pub fn with_retry_after(mut self, delay: Option<std::time::Duration>) -> Self {
+        if let Self::Hub { retry_after, .. } = &mut self {
+            *retry_after = delay;
+        }
+        self
+    }
+
+    /// How long the server asked us to wait before retrying, when it said.
+    pub fn retry_after(&self) -> Option<std::time::Duration> {
+        match self {
+            Self::Hub { retry_after, .. } => *retry_after,
+            _ => None,
         }
     }
 
@@ -67,8 +90,11 @@ impl fmt::Display for Error {
             Self::Hub {
                 message,
                 status: Some(s),
+                ..
             } => write!(f, "Hub API error ({s}): {message}"),
-            Self::Hub { message, status: None } => write!(f, "Hub API error: {message}"),
+            Self::Hub {
+                message, status: None, ..
+            } => write!(f, "Hub API error: {message}"),
             Self::Xet(msg) => write!(f, "Xet error: {msg}"),
             Self::Io(err) => write!(f, "IO error: {err}"),
             Self::Json(err) => write!(f, "JSON error: {err}"),
@@ -145,6 +171,17 @@ mod tests {
         assert_eq!(Error::hub_status(501, "not implemented").to_errno(), libc::EIO);
         assert_eq!(Error::hub("no status").to_errno(), libc::EIO);
         assert_eq!(Error::Xet("opaque".into()).to_errno(), libc::EIO);
+    }
+
+    #[test]
+    fn retry_after_only_carried_by_hub_errors() {
+        let delay = std::time::Duration::from_secs(30);
+        assert_eq!(
+            Error::hub_status(429, "x").with_retry_after(Some(delay)).retry_after(),
+            Some(delay)
+        );
+        assert_eq!(Error::hub_status(429, "x").retry_after(), None);
+        assert_eq!(Error::Xet("x".into()).with_retry_after(Some(delay)).retry_after(), None);
     }
 
     #[test]

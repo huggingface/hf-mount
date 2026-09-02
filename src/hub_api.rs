@@ -393,6 +393,8 @@ async fn probe_repo(
 
 /// Send an HTTP request with automatic retry on transient errors (408, 429, 5xx, timeouts).
 /// Uses the IETF RateLimit header's t= parameter when present, falls back to exponential backoff (2 retries max).
+/// When the retries are exhausted the returned error carries the server's last
+/// RateLimit hint (`Error::retry_after`) so an outer loop can keep honoring it.
 /// Set `accept_redirects` to treat 3xx as success (needed for HEAD on /resolve/ endpoints
 /// where the redirect response itself carries metadata headers).
 async fn send_with_retry(
@@ -410,14 +412,17 @@ async fn send_with_retry(
             }
             Ok(resp) => {
                 let status = resp.status().as_u16();
+                let hinted_delay = parse_retry_delay(resp.headers());
                 if is_retryable_status(status) && attempt <= MAX_RETRIES {
-                    let delay = parse_retry_delay(resp.headers()).unwrap_or_else(|| retry_delay(attempt));
+                    let delay = hinted_delay.unwrap_or_else(|| retry_delay(attempt));
                     warn!("{context}: transient error ({status}), retry {attempt}/{MAX_RETRIES} in {delay:?}");
                     tokio::time::sleep(delay).await;
                     continue;
                 }
                 let body = resp.text().await.unwrap_or_default();
-                return Err(Error::hub_status(status, format!("{context}: {status} {body}")));
+                return Err(
+                    Error::hub_status(status, format!("{context}: {status} {body}")).with_retry_after(hinted_delay)
+                );
             }
             Err(err) if is_transient_http(&err) && attempt <= MAX_RETRIES => {
                 let delay = retry_delay(attempt);
