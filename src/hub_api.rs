@@ -9,7 +9,7 @@ use tokio::io::AsyncWriteExt;
 use tracing::{info, warn};
 use xet_client::cas_client::auth::{AuthError, TokenInfo, TokenRefresher};
 
-use crate::error::{Error, Result, is_retryable_status};
+use crate::error::{Error, Result, is_retryable_status, is_transient_http};
 
 /// Characters that must be percent-encoded when a file path is interpolated
 /// into a URL path: `#` starts a fragment, `?` a query string, `%` corrupts
@@ -325,6 +325,10 @@ pub(crate) fn retry_delay(attempt: u32) -> std::time::Duration {
     std::time::Duration::from_millis(500 * 2u64.pow(attempt - 1))
 }
 
+/// Upper bound on any single retry sleep, whether server-hinted (RateLimit
+/// header) or exponential.
+pub(crate) const MAX_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Parse the IETF `RateLimit` header for `t=<seconds>` (time until window reset), capped at 30s.
 /// Format: `"resource_type";r=<remaining>;t=<seconds_until_reset>`
 /// This is what moon-landing sends on 429 responses.
@@ -335,7 +339,7 @@ fn parse_retry_delay(headers: &reqwest::header::HeaderMap) -> Option<std::time::
         if let Some(secs_str) = part.strip_prefix("t=")
             && let Ok(secs) = secs_str.parse::<u64>()
         {
-            return Some(std::time::Duration::from_secs(secs.min(30)));
+            return Some(std::time::Duration::from_secs(secs).min(MAX_RETRY_DELAY));
         }
     }
     None
@@ -415,7 +419,7 @@ async fn send_with_retry(
                 let body = resp.text().await.unwrap_or_default();
                 return Err(Error::hub_status(status, format!("{context}: {status} {body}")));
             }
-            Err(err) if (err.is_timeout() || err.is_connect()) && attempt <= MAX_RETRIES => {
+            Err(err) if is_transient_http(&err) && attempt <= MAX_RETRIES => {
                 let delay = retry_delay(attempt);
                 warn!("{context}: transient error, retry {attempt}/{MAX_RETRIES} in {delay:?}: {err}");
                 tokio::time::sleep(delay).await;

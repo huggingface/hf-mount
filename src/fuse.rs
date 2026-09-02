@@ -14,7 +14,7 @@ use fuser::{
 use tracing::{error, info, warn};
 
 use crate::daemon::DaemonGuard;
-use crate::setup::MountSetup;
+use crate::setup::{FS_NAME, MountSetup, unmount_fuse};
 use crate::virtual_fs::inode::InodeKind;
 use crate::virtual_fs::{InvalKind, VirtualFs, VirtualFsAttr};
 
@@ -612,7 +612,7 @@ pub fn mount_fuse(
 
     let mut config = fuser::Config::default();
     config.mount_options = vec![
-        fuser::MountOption::FSName("hf-mount".to_string()),
+        fuser::MountOption::FSName(FS_NAME.to_string()),
         fuser::MountOption::DefaultPermissions,
     ];
     if setup.read_only {
@@ -623,7 +623,7 @@ pub fn mount_fuse(
         let volname = mount_point
             .file_name()
             .map(|n: &OsStr| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "hf-mount".to_string());
+            .unwrap_or_else(|| FS_NAME.to_string());
         if !volname.contains(',') {
             config
                 .mount_options
@@ -796,7 +796,3 @@ async fn wait_for_signal() {
         _ = sighup.recv() => {}
     }
 }
-
-// Re-exported for the signal path above; lives in setup.rs so it compiles
-// regardless of the enabled backend features.
-pub(crate) use crate::setup::unmount_fuse;

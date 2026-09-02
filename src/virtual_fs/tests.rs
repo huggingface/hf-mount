@@ -6303,16 +6303,11 @@ fn assert_shutdown_drains_inflight_write(advanced: bool) {
     let hub = MockHub::new();
     hub.add_file("ckpt.distcp", 100, Some("hash1"), None);
     let xet = MockXet::new();
-    let rt = new_runtime();
-    let vfs = make_test_vfs(
-        hub.clone(),
-        xet.clone(),
-        TestOpts {
-            advanced_writes: advanced,
-            ..Default::default()
-        },
-        &rt,
-    );
+    let (rt, vfs) = if advanced {
+        vfs_advanced(&hub, &xet)
+    } else {
+        vfs_simple(&hub, &xet)
+    };
     rt.block_on(async {
         let ino = vfs.lookup(ROOT_INODE, "ckpt.distcp").await.unwrap().ino;
         let fh = vfs.open(ino, true, true, Some(1)).await.unwrap();

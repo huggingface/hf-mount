@@ -18,6 +18,11 @@ use crate::overlay::OverlayBacking;
 use crate::virtual_fs::{VfsConfig, VirtualFs};
 use crate::xet::{StagingDir, XetSessions};
 
+/// Name hf-mount registers its FUSE mounts under (fuser `FSName`, i.e. the
+/// mount source; the CSI helper uses it as the `fuse.<subtype>`). The
+/// dead-mount detector matches on it, so the two must stay in sync.
+pub const FS_NAME: &str = "hf-mount";
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum CacheMode {
     /// xet-core's chunk_cache: caches xorb byte ranges on disk.
@@ -282,6 +287,20 @@ pub struct MountSetup {
 
 // ── Tracing + env vars (no threads) ──────────────────────────────────
 
+/// Upper bound on xet-core's adaptive upload concurrency. Each in-flight
+/// upload pins one serialized ~64MiB xorb in memory, so xet-core's default
+/// max of 64 lets a stalled CAS pin up to ~4GiB and get the FUSE daemon
+/// OOM-killed mid-write. 8 × 64MiB bounds that backlog at ~512MiB while
+/// still saturating healthy links. Set via env in `init_tracing` and read
+/// back from the effective config to catch upstream env renames.
+const XET_UPLOAD_CONCURRENCY_CAP: usize = 8;
+
+/// Whether the user pinned a fixed upload concurrency, which the adaptive
+/// cap must not override.
+fn user_fixed_upload_concurrency() -> bool {
+    std::env::var("HF_XET_FIXED_UPLOAD_CONCURRENCY").is_ok()
+}
+
 /// Initialize tracing and xet-core env vars.
 /// No threads are spawned. Safe to fork() after this returns.
 pub fn init_tracing(daemon: bool) {
@@ -301,6 +320,7 @@ pub fn init_tracing(daemon: bool) {
     }
 
     // Tune xet-core for interactive FUSE reads (not batch downloads).
+    let upload_cap = XET_UPLOAD_CONCURRENCY_CAP.to_string();
     for (k, v) in [
         ("HF_XET_CLIENT_AC_INITIAL_DOWNLOAD_CONCURRENCY", "16"),
         ("HF_XET_CLIENT_AC_MIN_BYTES_REQUIRED_FOR_ADJUSTMENT", "4194304"),
@@ -319,20 +339,16 @@ pub fn init_tracing(daemon: bool) {
         // and wedge the mount.
         ("HF_XET_CLIENT_READ_TIMEOUT", "30"),
         // Upload tuning: skip slow adaptive concurrency ramp-up, but CAP the
-        // adaptive controller's upper bound. Each in-flight upload pins one
-        // serialized ~64MiB xorb in memory, so xet-core's default max of 64
-        // lets a stalled CAS pin up to ~4GiB and get the FUSE daemon
-        // OOM-killed mid-write. 8 × 64MiB bounds that backlog at ~512MiB
-        // while still saturating healthy links.
-        ("HF_XET_CLIENT_AC_INITIAL_UPLOAD_CONCURRENCY", "8"),
-        ("HF_XET_CLIENT_AC_MAX_UPLOAD_CONCURRENCY", "8"),
+        // adaptive controller's upper bound (see XET_UPLOAD_CONCURRENCY_CAP).
+        ("HF_XET_CLIENT_AC_INITIAL_UPLOAD_CONCURRENCY", upload_cap.as_str()),
+        ("HF_XET_CLIENT_AC_MAX_UPLOAD_CONCURRENCY", upload_cap.as_str()),
         // Larger ingestion blocks = fewer CDC calls
         ("HF_XET_DATA_INGESTION_BLOCK_SIZE", "16777216"),
     ] {
         // xet-runtime consults HF_XET_FIXED_UPLOAD_CONCURRENCY only when the
         // canonical AC variables are absent — defaulting the canonical names
         // would silently turn a user-fixed concurrency into an adaptive one.
-        if k.contains("UPLOAD_CONCURRENCY") && std::env::var("HF_XET_FIXED_UPLOAD_CONCURRENCY").is_ok() {
+        if k.contains("UPLOAD_CONCURRENCY") && user_fixed_upload_concurrency() {
             continue;
         }
         if std::env::var(k).is_err() {
@@ -459,7 +475,7 @@ pub fn build_with_runtime(
     // xet-core: if one is ever renamed upstream, the cap silently stops
     // applying. Read back the effective value so that drift is loud instead
     // of resurfacing as unbounded RSS under a stalled CAS.
-    if std::env::var("HF_XET_FIXED_UPLOAD_CONCURRENCY").is_err() && xet_ctx.config.client.ac_max_upload_concurrency > 8
+    if !user_fixed_upload_concurrency() && xet_ctx.config.client.ac_max_upload_concurrency > XET_UPLOAD_CONCURRENCY_CAP
     {
         warn!(
             "xet upload concurrency cap not applied (effective max {}); write-path memory \
@@ -688,13 +704,9 @@ pub fn raise_fd_limit() {
 
 /// Detect and lazily detach a dead FUSE mount left at `path` by a crashed
 /// predecessor. A healthy path stats fine; a dead FUSE mountpoint fails with
-/// ENOTCONN (or EIO — both are "corrupted mount" errnos, matching what
-/// k8s mount-utils treats as corrupted). On a genuinely failing disk the
-/// detach is harmless: umount fails cleanly and the subsequent
-/// create_dir_all fails exactly as it did before this cleanup existed.
-/// Detaching is safe for consumers: bind mounts made from this path
-/// reference the superblock directly and keep working (validated e2e —
-/// app-pod binds survive the detach and receive the repaired mount).
+/// ENOTCONN or EIO (the "corrupted mount" errnos k8s mount-utils also keys
+/// on). Detaching is safe for consumers: bind mounts made from this path
+/// reference the superblock directly and keep working.
 fn detach_dead_mount(path: &Path) {
     let Err(e) = std::fs::metadata(path) else { return };
     if !matches!(e.raw_os_error(), Some(libc::ENOTCONN) | Some(libc::EIO)) {
@@ -748,8 +760,8 @@ fn hf_mount_mounted_at(_path: &Path) -> bool {
 /// in mount order and `umount2` detaches the topmost, so only the LAST
 /// entry for the path counts — a foreign filesystem overmounted on a dead
 /// hf-mount must not get detached in its place. Direct mounts show as
-/// fstype "fuse" with source "hf-mount" (fuser FSName); mountpod-mode
-/// mounts made by the CSI helper show as fstype "fuse.hf-mount".
+/// fstype "fuse" with source `FS_NAME` (fuser FSName); mountpod-mode mounts
+/// made by the CSI helper show as fstype `fuse.<FS_NAME>`.
 #[cfg(any(target_os = "linux", test))]
 fn mountinfo_has_hf_mount(mountinfo: &str, target: &str) -> bool {
     let topmost = mountinfo.lines().rev().find(|line| {
@@ -769,7 +781,7 @@ fn mountinfo_has_hf_mount(mountinfo: &str, target: &str) -> bool {
     let (Some(fstype), Some(source)) = (after_separator.next(), after_separator.next()) else {
         return false;
     };
-    fstype == "fuse.hf-mount" || (fstype.starts_with("fuse") && source == "hf-mount")
+    fstype.strip_prefix("fuse.") == Some(FS_NAME) || (fstype.starts_with("fuse") && source == FS_NAME)
 }
 
 /// Retry window for Hub calls made during mount startup, before the FUSE
@@ -789,15 +801,16 @@ where
         match attempt().await {
             Ok(v) => return Ok(v),
             Err(e) => {
-                if !e.is_transient() || start.elapsed() >= STARTUP_RETRY_DEADLINE {
+                let elapsed = start.elapsed();
+                if !e.is_transient() || elapsed >= STARTUP_RETRY_DEADLINE {
                     return Err(e);
                 }
                 attempt_no += 1;
-                let remaining = STARTUP_RETRY_DEADLINE.saturating_sub(start.elapsed());
+                let remaining = STARTUP_RETRY_DEADLINE - elapsed;
                 warn!("{what}: transient startup failure ({e}); retrying for up to {remaining:?} more");
                 tokio::time::sleep(
                     crate::hub_api::retry_delay(attempt_no)
-                        .min(Duration::from_secs(30))
+                        .min(crate::hub_api::MAX_RETRY_DELAY)
                         .min(remaining),
                 )
                 .await;

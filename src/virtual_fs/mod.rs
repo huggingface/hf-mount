@@ -631,7 +631,7 @@ impl VirtualFs {
             let dirty = self.inode_table.read().expect("inodes poisoned").dirty_inos();
             fm.shutdown(dirty, &self.runtime, self.flush_shutdown_timeout);
         } else if !self.read_only {
-            self.drain_streaming_writes();
+            self.streaming_drain_once.call_once(|| self.drain_streaming_writes());
         }
         info!("Flush loop finished, VFS shut down.");
     }
@@ -643,15 +643,8 @@ impl VirtualFs {
     /// the exit closes /dev/fuse, which aborts the FUSE connection under the
     /// writer. Goes through `flush` + `release` so the normal commit-state
     /// bookkeeping applies (already-committed handles are no-ops, failures
-    /// revert the inode), mirroring the NFS shutdown drain. `release` removes
-    /// each handle from `open_files`, which also makes a second `shutdown`
-    /// call (destroy + signal-handler safety net) a natural no-op.
+    /// revert the inode), mirroring the NFS shutdown drain.
     fn drain_streaming_writes(&self) {
-        self.streaming_drain_once
-            .call_once(|| self.drain_streaming_writes_inner());
-    }
-
-    fn drain_streaming_writes_inner(&self) {
         let streaming: Vec<(u64, u64)> = {
             let files = self.open_files.read().expect("open_files poisoned");
             files
@@ -1456,30 +1449,10 @@ impl VirtualFs {
                         .map(|e| self.make_vfs_attr(e))
                         .ok_or(libc::ENOENT);
                 }
-                // HEAD probe catches files added remotely. A TRANSIENT probe
-                // failure (429 rate limit, 5xx, network) must surface as its
-                // errno — NOT be swallowed into ENOENT: caching a false
-                // negative here hides a freshly committed path (e.g. a _READY
-                // marker) for NEG_CACHE_TTL even after the Hub recovers.
-                // Permanent failures fall through to the targeted listing
-                // below, which can still resolve the path when it is a
-                // directory (the resolve endpoint is file-only).
-                let head = match self.hub_client.head_file(&full_path).await {
-                    Ok(head) => head,
-                    Err(e) if e.is_transient() => {
-                        debug!("HEAD miss-probe {} failed: {}", full_path, e);
-                        return Err(e.to_errno());
-                    }
-                    Err(e) => {
-                        debug!(
-                            "HEAD miss-probe {} failed permanently, falling back to list: {}",
-                            full_path, e
-                        );
-                        None
-                    }
-                };
-                if let Some(head) = head.filter(|h| h.size.is_some()) {
-                    return self.insert_file_from_head(parent, name, &full_path, head);
+                match self.head_probe(&full_path).await {
+                    HeadProbe::File(head) => return self.insert_file_from_head(parent, name, &full_path, head),
+                    HeadProbe::Transient(e) => return Err(e.to_errno()),
+                    HeadProbe::Inconclusive => {}
                 }
                 // The resolve endpoint returns 404 for directories, so a HEAD
                 // miss could still be a remotely-added dir. Targeted listing
@@ -1538,29 +1511,9 @@ impl VirtualFs {
         // Resolve the single requested path via HEAD instead of listing the
         // whole parent — for point-access workloads (no `readdir`) this keeps
         // the inode table scoped to what the caller actually touches.
-        enum HeadProbe {
-            /// HEAD answered 404: no file at this path (could still be a dir).
-            Missing,
-            /// HEAD found the file but without a size; only the listing has
-            /// the authoritative size, so it gets the final word.
-            FoundWithoutSize,
-            Failed(crate::error::Error),
-        }
-        let head_probe = match self.hub_client.head_file(&full_path).await {
-            // Without size, `open_readonly` would take the empty-file shortcut
-            // and expose a zero-byte file. Fall back to list_tree which has
-            // the authoritative size from the tree index.
-            Ok(Some(head)) if head.size.is_some() => {
-                return self.insert_file_from_head(parent, name, &full_path, head);
-            }
-            Ok(Some(_)) => HeadProbe::FoundWithoutSize,
-            // 404 may mean "doesn't exist" or "it's a directory" (the resolve
-            // endpoint only handles files), so the listing has the final word.
-            Ok(None) => HeadProbe::Missing,
-            Err(e) => {
-                debug!("HEAD lookup {} failed, falling back to list: {}", full_path, e);
-                HeadProbe::Failed(e)
-            }
+        let head_probe = match self.head_probe(&full_path).await {
+            HeadProbe::File(head) => return self.insert_file_from_head(parent, name, &full_path, head),
+            other => other,
         };
 
         let freshly_listed = self.ensure_children_loaded(parent).await?;
@@ -1577,19 +1530,40 @@ impl VirtualFs {
                     return Err(libc::ENOENT);
                 }
                 // The listing was loaded earlier (or by a concurrent task)
-                // and may predate a remote commit, so nothing here is
-                // authoritative enough to negative-cache: HEAD's 404 says
-                // nothing about a remotely-added directory (the resolve
-                // endpoint is file-only), and a sizeless hit says the file
-                // exists. Uncached ENOENT lets the next lookup retry against
-                // a fresher listing.
+                // and may predate a remote commit: an inconclusive probe is
+                // not authoritative enough to negative-cache (uncached ENOENT
+                // lets the next lookup retry against a fresher listing), and
+                // a rate-limited probe surfaces its errno instead of a false
+                // ENOENT.
                 match head_probe {
-                    // The HEAD probe that would have caught a file newer than
-                    // the listing was rate-limited: surface the transient
-                    // error instead of a false ENOENT.
-                    HeadProbe::Failed(e) if e.is_transient() => Err(e.to_errno()),
-                    HeadProbe::Missing | HeadProbe::FoundWithoutSize | HeadProbe::Failed(_) => Err(libc::ENOENT),
+                    HeadProbe::Transient(e) => Err(e.to_errno()),
+                    _ => Err(libc::ENOENT),
                 }
+            }
+        }
+    }
+
+    /// HEAD-probe `full_path` for a remotely-added file; both lookup miss
+    /// paths start here. A sized hit resolves the file directly. A 404 (also
+    /// what the file-only resolve endpoint returns for directories), a
+    /// sizeless hit (only the tree listing has the authoritative size — with
+    /// 0, `open_readonly` would take the empty-file shortcut), or a permanent
+    /// failure are inconclusive: the caller defers to a listing. A transient
+    /// failure (429 rate limit, 5xx, network) is handed back so the caller
+    /// returns its errno — swallowing it into ENOENT would cache a false
+    /// negative that hides a freshly committed path (e.g. a `_READY` marker)
+    /// for NEG_CACHE_TTL even after the Hub recovers.
+    async fn head_probe(&self, full_path: &str) -> HeadProbe {
+        match self.hub_client.head_file(full_path).await {
+            Ok(Some(head)) if head.size.is_some() => HeadProbe::File(head),
+            Ok(_) => HeadProbe::Inconclusive,
+            Err(e) if e.is_transient() => HeadProbe::Transient(e),
+            Err(e) => {
+                debug!(
+                    "HEAD probe {} failed permanently, deferring to listing: {}",
+                    full_path, e
+                );
+                HeadProbe::Inconclusive
             }
         }
     }
@@ -4469,6 +4443,13 @@ impl StreamingChannel {
     fn owns_generation(&self, inode_dirty_generation: u64) -> bool {
         self.dirty_generation_at_open.load(Ordering::Relaxed) == inode_dirty_generation
     }
+}
+
+/// Outcome of `VirtualFs::head_probe`.
+enum HeadProbe {
+    File(crate::hub_api::HeadFileInfo),
+    Inconclusive,
+    Transient(crate::error::Error),
 }
 
 /// True when the channel's commit reached a terminal state (Committed or

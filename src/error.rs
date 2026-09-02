@@ -50,14 +50,13 @@ impl Error {
     }
 
     /// Whether retrying this error can plausibly succeed. Single source of
-    /// truth for "transient": HTTP statuses defer to `is_retryable_status`;
-    /// transport errors are transient only for connect/timeout failures
-    /// (mirrors `send_with_retry` — decode or TLS failures are permanent).
+    /// truth for "transient", shared with `send_with_retry`: HTTP statuses
+    /// defer to `is_retryable_status`; transport errors are transient only
+    /// for connect/timeout failures (decode or TLS failures are permanent).
     pub fn is_transient(&self) -> bool {
         match self {
-            Self::Hub { status: Some(s), .. } => is_retryable_status(*s),
-            Self::Http(e) => e.is_timeout() || e.is_connect(),
-            _ => false,
+            Self::Http(e) => is_transient_http(e),
+            _ => self.status().is_some_and(is_retryable_status),
         }
     }
 }
@@ -120,6 +119,12 @@ impl From<xet_data::file_reconstruction::FileReconstructionError> for Error {
 
 pub fn is_retryable_status(status: u16) -> bool {
     matches!(status, 408 | 429 | 500 | 502 | 503 | 504)
+}
+
+/// Transport failures worth retrying: connect and timeout only (decode or
+/// TLS failures are permanent).
+pub fn is_transient_http(err: &reqwest::Error) -> bool {
+    err.is_timeout() || err.is_connect()
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

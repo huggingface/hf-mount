@@ -171,6 +171,14 @@ impl MockHub {
     }
 }
 
+/// Build a mock Hub error, carrying `status` when one is configured.
+fn mock_error(status: Option<u16>, msg: &str) -> Error {
+    match status {
+        Some(status) => Error::hub_status(status, msg),
+        None => Error::hub(msg),
+    }
+}
+
 #[async_trait::async_trait]
 impl HubOps for MockHub {
     async fn list_tree(&self, prefix: &str) -> Result<Vec<TreeEntry>> {
@@ -183,10 +191,7 @@ impl HubOps for MockHub {
                 } else {
                     None
                 };
-                return Err(match status {
-                    Some(s) => Error::hub_status(s, "mock list_tree failure"),
-                    None => Error::hub("mock list_tree failure"),
-                });
+                return Err(mock_error(status, "mock list_tree failure"));
             }
         }
         let tree = self.tree.lock().unwrap();
@@ -238,10 +243,8 @@ impl HubOps for MockHub {
     async fn head_file(&self, path: &str) -> Result<Option<HeadFileInfo>> {
         self.head_file_calls.fetch_add(1, Ordering::SeqCst);
         if self.head_fail.swap(false, Ordering::SeqCst) {
-            return Err(match self.head_fail_status.lock().unwrap().take() {
-                Some(status) => Error::hub_status(status, "mock head_file failure"),
-                None => Error::hub("mock head_file failure"),
-            });
+            let status = self.head_fail_status.lock().unwrap().take();
+            return Err(mock_error(status, "mock head_file failure"));
         }
         let responses = self.head_responses.lock().unwrap();
         match responses.get(path) {
@@ -299,8 +302,7 @@ impl HubOps for MockHub {
         self.probe_revision_calls.fetch_add(1, Ordering::SeqCst);
         match &*self.revision.lock().unwrap() {
             Ok(s) => Ok(s.clone()),
-            Err((Some(status), msg)) => Err(Error::hub_status(*status, msg.clone())),
-            Err((None, msg)) => Err(Error::hub(msg.clone())),
+            Err((status, msg)) => Err(mock_error(*status, msg)),
         }
     }
 }
