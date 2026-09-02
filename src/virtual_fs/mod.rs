@@ -657,28 +657,48 @@ impl VirtualFs {
                 })
                 .collect()
         };
-        if streaming.is_empty() {
-            return;
-        }
-        info!(
-            "Draining {} in-flight streaming write(s) before shutdown (timeout {:?})",
-            streaming.len(),
-            self.flush_shutdown_timeout
-        );
         let deadline = self.flush_shutdown_timeout;
         flush::run_blocking(|| {
             self.runtime.block_on(async {
-                // Handles are independent (one worker + CAS session each):
-                // drain them concurrently so N handles fit the same deadline
-                // as one.
-                let drain = futures::future::join_all(streaming.iter().map(|&(ino, fh)| async move {
-                    if let Err(errno) = self.flush(ino, fh, None).await {
-                        error!("Shutdown drain flush failed for ino={}: errno {}", ino, errno);
+                let drain = async {
+                    if !streaming.is_empty() {
+                        info!(
+                            "Draining {} in-flight streaming write(s) before shutdown (timeout {:?})",
+                            streaming.len(),
+                            deadline
+                        );
                     }
-                    if let Err(errno) = self.release(fh).await {
-                        error!("Shutdown drain release failed for fh={}: errno {}", fh, errno);
+                    // Handles are independent (one worker + CAS session each):
+                    // drain them concurrently so N handles fit the same deadline
+                    // as one.
+                    futures::future::join_all(streaming.iter().map(|&(ino, fh)| async move {
+                        if let Err(errno) = self.flush(ino, fh, None).await {
+                            error!("Shutdown drain flush failed for ino={}: errno {}", ino, errno);
+                        }
+                        if let Err(errno) = self.release(fh).await {
+                            error!("Shutdown drain release failed for fh={}: errno {}", fh, errno);
+                        }
+                    }))
+                    .await;
+                    // A normal release() racing the shutdown removes its handle
+                    // from open_files before committing, so the snapshot above
+                    // misses it; its commit hook in pending_commits is how we
+                    // wait for it instead of exiting under the commit.
+                    let in_flight: Vec<u64> = self
+                        .pending_commits
+                        .lock()
+                        .expect("pending_commits poisoned")
+                        .keys()
+                        .copied()
+                        .collect();
+                    if !in_flight.is_empty() {
+                        info!(
+                            "Waiting for {} in-flight release commit(s) before shutdown",
+                            in_flight.len()
+                        );
                     }
-                }));
+                    futures::future::join_all(in_flight.iter().map(|&ino| self.await_pending_commit(ino))).await;
+                };
                 if tokio::time::timeout(deadline, drain).await.is_err() {
                     warn!(
                         "Streaming drain exceeded shutdown timeout ({:?}); \

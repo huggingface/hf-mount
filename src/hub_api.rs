@@ -339,7 +339,9 @@ fn parse_retry_delay(headers: &reqwest::header::HeaderMap) -> Option<std::time::
         if let Some(secs_str) = part.strip_prefix("t=")
             && let Ok(secs) = secs_str.parse::<u64>()
         {
-            return Some(std::time::Duration::from_secs(secs).min(MAX_RETRY_DELAY));
+            // t=0 means the window already reset: no hint, use the backoff
+            // schedule rather than retrying immediately.
+            return (secs > 0).then(|| std::time::Duration::from_secs(secs).min(MAX_RETRY_DELAY));
         }
     }
     None
@@ -1554,6 +1556,13 @@ mod tests {
     }
 
     // ── retry / error helpers ─────────────────────────────────────────
+
+    #[test]
+    fn parse_retry_delay_ignores_zero_hint() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("ratelimit", r#""hub_api";r=0;t=0"#.parse().unwrap());
+        assert_eq!(parse_retry_delay(&headers), None);
+    }
 
     #[test]
     fn retry_delay_exponential_backoff() {

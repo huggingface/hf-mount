@@ -750,9 +750,11 @@ fn hf_mount_mounted_at(path: &Path) -> bool {
     mountinfo_has_hf_mount(&String::from_utf8_lossy(&mountinfo), &target.to_string_lossy())
 }
 
+/// No mount table to consult off Linux: fail closed (the dead-mount recovery
+/// is a Kubernetes concern; macOS is a development platform).
 #[cfg(not(target_os = "linux"))]
 fn hf_mount_mounted_at(_path: &Path) -> bool {
-    true
+    false
 }
 
 /// Parse /proc/self/mountinfo content: is the active mount at exactly
@@ -800,15 +802,22 @@ where
     let start = std::time::Instant::now();
     let mut attempt_no: u32 = 0;
     loop {
-        match attempt().await {
+        // An attempt is itself several requests with internal retries; bound
+        // it too, or the last one can overrun the deadline by minutes.
+        let remaining = STARTUP_RETRY_DEADLINE.saturating_sub(start.elapsed());
+        let Ok(result) = tokio::time::timeout(remaining, attempt()).await else {
+            return Err(crate::error::Error::hub(format!(
+                "{what}: still failing after {STARTUP_RETRY_DEADLINE:?} of transient errors"
+            )));
+        };
+        match result {
             Ok(v) => return Ok(v),
             Err(e) => {
-                let elapsed = start.elapsed();
-                if !e.is_transient() || elapsed >= STARTUP_RETRY_DEADLINE {
+                let remaining = STARTUP_RETRY_DEADLINE.saturating_sub(start.elapsed());
+                if !e.is_transient() || remaining.is_zero() {
                     return Err(e);
                 }
                 attempt_no += 1;
-                let remaining = STARTUP_RETRY_DEADLINE - elapsed;
                 warn!("{what}: transient startup failure ({e}); retrying for up to {remaining:?} more");
                 tokio::time::sleep(
                     e.retry_after()
