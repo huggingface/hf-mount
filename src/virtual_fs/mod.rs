@@ -1146,6 +1146,33 @@ impl VirtualFs {
             .insert(ino, rx);
     }
 
+    /// Defer the commit of a streaming handle to release(), unless a
+    /// concurrent commit (e.g. the shutdown drain) already settled it. The
+    /// check-and-set is atomic under the state lock: overwriting a settled
+    /// state back to Deferred would make release() re-commit against a
+    /// finished worker and revert a successfully committed inode.
+    fn defer_streaming_commit(&self, ino: u64, channel: &StreamingChannel) -> VirtualFsResult<()> {
+        self.install_commit_hook(ino, channel);
+        let settled = {
+            let mut state = channel.state.lock().expect("state poisoned");
+            match &*state {
+                CommitState::Committed => Some(Ok(())),
+                CommitState::Failed(_) => Some(Err(libc::EIO)),
+                CommitState::Writing | CommitState::Deferred => {
+                    *state = CommitState::Deferred;
+                    None
+                }
+            }
+        };
+        match settled {
+            Some(result) => {
+                self.fulfill_commit_hook(ino, channel, result);
+                result
+            }
+            None => Ok(()),
+        }
+    }
+
     /// Fulfill the pending commit hook with a result, then clean up the map.
     fn fulfill_commit_hook(&self, ino: u64, channel: &StreamingChannel, result: Result<(), i32>) {
         if let Some(tx) = channel.commit_hook.lock().expect("commit_hook poisoned").take() {
@@ -2547,17 +2574,13 @@ impl VirtualFs {
                     "flush: deferring commit for ino={} (open_pid={}, flush_pid={})",
                     ino, open_pid, flush_pid
                 );
-                self.install_commit_hook(ino, &channel);
-                *channel.state.lock().expect("state poisoned") = CommitState::Deferred;
-                return Ok(());
+                return self.defer_streaming_commit(ino, &channel);
             }
 
             // Secondary gate: skip commit if no data was written (covers NFS
             // and zero-write cases like `touch`). release() will handle it.
             if channel.bytes_written.load(Ordering::Relaxed) == 0 {
-                self.install_commit_hook(ino, &channel);
-                *channel.state.lock().expect("state poisoned") = CommitState::Deferred;
-                return Ok(());
+                return self.defer_streaming_commit(ino, &channel);
             }
 
             // Install hook before commit so concurrent open() can wait on us.
@@ -2639,7 +2662,7 @@ impl VirtualFs {
                         self.install_commit_hook(ino, &channel);
                     }
 
-                    let result = match self.streaming_commit(ino, &channel).await {
+                    let mut result = match self.streaming_commit(ino, &channel).await {
                         Ok(()) => Ok(()),
                         Err(e) => {
                             // Retry only if CAS upload succeeded but Hub commit failed
@@ -2654,26 +2677,36 @@ impl VirtualFs {
                         }
                     };
 
-                    match &result {
+                    match result {
                         Ok(()) => {
                             *channel.state.lock().expect("state poisoned") = CommitState::Committed;
                         }
                         Err(e) => {
-                            let is_unlinked = self
-                                .inode_table
-                                .read()
-                                .expect("inodes poisoned")
-                                .get(ino)
-                                .is_none_or(|entry| entry.nlink == 0);
-                            if is_unlinked {
-                                debug!("streaming commit failed for unlinked ino={} (expected)", ino);
+                            // Publish the failure under the commit lock: a
+                            // delayed flush may still be retrying through
+                            // pending_info. If it won meanwhile, the data is
+                            // committed — reverting here would report DATA
+                            // LOSS for a file that is safely on the Hub.
+                            let _commit_guard = channel.commit_lock.lock().await;
+                            if matches!(&*channel.state.lock().expect("state poisoned"), CommitState::Committed) {
+                                result = Ok(());
                             } else {
-                                error!("DATA LOSS: streaming commit failed for ino={}: errno={}", ino, e);
+                                let is_unlinked = self
+                                    .inode_table
+                                    .read()
+                                    .expect("inodes poisoned")
+                                    .get(ino)
+                                    .is_none_or(|entry| entry.nlink == 0);
+                                if is_unlinked {
+                                    debug!("streaming commit failed for unlinked ino={} (expected)", ino);
+                                } else {
+                                    error!("DATA LOSS: streaming commit failed for ino={}: errno={}", ino, e);
+                                }
+                                self.revert_inode(ino, &channel.snapshot);
+                                *channel.state.lock().expect("state poisoned") =
+                                    CommitState::Failed("commit failed".into());
+                                release_error = Some(e);
                             }
-                            self.revert_inode(ino, &channel.snapshot);
-                            *channel.state.lock().expect("state poisoned") =
-                                CommitState::Failed("commit failed".into());
-                            release_error = Some(*e);
                         }
                     }
 
@@ -2757,9 +2790,19 @@ impl VirtualFs {
         // normal flush/release) waits here, then sees the winner's Committed
         // state below instead of racing a second Finish into the worker.
         let _commit_guard = channel.commit_lock.lock().await;
-        if matches!(&*channel.state.lock().expect("state poisoned"), CommitState::Committed) {
-            debug!("streaming_commit: already committed for ino={}", ino);
-            return Ok(());
+        {
+            let state = channel.state.lock().expect("state poisoned");
+            match &*state {
+                CommitState::Committed => {
+                    debug!("streaming_commit: already committed for ino={}", ino);
+                    return Ok(());
+                }
+                CommitState::Failed(msg) => {
+                    debug!("streaming_commit: already failed for ino={}: {}", ino, msg);
+                    return Err(libc::EIO);
+                }
+                CommitState::Writing | CommitState::Deferred => {}
+            }
         }
 
         // Unlinked files (nlink=0) must not be re-committed on close —
