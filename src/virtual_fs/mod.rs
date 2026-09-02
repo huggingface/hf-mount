@@ -2656,6 +2656,17 @@ impl VirtualFs {
     pub async fn release(&self, file_handle: u64) -> VirtualFsResult<()> {
         debug!("release: fh={}", file_handle);
 
+        // Hand the commit over before dropping the handle from open_files: the
+        // shutdown drain finds in-flight releases through pending_commits, so
+        // there must be no window where a committing handle is in neither map.
+        {
+            let files = self.open_files.read().expect("open_files poisoned");
+            if let Some(OpenFile::Streaming { ino, channel }) = files.get(&file_handle)
+                && !channel_is_terminal(channel)
+            {
+                self.install_commit_hook(*ino, channel);
+            }
+        }
         let removed = self
             .open_files
             .write()
@@ -2756,6 +2767,16 @@ impl VirtualFs {
 
                     self.fulfill_commit_hook(ino, &channel, result);
                 }
+            }
+            Some(OpenFile::Streaming { ino, channel }) => {
+                // Turned terminal since the handoff above: the winner has
+                // fulfilled the live hook, but a hook the handoff installed
+                // after that fulfill would dangle and wedge later opens.
+                let result = match &*channel.state.lock().expect("state poisoned") {
+                    CommitState::Failed(_) => Err(libc::EIO),
+                    _ => Ok(()),
+                };
+                self.fulfill_commit_hook(ino, &channel, result);
             }
             _ => {}
         }

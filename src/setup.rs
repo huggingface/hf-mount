@@ -805,10 +805,17 @@ where
         // An attempt is itself several requests with internal retries; bound
         // it too, or the last one can overrun the deadline by minutes.
         let remaining = STARTUP_RETRY_DEADLINE.saturating_sub(start.elapsed());
-        let Ok(result) = tokio::time::timeout(remaining, attempt()).await else {
-            return Err(crate::error::Error::hub(format!(
+        // timeout() polls the wrapped future once even at zero: check first.
+        let deadline_exceeded = || {
+            crate::error::Error::hub(format!(
                 "{what}: still failing after {STARTUP_RETRY_DEADLINE:?} of transient errors"
-            )));
+            ))
+        };
+        if remaining.is_zero() {
+            return Err(deadline_exceeded());
+        }
+        let Ok(result) = tokio::time::timeout(remaining, attempt()).await else {
+            return Err(deadline_exceeded());
         };
         match result {
             Ok(v) => return Ok(v),
