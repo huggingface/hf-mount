@@ -137,10 +137,13 @@ pub struct VfsConfig {
 
 /// Lock ordering (acquire in this order to prevent deadlocks):
 ///
-///   dir_loading_locks[ino]      (tokio::sync::Mutex, per-directory)
+///   dir_loading_locks\[ino\]      (tokio::sync::Mutex, per-directory)
 ///     → inode_table             (RwLock, read or write)
 ///
-///   staging.lock(ino)           (tokio::sync::Mutex, per-inode)
+///   staging.lock(ino)           (tokio::sync::Mutex, per-inode — also
+///                                serializes streaming writer creation,
+///                                streaming commits (flush/link/release),
+///                                and streaming-mode unlink)
 ///     → inode_table             (RwLock, read or write)
 ///         → open_files          (RwLock, read only — via has_open_handles)
 ///         → negative_cache      (RwLock, write — in poll_remote_changes)
@@ -900,12 +903,11 @@ impl VirtualFs {
             let rel_path = if prefix.is_empty() {
                 entry.path.clone()
             } else {
-                entry
-                    .path
-                    .strip_prefix(&prefix)
-                    .and_then(|p| p.strip_prefix('/'))
-                    .unwrap_or(&entry.path)
-                    .to_string()
+                match crate::hub_api::strict_descendant_rel(&entry.path, &prefix) {
+                    Some(rel) => rel.to_string(),
+                    // list_tree guarantees strict descendants; skip defensively.
+                    None => continue,
+                }
             };
 
             if let Some(slash_pos) = rel_path.find('/') {
@@ -1140,48 +1142,33 @@ impl VirtualFs {
         }
         let (tx, rx) = tokio::sync::watch::channel(None);
         *hook = Some(tx);
+        // Register the receiver only if the ino has none yet: a stale
+        // writer's deferred flush racing an O_TRUNC supersede must not
+        // replace the ACTIVE writer's receiver (fulfilled hooks remove their
+        // own entry, so an existing entry always belongs to a live hook).
+        // An unregistered hook is harmless: its fulfill sends to no waiter
+        // and the ownership check skips the map removal.
         self.pending_commits
             .lock()
             .expect("pending_commits poisoned")
-            .insert(ino, rx);
+            .entry(ino)
+            .or_insert(rx);
     }
 
-    /// Defer the commit of a streaming handle to release(), unless a
-    /// concurrent commit (e.g. the shutdown drain) already settled it. The
-    /// check-and-set is atomic under the state lock: overwriting a settled
-    /// state back to Deferred would make release() re-commit against a
-    /// finished worker and revert a successfully committed inode.
-    fn defer_streaming_commit(&self, ino: u64, channel: &StreamingChannel) -> VirtualFsResult<()> {
-        self.install_commit_hook(ino, channel);
-        let settled = {
-            let mut state = channel.state.lock().expect("state poisoned");
-            match &*state {
-                CommitState::Committed => Some(Ok(())),
-                CommitState::Failed(_) => Some(Err(libc::EIO)),
-                CommitState::Writing | CommitState::Deferred => {
-                    *state = CommitState::Deferred;
-                    None
-                }
-            }
-        };
-        match settled {
-            Some(result) => {
-                self.fulfill_commit_hook(ino, channel, result);
-                result
-            }
-            None => Ok(()),
-        }
-    }
-
-    /// Fulfill the pending commit hook with a result, then clean up the map.
+    /// Fulfill the pending commit hook with a result, then clean up the map —
+    /// but only the entry that belongs to THIS channel's hook. A replacement
+    /// writer (O_TRUNC supersede) may have installed its own hook under the
+    /// same ino between this channel's install and its fulfill; removing the
+    /// replacement's receiver would let later opens bypass its in-flight
+    /// commit.
     fn fulfill_commit_hook(&self, ino: u64, channel: &StreamingChannel, result: Result<(), i32>) {
         if let Some(tx) = channel.commit_hook.lock().expect("commit_hook poisoned").take() {
             let _ = tx.send(Some(result));
+            let mut pending = self.pending_commits.lock().expect("pending_commits poisoned");
+            if pending.get(&ino).is_some_and(|rx| rx.same_channel(&tx.subscribe())) {
+                pending.remove(&ino);
+            }
         }
-        self.pending_commits
-            .lock()
-            .expect("pending_commits poisoned")
-            .remove(&ino);
     }
 
     /// Wait for any in-flight streaming commit on this inode to complete.
@@ -1245,7 +1232,6 @@ impl VirtualFs {
             snapshot,
             dirty_generation_at_open: AtomicU64::new(dirty_generation_at_open),
             commit_hook: std::sync::Mutex::new(None),
-            commit_lock: tokio::sync::Mutex::new(()),
         });
 
         let file_handle = self.alloc_file_handle();
@@ -1494,7 +1480,8 @@ impl VirtualFs {
                 }
                 // The resolve endpoint returns 404 for directories, so a HEAD
                 // miss could still be a remotely-added dir. Targeted listing
-                // catches that; non-empty result means the dir exists.
+                // catches that; list_tree only returns strict descendants of
+                // the path, so a non-empty result means the dir exists.
                 let entries = match self.hub_client.list_tree(&full_path).await {
                     Ok(entries) => entries,
                     Err(e) if e.is_transient() => {
@@ -1987,20 +1974,44 @@ impl VirtualFs {
         let staging_mutex = self.staging.lock(ino);
         let _staging_guard = staging_mutex.lock().await;
 
-        // Capture inode snapshot before mutation (for revert on commit failure)
-        let snapshot = {
-            let inodes = self.inode_table.read().expect("inodes poisoned");
-            let entry = inodes.get(ino).ok_or(libc::ENOENT)?;
-            InodeSnapshot {
-                xet_hash: entry.xet_hash.clone(),
-                size: entry.size,
-                mtime: entry.mtime,
-                pending_deletes: entry.pending_deletes.clone(),
-                existed_before: true,
+        // Capture inode snapshot before mutation (for revert on commit failure).
+        // When superseding an active writer, inherit ITS snapshot: the inode
+        // is already dirty (xet_hash stripped by the old writer's open), so
+        // snapshotting it now would make a later failed commit revert to a
+        // hashless ghost state instead of the last committed one. The
+        // per-inode lock held across this whole function keeps the active
+        // channel stable between this lookup and the supersede below.
+        let active = self.streaming_channel_for(ino);
+        let snapshot = match &active {
+            Some(active) => active.snapshot.clone(),
+            None => {
+                let inodes = self.inode_table.read().expect("inodes poisoned");
+                let entry = inodes.get(ino).ok_or(libc::ENOENT)?;
+                InodeSnapshot {
+                    xet_hash: entry.xet_hash.clone(),
+                    size: entry.size,
+                    mtime: entry.mtime,
+                    pending_deletes: entry.pending_deletes.clone(),
+                    existed_before: true,
+                }
             }
         };
 
         let (file_handle, channel) = self.setup_streaming_writer(pid, snapshot, 0).await?;
+
+        // The replacement writer is ready — supersede the active writer
+        // (only after setup succeeded: failing the old writer for a stillborn
+        // replacement would strand its acknowledged bytes for nothing). The
+        // generation bump below makes the old channel's bytes uncommittable
+        // (streaming_commit skips superseded channels), so fail it loudly
+        // NOW: its writes and flush must return EIO instead of acknowledging
+        // bytes that would be silently discarded. Fulfilling the hook
+        // unblocks any open() already waiting on the old channel's deferred
+        // commit.
+        if let Some(old) = active {
+            *old.state.lock().expect("state poisoned") = CommitState::Failed("superseded by O_TRUNC reopen".into());
+            self.fulfill_commit_hook(ino, &old, Err(libc::EIO));
+        }
 
         {
             let mut inodes = self.inode_table.write().expect("inodes poisoned");
@@ -2517,10 +2528,37 @@ impl VirtualFs {
                 }
 
                 let len = data.len();
-                channel.tx.blocking_send(WriteMsg::Data(data.to_vec())).map_err(|_| {
+                // Reserve the channel slot BEFORE taking the state mutex: the
+                // backpressure wait (32-slot channel, worker draining at
+                // network speed) must not run while holding the lock every
+                // commit path contends on. permit.send() cannot block, so the
+                // state check and the enqueue below stay atomic under the
+                // mutex streaming_commit() flips to Committing under: either
+                // this Data lands ahead of Finish (and joins the commit), or
+                // the write observes Committing/Committed and fails loudly
+                // instead of being silently dropped behind Finish.
+                let closed = || {
                     error!("streaming channel closed for ino={}", handle_ino);
                     libc::EIO
-                })?;
+                };
+                let permit = match channel.tx.try_reserve() {
+                    Ok(permit) => permit,
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(())) => {
+                        self.runtime.block_on(channel.tx.reserve()).map_err(|_| closed())?
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(())) => return Err(closed()),
+                };
+                {
+                    let state = channel.state.lock().expect("state poisoned");
+                    match &*state {
+                        CommitState::Writing | CommitState::Deferred => {}
+                        _ => {
+                            debug!("streaming write after commit rejected for ino={}", handle_ino);
+                            return Err(libc::EIO);
+                        }
+                    }
+                    permit.send(WriteMsg::Data(data.to_vec()));
+                }
                 channel.bytes_written.fetch_add(len as u64, Ordering::Relaxed);
 
                 let new_size = offset + len as u64;
@@ -2561,7 +2599,7 @@ impl VirtualFs {
                         debug!("flush: already failed for ino={}: {}", ino, msg);
                         return Err(libc::EIO);
                     }
-                    CommitState::Writing | CommitState::Deferred => {}
+                    CommitState::Writing | CommitState::Deferred | CommitState::Committing => {}
                 }
             }
 
@@ -2574,33 +2612,18 @@ impl VirtualFs {
                     "flush: deferring commit for ino={} (open_pid={}, flush_pid={})",
                     ino, open_pid, flush_pid
                 );
-                return self.defer_streaming_commit(ino, &channel);
+                self.defer_commit(ino, &channel);
+                return Ok(());
             }
 
             // Secondary gate: skip commit if no data was written (covers NFS
             // and zero-write cases like `touch`). release() will handle it.
             if channel.bytes_written.load(Ordering::Relaxed) == 0 {
-                return self.defer_streaming_commit(ino, &channel);
+                self.defer_commit(ino, &channel);
+                return Ok(());
             }
 
-            // Install hook before commit so concurrent open() can wait on us.
-            self.install_commit_hook(ino, &channel);
-
-            match self.streaming_commit(ino, &channel).await {
-                Ok(()) => {
-                    *channel.state.lock().expect("state poisoned") = CommitState::Committed;
-                    self.fulfill_commit_hook(ino, &channel, Ok(()));
-                }
-                Err(e) => {
-                    // CAS upload may have succeeded — file_info is preserved
-                    // in pending_info for retry in release(). Don't fulfill the
-                    // hook here: release() will retry and publish the final outcome.
-                    // Keeping the hook active ensures concurrent open(O_TRUNC) waits
-                    // for release() instead of racing with the retry.
-                    return Err(e);
-                }
-            }
-            return Ok(());
+            return self.commit_streaming_now(ino, &channel).await;
         }
 
         // Advanced writes mode: check if a previous async flush failed
@@ -2628,9 +2651,6 @@ impl VirtualFs {
             | Some(OpenFile::Streaming { ino, .. }) => Some(*ino),
             _ => None,
         };
-        if let Some(ino) = released_ino {
-            self.inode_table.read().expect("inodes poisoned").drop_open_handles(ino);
-        }
 
         let mut release_error: Option<i32> = None;
 
@@ -2650,10 +2670,27 @@ impl VirtualFs {
                     fm.enqueue(ino);
                 }
             }
-            Some(OpenFile::Streaming { ino, channel }) => {
+            Some(OpenFile::Streaming { ino, channel }) if !channel_is_terminal(&channel) => {
+                // (Terminal states never regress, so the unlocked fast-path
+                // check above safely skips the per-inode lock — which another
+                // handle may hold across a whole commit — on the common
+                // already-committed close.)
+                //
+                // Serialize against an in-flight flush()/link() commit: without
+                // the lock, release() would observe `Committing`, re-run the
+                // commit against the in-flight one, and fail with a spurious
+                // EIO plus an inode revert racing the successful commit.
+                let staging_mutex = self.staging.lock(ino);
+                let _commit_guard = staging_mutex.lock().await;
                 let needs_commit = {
                     let state = channel.state.lock().expect("state poisoned");
-                    matches!(&*state, CommitState::Writing | CommitState::Deferred)
+                    // Committing under the lock: an earlier flush()/link()
+                    // commit failed mid-flight (pending_info parked) —
+                    // release retries it.
+                    matches!(
+                        &*state,
+                        CommitState::Writing | CommitState::Deferred | CommitState::Committing
+                    )
                 };
                 if needs_commit {
                     // If flush() didn't defer (e.g. Writing state from a direct
@@ -2662,7 +2699,7 @@ impl VirtualFs {
                         self.install_commit_hook(ino, &channel);
                     }
 
-                    let mut result = match self.streaming_commit(ino, &channel).await {
+                    let result = match self.streaming_commit(ino, &channel).await {
                         Ok(()) => Ok(()),
                         Err(e) => {
                             // Retry only if CAS upload succeeded but Hub commit failed
@@ -2677,36 +2714,26 @@ impl VirtualFs {
                         }
                     };
 
-                    match result {
+                    match &result {
                         Ok(()) => {
                             *channel.state.lock().expect("state poisoned") = CommitState::Committed;
                         }
                         Err(e) => {
-                            // Publish the failure under the commit lock: a
-                            // delayed flush may still be retrying through
-                            // pending_info. If it won meanwhile, the data is
-                            // committed — reverting here would report DATA
-                            // LOSS for a file that is safely on the Hub.
-                            let _commit_guard = channel.commit_lock.lock().await;
-                            if matches!(&*channel.state.lock().expect("state poisoned"), CommitState::Committed) {
-                                result = Ok(());
+                            let is_unlinked = self
+                                .inode_table
+                                .read()
+                                .expect("inodes poisoned")
+                                .get(ino)
+                                .is_none_or(|entry| entry.nlink == 0);
+                            if is_unlinked {
+                                debug!("streaming commit failed for unlinked ino={} (expected)", ino);
                             } else {
-                                let is_unlinked = self
-                                    .inode_table
-                                    .read()
-                                    .expect("inodes poisoned")
-                                    .get(ino)
-                                    .is_none_or(|entry| entry.nlink == 0);
-                                if is_unlinked {
-                                    debug!("streaming commit failed for unlinked ino={} (expected)", ino);
-                                } else {
-                                    error!("DATA LOSS: streaming commit failed for ino={}: errno={}", ino, e);
-                                }
-                                self.revert_inode(ino, &channel.snapshot);
-                                *channel.state.lock().expect("state poisoned") =
-                                    CommitState::Failed("commit failed".into());
-                                release_error = Some(e);
+                                error!("DATA LOSS: streaming commit failed for ino={}: errno={}", ino, e);
                             }
+                            self.revert_inode(ino, &channel.snapshot);
+                            *channel.state.lock().expect("state poisoned") =
+                                CommitState::Failed("commit failed".into());
+                            release_error = Some(*e);
                         }
                     }
 
@@ -2716,48 +2743,67 @@ impl VirtualFs {
             _ => {}
         }
 
-        if let Some(ino) = released_ino
-            && !self.has_open_handles(ino)
-        {
-            let (removed, is_clean, overlay_path) = {
-                let mut inodes = self.inode_table.write().expect("inodes poisoned");
-                // Capture path before removal so we can clean up the overlay
-                // backing file for an unlink-while-open case (POSIX delete on
-                // last close): unlink() saw open handles and skipped the
-                // overlay-side remove, so we have to do it here.
-                let overlay_path = self
-                    .overlay_backing
-                    .is_some()
-                    .then(|| inodes.get(ino).map(|e| e.full_path.clone()))
-                    .flatten();
-                let orphan = inodes.remove_orphan(ino);
-                let evicted = inodes.take_evict_pending(ino) && inodes.evict_if_safe(ino);
-                let removed = orphan || evicted;
-                let is_clean = !removed && inodes.get(ino).is_some_and(|entry| !entry.is_dirty());
-                (removed, is_clean, overlay_path.filter(|_| removed))
-            };
-            if removed {
-                if let Some(path) = overlay_path {
-                    if let Err(e) = self.remove_local_backing_file(ino, &path)
-                        && e.kind() != std::io::ErrorKind::NotFound
-                    {
-                        warn!("Failed to remove overlay file for ino={} on release: {}", ino, e);
-                    }
-                } else {
-                    self.drop_staging(ino);
-                }
-            } else if is_clean && self.staging.gc_one(ino, &self.inode_table).await {
-                debug!("staging GC: removed ino={} on release", ino);
-            }
-        }
+        if let Some(ino) = released_ino {
+            // Decrement the handle count only after the commit section above:
+            // a release() parked on the per-inode lock behind an in-flight
+            // link() commit must keep the inode "open", or a concurrent
+            // unlink of the dirty file passes its open-handles guard and the
+            // source AddFile then resurrects the just-removed path on the
+            // Hub.
+            self.inode_table.read().expect("inodes poisoned").drop_open_handles(ino);
 
-        // Per-inode staging locks are intentionally not cleaned up here:
-        // removing while another open() may hold the Arc would break
-        // serialization. Entries are tiny and bounded by inodes ever staged.
+            if !self.has_open_handles(ino) {
+                self.reap_on_last_release(ino).await;
+            }
+
+            // Reclaim the per-inode lock entry once nothing else holds its
+            // Arc (strong_count check inside — a held or awaited lock is
+            // never removed, so serialization is preserved). Without this,
+            // create-heavy streaming workloads grow the map by one entry per
+            // file created for the life of the mount (unlink handles the
+            // delete-heavy counterpart).
+            self.staging.forget_lock_if_unused(ino);
+        }
 
         match release_error {
             Some(e) => Err(e),
             None => Ok(()),
+        }
+    }
+
+    /// Last-close cleanup: reap the orphan or evict-pending inode, remove its
+    /// local backing (overlay file or staging), and GC clean staging files
+    /// over budget.
+    async fn reap_on_last_release(&self, ino: u64) {
+        let (removed, is_clean, overlay_path) = {
+            let mut inodes = self.inode_table.write().expect("inodes poisoned");
+            // Capture path before removal so we can clean up the overlay
+            // backing file for an unlink-while-open case (POSIX delete on
+            // last close): unlink() saw open handles and skipped the
+            // overlay-side remove, so we have to do it here.
+            let overlay_path = self
+                .overlay_backing
+                .is_some()
+                .then(|| inodes.get(ino).map(|e| e.full_path.clone()))
+                .flatten();
+            let orphan = inodes.remove_orphan(ino);
+            let evicted = inodes.take_evict_pending(ino) && inodes.evict_if_safe(ino);
+            let removed = orphan || evicted;
+            let is_clean = !removed && inodes.get(ino).is_some_and(|entry| !entry.is_dirty());
+            (removed, is_clean, overlay_path.filter(|_| removed))
+        };
+        if removed {
+            if let Some(path) = overlay_path {
+                if let Err(e) = self.remove_local_backing_file(ino, &path)
+                    && e.kind() != std::io::ErrorKind::NotFound
+                {
+                    warn!("Failed to remove overlay file for ino={} on release: {}", ino, e);
+                }
+            } else {
+                self.drop_staging(ino);
+            }
+        } else if is_clean && self.staging.gc_one(ino, &self.inode_table).await {
+            debug!("staging GC: removed ino={} on release", ino);
         }
     }
 
@@ -2786,36 +2832,34 @@ impl VirtualFs {
     async fn streaming_commit(&self, ino: u64, channel: &StreamingChannel) -> Result<(), i32> {
         assert!(!self.overlay(), "overlay forces advanced_writes; streaming unreachable");
 
-        // Serialize commit attempts: a concurrent caller (shutdown drain vs
-        // normal flush/release) waits here, then sees the winner's Committed
-        // state below instead of racing a second Finish into the worker.
-        let _commit_guard = channel.commit_lock.lock().await;
-        {
-            let state = channel.state.lock().expect("state poisoned");
-            match &*state {
-                CommitState::Committed => {
-                    debug!("streaming_commit: already committed for ino={}", ino);
-                    return Ok(());
-                }
-                CommitState::Failed(msg) => {
-                    debug!("streaming_commit: already failed for ino={}: {}", ino, msg);
-                    return Err(libc::EIO);
-                }
-                CommitState::Writing | CommitState::Deferred => {}
+        // Unlinked files (nlink=0) must not be re-committed on close — user
+        // deleted the file, uploading would resurrect it. A superseded
+        // channel (a newer O_TRUNC writer bumped the dirty generation, and
+        // may have committed already) must not commit either: its AddFile
+        // would roll the remote back over the successor's bytes. Both checks
+        // run under the per-inode staging lock held by every commit driver,
+        // so they cannot go stale before the Hub call.
+        let skip_commit = {
+            let inodes = self.inode_table.read().expect("inodes poisoned");
+            match inodes.get(ino) {
+                Some(entry) => entry.nlink == 0 || !channel.owns_generation(entry.dirty_generation),
+                None => true,
             }
+        };
+        if skip_commit {
+            debug!("streaming_commit: skipping unlinked or superseded ino={}", ino);
+            return Ok(());
         }
 
-        // Unlinked files (nlink=0) must not be re-committed on close —
-        // user deleted the file, uploading would resurrect it.
-        if self
-            .inode_table
-            .read()
-            .expect("inodes poisoned")
-            .get(ino)
-            .is_some_and(|e| e.nlink == 0)
+        // Flip to Committing under the state mutex BEFORE enqueueing Finish:
+        // write() enqueues Data under the same mutex, so a racing write either
+        // lands ahead of Finish or observes Committing and is rejected instead
+        // of being silently dropped behind Finish.
         {
-            debug!("streaming_commit: skipping unlinked ino={}", ino);
-            return Ok(());
+            let mut state = channel.state.lock().expect("state poisoned");
+            if matches!(&*state, CommitState::Writing | CommitState::Deferred) {
+                *state = CommitState::Committing;
+            }
         }
 
         let file_info = {
@@ -3107,6 +3151,130 @@ impl VirtualFs {
         Ok(self.make_vfs_attr(inodes.get(ino).ok_or(libc::ENOENT)?))
     }
 
+    /// Phase-1a source read for `link()`: `Ok(None)` means the source exists
+    /// but has no committed hash yet (dirty, or created and never flushed).
+    fn link_source(&self, ino: u64) -> VirtualFsResult<Option<LinkSource>> {
+        let inodes = self.inode_table.read().expect("inodes poisoned");
+        let source = inodes.get(ino).ok_or(libc::ENOENT)?;
+        if source.kind != InodeKind::File {
+            return Err(libc::EPERM);
+        }
+        if source.is_dirty() {
+            return Ok(None);
+        }
+        let Some(hash) = source.xet_hash.as_ref().filter(|hash| !hash.is_empty()).cloned() else {
+            return Ok(None);
+        };
+        Ok(Some(LinkSource {
+            path: source.full_path.clone(),
+            xet_hash: hash,
+            size: source.size,
+            mode: source.mode,
+            uid: source.uid,
+            gid: source.gid,
+        }))
+    }
+
+    /// Find the open streaming channel that owns `ino`'s current dirty bytes:
+    /// non-terminal state, and `dirty_generation_at_open` matching the
+    /// inode's current dirty generation (the same token streaming_commit
+    /// uses for clear_dirty_if). Multiple streaming handles can coexist on
+    /// one inode (a flushed-but-still-open handle plus a newer O_TRUNC
+    /// writer), and HashMap iteration order is arbitrary — a stale channel
+    /// must not shadow the active writer. The state filter matters because
+    /// generations are reused: a successful commit resets the inode's
+    /// generation to 0, so a committed-but-open generation-1 channel and the
+    /// next O_TRUNC writer would both match generation 1.
+    fn streaming_channel_for(&self, ino: u64) -> Option<Arc<StreamingChannel>> {
+        let current_generation = {
+            let inodes = self.inode_table.read().expect("inodes poisoned");
+            inodes.get(ino)?.dirty_generation
+        };
+        let files = self.open_files.read().expect("open_files poisoned");
+        files.values().find_map(|open| match open {
+            OpenFile::Streaming { ino: open_ino, channel }
+                if *open_ino == ino
+                    && channel.owns_generation(current_generation)
+                    && !matches!(
+                        &*channel.state.lock().expect("state poisoned"),
+                        CommitState::Committed | CommitState::Failed(_)
+                    ) =>
+            {
+                Some(Arc::clone(channel))
+            }
+            _ => None,
+        })
+    }
+
+    /// Defer a streaming channel's commit to release(): install the hook so
+    /// concurrent open() can wait on the outcome, then demote the state.
+    /// Only a channel still in `Writing` is demoted: overwriting `Committing`
+    /// would reopen the lost-write race the state exists to close (a write()
+    /// could pass the Writing|Deferred gate and enqueue bytes behind an
+    /// in-flight Finish), and Committed/Failed are terminal.
+    ///
+    /// A terminal channel gets its hook fulfilled immediately: deferral runs
+    /// without the per-inode staging lock, so an O_TRUNC supersede can flip
+    /// the channel to Failed between flush()'s state check and this call;
+    /// nothing else would ever fulfill that hook (release fast-paths terminal
+    /// channels), and its pending_commits entry would wedge every later open
+    /// of the inode. Both racers may fulfill; fulfill_commit_hook take()s the
+    /// sender, so the second call is a harmless no-op.
+    fn defer_commit(&self, ino: u64, channel: &StreamingChannel) {
+        self.install_commit_hook(ino, channel);
+        let terminal_result = {
+            let mut state = channel.state.lock().expect("state poisoned");
+            match &*state {
+                CommitState::Writing => {
+                    *state = CommitState::Deferred;
+                    None
+                }
+                CommitState::Deferred | CommitState::Committing => None,
+                CommitState::Committed => Some(Ok(())),
+                CommitState::Failed(_) => Some(Err(libc::EIO)),
+            }
+        };
+        if let Some(result) = terminal_result {
+            self.fulfill_commit_hook(ino, channel, result);
+        }
+    }
+
+    /// Terminal streaming-commit sequence, shared by `flush()` and `link()`:
+    /// per-inode lock → error check → state check → install hook → commit →
+    /// mark Committed → fulfill hook. On error the hook stays active and
+    /// pending_info is preserved so release() retries and publishes the final
+    /// outcome; concurrent open(O_TRUNC) waits on the hook instead of racing
+    /// the retry. The per-inode staging lock serializes every streaming
+    /// commit driver (flush/link/release) plus writer creation and unlink:
+    /// without it, a release() racing a link()-initiated commit would observe
+    /// `Committing`, re-run the commit against the in-flight one, and fail
+    /// with a spurious EIO (plus an inode revert racing the successful
+    /// commit).
+    async fn commit_streaming_now(&self, ino: u64, channel: &Arc<StreamingChannel>) -> VirtualFsResult<()> {
+        let staging_mutex = self.staging.lock(ino);
+        let _commit_guard = staging_mutex.lock().await;
+        if let Some(err) = channel.error.lock().expect("error poisoned").as_ref() {
+            return Err(err.to_errno());
+        }
+        {
+            let state = channel.state.lock().expect("state poisoned");
+            match &*state {
+                CommitState::Committed => return Ok(()),
+                CommitState::Failed(msg) => {
+                    debug!("streaming commit already failed for ino={}: {}", ino, msg);
+                    return Err(libc::EIO);
+                }
+                CommitState::Writing | CommitState::Deferred | CommitState::Committing => {}
+            }
+        }
+        // Install hook before commit so concurrent open() can wait on us.
+        self.install_commit_hook(ino, channel);
+        self.streaming_commit(ino, channel).await?;
+        *channel.state.lock().expect("state poisoned") = CommitState::Committed;
+        self.fulfill_commit_hook(ino, channel, Ok(()));
+        Ok(())
+    }
+
     /// Hard-link `ino` at `newparent/newname` as a server-side copy: a new Hub
     /// file entry referencing the source's xet hash, so no bytes move through
     /// CAS. The alias gets its own inode (writes to one path never affect the
@@ -3138,26 +3306,21 @@ impl VirtualFs {
         // destination's remote children. A rejected source (dirty or hashless,
         // the routine *arr link-then-copy fallback) must not pay for a
         // list_tree it would throw away.
-        let (source_path, xet_hash, size, mode, uid, gid) = {
-            let inodes = self.inode_table.read().expect("inodes poisoned");
-            let source = inodes.get(ino).ok_or(libc::ENOENT)?;
-            if source.kind != InodeKind::File {
-                return Err(libc::EPERM);
-            }
-            if source.is_dirty() {
-                return Err(libc::ENOTSUP);
-            }
-            let Some(hash) = source.xet_hash.as_ref().filter(|hash| !hash.is_empty()).cloned() else {
-                return Err(libc::ENOTSUP);
-            };
-            (
-                source.full_path.clone(),
-                hash,
-                source.size,
-                source.mode,
-                source.uid,
-                source.gid,
-            )
+        //
+        // A dirty source with an open streaming handle gets one synchronous
+        // commit (same sequence as flush()): object_store-based writers
+        // (Lance, Delta) emulate atomic rename as write → hard_link → unlink
+        // → close, so their link() arrives before the close-time commit. The
+        // commit itself waits until the destination has validated — a link
+        // that fails EEXIST/ENOTDIR must not leave remote mutation behind.
+        let source = self.link_source(ino)?;
+        let dirty_channel = if source.is_none() {
+            // Dirty with no committable handle (the routine *arr
+            // link-then-copy fallback): reject before paying for the
+            // destination list_tree below.
+            Some(self.streaming_channel_for(ino).ok_or(libc::ENOTSUP)?)
+        } else {
+            None
         };
 
         // Load remote children so the EEXIST check below also sees files that
@@ -3179,19 +3342,27 @@ impl VirtualFs {
             new_full_path
         };
 
+        let source = match dirty_channel {
+            Some(channel) => {
+                self.commit_streaming_now(ino, &channel).await?;
+                self.link_source(ino)?.ok_or(libc::ENOTSUP)?
+            }
+            None => source.ok_or(libc::ENOTSUP)?,
+        };
+
         // Phase 2: commit the alias to the Hub.
         let now = SystemTime::now();
         let mtime_ms = now.duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
         let ops = [BatchOp::AddFile {
             path: new_full_path.clone(),
-            xet_hash: xet_hash.clone(),
+            xet_hash: source.xet_hash.clone(),
             mtime: mtime_ms,
             content_type: None,
         }];
         if let Err(e) = self.hub_client.batch_operations(&ops).await {
             error!(
                 "link: failed to commit {} as alias of {}: {}",
-                new_full_path, source_path, e
+                new_full_path, source.path, e
             );
             return Err(e.to_errno());
         }
@@ -3209,21 +3380,26 @@ impl VirtualFs {
         }
         // A concurrent create may have won the race since phase 1; the remote
         // add already landed, but locally the newer entry owns the name.
+        // Accepted TOCTOU: in this narrow window a failed link leaves the
+        // alias (and, for a dirty source, the source commit) on the Hub —
+        // same trade-off as pre-existing clean-source links. Deterministic
+        // validation failures (EEXIST/ENOTDIR/ENOENT in phase 1b) commit
+        // nothing.
         if inodes.lookup_child(newparent, newname).is_some() {
             return Err(libc::EEXIST);
         }
-        info!("Linked {} -> {} (server-side copy)", source_path, new_full_path);
+        info!("Linked {} -> {} (server-side copy)", source.path, new_full_path);
         let new_ino = inodes.insert(
             newparent,
             newname.to_string(),
             new_full_path,
             InodeKind::File,
-            size,
+            source.size,
             now,
-            Some(xet_hash),
-            mode,
-            uid,
-            gid,
+            Some(source.xet_hash),
+            source.mode,
+            source.uid,
+            source.gid,
         );
         inodes.touch_parent(newparent, now);
         inodes.touch(new_ino);
@@ -3240,13 +3416,47 @@ impl VirtualFs {
 
         self.ensure_children_loaded(parent).await?;
 
-        let (ino, full_path, needs_remote_delete) = {
+        // In streaming mode, serialize against in-flight streaming commits
+        // AND writer creation (both hold the same per-inode staging lock)
+        // before snapshotting: a commit landing between the snapshot and the
+        // local removal would flip the file to committed-with-hash after
+        // needs_remote_delete was computed as false, leaving the freshly
+        // committed remote file undeleted — and a writer created after a
+        // per-channel check would dodge a channel-scoped lock entirely.
+        // Lock-then-revalidate loop: a concurrent rename can replace
+        // `parent/name` with a different inode between the lookup and the
+        // lock acquisition, and holding the OLD inode's lock would leave the
+        // replacement unserialized. Advanced mode takes no lock, so it skips
+        // the pre-lookup and never retries.
+        let (ino, full_path, needs_remote_delete, dirty, commit_guard) = loop {
+            let (locked_ino, commit_guard) = if !self.advanced_writes {
+                let target_ino = {
+                    let inodes = self.inode_table.read().expect("inodes poisoned");
+                    match inodes.lookup_child(parent, name) {
+                        Some(entry) if entry.kind != InodeKind::Directory => entry.inode,
+                        Some(_) => return Err(libc::EISDIR),
+                        None => return Err(libc::ENOENT),
+                    }
+                };
+                let staging_mutex = self.staging.lock(target_ino);
+                (Some(target_ino), Some(staging_mutex.lock_owned().await))
+            } else {
+                (None, None)
+            };
+
             let inodes = self.inode_table.read().expect("inodes poisoned");
             let entry = match inodes.lookup_child(parent, name) {
                 Some(entry) if entry.kind != InodeKind::Directory => entry,
                 Some(_) => return Err(libc::EISDIR),
                 None => return Err(libc::ENOENT),
             };
+            // The name changed owners while we were acquiring the lock —
+            // release it (scope end) and re-serialize on the new inode.
+            if let Some(locked_ino) = locked_ino
+                && entry.inode != locked_ino
+            {
+                continue;
+            }
             // Overlay: cannot delete clean remote entries (no whiteout support).
             // Deleting dirty (local) entries is allowed; remote reappears on remount.
             if self.is_overlay_immutable(entry) {
@@ -3255,15 +3465,31 @@ impl VirtualFs {
             // Remote delete only when last link is removed and file exists on the hub.
             // Skipped in overlay mode (writes never propagate to remote).
             let needs_remote = !self.overlay() && entry.xet_hash.is_some() && entry.nlink <= 1;
-            (entry.inode, entry.full_path.to_string(), needs_remote)
+            break (
+                entry.inode,
+                entry.full_path.to_string(),
+                needs_remote,
+                entry.is_dirty(),
+                commit_guard,
+            );
         };
 
-        // In streaming mode, block unlink while the file has any open handles.
-        // This prevents editors (vim) from deleting a file they can't rewrite
-        // (streaming mode returns EPERM for O_RDWR without O_TRUNC), which
-        // would cause silent data loss. Same approach as mountpoint-s3.
-        if !self.advanced_writes && self.has_open_handles(ino) {
-            debug!("unlink: blocked for ino={} (has open handles in streaming mode)", ino);
+        // In streaming mode, block unlink while the file has open handles AND
+        // uncommitted changes: deleting out from under an editor mid-rewrite
+        // (vim can't rewrite in place in streaming mode and may fall back to
+        // unlink + recreate) would silently lose the un-committed bytes. Same
+        // approach as mountpoint-s3.
+        //
+        // Clean inodes get POSIX unlink-while-open semantics instead: the
+        // entry goes away now and open handles keep reading via the committed
+        // hash / staging file until release() reaps the orphan. This is what
+        // object_store-based writers (Lance, Delta) rely on for staging
+        // cleanup and recursive dataset deletes.
+        if !self.advanced_writes && dirty && self.has_open_handles(ino) {
+            debug!(
+                "unlink: blocked for ino={} (dirty with open handles in streaming mode)",
+                ino
+            );
             return Err(libc::EPERM);
         }
 
@@ -3312,6 +3538,16 @@ impl VirtualFs {
         // otherwise HEAD the still-existing remote (the delete is only queued)
         // and resurrect this name locally during the drop_locked await window.
         self.negative_cache_insert(full_path.clone());
+
+        // The commit/creation serialization is complete (remote delete and
+        // local unlink both done); release the per-inode lock before
+        // drop_locked re-acquires it below, then evict the lock-map entry if
+        // unused — mass deletes (Lance drop_table) would otherwise grow the
+        // map by one entry per deleted file for the life of the mount.
+        if commit_guard.is_some() {
+            drop(commit_guard);
+            self.staging.forget_lock_if_unused(ino);
+        }
 
         // Clean up staging file only when the inode is actually gone. With an
         // open fd, drop_staging waits until release() so writes through the
@@ -4133,7 +4369,6 @@ struct FileEntry {
     full_path: String,
 }
 
-/// State machine for streaming writes.
 /// Message sent from the write() caller to the background streaming worker.
 enum WriteMsg {
     Data(Vec<u8>),
@@ -4142,6 +4377,7 @@ enum WriteMsg {
 
 /// Snapshot of inode state captured when a streaming writer is opened.
 /// Used to revert the inode on commit failure (data loss recovery).
+#[derive(Clone)]
 struct InodeSnapshot {
     xet_hash: Option<String>,
     size: u64,
@@ -4157,6 +4393,10 @@ enum CommitState {
     Writing,
     /// flush() deferred commit (dup'd fd or zero writes). release() will handle it.
     Deferred,
+    /// A commit is in flight: Finish is (about to be) enqueued. Writes are
+    /// rejected from this point — they would land behind Finish and be
+    /// silently dropped by the exiting worker.
+    Committing,
     /// Commit completed successfully.
     Committed,
     /// Unrecoverable error — inode has been reverted.
@@ -4188,12 +4428,35 @@ struct StreamingChannel {
     /// Watch sender for the pending commit hook. Created in flush() on deferral,
     /// fulfilled in release() when the commit completes (or fails).
     commit_hook: std::sync::Mutex<Option<CommitHookTx>>,
-    /// Serializes commit attempts. The worker replies to a single Finish, so
-    /// two concurrent streaming_commit calls (e.g. the shutdown drain
-    /// overlapping a normal flush) would leave the loser with a dropped reply
-    /// and a false failure; instead it waits here and observes the winner's
-    /// outcome through `state`.
-    commit_lock: tokio::sync::Mutex<()>,
+}
+
+/// Committed source attributes read under lock for `link()`.
+struct LinkSource {
+    path: Arc<str>,
+    xet_hash: String,
+    size: u64,
+    mode: u16,
+    uid: u32,
+    gid: u32,
+}
+
+impl StreamingChannel {
+    /// True when this channel owns the inode's current dirty bytes: its
+    /// generation-at-open matches the inode's dirty generation (the same
+    /// token streaming_commit hands to clear_dirty_if). False once a newer
+    /// O_TRUNC writer bumped the generation, or after commit/revert reset it.
+    fn owns_generation(&self, inode_dirty_generation: u64) -> bool {
+        self.dirty_generation_at_open.load(Ordering::Relaxed) == inode_dirty_generation
+    }
+}
+
+/// True when the channel's commit reached a terminal state (Committed or
+/// Failed). Terminal states never regress, so an unlocked read is stable.
+fn channel_is_terminal(channel: &StreamingChannel) -> bool {
+    matches!(
+        &*channel.state.lock().expect("state poisoned"),
+        CommitState::Committed | CommitState::Failed(_)
+    )
 }
 
 /// An open file handle — either a local fd, lazy remote reference, or streaming writer.

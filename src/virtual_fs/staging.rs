@@ -43,6 +43,21 @@ impl StagingCoordinator {
             .clone()
     }
 
+    /// Evict the per-inode lock entry when no one else holds it. Called by
+    /// paths that touch inodes exactly once (streaming-mode unlink): without
+    /// eviction, a mass delete grows the map by one entry per deleted file
+    /// for the life of the mount. Safe: strong_count == 1 means no guard is
+    /// held and no waiter exists; a concurrent lock() re-inserts a fresh
+    /// entry under the same map mutex.
+    pub(crate) fn forget_lock_if_unused(&self, ino: u64) {
+        let mut locks = self.locks.lock().expect("staging locks poisoned");
+        if let Some(lock) = locks.get(&ino)
+            && Arc::strong_count(lock) == 1
+        {
+            locks.remove(&ino);
+        }
+    }
+
     /// Unconditionally remove an inode's staging file under the per-inode
     /// lock. Used by paths that have already decided the inode is gone
     /// (unlink, rename-replaced target). Holding the lock serializes with

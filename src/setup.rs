@@ -42,9 +42,30 @@ pub enum Source {
         /// Local directory where the filesystem will be mounted
         mount_point: PathBuf,
         /// Git revision to mount
-        #[arg(long, default_value = "main")]
+        #[arg(long, default_value = "main", value_parser = validate_revision)]
         revision: String,
     },
+}
+
+/// Validate a repo revision against a git-ref-safe character allowlist. The
+/// value flows into Hub URLs and the args file, where a `?` would split the URL
+/// into a query string and smuggle the trailing text on. An allowlist refuses
+/// anything unanticipated; branches, tags, slashed branches and SHAs all pass.
+fn validate_revision(s: &str) -> Result<String, String> {
+    if s.is_empty() {
+        return Err("revision must not be empty".to_string());
+    }
+    if let Some(c) = s
+        .chars()
+        .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/')))
+    {
+        return Err(format!("revision contains an invalid character: {c:?}"));
+    }
+    // `..` is invalid in a git ref and would let the revision traverse the Hub URL path.
+    if s.contains("..") {
+        return Err("revision must not contain '..'".to_string());
+    }
+    Ok(s.to_string())
 }
 
 impl Source {
@@ -789,4 +810,43 @@ pub(crate) fn unmount_fuse(mount_point: &Path) -> bool {
         return false;
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_revision;
+
+    #[test]
+    fn accepts_plain_refs_and_shas() {
+        for ok in [
+            "main",
+            "v1.0.0",
+            "feature/foo",
+            "refs/heads/dev",
+            "0123456789abcdef0123456789abcdef01234567",
+        ] {
+            assert!(validate_revision(ok).is_ok(), "should accept {ok:?}");
+        }
+    }
+
+    #[test]
+    fn rejects_query_smuggling() {
+        assert!(validate_revision("main?; /usr/bin/id > /tmp/x").is_err());
+    }
+
+    #[test]
+    fn rejects_shell_and_url_metacharacters() {
+        for bad in [
+            "a?b", "a#b", "a;b", "a b", "a|b", "a&b", "a`b`", "a$b", "a>b", "a\\b", "",
+        ] {
+            assert!(validate_revision(bad).is_err(), "should reject {bad:?}");
+        }
+    }
+
+    #[test]
+    fn rejects_chars_outside_allowlist_and_dot_dot() {
+        for bad in ["a@b", "a:b", "a~b", "a^b", "a%b", "a+b", "main/../etc"] {
+            assert!(validate_revision(bad).is_err(), "should reject {bad:?}");
+        }
+    }
 }

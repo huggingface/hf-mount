@@ -58,8 +58,12 @@ pub async fn setup_bucket(test_name: &str) -> Option<BucketGuard> {
     };
 
     let ep = endpoint();
+    // whoami also validates the token. Bucket namespace defaults to the token
+    // owner but is overridable (HF_BUCKET_NAMESPACE) so CI creates scratch buckets
+    // under a shared org (infra-workloads), not a maintainer's personal account.
     let username = whoami(&ep, &token).await;
-    let bucket_id = format!("{}/hf-mount-{}-{}", username, test_name, std::process::id());
+    let namespace = std::env::var("HF_BUCKET_NAMESPACE").unwrap_or(username);
+    let bucket_id = format!("{}/hf-mount-{}-{}", namespace, test_name, std::process::id());
 
     create_bucket(&ep, &token, &bucket_id).await;
     eprintln!("Created bucket: {}", bucket_id);

@@ -1,6 +1,6 @@
 [package]
 name = "hf-mount"
-version = "0.9.0"
+version = "0.9.2"
 edition = "2024"
 license = "Apache-2.0"
 description = "Mount Hugging Face Buckets and repos as a local filesystem using FUSE or NFS"
@@ -9,11 +9,12 @@ keywords = ["fuse", "nfs", "huggingface", "filesystem", "mount"]
 categories = ["filesystem", "command-line-utilities"]
 
 [dependencies]
-# xet-core crates
-xet-client = { git = "https://github.com/huggingface/xet-core.git", branch = "main" }
-xet-core-structures = { git = "https://github.com/huggingface/xet-core.git", branch = "main" }
-xet-data = { git = "https://github.com/huggingface/xet-core.git", branch = "main" }
-xet-runtime = { git = "https://github.com/huggingface/xet-core.git", branch = "main" }
+# xet-core crates, pinned to a fixed rev (not branch = "main") so releases are
+# reproducible. Bump deliberately, adapting cached_xet_client.rs to trait changes.
+xet-client = { git = "https://github.com/huggingface/xet-core.git", rev = "0e4740050f3dc26c263ca3d170c179c78ce16f55" }
+xet-core-structures = { git = "https://github.com/huggingface/xet-core.git", rev = "0e4740050f3dc26c263ca3d170c179c78ce16f55" }
+xet-data = { git = "https://github.com/huggingface/xet-core.git", rev = "0e4740050f3dc26c263ca3d170c179c78ce16f55" }
+xet-runtime = { git = "https://github.com/huggingface/xet-core.git", rev = "0e4740050f3dc26c263ca3d170c179c78ce16f55" }
 
 # External crates
 async-trait = "0.1"
@@ -25,6 +26,7 @@ fuser = { version = "0.17", optional = true }
 futures = "0.3"
 libc = "0.2"
 nfsserve = { version = "0.11", optional = true }
+percent-encoding = "2"
 reqwest = { version = "0.12", features = ["json", "stream"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

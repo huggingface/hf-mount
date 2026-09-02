@@ -38,6 +38,25 @@ async fn write_blocking(
         .unwrap()
 }
 
+/// Poll write_blocking until an in-flight commit rejects the write with EIO
+/// (the channel flipped to Committing). Until the flip a write may still
+/// legally succeed (it lands ahead of Finish and joins the commit), so this
+/// keeps writing from `offset` and returns the offset after the accepted
+/// writes.
+async fn wait_for_commit_in_flight(vfs: &std::sync::Arc<VirtualFs>, ino: u64, fh: u64, mut offset: u64) -> u64 {
+    for _ in 0..200 {
+        match write_blocking(vfs, ino, fh, offset, b"more").await {
+            Err(err) => {
+                assert_eq!(err, libc::EIO);
+                return offset;
+            }
+            Ok(written) => offset += written as u64,
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    panic!("commit never went in flight (writes still accepted)");
+}
+
 /// Build a VFS with default settings (simple write mode, bucket source).
 fn vfs_simple(
     hub: &std::sync::Arc<MockHub>,
@@ -134,31 +153,74 @@ fn streaming_write_happy_path() {
     assert_eq!(logs.len(), 1);
 }
 
-/// In streaming mode, unlink is blocked while the file has open handles.
-/// This prevents editors (vim) from deleting files they can't rewrite.
+/// In streaming mode, unlink of a CLEAN file with open handles follows POSIX
+/// unlink-while-open semantics: the entry goes away immediately (remote
+/// delete included) and the open handle keeps working until release().
+/// This is what object_store writers (Lance, Delta) rely on for staging
+/// cleanup and recursive dataset deletes.
 #[test]
-fn unlink_blocked_with_open_handles_streaming() {
+fn unlink_clean_file_with_open_handle_is_posix() {
     let hub = MockHub::new();
-    hub.add_file("guarded.txt", 100, Some("hash1"), None);
+    let content = b"still readable after unlink";
+    hub.add_file("clean.txt", content.len() as u64, Some("hash1"), None);
+    let xet = MockXet::new();
+    xet.add_file("hash1", content);
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let attr = vfs.lookup(ROOT_INODE, "clean.txt").await.unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open(ino, false, false, Some(42)).await.unwrap();
+
+        vfs.unlink(ROOT_INODE, "clean.txt").await.unwrap();
+
+        // Entry is gone, remote delete was sent, handle still open.
+        {
+            let inodes = vfs.inode_table.read().unwrap();
+            assert!(inodes.lookup_child(ROOT_INODE, "clean.txt").is_none());
+        }
+        let logs = hub.take_batch_log();
+        let has_delete = logs
+            .iter()
+            .flatten()
+            .any(|op| matches!(op, BatchOp::DeleteFile { path } if path == "clean.txt"));
+        assert!(has_delete, "remote delete sent at unlink time");
+        assert!(vfs.has_open_handles(ino), "open handle survives the unlink");
+
+        // The POSIX promise: the open handle still reads the content.
+        let (data, eof) = vfs.read(fh, 0, 100).await.unwrap();
+        assert_eq!(&data[..], content);
+        assert!(eof);
+
+        vfs.release(fh).await.unwrap();
+        assert!(!vfs.has_open_handles(ino));
+    });
+}
+
+/// In streaming mode, unlink of a DIRTY file with open handles stays blocked:
+/// deleting out from under an editor mid-rewrite would silently lose the
+/// un-committed bytes (the vim unlink+recreate fallback).
+#[test]
+fn unlink_blocked_dirty_with_open_handles_streaming() {
+    let hub = MockHub::new();
     let xet = MockXet::new();
     let (rt, vfs) = vfs_simple(&hub, &xet);
 
     rt.block_on(async {
-        let attr = vfs.lookup(ROOT_INODE, "guarded.txt").await.unwrap();
+        let (attr, fh) = vfs
+            .create(ROOT_INODE, "editing.txt", 0o644, 1000, 1000, Some(42))
+            .await
+            .unwrap();
         let ino = attr.ino;
+        write_blocking(&vfs, ino, fh, 0, b"uncommitted").await.unwrap();
 
-        // Open read-only (like vim does before trying to save)
-        let fh = vfs.open(ino, false, false, Some(42)).await.unwrap();
+        let err = vfs.unlink(ROOT_INODE, "editing.txt").await.unwrap_err();
+        assert_eq!(err, libc::EPERM, "dirty file with open handle stays protected");
 
-        // Unlink should be blocked (has open handles in streaming mode)
-        let err = vfs.unlink(ROOT_INODE, "guarded.txt").await.unwrap_err();
-        assert_eq!(err, libc::EPERM, "unlink must be blocked with open handles");
-
-        // Close the handle
+        // Commit + close, then the unlink goes through.
+        vfs.flush(ino, fh, Some(42)).await.unwrap();
         vfs.release(fh).await.unwrap();
-
-        // Now unlink should succeed
-        vfs.unlink(ROOT_INODE, "guarded.txt").await.unwrap();
+        vfs.unlink(ROOT_INODE, "editing.txt").await.unwrap();
     });
 }
 
@@ -880,6 +942,32 @@ fn lookup_uses_head_not_list_tree() {
             pre_len + 1,
             "only the requested file should be materialized"
         );
+    });
+}
+
+/// A name that is a raw key-prefix of an existing file must not resolve as
+/// a directory (`1.manifest` vs the `1.manifest#1` staging convention of
+/// object_store writers). The raw-prefix filtering itself lives in
+/// `HubApiClient::list_tree` (see `test_strict_descendant_rel`); this covers
+/// the consumer side: an empty listing is ENOENT, not a phantom directory.
+#[test]
+fn lookup_prefix_of_existing_file_is_enoent() {
+    let hub = MockHub::new();
+    hub.add_file("_versions/1.manifest#1", 10, Some("h"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let dir = vfs.lookup(ROOT_INODE, "_versions").await.unwrap();
+        // Load children so the miss goes through the loaded-parent fallback.
+        let _ = vfs.readdir(dir.ino).await.unwrap();
+
+        let err = vfs.lookup(dir.ino, "1.manifest").await.unwrap_err();
+        assert_eq!(err, libc::ENOENT, "prefix of an existing file is not a directory");
+
+        // The sibling itself still resolves as a plain file.
+        let attr = vfs.lookup(dir.ino, "1.manifest#1").await.unwrap();
+        assert_eq!(attr.size, 10);
     });
 }
 
@@ -4495,6 +4583,394 @@ fn link_clean_file_creates_server_side_copy() {
         assert!(!alias.is_dirty());
         let src = inodes.get(src_attr.ino).unwrap();
         assert_eq!(src.full_path.as_ref(), "src.txt");
+    });
+}
+
+/// link() on a dirty source with an open streaming handle commits the source
+/// synchronously, then aliases the committed hash. This is the atomic-rename
+/// emulation of object_store writers (Lance, Delta): write → hard_link →
+/// unlink → close, so the link arrives before the close-time commit.
+#[test]
+fn link_dirty_streaming_source_commits_then_aliases() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let (attr, fh) = vfs
+            .create(ROOT_INODE, "staging#1", 0o644, 1000, 1000, Some(42))
+            .await
+            .unwrap();
+        let ino = attr.ino;
+        write_blocking(&vfs, ino, fh, 0, b"manifest bytes").await.unwrap();
+
+        // Hard-link while the handle is still open and the inode dirty.
+        let alias_attr = vfs.link(ino, ROOT_INODE, "final.manifest").await.unwrap();
+        assert_ne!(alias_attr.ino, ino, "alias gets its own inode");
+        assert_eq!(alias_attr.size, 14);
+
+        {
+            let inodes = vfs.inode_table.read().unwrap();
+            let source = inodes.get(ino).unwrap();
+            assert!(!source.is_dirty(), "link must have committed the source");
+            let source_hash = source.xet_hash.clone().expect("source hash set by commit");
+            let alias = inodes.get(alias_attr.ino).unwrap();
+            assert_eq!(
+                alias.xet_hash.as_ref(),
+                Some(&source_hash),
+                "alias points at the committed hash"
+            );
+        }
+
+        // The staging unlink lands while the handle is still open, but the
+        // link() above committed the source, so the clean-file POSIX path
+        // applies: entry gone now, handle valid until release.
+        vfs.unlink(ROOT_INODE, "staging#1").await.unwrap();
+        vfs.release(fh).await.unwrap();
+
+        let inodes = vfs.inode_table.read().unwrap();
+        assert!(inodes.lookup_child(ROOT_INODE, "final.manifest").is_some());
+        assert!(inodes.lookup_child(ROOT_INODE, "staging#1").is_none());
+    });
+}
+
+/// A link() that fails destination validation must not have committed the
+/// dirty source: a failed syscall must leave no observable remote mutation.
+#[test]
+fn link_failed_destination_does_not_commit_source() {
+    let hub = MockHub::new();
+    hub.add_file("taken.txt", 5, Some("hash0"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let (attr, fh) = vfs
+            .create(ROOT_INODE, "staging#1", 0o644, 1000, 1000, Some(42))
+            .await
+            .unwrap();
+        let ino = attr.ino;
+        write_blocking(&vfs, ino, fh, 0, b"manifest bytes").await.unwrap();
+        hub.take_batch_log();
+
+        let err = vfs.link(ino, ROOT_INODE, "taken.txt").await.unwrap_err();
+        assert_eq!(err, libc::EEXIST);
+        assert!(
+            hub.take_batch_log().is_empty(),
+            "failed link must not commit the source"
+        );
+        {
+            let inodes = vfs.inode_table.read().unwrap();
+            assert!(
+                inodes.get(ino).unwrap().is_dirty(),
+                "source stays dirty for the close-time commit"
+            );
+        }
+
+        vfs.release(fh).await.unwrap();
+    });
+}
+
+/// Writes racing a commit IN FLIGHT are rejected too: streaming_commit flips
+/// the channel to Committing (under the same mutex write() enqueues under)
+/// before sending Finish, so a write can never land behind Finish and be
+/// silently dropped by the exiting worker.
+#[test]
+fn write_during_inflight_commit_is_rejected() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let (attr, fh) = vfs
+            .create(ROOT_INODE, "racing.txt", 0o644, 1000, 1000, Some(42))
+            .await
+            .unwrap();
+        let ino = attr.ino;
+        write_blocking(&vfs, ino, fh, 0, b"payload").await.unwrap();
+
+        // Park the commit at the Hub batch call: the channel is Committing
+        // (Finish already enqueued) while flush() waits on the barrier.
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        hub.set_batch_barrier(barrier.clone());
+        let vfs_flush = vfs.clone();
+        let flush_task = tokio::spawn(async move { vfs_flush.flush(ino, fh, Some(42)).await });
+
+        wait_for_commit_in_flight(&vfs, ino, fh, 7).await;
+
+        barrier.wait().await;
+        flush_task.await.unwrap().unwrap();
+        vfs.release(fh).await.unwrap();
+    });
+}
+
+/// Writes after the streaming channel has committed (flush(), or link() on a
+/// dirty source) are rejected instead of being silently dropped after Finish.
+#[test]
+fn write_after_streaming_commit_is_rejected() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let (attr, fh) = vfs
+            .create(ROOT_INODE, "once.txt", 0o644, 1000, 1000, Some(42))
+            .await
+            .unwrap();
+        let ino = attr.ino;
+        write_blocking(&vfs, ino, fh, 0, b"payload").await.unwrap();
+        vfs.flush(ino, fh, Some(42)).await.unwrap();
+
+        let err = write_blocking(&vfs, ino, fh, 7, b"more").await.unwrap_err();
+        assert_eq!(err, libc::EIO);
+
+        vfs.release(fh).await.unwrap();
+    });
+}
+
+/// A second O_TRUNC writer supersedes the first: the old handle's bytes can
+/// never commit (generation mismatch), so its writes and flush must fail
+/// loudly with EIO instead of acknowledging bytes that are then silently
+/// discarded. The new writer commits normally.
+#[test]
+fn otrunc_reopen_supersedes_old_streaming_writer() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let (attr, fh_old) = vfs
+            .create(ROOT_INODE, "super.txt", 0o644, 1000, 1000, Some(42))
+            .await
+            .unwrap();
+        let ino = attr.ino;
+        write_blocking(&vfs, ino, fh_old, 0, b"old bytes").await.unwrap();
+
+        // Second O_TRUNC writer supersedes the first.
+        let fh_new = vfs.open(ino, true, true, Some(42)).await.unwrap();
+
+        let err = write_blocking(&vfs, ino, fh_old, 9, b"more").await.unwrap_err();
+        assert_eq!(err, libc::EIO, "superseded writes must fail loudly");
+        let err = vfs.flush(ino, fh_old, Some(42)).await.unwrap_err();
+        assert_eq!(err, libc::EIO, "superseded flush must fail loudly");
+        vfs.release(fh_old).await.unwrap();
+
+        // The new writer is unaffected and commits its bytes.
+        write_blocking(&vfs, ino, fh_new, 0, b"new bytes").await.unwrap();
+        vfs.flush(ino, fh_new, Some(42)).await.unwrap();
+        vfs.release(fh_new).await.unwrap();
+
+        let committed = hub
+            .take_batch_log()
+            .iter()
+            .flatten()
+            .filter(|op| matches!(op, BatchOp::AddFile { path, .. } if path == "super.txt"))
+            .count();
+        assert_eq!(committed, 1, "only the new writer's commit lands");
+    });
+}
+
+/// A superseding writer inherits the superseded writer's rollback snapshot:
+/// its own open sees an already-dirty inode (xet_hash stripped), so a
+/// permanently failed commit must revert to the last committed state, not a
+/// hashless ghost.
+#[test]
+fn superseded_writer_failed_commit_reverts_to_original() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        // Commit v1.
+        let (attr, fh) = vfs
+            .create(ROOT_INODE, "revert.txt", 0o644, 1000, 1000, Some(42))
+            .await
+            .unwrap();
+        let ino = attr.ino;
+        write_blocking(&vfs, ino, fh, 0, b"v1").await.unwrap();
+        vfs.flush(ino, fh, Some(42)).await.unwrap();
+        vfs.release(fh).await.unwrap();
+        let original_hash = {
+            let inodes = vfs.inode_table.read().unwrap();
+            inodes.get(ino).unwrap().xet_hash.clone().unwrap()
+        };
+
+        // Writer A truncates, writer B supersedes A. B's worker fails
+        // mid-write -> its commit fails permanently, and the revert must
+        // restore v1, not a hashless ghost from A's dirty window.
+        let fh_a = vfs.open(ino, true, true, Some(42)).await.unwrap();
+        write_blocking(&vfs, ino, fh_a, 0, b"aaa").await.unwrap();
+        xet.fail_writer_after(1);
+        let fh_b = vfs.open(ino, true, true, Some(42)).await.unwrap();
+        vfs.release(fh_a).await.unwrap();
+
+        let _ = write_blocking(&vfs, ino, fh_b, 0, b"bbb").await;
+        assert!(vfs.release(fh_b).await.is_err());
+
+        let inodes = vfs.inode_table.read().unwrap();
+        let entry = inodes.get(ino).unwrap();
+        assert_eq!(entry.xet_hash.as_deref(), Some(original_hash.as_str()));
+        assert_eq!(entry.size, 2, "reverted to v1's size");
+        assert!(!entry.is_dirty(), "revert clears the dirty flag");
+    });
+}
+
+/// A failed O_TRUNC reopen must not supersede the active writer: failing the
+/// old channel for a stillborn replacement would strand its acknowledged
+/// bytes for nothing.
+#[test]
+fn failed_otrunc_reopen_leaves_active_writer_intact() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let (attr, fh) = vfs
+            .create(ROOT_INODE, "keep.txt", 0o644, 1000, 1000, Some(42))
+            .await
+            .unwrap();
+        let ino = attr.ino;
+        write_blocking(&vfs, ino, fh, 0, b"payload").await.unwrap();
+
+        xet.fail_next_writer_create();
+        assert!(vfs.open(ino, true, true, Some(42)).await.is_err());
+
+        // The original writer still works end to end.
+        write_blocking(&vfs, ino, fh, 7, b" more").await.unwrap();
+        vfs.flush(ino, fh, Some(42)).await.unwrap();
+        vfs.release(fh).await.unwrap();
+
+        let committed = hub
+            .take_batch_log()
+            .iter()
+            .flatten()
+            .any(|op| matches!(op, BatchOp::AddFile { path, .. } if path == "keep.txt"));
+        assert!(committed, "original writer's commit must land");
+    });
+}
+
+/// A dup'd-fd flush (PID mismatch) racing a commit IN FLIGHT must not demote
+/// Committing back to Deferred: that would let a subsequent write pass the
+/// Writing|Deferred gate, land behind Finish, and be silently dropped by the
+/// exiting worker.
+#[test]
+fn flush_from_other_pid_does_not_demote_inflight_commit() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let (attr, fh) = vfs
+            .create(ROOT_INODE, "demote.txt", 0o644, 1000, 1000, Some(42))
+            .await
+            .unwrap();
+        let ino = attr.ino;
+        write_blocking(&vfs, ino, fh, 0, b"payload").await.unwrap();
+
+        // Park the commit at the Hub batch call: state is Committing.
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        hub.set_batch_barrier(barrier.clone());
+        let vfs_flush = vfs.clone();
+        let flush_task = tokio::spawn(async move { vfs_flush.flush(ino, fh, Some(42)).await });
+
+        let offset = wait_for_commit_in_flight(&vfs, ino, fh, 7).await;
+
+        // Dup'd-fd flush while the commit is in flight: defers without
+        // touching the Committing state.
+        vfs.flush(ino, fh, Some(999)).await.unwrap();
+
+        // Still rejected — a Deferred demotion would accept these bytes and
+        // silently drop them behind the in-flight Finish.
+        let err = write_blocking(&vfs, ino, fh, offset, b"lost").await.unwrap_err();
+        assert_eq!(err, libc::EIO);
+
+        barrier.wait().await;
+        flush_task.await.unwrap().unwrap();
+        vfs.release(fh).await.unwrap();
+    });
+}
+
+/// release() racing a link()-initiated commit must wait for it (commit_lock)
+/// instead of re-running the commit against the in-flight one — the re-run
+/// found no worker and no pending_info, returned a spurious EIO at close, and
+/// reverted the inode while the commit was succeeding.
+#[test]
+fn release_waits_for_inflight_link_commit() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let (attr, fh) = vfs
+            .create(ROOT_INODE, "staging#1", 0o644, 1000, 1000, Some(42))
+            .await
+            .unwrap();
+        let ino = attr.ino;
+        write_blocking(&vfs, ino, fh, 0, b"manifest bytes").await.unwrap();
+
+        // Park link()'s synchronous source commit at the Hub batch call.
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        hub.set_batch_barrier(barrier.clone());
+        let vfs_link = vfs.clone();
+        let link_task = tokio::spawn(async move { vfs_link.link(ino, ROOT_INODE, "final.manifest").await });
+
+        // Wait until the commit is in flight (writes rejected).
+        wait_for_commit_in_flight(&vfs, ino, fh, 14).await;
+
+        // release() must block on the commit lock, not re-run the commit.
+        let vfs_release = vfs.clone();
+        let release_task = tokio::spawn(async move { vfs_release.release(fh).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        barrier.wait().await; // unpark the source commit
+        barrier.wait().await; // unpark the alias commit
+        link_task.await.unwrap().unwrap();
+        release_task
+            .await
+            .unwrap()
+            .expect("release must not fail after a successful commit");
+
+        // The source inode survived: no revert raced the commit.
+        {
+            let inodes = vfs.inode_table.read().unwrap();
+            let entry = inodes.get(ino).unwrap();
+            assert!(!entry.is_dirty(), "source stays committed after release");
+        }
+    });
+}
+
+/// When the synchronous commit inside link() fails, the error propagates and
+/// no alias is committed — pending_info stays parked for the release() retry
+/// (same failure contract as flush()).
+#[test]
+fn link_commit_failure_leaves_no_alias() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let (attr, fh) = vfs
+            .create(ROOT_INODE, "staging#1", 0o644, 1000, 1000, Some(42))
+            .await
+            .unwrap();
+        let ino = attr.ino;
+        write_blocking(&vfs, ino, fh, 0, b"manifest bytes").await.unwrap();
+
+        hub.fail_next_batch(1);
+        assert!(vfs.link(ino, ROOT_INODE, "final.manifest").await.is_err());
+
+        let logs = hub.take_batch_log();
+        let has_alias = logs
+            .iter()
+            .flatten()
+            .any(|op| matches!(op, BatchOp::AddFile { path, .. } if path == "final.manifest"));
+        assert!(!has_alias, "no alias committed after a failed source commit");
+        {
+            let inodes = vfs.inode_table.read().unwrap();
+            assert!(inodes.lookup_child(ROOT_INODE, "final.manifest").is_none());
+        }
+
+        // release() retries the commit (hub no longer failing) and succeeds.
+        vfs.release(fh).await.unwrap();
     });
 }
 
