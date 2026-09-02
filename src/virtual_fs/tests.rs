@@ -6417,3 +6417,81 @@ fn concurrent_streaming_commits_are_serialized() {
     });
     assert_eq!(hub.take_batch_log().len(), 1, "exactly one Hub commit");
 }
+
+/// Slow-path lookup with a transiently failing HEAD probe, while the parent
+/// listing is loaded by a concurrent task (simulated by holding the
+/// dir-loading lock and marking the listing loaded before releasing it).
+/// That listing may predate a remote commit and the HEAD probe that would
+/// have caught a newer file was rate-limited: the miss must surface EAGAIN,
+/// not a false ENOENT.
+#[test]
+fn slow_path_lookup_surfaces_transient_head_failure_on_concurrent_listing() {
+    let hub = MockHub::new();
+    hub.add_file("ckpt/model/__0_0.distcp", 100, Some("hash1"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let ckpt = vfs.lookup(ROOT_INODE, "ckpt").await.unwrap();
+        let model = vfs.lookup(ckpt.ino, "model").await.unwrap();
+
+        // Park the lookup's ensure_children_loaded on the dir-loading lock.
+        let dir_lock = vfs.dir_loading_lock(model.ino);
+        let guard = dir_lock.lock().await;
+
+        hub.fail_next_head_with_status(429);
+        let heads_before = hub.head_file_call_count();
+        let vfs_task = vfs.clone();
+        let model_ino = model.ino;
+        let lookup = tokio::spawn(async move { vfs_task.lookup(model_ino, "_READY").await });
+
+        // Wait until the lookup ran its HEAD probe (the dir lock comes next).
+        while hub.head_file_call_count() == heads_before {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // The "concurrent task" publishes a listing that predates _READY.
+        {
+            let mut inodes = vfs.inode_table.write().unwrap();
+            let entry = inodes.get_mut(model_ino).unwrap();
+            entry.children_loaded_at = Some(std::time::Instant::now());
+            entry.children_from_remote = true;
+        }
+        drop(guard);
+
+        let errno = lookup.await.unwrap().unwrap_err();
+        assert_eq!(
+            errno,
+            libc::EAGAIN,
+            "stale-listing miss under rate limiting must not be ENOENT"
+        );
+    });
+}
+
+/// Same transient HEAD failure, but the lookup itself fetches a fresh
+/// listing: the miss is authoritative — ENOENT, and negative-cached.
+#[test]
+fn slow_path_lookup_fresh_listing_wins_over_transient_head_failure() {
+    let hub = MockHub::new();
+    hub.add_file("ckpt/model/__0_0.distcp", 100, Some("hash1"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let ckpt = vfs.lookup(ROOT_INODE, "ckpt").await.unwrap();
+        let model = vfs.lookup(ckpt.ino, "model").await.unwrap();
+
+        hub.fail_next_head_with_status(429);
+        let errno = vfs.lookup(model.ino, "_READY").await.unwrap_err();
+        assert_eq!(
+            errno,
+            libc::ENOENT,
+            "fresh listing is authoritative despite the HEAD failure"
+        );
+
+        // The authoritative miss is negative-cached: no further Hub probes.
+        let listings = hub.list_tree_call_count();
+        assert_eq!(vfs.lookup(model.ino, "_READY").await.unwrap_err(), libc::ENOENT);
+        assert_eq!(hub.list_tree_call_count(), listings);
+    });
+}

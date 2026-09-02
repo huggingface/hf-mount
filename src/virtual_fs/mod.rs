@@ -848,13 +848,16 @@ impl VirtualFs {
     /// Uses a per-directory lock to prevent thundering herd: concurrent callers
     /// for the same directory wait on the lock rather than making duplicate HTTP calls.
     /// Returns ENOENT if the inode doesn't exist, ENOTDIR if it's not a directory.
-    async fn ensure_children_loaded(&self, parent_ino: u64) -> VirtualFsResult<()> {
+    /// Returns `true` when THIS call fetched and installed the listing:
+    /// `false` means it short-circuited on a listing loaded earlier (or
+    /// concurrently), which may predate a recent remote commit.
+    async fn ensure_children_loaded(&self, parent_ino: u64) -> VirtualFsResult<bool> {
         // Fast path: already loaded (no lock needed).
         {
             let inodes = self.inode_table.read().expect("inodes poisoned");
             match inodes.get(parent_ino) {
                 Some(e) if e.kind != InodeKind::Directory => return Err(libc::ENOTDIR),
-                Some(e) if e.children_loaded() => return Ok(()),
+                Some(e) if e.children_loaded() => return Ok(false),
                 None => return Err(libc::ENOENT),
                 _ => {}
             }
@@ -869,7 +872,7 @@ impl VirtualFs {
             let inodes = self.inode_table.read().expect("inodes poisoned");
             match inodes.get(parent_ino) {
                 Some(e) if e.kind != InodeKind::Directory => return Err(libc::ENOTDIR),
-                Some(e) if e.children_loaded() => return Ok(()),
+                Some(e) if e.children_loaded() => return Ok(false),
                 Some(e) => e.full_path.to_string(),
                 None => return Err(libc::ENOENT),
             }
@@ -889,7 +892,7 @@ impl VirtualFs {
 
         let mut inodes = self.inode_table.write().expect("inodes poisoned");
         match inodes.get(parent_ino) {
-            Some(e) if e.children_loaded() => return Ok(()),
+            Some(e) if e.children_loaded() => return Ok(false),
             Some(e) if e.kind != InodeKind::Directory => return Err(libc::ENOTDIR),
             None => return Err(libc::ENOENT),
             _ => {}
@@ -1001,7 +1004,7 @@ impl VirtualFs {
             parent.children_loaded_at = Some(Instant::now());
             parent.children_from_remote = true;
         }
-        Ok(())
+        Ok(true)
     }
 
     /// Recursively load all descendants of a directory so in-memory state
@@ -1535,7 +1538,7 @@ impl VirtualFs {
         // Resolve the single requested path via HEAD instead of listing the
         // whole parent — for point-access workloads (no `readdir`) this keeps
         // the inode table scoped to what the caller actually touches.
-        let mut head_probe_errored = false;
+        let mut head_probe_error: Option<crate::error::Error> = None;
         match self.hub_client.head_file(&full_path).await {
             // Without size, `open_readonly` would take the empty-file shortcut
             // and expose a zero-byte file. Fall back to list_tree which has
@@ -1548,27 +1551,34 @@ impl VirtualFs {
             Ok(_) => {}
             Err(e) => {
                 debug!("HEAD lookup {} failed, falling back to list: {}", full_path, e);
-                head_probe_errored = true;
+                head_probe_error = Some(e);
             }
         }
 
-        self.ensure_children_loaded(parent).await?;
+        let freshly_listed = self.ensure_children_loaded(parent).await?;
 
         let inodes = self.inode_table.read().expect("inodes poisoned");
         match inodes.lookup_child(parent, name) {
             Some(entry) => Ok(self.make_vfs_attr(entry)),
             None => {
                 drop(inodes);
-                // Only cache the negative result when the HEAD probe was
-                // authoritative. If it errored (e.g. rate limited) and
-                // ensure_children_loaded returned early because a concurrent
-                // task had already loaded the listing, the miss may predate a
-                // remote commit — caching it would hide the path for
-                // NEG_CACHE_TTL after the Hub recovers.
-                if !head_probe_errored {
+                // A fresh listing is authoritative regardless of the HEAD
+                // outcome: the miss is real and safe to cache. Same when the
+                // HEAD probe itself answered 404 (Ok fell through here).
+                if freshly_listed || head_probe_error.is_none() {
                     self.negative_cache_insert(full_path);
+                    return Err(libc::ENOENT);
                 }
-                Err(libc::ENOENT)
+                match head_probe_error {
+                    // The listing was loaded earlier (or by a concurrent
+                    // task) and may predate a remote commit; the HEAD probe
+                    // that would have caught a newer file was rate-limited.
+                    // Surface the transient error instead of a false ENOENT.
+                    Some(e) if e.is_transient() => Err(e.to_errno()),
+                    // Permanent probe failure over a possibly-stale listing:
+                    // ENOENT, but don't poison the negative cache.
+                    _ => Err(libc::ENOENT),
+                }
             }
         }
     }

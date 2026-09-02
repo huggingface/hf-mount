@@ -24,6 +24,8 @@ pub struct MockHub {
     batch_barrier: Mutex<Option<Arc<tokio::sync::Barrier>>>,
     /// Remaining list_tree calls to fail + the HTTP status carried by the error.
     list_tree_fail: Mutex<Option<(u32, Option<u16>)>>,
+    /// HTTP status for the next head_file failure (used with head_fail).
+    head_fail_status: Mutex<Option<u16>>,
     head_fail: AtomicBool,
     download_fail: AtomicBool,
     source: SourceKind,
@@ -46,6 +48,7 @@ impl MockHub {
             batch_fail_count: AtomicU32::new(0),
             batch_barrier: Mutex::new(None),
             list_tree_fail: Mutex::new(None),
+            head_fail_status: Mutex::new(None),
             head_fail: AtomicBool::new(false),
             download_fail: AtomicBool::new(false),
             source,
@@ -118,6 +121,13 @@ impl MockHub {
     }
 
     pub fn fail_next_head(&self) {
+        self.head_fail.store(true, Ordering::SeqCst);
+    }
+
+    /// Make the next head_file call fail with the given HTTP status (e.g.
+    /// 429 to simulate rate limiting after client-side retries).
+    pub fn fail_next_head_with_status(&self, status: u16) {
+        *self.head_fail_status.lock().unwrap() = Some(status);
         self.head_fail.store(true, Ordering::SeqCst);
     }
 
@@ -228,7 +238,10 @@ impl HubOps for MockHub {
     async fn head_file(&self, path: &str) -> Result<Option<HeadFileInfo>> {
         self.head_file_calls.fetch_add(1, Ordering::SeqCst);
         if self.head_fail.swap(false, Ordering::SeqCst) {
-            return Err(Error::hub("mock head_file failure"));
+            return Err(match self.head_fail_status.lock().unwrap().take() {
+                Some(status) => Error::hub_status(status, "mock head_file failure"),
+                None => Error::hub("mock head_file failure"),
+            });
         }
         let responses = self.head_responses.lock().unwrap();
         match responses.get(path) {
