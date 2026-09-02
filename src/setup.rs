@@ -697,18 +697,20 @@ pub fn raise_fd_limit() {
 /// app-pod binds survive the detach and receive the repaired mount).
 fn detach_dead_mount(path: &Path) {
     let Err(e) = std::fs::metadata(path) else { return };
-    if !matches!(e.raw_os_error(), Some(libc::ENOTCONN) | Some(libc::EIO)) {
-        return;
-    }
+    let errno = e.raw_os_error();
+    // ENOTCONN is unambiguous: only a disconnected FUSE mount stats that way.
     // EIO can also come from a foreign filesystem mounted at this path (an
     // NFS outage, a failing disk behind a bind mount) — MNT_DETACH would
-    // tear down a mount that isn't ours. Only detach when the mount table
-    // shows a FUSE mount at this exact path: a dead predecessor always is
-    // one (fsname varies in mountpod mode, so match the fstype, not the
-    // source).
-    if !fuse_mounted_at(path) {
+    // tear down a mount that isn't ours — so it additionally requires the
+    // mount table to show an hf-mount FUSE mount at exactly this path.
+    let is_dead_fuse = match errno {
+        Some(libc::ENOTCONN) => true,
+        Some(libc::EIO) => hf_mount_mounted_at(path),
+        _ => return,
+    };
+    if !is_dead_fuse {
         warn!(
-            "Mount point {:?} fails stat ({}) but is not a FUSE mount; leaving it alone",
+            "Mount point {:?} fails stat ({}) but the mount table shows no hf-mount there; leaving it alone",
             path, e
         );
         return;
@@ -722,28 +724,37 @@ fn detach_dead_mount(path: &Path) {
     }
 }
 
-/// Whether the mount table shows a FUSE mount at exactly `path`.
+/// Whether the mount table shows an hf-mount FUSE mount at exactly `path`.
+/// Fail-closed: an unreadable mount table does not authorize a detach (the
+/// unambiguous ENOTCONN path above stays exempt, so a dead FUSE mount still
+/// gets cleaned up even if /proc were unavailable).
 #[cfg(target_os = "linux")]
-fn fuse_mounted_at(path: &Path) -> bool {
-    let Ok(mountinfo) = std::fs::read_to_string("/proc/self/mountinfo") else {
-        // Can't verify — fall back to the pre-guard behavior (a dead FUSE
-        // mount here would otherwise crash-loop the container forever).
-        return true;
+fn hf_mount_mounted_at(path: &Path) -> bool {
+    // Not read_to_string: a single non-UTF-8 mount path elsewhere in the
+    // table would fail the whole read. Lossy conversion keeps our (UTF-8)
+    // target comparable.
+    let Ok(mountinfo) = std::fs::read("/proc/self/mountinfo") else {
+        return false;
     };
-    mountinfo_has_fuse_mount(&mountinfo, &path.to_string_lossy())
+    // Lexical absolutization only — the path stats with an error, so
+    // canonicalize() is not an option here.
+    let target = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    mountinfo_has_hf_mount(&String::from_utf8_lossy(&mountinfo), &target.to_string_lossy())
 }
 
 #[cfg(not(target_os = "linux"))]
-fn fuse_mounted_at(_path: &Path) -> bool {
+fn hf_mount_mounted_at(_path: &Path) -> bool {
     true
 }
 
-/// Parse /proc/self/mountinfo content: is there a mount of fstype fuse (or
-/// fuse.*) whose mount point is exactly `target`?
+/// Parse /proc/self/mountinfo content: is there an hf-mount FUSE mount whose
+/// mount point is exactly `target`? Direct mounts show as fstype "fuse" with
+/// source "hf-mount" (fuser FSName); mountpod-mode mounts made by the CSI
+/// helper show as fstype "fuse.hf-mount".
 #[cfg(any(target_os = "linux", test))]
-fn mountinfo_has_fuse_mount(mountinfo: &str, target: &str) -> bool {
+fn mountinfo_has_hf_mount(mountinfo: &str, target: &str) -> bool {
     mountinfo.lines().any(|line| {
-        // Fields: id parent major:minor root MOUNT-POINT options... - FSTYPE source ...
+        // Fields: id parent major:minor root MOUNT-POINT options... - FSTYPE SOURCE super_opts
         let mut fields = line.split(' ');
         let Some(mount_point) = fields.nth(4) else { return false };
         // mountinfo octal-escapes whitespace and backslash in paths.
@@ -755,10 +766,11 @@ fn mountinfo_has_fuse_mount(mountinfo: &str, target: &str) -> bool {
         if unescaped != target {
             return false;
         }
-        let mut after_separator = fields.skip_while(|field| *field != "-");
-        after_separator
-            .nth(1)
-            .is_some_and(|fstype| fstype == "fuse" || fstype.starts_with("fuse."))
+        let mut after_separator = fields.skip_while(|field| *field != "-").skip(1);
+        let (Some(fstype), Some(source)) = (after_separator.next(), after_separator.next()) else {
+            return false;
+        };
+        fstype == "fuse.hf-mount" || (fstype.starts_with("fuse") && source == "hf-mount")
     })
 }
 
@@ -867,26 +879,30 @@ pub(crate) fn unmount_fuse(mount_point: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{mountinfo_has_fuse_mount, validate_revision};
+    use super::{mountinfo_has_hf_mount, validate_revision};
 
     #[test]
-    fn mountinfo_matches_fuse_mounts_only() {
+    fn mountinfo_matches_hf_mount_mounts_only() {
         let mountinfo = "\
 36 25 0:31 / /data/nfs rw,relatime shared:1 - nfs4 10.0.0.1:/export rw,addr=10.0.0.1
 37 25 0:32 / /mnt/hf rw,nosuid,nodev shared:2 - fuse hf-mount rw,user_id=0,group_id=0
-38 25 0:33 / /mnt/other rw,relatime - fuse.sshfs user@host:/ rw
-39 25 8:1 / /mnt/disk rw,relatime shared:3 - ext4 /dev/sda1 rw
-40 25 0:34 / /mnt/with\\040space rw - fuse hf-mount rw
+38 25 0:33 / /mnt/pod rw,nosuid shared:4 - fuse.hf-mount hf-mount rw,user_id=0
+39 25 0:35 / /mnt/other rw,relatime - fuse.sshfs user@host:/ rw
+40 25 8:1 / /mnt/disk rw,relatime shared:3 - ext4 /dev/sda1 rw
+41 25 0:34 / /mnt/with\\040space rw - fuse hf-mount rw
 ";
-        assert!(mountinfo_has_fuse_mount(mountinfo, "/mnt/hf"));
-        assert!(mountinfo_has_fuse_mount(mountinfo, "/mnt/other"));
-        assert!(mountinfo_has_fuse_mount(mountinfo, "/mnt/with space"));
-        // Foreign filesystems and non-mountpoints must not match.
-        assert!(!mountinfo_has_fuse_mount(mountinfo, "/data/nfs"));
-        assert!(!mountinfo_has_fuse_mount(mountinfo, "/mnt/disk"));
-        assert!(!mountinfo_has_fuse_mount(mountinfo, "/mnt/nothing"));
-        // Exact match only — a parent of a FUSE mount is not itself one.
-        assert!(!mountinfo_has_fuse_mount(mountinfo, "/mnt"));
+        // Direct mount (fuser FSName) and mountpod mount (CSI helper subtype).
+        assert!(mountinfo_has_hf_mount(mountinfo, "/mnt/hf"));
+        assert!(mountinfo_has_hf_mount(mountinfo, "/mnt/pod"));
+        assert!(mountinfo_has_hf_mount(mountinfo, "/mnt/with space"));
+        // A foreign FUSE filesystem is not ours.
+        assert!(!mountinfo_has_hf_mount(mountinfo, "/mnt/other"));
+        // Non-FUSE filesystems and non-mountpoints must not match.
+        assert!(!mountinfo_has_hf_mount(mountinfo, "/data/nfs"));
+        assert!(!mountinfo_has_hf_mount(mountinfo, "/mnt/disk"));
+        assert!(!mountinfo_has_hf_mount(mountinfo, "/mnt/nothing"));
+        // Exact match only — a parent of a mount is not itself one.
+        assert!(!mountinfo_has_hf_mount(mountinfo, "/mnt"));
     }
 
     #[test]

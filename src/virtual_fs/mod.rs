@@ -1538,22 +1538,30 @@ impl VirtualFs {
         // Resolve the single requested path via HEAD instead of listing the
         // whole parent — for point-access workloads (no `readdir`) this keeps
         // the inode table scoped to what the caller actually touches.
-        let mut head_probe_error: Option<crate::error::Error> = None;
-        match self.hub_client.head_file(&full_path).await {
+        enum HeadProbe {
+            /// HEAD answered 404: no file at this path (could still be a dir).
+            Missing,
+            /// HEAD found the file but without a size; only the listing has
+            /// the authoritative size, so it gets the final word.
+            FoundWithoutSize,
+            Failed(crate::error::Error),
+        }
+        let head_probe = match self.hub_client.head_file(&full_path).await {
             // Without size, `open_readonly` would take the empty-file shortcut
             // and expose a zero-byte file. Fall back to list_tree which has
             // the authoritative size from the tree index.
             Ok(Some(head)) if head.size.is_some() => {
                 return self.insert_file_from_head(parent, name, &full_path, head);
             }
+            Ok(Some(_)) => HeadProbe::FoundWithoutSize,
             // 404 may mean "doesn't exist" or "it's a directory" (the resolve
             // endpoint only handles files), so the listing has the final word.
-            Ok(_) => {}
+            Ok(None) => HeadProbe::Missing,
             Err(e) => {
                 debug!("HEAD lookup {} failed, falling back to list: {}", full_path, e);
-                head_probe_error = Some(e);
+                HeadProbe::Failed(e)
             }
-        }
+        };
 
         let freshly_listed = self.ensure_children_loaded(parent).await?;
 
@@ -1563,21 +1571,28 @@ impl VirtualFs {
             None => {
                 drop(inodes);
                 // A fresh listing is authoritative regardless of the HEAD
-                // outcome: the miss is real and safe to cache. Same when the
-                // HEAD probe itself answered 404 (Ok fell through here).
-                if freshly_listed || head_probe_error.is_none() {
+                // outcome: the miss is real and safe to cache.
+                if freshly_listed {
                     self.negative_cache_insert(full_path);
                     return Err(libc::ENOENT);
                 }
-                match head_probe_error {
-                    // The listing was loaded earlier (or by a concurrent
-                    // task) and may predate a remote commit; the HEAD probe
-                    // that would have caught a newer file was rate-limited.
-                    // Surface the transient error instead of a false ENOENT.
-                    Some(e) if e.is_transient() => Err(e.to_errno()),
-                    // Permanent probe failure over a possibly-stale listing:
-                    // ENOENT, but don't poison the negative cache.
-                    _ => Err(libc::ENOENT),
+                // The listing was loaded earlier (or by a concurrent task)
+                // and may predate a remote commit; only HEAD's own 404 makes
+                // the miss trustworthy enough to cache.
+                match head_probe {
+                    HeadProbe::Missing => {
+                        self.negative_cache_insert(full_path);
+                        Err(libc::ENOENT)
+                    }
+                    // The HEAD probe that would have caught a file newer than
+                    // the listing was rate-limited: surface the transient
+                    // error instead of a false ENOENT.
+                    HeadProbe::Failed(e) if e.is_transient() => Err(e.to_errno()),
+                    // HEAD proved the file exists (sizeless) but the stale
+                    // listing misses it: ENOENT for now, uncached so the next
+                    // lookup retries against a fresher listing. Permanent
+                    // probe failures land here too.
+                    HeadProbe::FoundWithoutSize | HeadProbe::Failed(_) => Err(libc::ENOENT),
                 }
             }
         }
