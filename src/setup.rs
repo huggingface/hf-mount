@@ -697,18 +697,15 @@ pub fn raise_fd_limit() {
 /// app-pod binds survive the detach and receive the repaired mount).
 fn detach_dead_mount(path: &Path) {
     let Err(e) = std::fs::metadata(path) else { return };
-    let errno = e.raw_os_error();
-    // ENOTCONN is unambiguous: only a disconnected FUSE mount stats that way.
-    // EIO can also come from a foreign filesystem mounted at this path (an
-    // NFS outage, a failing disk behind a bind mount) — MNT_DETACH would
-    // tear down a mount that isn't ours — so it additionally requires the
-    // mount table to show an hf-mount FUSE mount at exactly this path.
-    let is_dead_fuse = match errno {
-        Some(libc::ENOTCONN) => true,
-        Some(libc::EIO) => hf_mount_mounted_at(path),
-        _ => return,
-    };
-    if !is_dead_fuse {
+    if !matches!(e.raw_os_error(), Some(libc::ENOTCONN) | Some(libc::EIO)) {
+        return;
+    }
+    // Both errnos can also come from a foreign filesystem at this path (a
+    // disconnected third-party FUSE mount, an NFS outage, a failing disk
+    // behind a bind mount) — MNT_DETACH would tear down a mount that isn't
+    // ours. Only detach when the mount table shows an hf-mount as the
+    // active (topmost) mount at exactly this path.
+    if !hf_mount_mounted_at(path) {
         warn!(
             "Mount point {:?} fails stat ({}) but the mount table shows no hf-mount there; leaving it alone",
             path, e
@@ -724,10 +721,9 @@ fn detach_dead_mount(path: &Path) {
     }
 }
 
-/// Whether the mount table shows an hf-mount FUSE mount at exactly `path`.
-/// Fail-closed: an unreadable mount table does not authorize a detach (the
-/// unambiguous ENOTCONN path above stays exempt, so a dead FUSE mount still
-/// gets cleaned up even if /proc were unavailable).
+/// Whether the mount table shows an hf-mount FUSE mount as the active mount
+/// at exactly `path`. Fail-closed: an unreadable mount table does not
+/// authorize a detach.
 #[cfg(target_os = "linux")]
 fn hf_mount_mounted_at(path: &Path) -> bool {
     // Not read_to_string: a single non-UTF-8 mount path elsewhere in the
@@ -747,31 +743,33 @@ fn hf_mount_mounted_at(_path: &Path) -> bool {
     true
 }
 
-/// Parse /proc/self/mountinfo content: is there an hf-mount FUSE mount whose
-/// mount point is exactly `target`? Direct mounts show as fstype "fuse" with
-/// source "hf-mount" (fuser FSName); mountpod-mode mounts made by the CSI
-/// helper show as fstype "fuse.hf-mount".
+/// Parse /proc/self/mountinfo content: is the active mount at exactly
+/// `target` an hf-mount FUSE mount? Stacked mounts on one path are listed
+/// in mount order and `umount2` detaches the topmost, so only the LAST
+/// entry for the path counts — a foreign filesystem overmounted on a dead
+/// hf-mount must not get detached in its place. Direct mounts show as
+/// fstype "fuse" with source "hf-mount" (fuser FSName); mountpod-mode
+/// mounts made by the CSI helper show as fstype "fuse.hf-mount".
 #[cfg(any(target_os = "linux", test))]
 fn mountinfo_has_hf_mount(mountinfo: &str, target: &str) -> bool {
-    mountinfo.lines().any(|line| {
+    let topmost = mountinfo.lines().rev().find(|line| {
         // Fields: id parent major:minor root MOUNT-POINT options... - FSTYPE SOURCE super_opts
-        let mut fields = line.split(' ');
-        let Some(mount_point) = fields.nth(4) else { return false };
         // mountinfo octal-escapes whitespace and backslash in paths.
-        let unescaped = mount_point
-            .replace("\\040", " ")
-            .replace("\\011", "\t")
-            .replace("\\012", "\n")
-            .replace("\\134", "\\");
-        if unescaped != target {
-            return false;
-        }
-        let mut after_separator = fields.skip_while(|field| *field != "-").skip(1);
-        let (Some(fstype), Some(source)) = (after_separator.next(), after_separator.next()) else {
-            return false;
-        };
-        fstype == "fuse.hf-mount" || (fstype.starts_with("fuse") && source == "hf-mount")
-    })
+        line.split(' ').nth(4).is_some_and(|mount_point| {
+            mount_point
+                .replace("\\040", " ")
+                .replace("\\011", "\t")
+                .replace("\\012", "\n")
+                .replace("\\134", "\\")
+                == target
+        })
+    });
+    let Some(line) = topmost else { return false };
+    let mut after_separator = line.split(' ').skip_while(|field| *field != "-").skip(1);
+    let (Some(fstype), Some(source)) = (after_separator.next(), after_separator.next()) else {
+        return false;
+    };
+    fstype == "fuse.hf-mount" || (fstype.starts_with("fuse") && source == "hf-mount")
 }
 
 /// Retry window for Hub calls made during mount startup, before the FUSE
@@ -890,6 +888,8 @@ mod tests {
 39 25 0:35 / /mnt/other rw,relatime - fuse.sshfs user@host:/ rw
 40 25 8:1 / /mnt/disk rw,relatime shared:3 - ext4 /dev/sda1 rw
 41 25 0:34 / /mnt/with\\040space rw - fuse hf-mount rw
+42 25 0:36 / /mnt/stacked rw shared:5 - fuse.hf-mount hf-mount rw
+43 25 0:37 / /mnt/stacked rw shared:6 - nfs4 10.0.0.2:/export rw
 ";
         // Direct mount (fuser FSName) and mountpod mount (CSI helper subtype).
         assert!(mountinfo_has_hf_mount(mountinfo, "/mnt/hf"));
@@ -903,6 +903,9 @@ mod tests {
         assert!(!mountinfo_has_hf_mount(mountinfo, "/mnt/nothing"));
         // Exact match only — a parent of a mount is not itself one.
         assert!(!mountinfo_has_hf_mount(mountinfo, "/mnt"));
+        // A foreign filesystem overmounted on a dead hf-mount is the active
+        // mount: umount2 would detach it, so it must not qualify.
+        assert!(!mountinfo_has_hf_mount(mountinfo, "/mnt/stacked"));
     }
 
     #[test]

@@ -1577,22 +1577,18 @@ impl VirtualFs {
                     return Err(libc::ENOENT);
                 }
                 // The listing was loaded earlier (or by a concurrent task)
-                // and may predate a remote commit; only HEAD's own 404 makes
-                // the miss trustworthy enough to cache.
+                // and may predate a remote commit, so nothing here is
+                // authoritative enough to negative-cache: HEAD's 404 says
+                // nothing about a remotely-added directory (the resolve
+                // endpoint is file-only), and a sizeless hit says the file
+                // exists. Uncached ENOENT lets the next lookup retry against
+                // a fresher listing.
                 match head_probe {
-                    HeadProbe::Missing => {
-                        self.negative_cache_insert(full_path);
-                        Err(libc::ENOENT)
-                    }
                     // The HEAD probe that would have caught a file newer than
                     // the listing was rate-limited: surface the transient
                     // error instead of a false ENOENT.
                     HeadProbe::Failed(e) if e.is_transient() => Err(e.to_errno()),
-                    // HEAD proved the file exists (sizeless) but the stale
-                    // listing misses it: ENOENT for now, uncached so the next
-                    // lookup retries against a fresher listing. Permanent
-                    // probe failures land here too.
-                    HeadProbe::FoundWithoutSize | HeadProbe::Failed(_) => Err(libc::ENOENT),
+                    HeadProbe::Missing | HeadProbe::FoundWithoutSize | HeadProbe::Failed(_) => Err(libc::ENOENT),
                 }
             }
         }
