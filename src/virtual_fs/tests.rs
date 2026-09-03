@@ -6445,3 +6445,34 @@ fn slow_path_lookup_fresh_listing_wins_over_transient_head_failure() {
         assert_eq!(hub.list_tree_call_count(), listings);
     });
 }
+
+/// Installing a commit hook on a channel that already reached a terminal
+/// state must fulfill it on the spot: nothing else would ever fulfill it
+/// (release fast-paths terminal channels) and a live pending_commits entry
+/// would wedge every later open of the inode.
+#[test]
+fn install_commit_hook_on_terminal_channel_does_not_wedge_pending_commits() {
+    let hub = MockHub::new();
+    hub.add_file("ckpt.distcp", 100, Some("hash1"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let ino = vfs.lookup(ROOT_INODE, "ckpt.distcp").await.unwrap().ino;
+        let fh = vfs.open(ino, true, true, Some(1)).await.unwrap();
+        write_blocking(&vfs, ino, fh, 0, b"checkpoint bytes").await.unwrap();
+        vfs.flush(ino, fh, Some(1)).await.unwrap();
+        let channel = vfs.streaming_channel_for(ino).expect("handle still open");
+        assert!(channel_is_terminal(&channel));
+
+        // A late deferral (dup'd fd flush racing the commit) installs after
+        // the winner fulfilled; the install must settle its own hook.
+        vfs.defer_commit(ino, &channel);
+        assert!(
+            vfs.pending_commits.lock().unwrap().get(&ino).is_none(),
+            "hook installed on a terminal channel must not linger in pending_commits"
+        );
+        vfs.await_pending_commit(ino).await.unwrap();
+        vfs.release(fh).await.unwrap();
+    });
+}
