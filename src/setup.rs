@@ -805,36 +805,31 @@ where
         // An attempt is itself several requests with internal retries; bound
         // it too, or the last one can overrun the deadline by minutes.
         let remaining = STARTUP_RETRY_DEADLINE.saturating_sub(start.elapsed());
-        // timeout() polls the wrapped future once even at zero: check first.
-        let deadline_exceeded = || {
-            crate::error::Error::hub(format!(
-                "{what}: still failing after {STARTUP_RETRY_DEADLINE:?} of transient errors"
-            ))
-        };
-        if remaining.is_zero() {
-            return Err(deadline_exceeded());
-        }
         let Ok(result) = tokio::time::timeout(remaining, attempt()).await else {
-            return Err(deadline_exceeded());
+            return Err(crate::error::Error::hub(format!(
+                "{what}: still failing after {STARTUP_RETRY_DEADLINE:?} of transient errors"
+            )));
         };
-        match result {
+        let e = match result {
             Ok(v) => return Ok(v),
-            Err(e) => {
-                let remaining = STARTUP_RETRY_DEADLINE.saturating_sub(start.elapsed());
-                if !e.is_transient() || remaining.is_zero() {
-                    return Err(e);
-                }
-                attempt_no += 1;
-                warn!("{what}: transient startup failure ({e}); retrying for up to {remaining:?} more");
-                tokio::time::sleep(
-                    e.retry_after()
-                        .unwrap_or_else(|| crate::hub_api::retry_delay(attempt_no))
-                        .min(crate::hub_api::MAX_RETRY_DELAY)
-                        .min(remaining),
-                )
-                .await;
-            }
+            Err(e) if !e.is_transient() => return Err(e),
+            Err(e) => e,
+        };
+        attempt_no += 1;
+        // Decide before sleeping so the deadline exit still carries the last
+        // Hub error (status, endpoint) instead of a synthetic message. The
+        // delay is never zero (t=0 hints parse as None), so this also covers
+        // an already-consumed deadline.
+        let delay = e
+            .retry_after()
+            .unwrap_or_else(|| crate::hub_api::retry_delay(attempt_no))
+            .min(crate::hub_api::MAX_RETRY_DELAY);
+        let remaining = STARTUP_RETRY_DEADLINE.saturating_sub(start.elapsed());
+        if delay >= remaining {
+            return Err(e);
         }
+        warn!("{what}: transient startup failure ({e}); retrying in {delay:?} (deadline in {remaining:?})");
+        tokio::time::sleep(delay).await;
     }
 }
 

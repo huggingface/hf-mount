@@ -1153,24 +1153,35 @@ impl VirtualFs {
     /// Called in flush() before commit or deferral so open() can await the result.
     /// No-op if a hook is already installed (prevents replacing a receiver that
     /// an open() caller may already be awaiting).
+    /// Install the commit hook for `channel` (idempotent: an existing hook is
+    /// kept). Terminal-safe: a channel that already reached Committed/Failed
+    /// gets the hook fulfilled on the spot — nothing else would ever fulfill
+    /// it (release fast-paths terminal channels) and its pending_commits entry
+    /// would wedge every later open of the inode. Both racers may fulfill;
+    /// fulfill_commit_hook take()s the sender, so the second call is a no-op.
     fn install_commit_hook(&self, ino: u64, channel: &StreamingChannel) {
-        let mut hook = channel.commit_hook.lock().expect("commit_hook poisoned");
-        if hook.is_some() {
-            return; // already installed — don't replace
+        {
+            let mut hook = channel.commit_hook.lock().expect("commit_hook poisoned");
+            if hook.is_none() {
+                let (tx, rx) = tokio::sync::watch::channel(None);
+                *hook = Some(tx);
+                // Register the receiver only if the ino has none yet: a stale
+                // writer's deferred flush racing an O_TRUNC supersede must not
+                // replace the ACTIVE writer's receiver (fulfilled hooks remove
+                // their own entry, so an existing entry always belongs to a
+                // live hook). An unregistered hook is harmless: its fulfill
+                // sends to no waiter and the ownership check skips the map
+                // removal.
+                self.pending_commits
+                    .lock()
+                    .expect("pending_commits poisoned")
+                    .entry(ino)
+                    .or_insert(rx);
+            }
         }
-        let (tx, rx) = tokio::sync::watch::channel(None);
-        *hook = Some(tx);
-        // Register the receiver only if the ino has none yet: a stale
-        // writer's deferred flush racing an O_TRUNC supersede must not
-        // replace the ACTIVE writer's receiver (fulfilled hooks remove their
-        // own entry, so an existing entry always belongs to a live hook).
-        // An unregistered hook is harmless: its fulfill sends to no waiter
-        // and the ownership check skips the map removal.
-        self.pending_commits
-            .lock()
-            .expect("pending_commits poisoned")
-            .entry(ino)
-            .or_insert(rx);
+        if let Some(result) = terminal_result(channel) {
+            self.fulfill_commit_hook(ino, channel, result);
+        }
     }
 
     /// Fulfill the pending commit hook with a result, then clean up the map —
@@ -2656,22 +2667,20 @@ impl VirtualFs {
     pub async fn release(&self, file_handle: u64) -> VirtualFsResult<()> {
         debug!("release: fh={}", file_handle);
 
-        // Hand the commit over before dropping the handle from open_files: the
+        // Hand the commit over under the same lock that drops the handle: the
         // shutdown drain finds in-flight releases through pending_commits, so
         // there must be no window where a committing handle is in neither map.
-        {
-            let files = self.open_files.read().expect("open_files poisoned");
-            if let Some(OpenFile::Streaming { ino, channel }) = files.get(&file_handle)
+        // (Already-committed closes, the common case, skip the install.)
+        let removed = {
+            let mut files = self.open_files.write().expect("open_files poisoned");
+            let removed = files.remove(&file_handle);
+            if let Some(OpenFile::Streaming { ino, channel }) = &removed
                 && !channel_is_terminal(channel)
             {
                 self.install_commit_hook(*ino, channel);
             }
-        }
-        let removed = self
-            .open_files
-            .write()
-            .expect("open_files poisoned")
-            .remove(&file_handle);
+            removed
+        };
 
         let released_ino = match &removed {
             Some(OpenFile::Local { ino, .. })
@@ -2721,12 +2730,6 @@ impl VirtualFs {
                     )
                 };
                 if needs_commit {
-                    // If flush() didn't defer (e.g. Writing state from a direct
-                    // release without flush), install the hook now.
-                    if channel.commit_hook.lock().expect("commit_hook poisoned").is_none() {
-                        self.install_commit_hook(ino, &channel);
-                    }
-
                     let result = match self.streaming_commit(ino, &channel).await {
                         Ok(()) => Ok(()),
                         Err(e) => {
@@ -2767,16 +2770,6 @@ impl VirtualFs {
 
                     self.fulfill_commit_hook(ino, &channel, result);
                 }
-            }
-            Some(OpenFile::Streaming { ino, channel }) => {
-                // Turned terminal since the handoff above: the winner has
-                // fulfilled the live hook, but a hook the handoff installed
-                // after that fulfill would dangle and wedge later opens.
-                let result = match &*channel.state.lock().expect("state poisoned") {
-                    CommitState::Failed(_) => Err(libc::EIO),
-                    _ => Ok(()),
-                };
-                self.fulfill_commit_hook(ino, &channel, result);
             }
             _ => {}
         }
@@ -3251,29 +3244,15 @@ impl VirtualFs {
     /// could pass the Writing|Deferred gate and enqueue bytes behind an
     /// in-flight Finish), and Committed/Failed are terminal.
     ///
-    /// A terminal channel gets its hook fulfilled immediately: deferral runs
-    /// without the per-inode staging lock, so an O_TRUNC supersede can flip
-    /// the channel to Failed between flush()'s state check and this call;
-    /// nothing else would ever fulfill that hook (release fast-paths terminal
-    /// channels), and its pending_commits entry would wedge every later open
-    /// of the inode. Both racers may fulfill; fulfill_commit_hook take()s the
-    /// sender, so the second call is a harmless no-op.
+    /// Deferral runs without the per-inode staging lock, so an O_TRUNC
+    /// supersede can flip the channel to Failed between flush()'s state check
+    /// and this call; install_commit_hook fulfills the hook on the spot in
+    /// that case.
     fn defer_commit(&self, ino: u64, channel: &StreamingChannel) {
         self.install_commit_hook(ino, channel);
-        let terminal_result = {
-            let mut state = channel.state.lock().expect("state poisoned");
-            match &*state {
-                CommitState::Writing => {
-                    *state = CommitState::Deferred;
-                    None
-                }
-                CommitState::Deferred | CommitState::Committing => None,
-                CommitState::Committed => Some(Ok(())),
-                CommitState::Failed(_) => Some(Err(libc::EIO)),
-            }
-        };
-        if let Some(result) = terminal_result {
-            self.fulfill_commit_hook(ino, channel, result);
+        let mut state = channel.state.lock().expect("state poisoned");
+        if matches!(&*state, CommitState::Writing) {
+            *state = CommitState::Deferred;
         }
     }
 
@@ -4495,13 +4474,19 @@ enum HeadProbe {
     Transient(crate::error::Error),
 }
 
-/// True when the channel's commit reached a terminal state (Committed or
-/// Failed). Terminal states never regress, so an unlocked read is stable.
+/// The channel's final commit outcome once it reached a terminal state
+/// (Committed or Failed). Terminal states never regress, so an unlocked read
+/// is stable.
+fn terminal_result(channel: &StreamingChannel) -> Option<Result<(), i32>> {
+    match &*channel.state.lock().expect("state poisoned") {
+        CommitState::Committed => Some(Ok(())),
+        CommitState::Failed(_) => Some(Err(libc::EIO)),
+        _ => None,
+    }
+}
+
 fn channel_is_terminal(channel: &StreamingChannel) -> bool {
-    matches!(
-        &*channel.state.lock().expect("state poisoned"),
-        CommitState::Committed | CommitState::Failed(_)
-    )
+    terminal_result(channel).is_some()
 }
 
 /// An open file handle — either a local fd, lazy remote reference, or streaming writer.

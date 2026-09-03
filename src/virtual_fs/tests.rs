@@ -6186,6 +6186,18 @@ fn streaming_worker_surfaces_real_hub_error_on_failed_write() {
     });
 }
 
+/// `ckpt/model/__0_0.distcp` on `hub`, with `ckpt/model` resolved through
+/// point lookups (its children stay unloaded). Returns the model dir inode.
+fn ckpt_model_vfs(hub: &std::sync::Arc<MockHub>) -> (tokio::runtime::Runtime, std::sync::Arc<VirtualFs>, u64) {
+    hub.add_file("ckpt/model/__0_0.distcp", 100, Some("hash1"), None);
+    let (rt, vfs) = vfs_simple(hub, &MockXet::new());
+    let model_ino = rt.block_on(async {
+        let ckpt = vfs.lookup(ROOT_INODE, "ckpt").await.unwrap();
+        vfs.lookup(ckpt.ino, "model").await.unwrap().ino
+    });
+    (rt, vfs, model_ino)
+}
+
 // ── Cross-cloud checkpoint workload: transient-failure behavior ────────
 //
 // A writer commits PyTorch DCP checkpoints while readers in another cloud
@@ -6203,23 +6215,17 @@ fn streaming_worker_surfaces_real_hub_error_on_failed_write() {
 #[test]
 fn lookup_surfaces_eagain_when_tree_listing_rate_limited() {
     let hub = MockHub::new();
-    hub.add_file("ckpt/model/__0_0.distcp", 100, Some("hash1"), None);
-    let xet = MockXet::new();
-    let (rt, vfs) = vfs_simple(&hub, &xet);
+    let (rt, vfs, model_ino) = ckpt_model_vfs(&hub);
 
     rt.block_on(async {
-        // Resolve .../model via point lookups; its children stay unloaded.
-        let ckpt = vfs.lookup(ROOT_INODE, "ckpt").await.unwrap();
-        let model = vfs.lookup(ckpt.ino, "model").await.unwrap();
-
         // Hub starts rate-limiting tree listings (send_with_retry exhausted).
         hub.fail_next_list_tree_with_status(429);
 
-        let errno = vfs.lookup(model.ino, "model").await.unwrap_err();
+        let errno = vfs.lookup(model_ino, "model").await.unwrap_err();
         assert_eq!(errno, libc::EAGAIN, "transient 429 must map to EAGAIN, not EIO");
 
         // Once the rate limit clears, the same lookup resolves normally.
-        let errno = vfs.lookup(model.ino, "model").await.unwrap_err();
+        let errno = vfs.lookup(model_ino, "model").await.unwrap_err();
         assert_eq!(errno, libc::ENOENT, "path truly doesn't exist once Hub is healthy");
     });
 }
@@ -6232,21 +6238,17 @@ fn lookup_surfaces_eagain_when_tree_listing_rate_limited() {
 #[test]
 fn transient_429_does_not_poison_negative_cache() {
     let hub = MockHub::new();
-    hub.add_file("ckpt/model/__0_0.distcp", 100, Some("hash1"), None);
-    let xet = MockXet::new();
-    let (rt, vfs) = vfs_simple(&hub, &xet);
+    let (rt, vfs, model_ino) = ckpt_model_vfs(&hub);
 
     rt.block_on(async {
-        let ckpt = vfs.lookup(ROOT_INODE, "ckpt").await.unwrap();
-        let model = vfs.lookup(ckpt.ino, "model").await.unwrap();
         // Reader listed the checkpoint dir → children_loaded = true.
-        vfs.readdir(model.ino).await.unwrap();
+        vfs.readdir(model_ino).await.unwrap();
 
         // _READY not committed yet; the reader polls for it while the Hub
         // rate-limits the miss-path listing probe. The transient failure
         // surfaces as EAGAIN instead of being cached as a false ENOENT.
         hub.fail_next_list_tree_with_status(429);
-        assert_eq!(vfs.lookup(model.ino, "_READY").await.unwrap_err(), libc::EAGAIN);
+        assert_eq!(vfs.lookup(model_ino, "_READY").await.unwrap_err(), libc::EAGAIN);
 
         // Writer commits _READY; Hub is healthy again.
         hub.add_file("ckpt/model/_READY", 0, None, Some("etag-ready"));
@@ -6261,7 +6263,7 @@ fn transient_429_does_not_poison_negative_cache() {
         );
 
         // The committed marker is visible immediately — no poisoned entry.
-        let attr = vfs.lookup(model.ino, "_READY").await.expect("marker must resolve");
+        let attr = vfs.lookup(model_ino, "_READY").await.expect("marker must resolve");
         assert_eq!(attr.size, 0);
     });
 }
@@ -6309,21 +6311,17 @@ fn shutdown_drains_inflight_advanced_write() {
 #[test]
 fn miss_probe_404_stays_enoent_and_seeds_negative_cache() {
     let hub = MockHub::new_repo();
-    hub.add_file("ckpt/model/__0_0.distcp", 100, Some("hash1"), None);
-    let xet = MockXet::new();
-    let (rt, vfs) = vfs_simple(&hub, &xet);
+    let (rt, vfs, model_ino) = ckpt_model_vfs(&hub);
 
     rt.block_on(async {
-        let ckpt = vfs.lookup(ROOT_INODE, "ckpt").await.unwrap();
-        let model = vfs.lookup(ckpt.ino, "model").await.unwrap();
-        vfs.readdir(model.ino).await.unwrap();
+        vfs.readdir(model_ino).await.unwrap();
 
         hub.fail_next_list_tree_with_status(404);
-        assert_eq!(vfs.lookup(model.ino, "missing").await.unwrap_err(), libc::ENOENT);
+        assert_eq!(vfs.lookup(model_ino, "missing").await.unwrap_err(), libc::ENOENT);
 
         // The authoritative miss is negative-cached: no further Hub probes.
         let listings = hub.list_tree_call_count();
-        assert_eq!(vfs.lookup(model.ino, "missing").await.unwrap_err(), libc::ENOENT);
+        assert_eq!(vfs.lookup(model_ino, "missing").await.unwrap_err(), libc::ENOENT);
         assert_eq!(
             hub.list_tree_call_count(),
             listings,
@@ -6338,14 +6336,10 @@ fn miss_probe_404_stays_enoent_and_seeds_negative_cache() {
 #[test]
 fn miss_probe_permanent_head_failure_still_resolves_dir_via_listing() {
     let hub = MockHub::new();
-    hub.add_file("ckpt/model/__0_0.distcp", 100, Some("hash1"), None);
-    let xet = MockXet::new();
-    let (rt, vfs) = vfs_simple(&hub, &xet);
+    let (rt, vfs, model_ino) = ckpt_model_vfs(&hub);
 
     rt.block_on(async {
-        let ckpt = vfs.lookup(ROOT_INODE, "ckpt").await.unwrap();
-        let model = vfs.lookup(ckpt.ino, "model").await.unwrap();
-        vfs.readdir(model.ino).await.unwrap();
+        vfs.readdir(model_ino).await.unwrap();
 
         // Directory added remotely after the listing was cached.
         hub.add_file("ckpt/model/step-100/__0_0.distcp", 100, Some("hash2"), None);
@@ -6353,7 +6347,7 @@ fn miss_probe_permanent_head_failure_still_resolves_dir_via_listing() {
         // HEAD fails permanently (statusless error); the listing rescues.
         hub.fail_next_head();
         let attr = vfs
-            .lookup(model.ino, "step-100")
+            .lookup(model_ino, "step-100")
             .await
             .expect("dir must resolve via listing");
         assert_eq!(attr.kind, InodeKind::Directory);
@@ -6394,22 +6388,16 @@ fn concurrent_streaming_commits_are_serialized() {
 #[test]
 fn slow_path_lookup_surfaces_transient_head_failure_on_concurrent_listing() {
     let hub = MockHub::new();
-    hub.add_file("ckpt/model/__0_0.distcp", 100, Some("hash1"), None);
-    let xet = MockXet::new();
-    let (rt, vfs) = vfs_simple(&hub, &xet);
+    let (rt, vfs, model_ino) = ckpt_model_vfs(&hub);
 
     rt.block_on(async {
-        let ckpt = vfs.lookup(ROOT_INODE, "ckpt").await.unwrap();
-        let model = vfs.lookup(ckpt.ino, "model").await.unwrap();
-
         // Park the lookup's ensure_children_loaded on the dir-loading lock.
-        let dir_lock = vfs.dir_loading_lock(model.ino);
+        let dir_lock = vfs.dir_loading_lock(model_ino);
         let guard = dir_lock.lock().await;
 
         hub.fail_next_head_with_status(429);
         let heads_before = hub.head_file_call_count();
         let vfs_task = vfs.clone();
-        let model_ino = model.ino;
         let lookup = tokio::spawn(async move { vfs_task.lookup(model_ino, "_READY").await });
 
         // Wait until the lookup ran its HEAD probe (the dir lock comes next).
@@ -6440,16 +6428,11 @@ fn slow_path_lookup_surfaces_transient_head_failure_on_concurrent_listing() {
 #[test]
 fn slow_path_lookup_fresh_listing_wins_over_transient_head_failure() {
     let hub = MockHub::new();
-    hub.add_file("ckpt/model/__0_0.distcp", 100, Some("hash1"), None);
-    let xet = MockXet::new();
-    let (rt, vfs) = vfs_simple(&hub, &xet);
+    let (rt, vfs, model_ino) = ckpt_model_vfs(&hub);
 
     rt.block_on(async {
-        let ckpt = vfs.lookup(ROOT_INODE, "ckpt").await.unwrap();
-        let model = vfs.lookup(ckpt.ino, "model").await.unwrap();
-
         hub.fail_next_head_with_status(429);
-        let errno = vfs.lookup(model.ino, "_READY").await.unwrap_err();
+        let errno = vfs.lookup(model_ino, "_READY").await.unwrap_err();
         assert_eq!(
             errno,
             libc::ENOENT,
@@ -6458,7 +6441,7 @@ fn slow_path_lookup_fresh_listing_wins_over_transient_head_failure() {
 
         // The authoritative miss is negative-cached: no further Hub probes.
         let listings = hub.list_tree_call_count();
-        assert_eq!(vfs.lookup(model.ino, "_READY").await.unwrap_err(), libc::ENOENT);
+        assert_eq!(vfs.lookup(model_ino, "_READY").await.unwrap_err(), libc::ENOENT);
         assert_eq!(hub.list_tree_call_count(), listings);
     });
 }

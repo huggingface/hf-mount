@@ -422,9 +422,11 @@ async fn send_with_retry(
                     continue;
                 }
                 let body = resp.text().await.unwrap_or_default();
-                return Err(
-                    Error::hub_status(status, format!("{context}: {status} {body}")).with_retry_after(hinted_delay)
-                );
+                return Err(Error::Hub {
+                    message: format!("{context}: {status} {body}"),
+                    status: Some(status),
+                    retry_after: hinted_delay,
+                });
             }
             Err(err) if is_transient_http(&err) && attempt <= MAX_RETRIES => {
                 let delay = retry_delay(attempt);

@@ -32,13 +32,6 @@ impl Error {
         }
     }
 
-    pub fn with_retry_after(mut self, delay: Option<std::time::Duration>) -> Self {
-        if let Self::Hub { retry_after, .. } = &mut self {
-            *retry_after = delay;
-        }
-        self
-    }
-
     /// How long the server asked us to wait before retrying, when it said.
     pub fn retry_after(&self) -> Option<std::time::Duration> {
         match self {
@@ -176,12 +169,14 @@ mod tests {
     #[test]
     fn retry_after_only_carried_by_hub_errors() {
         let delay = std::time::Duration::from_secs(30);
-        assert_eq!(
-            Error::hub_status(429, "x").with_retry_after(Some(delay)).retry_after(),
-            Some(delay)
-        );
+        let hinted = Error::Hub {
+            message: "x".into(),
+            status: Some(429),
+            retry_after: Some(delay),
+        };
+        assert_eq!(hinted.retry_after(), Some(delay));
         assert_eq!(Error::hub_status(429, "x").retry_after(), None);
-        assert_eq!(Error::Xet("x".into()).with_retry_after(Some(delay)).retry_after(), None);
+        assert_eq!(Error::Xet("x".into()).retry_after(), None);
     }
 
     #[test]
