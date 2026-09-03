@@ -49,6 +49,16 @@ pub enum Source {
 /// value flows into Hub URLs and the args file, where a `?` would split the URL
 /// into a query string and smuggle the trailing text on. An allowlist refuses
 /// anything unanticipated; branches, tags, slashed branches and SHAs all pass.
+/// Parse an octal permission string such as `0755`, `755` or `0o777`.
+fn parse_mode(s: &str) -> Result<u16, String> {
+    let digits = s.strip_prefix("0o").unwrap_or(s);
+    let mode = u16::from_str_radix(digits, 8).map_err(|_| format!("{s:?} is not an octal permission mode"))?;
+    if mode > 0o7777 {
+        return Err(format!("{s:?} exceeds the maximum permission mode 07777"));
+    }
+    Ok(mode)
+}
+
 fn validate_revision(s: &str) -> Result<String, String> {
     if s.is_empty() {
         return Err("revision must not be empty".to_string());
@@ -115,6 +125,16 @@ pub struct MountOptions {
     /// Override the GID for all files and directories (defaults to current group)
     #[arg(long)]
     pub gid: Option<u32>,
+
+    /// Permission bits (octal) reported for directories listed from the remote.
+    /// Entries created through the mount keep the mode they were created with.
+    #[arg(long, default_value = "0755", value_parser = parse_mode)]
+    pub dir_mode: u16,
+
+    /// Permission bits (octal) reported for files listed from the remote.
+    /// Entries created through the mount keep the mode they were created with.
+    #[arg(long, default_value = "0644", value_parser = parse_mode)]
+    pub file_mode: u16,
 
     /// Mount in read-only mode (no writes allowed)
     #[arg(long, default_value_t = false)]
@@ -550,7 +570,8 @@ pub fn build_with_runtime(
         "Config: advanced_writes={} overlay={} remote_read_only={} direct_io={} poll_interval={}s \
          poll_listing_concurrency={} metadata_ttl={}ms \
          cache_dir={:?} cache_size={} no_disk_cache={} cache_mode={:?} max_staging_size={} max_threads={} \
-         flush_debounce={}ms flush_max_batch={}ms read_fetch_timeout={}ms uid={} gid={} filter_os_files={}",
+         flush_debounce={}ms flush_max_batch={}ms read_fetch_timeout={}ms uid={} gid={} dir_mode={:04o} \
+         file_mode={:04o} filter_os_files={}",
         advanced_writes,
         options.overlay,
         remote_read_only,
@@ -569,6 +590,8 @@ pub fn build_with_runtime(
         options.read_fetch_timeout_ms,
         uid,
         gid,
+        options.dir_mode,
+        options.file_mode,
         !options.no_filter_os_files,
     );
 
@@ -586,6 +609,8 @@ pub fn build_with_runtime(
             advanced_writes,
             uid,
             gid,
+            dir_mode: options.dir_mode,
+            file_mode: options.file_mode,
             poll_interval_secs: options.poll_interval_secs,
             poll_listing_concurrency: options.poll_listing_concurrency as usize,
             metadata_ttl,
@@ -672,7 +697,22 @@ fn build_cas_config(
 
 #[cfg(test)]
 mod tests {
-    use super::validate_revision;
+    use super::{parse_mode, validate_revision};
+
+    #[test]
+    fn parse_mode_accepts_octal_forms() {
+        assert_eq!(parse_mode("0755").unwrap(), 0o755);
+        assert_eq!(parse_mode("777").unwrap(), 0o777);
+        assert_eq!(parse_mode("0o666").unwrap(), 0o666);
+        assert_eq!(parse_mode("1777").unwrap(), 0o1777);
+    }
+
+    #[test]
+    fn parse_mode_rejects_invalid() {
+        for bad in ["", "8", "0x1ff", "rwx", "10000"] {
+            assert!(parse_mode(bad).is_err(), "should reject {bad:?}");
+        }
+    }
 
     #[test]
     fn accepts_plain_refs_and_shas() {

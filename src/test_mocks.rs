@@ -558,6 +558,8 @@ pub struct TestOpts {
     pub inode_soft_limit: usize,
     pub max_staging_size: u64,
     pub read_fetch_timeout: Duration,
+    pub dir_mode: u16,
+    pub file_mode: u16,
 }
 
 impl Default for TestOpts {
@@ -571,6 +573,8 @@ impl Default for TestOpts {
             inode_soft_limit: 0,
             max_staging_size: 0,
             read_fetch_timeout: Duration::from_secs(30),
+            dir_mode: 0o755,
+            file_mode: 0o644,
         }
     }
 }
@@ -644,6 +648,8 @@ pub fn make_test_vfs(
             advanced_writes: opts.advanced_writes,
             uid: 1000,
             gid: 1000,
+            dir_mode: opts.dir_mode,
+            file_mode: opts.file_mode,
             poll_interval_secs: 0,
             poll_listing_concurrency: 4,
             metadata_ttl: opts.metadata_ttl,
@@ -689,6 +695,8 @@ pub fn make_overlay_test_vfs_with_root(
             advanced_writes: false,
             uid: 1000,
             gid: 1000,
+            dir_mode: 0o755,
+            file_mode: 0o644,
             poll_interval_secs: 0,
             poll_listing_concurrency: 4,
             metadata_ttl: Duration::from_secs(1),

@@ -1966,6 +1966,68 @@ fn writable_permissions() {
     });
 }
 
+/// `dir_mode` / `file_mode` override the mode reported for remote-listed
+/// entries (including the root), while entries created through the mount
+/// keep the mode they were created with.
+#[test]
+fn custom_remote_modes() {
+    let hub = MockHub::new();
+    hub.add_file("file.txt", 100, Some("hash1"), None);
+    hub.add_dir("mydir");
+    let xet = MockXet::new();
+    let rt = new_runtime();
+    let vfs = make_test_vfs(
+        hub.clone(),
+        xet.clone(),
+        TestOpts {
+            dir_mode: 0o777,
+            file_mode: 0o666,
+            ..Default::default()
+        },
+        &rt,
+    );
+
+    rt.block_on(async {
+        assert_eq!(vfs.getattr(ROOT_INODE).unwrap().perm, 0o777);
+        assert_eq!(vfs.lookup(ROOT_INODE, "file.txt").await.unwrap().perm, 0o666);
+        assert_eq!(vfs.lookup(ROOT_INODE, "mydir").await.unwrap().perm, 0o777);
+
+        let (created, _fh) = vfs
+            .create(ROOT_INODE, "new.txt", 0o640, 1001, 1001, None)
+            .await
+            .unwrap();
+        assert_eq!(created.perm, 0o640);
+        assert_eq!(created.uid, 1001);
+        let mkdir = vfs.mkdir(ROOT_INODE, "newdir", 0o750, 1001, 1001).await.unwrap();
+        assert_eq!(mkdir.perm, 0o750);
+    });
+}
+
+/// Read-only mounts ignore `dir_mode` / `file_mode`.
+#[test]
+fn custom_remote_modes_ignored_when_readonly() {
+    let hub = MockHub::new();
+    hub.add_file("file.txt", 100, Some("hash1"), None);
+    let xet = MockXet::new();
+    let rt = new_runtime();
+    let vfs = make_test_vfs(
+        hub.clone(),
+        xet.clone(),
+        TestOpts {
+            read_only: true,
+            dir_mode: 0o777,
+            file_mode: 0o666,
+            ..Default::default()
+        },
+        &rt,
+    );
+
+    rt.block_on(async {
+        assert_eq!(vfs.getattr(ROOT_INODE).unwrap().perm, 0o555);
+        assert_eq!(vfs.lookup(ROOT_INODE, "file.txt").await.unwrap().perm, 0o444);
+    });
+}
+
 /// unlink/rename/rmdir on a read-only VFS all return EROFS.
 #[test]
 fn mutation_ops_readonly_erofs() {

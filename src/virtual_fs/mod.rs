@@ -110,6 +110,10 @@ pub struct VfsConfig {
     pub advanced_writes: bool,
     pub uid: u32,
     pub gid: u32,
+    /// Mode reported for directories listed from the remote (no POSIX metadata upstream).
+    pub dir_mode: u16,
+    /// Mode reported for files listed from the remote.
+    pub file_mode: u16,
     pub poll_interval_secs: u64,
     /// Maximum concurrent tree-listing requests per poll round.
     /// Must be >= 1.
@@ -183,6 +187,8 @@ pub struct VirtualFs {
     next_file_handle: AtomicU64,
     uid: u32,
     gid: u32,
+    dir_mode: u16,
+    file_mode: u16,
     /// Negative lookup cache: paths known to not exist (TTL-based).
     negative_cache: Arc<RwLock<HashMap<String, Instant>>>,
     /// Per-directory loading locks: serializes concurrent ensure_children_loaded() calls
@@ -322,6 +328,8 @@ impl VirtualFs {
             next_file_handle: AtomicU64::new(1),
             uid: config.uid,
             gid: config.gid,
+            dir_mode: config.dir_mode,
+            file_mode: config.file_mode,
             negative_cache,
             dir_loading_locks: Mutex::new(HashMap::new()),
             pending_commits: Mutex::new(HashMap::new()),
@@ -346,6 +354,7 @@ impl VirtualFs {
                 root.atime = root.mtime;
                 root.uid = vfs.uid;
                 root.gid = vfs.gid;
+                root.mode = vfs.dir_mode;
             }
         }
 
@@ -855,7 +864,7 @@ impl VirtualFs {
                         0,
                         self.hub_client.default_mtime(),
                         None,
-                        0o755,
+                        self.dir_mode,
                         self.uid,
                         self.gid,
                     );
@@ -872,7 +881,11 @@ impl VirtualFs {
                     .as_deref()
                     .map(crate::hub_api::mtime_from_str)
                     .unwrap_or_else(|| self.hub_client.default_mtime());
-                let default_mode = if kind == InodeKind::Directory { 0o755 } else { 0o644 };
+                let default_mode = if kind == InodeKind::Directory {
+                    self.dir_mode
+                } else {
+                    self.file_mode
+                };
 
                 let ino = inodes.insert(
                     parent_ino,
@@ -1501,7 +1514,7 @@ impl VirtualFs {
             size,
             mtime,
             head.xet_hash,
-            0o644,
+            self.file_mode,
             self.uid,
             self.gid,
         );
@@ -1538,7 +1551,7 @@ impl VirtualFs {
             0,
             self.hub_client.default_mtime(),
             None,
-            0o755,
+            self.dir_mode,
             self.uid,
             self.gid,
         );
