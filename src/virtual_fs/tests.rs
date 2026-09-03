@@ -6462,7 +6462,12 @@ fn install_commit_hook_on_terminal_channel_does_not_wedge_pending_commits() {
         let fh = vfs.open(ino, true, true, Some(1)).await.unwrap();
         write_blocking(&vfs, ino, fh, 0, b"checkpoint bytes").await.unwrap();
         vfs.flush(ino, fh, Some(1)).await.unwrap();
-        let channel = vfs.streaming_channel_for(ino).expect("handle still open");
+        // streaming_channel_for() deliberately skips terminal channels;
+        // fetch the (still open) handle's channel directly.
+        let channel = match vfs.open_files.read().unwrap().get(&fh) {
+            Some(OpenFile::Streaming { channel, .. }) => channel.clone(),
+            _ => panic!("streaming handle still open"),
+        };
         assert!(channel_is_terminal(&channel));
 
         // A late deferral (dup'd fd flush racing the commit) installs after
