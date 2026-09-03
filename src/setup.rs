@@ -744,10 +744,7 @@ fn hf_mount_mounted_at(path: &Path) -> bool {
     let Ok(mountinfo) = std::fs::read("/proc/self/mountinfo") else {
         return false;
     };
-    // Lexical absolutization only — the path stats with an error, so
-    // canonicalize() is not an option here.
-    let target = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
-    mountinfo_has_hf_mount(&String::from_utf8_lossy(&mountinfo), &target.to_string_lossy())
+    mountinfo_has_hf_mount(&String::from_utf8_lossy(&mountinfo), path)
 }
 
 /// No mount table to consult off Linux: fail closed (the dead-mount recovery
@@ -765,7 +762,12 @@ fn hf_mount_mounted_at(_path: &Path) -> bool {
 /// fstype "fuse" with source `FS_NAME` (fuser FSName); mountpod-mode mounts
 /// made by the CSI helper show as fstype `fuse.<FS_NAME>`.
 #[cfg(any(target_os = "linux", test))]
-fn mountinfo_has_hf_mount(mountinfo: &str, target: &str) -> bool {
+fn mountinfo_has_hf_mount(mountinfo: &str, target: &Path) -> bool {
+    // mountinfo prints mount points normalized (absolute, no trailing slash,
+    // no `.`/`..`); the configured path may be spelled otherwise. Lexical
+    // only: the path stats with an error, so canonicalize() is not an option.
+    let target = normalize_lexically(&std::path::absolute(target).unwrap_or_else(|_| target.to_path_buf()));
+    let target = target.to_string_lossy();
     let topmost = mountinfo.lines().rev().find(|line| {
         // Fields: id parent major:minor root MOUNT-POINT options... - FSTYPE SOURCE super_opts
         // mountinfo octal-escapes whitespace and backslash in paths.
@@ -784,6 +786,23 @@ fn mountinfo_has_hf_mount(mountinfo: &str, target: &str) -> bool {
         return false;
     };
     fstype.strip_prefix("fuse.") == Some(FS_NAME) || (fstype.starts_with("fuse") && source == FS_NAME)
+}
+
+/// Collapse `.`, `..` and trailing separators without touching the filesystem.
+#[cfg(any(target_os = "linux", test))]
+fn normalize_lexically(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 /// Retry window for Hub calls made during mount startup, before the FUSE
@@ -905,6 +924,7 @@ pub(crate) fn unmount_fuse(mount_point: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{mountinfo_has_hf_mount, validate_revision};
+    use std::path::Path;
 
     #[test]
     fn mountinfo_matches_hf_mount_mounts_only() {
@@ -919,20 +939,23 @@ mod tests {
 43 25 0:37 / /mnt/stacked rw shared:6 - nfs4 10.0.0.2:/export rw
 ";
         // Direct mount (fuser FSName) and mountpod mount (CSI helper subtype).
-        assert!(mountinfo_has_hf_mount(mountinfo, "/mnt/hf"));
-        assert!(mountinfo_has_hf_mount(mountinfo, "/mnt/pod"));
-        assert!(mountinfo_has_hf_mount(mountinfo, "/mnt/with space"));
+        assert!(mountinfo_has_hf_mount(mountinfo, Path::new("/mnt/hf")));
+        // Spellings mountinfo normalizes away must still match.
+        assert!(mountinfo_has_hf_mount(mountinfo, Path::new("/mnt/hf/")));
+        assert!(mountinfo_has_hf_mount(mountinfo, Path::new("/mnt/./other/../hf")));
+        assert!(mountinfo_has_hf_mount(mountinfo, Path::new("/mnt/pod")));
+        assert!(mountinfo_has_hf_mount(mountinfo, Path::new("/mnt/with space")));
         // A foreign FUSE filesystem is not ours.
-        assert!(!mountinfo_has_hf_mount(mountinfo, "/mnt/other"));
+        assert!(!mountinfo_has_hf_mount(mountinfo, Path::new("/mnt/other")));
         // Non-FUSE filesystems and non-mountpoints must not match.
-        assert!(!mountinfo_has_hf_mount(mountinfo, "/data/nfs"));
-        assert!(!mountinfo_has_hf_mount(mountinfo, "/mnt/disk"));
-        assert!(!mountinfo_has_hf_mount(mountinfo, "/mnt/nothing"));
+        assert!(!mountinfo_has_hf_mount(mountinfo, Path::new("/data/nfs")));
+        assert!(!mountinfo_has_hf_mount(mountinfo, Path::new("/mnt/disk")));
+        assert!(!mountinfo_has_hf_mount(mountinfo, Path::new("/mnt/nothing")));
         // Exact match only — a parent of a mount is not itself one.
-        assert!(!mountinfo_has_hf_mount(mountinfo, "/mnt"));
+        assert!(!mountinfo_has_hf_mount(mountinfo, Path::new("/mnt")));
         // A foreign filesystem overmounted on a dead hf-mount is the active
         // mount: umount2 would detach it, so it must not qualify.
-        assert!(!mountinfo_has_hf_mount(mountinfo, "/mnt/stacked"));
+        assert!(!mountinfo_has_hf_mount(mountinfo, Path::new("/mnt/stacked")));
     }
 
     #[test]
