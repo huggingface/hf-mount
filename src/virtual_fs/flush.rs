@@ -189,7 +189,7 @@ impl FlushManager {
 
 /// Run a blocking closure, using `block_in_place` when called from within the
 /// Tokio runtime (e.g. NFS shutdown) and directly otherwise (e.g. FUSE destroy).
-fn run_blocking<F: FnOnce()>(f: F) {
+pub(super) fn run_blocking<F: FnOnce()>(f: F) {
     if tokio::runtime::Handle::try_current().is_ok() {
         tokio::task::block_in_place(f);
     } else {

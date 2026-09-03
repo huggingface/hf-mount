@@ -9,7 +9,7 @@ use tokio::io::AsyncWriteExt;
 use tracing::{info, warn};
 use xet_client::cas_client::auth::{AuthError, TokenInfo, TokenRefresher};
 
-use crate::error::{Error, Result, is_retryable_status};
+use crate::error::{Error, Result, is_retryable_status, is_transient_http};
 
 /// Characters that must be percent-encoded when a file path is interpolated
 /// into a URL path: `#` starts a fragment, `?` a query string, `%` corrupts
@@ -320,10 +320,14 @@ pub fn split_path_prefix(raw: &str) -> std::result::Result<(&str, &str), &'stati
     }
 }
 
-fn retry_delay(attempt: u32) -> std::time::Duration {
+pub(crate) fn retry_delay(attempt: u32) -> std::time::Duration {
     debug_assert!(attempt > 0, "retry_delay called with attempt=0");
     std::time::Duration::from_millis(500 * 2u64.pow(attempt - 1))
 }
+
+/// Upper bound on any single retry sleep, whether server-hinted (RateLimit
+/// header) or exponential.
+pub(crate) const MAX_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Parse the IETF `RateLimit` header for `t=<seconds>` (time until window reset), capped at 30s.
 /// Format: `"resource_type";r=<remaining>;t=<seconds_until_reset>`
@@ -335,7 +339,9 @@ fn parse_retry_delay(headers: &reqwest::header::HeaderMap) -> Option<std::time::
         if let Some(secs_str) = part.strip_prefix("t=")
             && let Ok(secs) = secs_str.parse::<u64>()
         {
-            return Some(std::time::Duration::from_secs(secs.min(30)));
+            // t=0 means the window already reset: no hint, use the backoff
+            // schedule rather than retrying immediately.
+            return (secs > 0).then(|| std::time::Duration::from_secs(secs).min(MAX_RETRY_DELAY));
         }
     }
     None
@@ -389,6 +395,8 @@ async fn probe_repo(
 
 /// Send an HTTP request with automatic retry on transient errors (408, 429, 5xx, timeouts).
 /// Uses the IETF RateLimit header's t= parameter when present, falls back to exponential backoff (2 retries max).
+/// When the retries are exhausted the returned error carries the server's last
+/// RateLimit hint (`Error::retry_after`) so an outer loop can keep honoring it.
 /// Set `accept_redirects` to treat 3xx as success (needed for HEAD on /resolve/ endpoints
 /// where the redirect response itself carries metadata headers).
 async fn send_with_retry(
@@ -406,16 +414,21 @@ async fn send_with_retry(
             }
             Ok(resp) => {
                 let status = resp.status().as_u16();
+                let hinted_delay = parse_retry_delay(resp.headers());
                 if is_retryable_status(status) && attempt <= MAX_RETRIES {
-                    let delay = parse_retry_delay(resp.headers()).unwrap_or_else(|| retry_delay(attempt));
+                    let delay = hinted_delay.unwrap_or_else(|| retry_delay(attempt));
                     warn!("{context}: transient error ({status}), retry {attempt}/{MAX_RETRIES} in {delay:?}");
                     tokio::time::sleep(delay).await;
                     continue;
                 }
                 let body = resp.text().await.unwrap_or_default();
-                return Err(Error::hub_status(status, format!("{context}: {status} {body}")));
+                return Err(Error::Hub {
+                    message: format!("{context}: {status} {body}"),
+                    status: Some(status),
+                    retry_after: hinted_delay,
+                });
             }
-            Err(err) if (err.is_timeout() || err.is_connect()) && attempt <= MAX_RETRIES => {
+            Err(err) if is_transient_http(&err) && attempt <= MAX_RETRIES => {
                 let delay = retry_delay(attempt);
                 warn!("{context}: transient error, retry {attempt}/{MAX_RETRIES} in {delay:?}: {err}");
                 tokio::time::sleep(delay).await;
@@ -493,23 +506,28 @@ impl HubApiClient {
             SourceKind::Bucket { bucket_id } => {
                 let url = format!("{}/api/buckets/{}", endpoint, bucket_id);
                 let context = format!("resolve bucket {bucket_id}");
-                let resp = match send_with_retry(|| init_auth_get(&client, &url, token, &token_file), &context, false)
-                    .await
-                {
-                    Ok(r) => r,
-                    Err(err) => {
-                        // Common mistake: user passed a repo id to `bucket`. Probe the
-                        // repo APIs and, if one matches, surface a hint instead of the
-                        // raw 401 from the bucket endpoint.
-                        if let Some(repo_type) = probe_repo(&client, &endpoint, &bucket_id, token, &token_file).await {
-                            return Err(Error::hub(format!(
-                                "{bucket_id} is not a bucket, but it exists as a {repo_type}. \
+                let resp =
+                    match send_with_retry(|| init_auth_get(&client, &url, token, &token_file), &context, false).await {
+                        Ok(r) => r,
+                        Err(err) => {
+                            // Common mistake: user passed a repo id to `bucket`. Probe the
+                            // repo APIs and, if one matches, surface a hint instead of the
+                            // raw 401 from the bucket endpoint. Skip the probe on transient
+                            // failures (rate limit, 5xx): it cannot succeed while the user
+                            // is being throttled, and startup retries would multiply its 3
+                            // extra requests into the very storm being waited out.
+                            if !err.is_transient()
+                                && let Some(repo_type) =
+                                    probe_repo(&client, &endpoint, &bucket_id, token, &token_file).await
+                            {
+                                return Err(Error::hub(format!(
+                                    "{bucket_id} is not a bucket, but it exists as a {repo_type}. \
                                  Use `repo {bucket_id}` (read-only) instead of `bucket {bucket_id}`."
-                            )));
+                                )));
+                            }
+                            return Err(err);
                         }
-                        return Err(err);
-                    }
-                };
+                    };
                 let body: serde_json::Value = resp.json().await?;
                 let last_modified = body["updatedAt"].as_str().map(mtime_from_str).unwrap_or(UNIX_EPOCH);
                 (SourceKind::Bucket { bucket_id }, last_modified)
@@ -1540,6 +1558,13 @@ mod tests {
     }
 
     // ── retry / error helpers ─────────────────────────────────────────
+
+    #[test]
+    fn parse_retry_delay_ignores_zero_hint() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("ratelimit", r#""hub_api";r=0;t=0"#.parse().unwrap());
+        assert_eq!(parse_retry_delay(&headers), None);
+    }
 
     #[test]
     fn retry_delay_exponential_backoff() {

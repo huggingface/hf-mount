@@ -6185,3 +6185,299 @@ fn streaming_worker_surfaces_real_hub_error_on_failed_write() {
         worker.await.unwrap();
     });
 }
+
+/// `ckpt/model/__0_0.distcp` on `hub`, with `ckpt/model` resolved through
+/// point lookups (its children stay unloaded). Returns the model dir inode.
+fn ckpt_model_vfs(hub: &std::sync::Arc<MockHub>) -> (tokio::runtime::Runtime, std::sync::Arc<VirtualFs>, u64) {
+    hub.add_file("ckpt/model/__0_0.distcp", 100, Some("hash1"), None);
+    let (rt, vfs) = vfs_simple(hub, &MockXet::new());
+    let model_ino = rt.block_on(async {
+        let ckpt = vfs.lookup(ROOT_INODE, "ckpt").await.unwrap();
+        vfs.lookup(ckpt.ino, "model").await.unwrap().ino
+    });
+    (rt, vfs, model_ino)
+}
+
+// ── Cross-cloud checkpoint workload: transient-failure behavior ────────
+//
+// A writer commits PyTorch DCP checkpoints while readers in another cloud
+// stat/load them, with the reader's HF user rate-limited (429) on the tree
+// API.
+
+/// `stat()` on a non-existent path (DCP probes `<ckpt>/model/model`, which
+/// never exists) under Hub rate limiting.
+///
+/// The parent directory's children are not loaded (point lookups only, or
+/// invalidated by the poll loop after a remote commit), so lookup takes the
+/// slow path: HEAD → 404 (Ok(None)), then ensure_children_loaded →
+/// list_tree → 429. A transient 429 must surface as EAGAIN (Error::to_errno),
+/// never as EIO — EIO reads as hard data loss and aborts distributed jobs.
+#[test]
+fn lookup_surfaces_eagain_when_tree_listing_rate_limited() {
+    let hub = MockHub::new();
+    let (rt, vfs, model_ino) = ckpt_model_vfs(&hub);
+
+    rt.block_on(async {
+        // Hub starts rate-limiting tree listings (send_with_retry exhausted).
+        hub.fail_next_list_tree_with_status(429);
+
+        let errno = vfs.lookup(model_ino, "model").await.unwrap_err();
+        assert_eq!(errno, libc::EAGAIN, "transient 429 must map to EAGAIN, not EIO");
+
+        // Once the rate limit clears, the same lookup resolves normally.
+        let errno = vfs.lookup(model_ino, "model").await.unwrap_err();
+        assert_eq!(errno, libc::ENOENT, "path truly doesn't exist once Hub is healthy");
+    });
+}
+
+/// Negative-cache poisoning: a reader polls for
+/// `_READY` while the Hub is rate-limiting. The lookup miss path must NOT
+/// cache the transient failure as "does not exist" — once the writer commits
+/// `_READY` and the Hub recovers, the marker must be visible immediately,
+/// not after NEG_CACHE_TTL.
+#[test]
+fn transient_429_does_not_poison_negative_cache() {
+    let hub = MockHub::new();
+    let (rt, vfs, model_ino) = ckpt_model_vfs(&hub);
+
+    rt.block_on(async {
+        // Reader listed the checkpoint dir → children_loaded = true.
+        vfs.readdir(model_ino).await.unwrap();
+
+        // _READY not committed yet; the reader polls for it while the Hub
+        // rate-limits the miss-path listing probe. The transient failure
+        // surfaces as EAGAIN instead of being cached as a false ENOENT.
+        hub.fail_next_list_tree_with_status(429);
+        assert_eq!(vfs.lookup(model_ino, "_READY").await.unwrap_err(), libc::EAGAIN);
+
+        // Writer commits _READY; Hub is healthy again.
+        hub.add_file("ckpt/model/_READY", 0, None, Some("etag-ready"));
+        hub.set_head(
+            "ckpt/model/_READY",
+            Some(HeadFileInfo {
+                xet_hash: None,
+                etag: Some("etag-ready".to_string()),
+                size: Some(0),
+                last_modified: None,
+            }),
+        );
+
+        // The committed marker is visible immediately — no poisoned entry.
+        let attr = vfs.lookup(model_ino, "_READY").await.expect("marker must resolve");
+        assert_eq!(attr.size, 0);
+    });
+}
+
+/// On SIGTERM the sidecar calls `vfs.shutdown()` then `exit(0)`. Both write
+/// modes must drain data the application already wrote before the process
+/// exits — otherwise exit(0) aborts the FUSE connection under the writer and
+/// silently drops the bytes. Exercises open-but-unclosed handles (the app is
+/// killed by the same signal and never calls close()).
+fn assert_shutdown_drains_inflight_write(advanced: bool) {
+    let hub = MockHub::new();
+    hub.add_file("ckpt.distcp", 100, Some("hash1"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = if advanced {
+        vfs_advanced(&hub, &xet)
+    } else {
+        vfs_simple(&hub, &xet)
+    };
+    rt.block_on(async {
+        let ino = vfs.lookup(ROOT_INODE, "ckpt.distcp").await.unwrap().ino;
+        let fh = vfs.open(ino, true, true, Some(1)).await.unwrap();
+        write_blocking(&vfs, ino, fh, 0, b"checkpoint bytes").await.unwrap();
+    });
+    vfs.shutdown();
+    assert!(
+        !hub.take_batch_log().is_empty(),
+        "shutdown (advanced={advanced}) must commit the in-flight write"
+    );
+}
+
+#[test]
+fn shutdown_drains_inflight_streaming_write() {
+    assert_shutdown_drains_inflight_write(false);
+}
+
+#[test]
+fn shutdown_drains_inflight_advanced_write() {
+    assert_shutdown_drains_inflight_write(true);
+}
+
+/// The repo tree endpoint returns 404 for a nonexistent path (buckets return
+/// an empty listing). A 404 on the miss-probe listing is an authoritative
+/// "does not exist": it must stay ENOENT and seed the negative cache — not
+/// surface as EIO like other non-transient failures.
+#[test]
+fn miss_probe_404_stays_enoent_and_seeds_negative_cache() {
+    let hub = MockHub::new_repo();
+    let (rt, vfs, model_ino) = ckpt_model_vfs(&hub);
+
+    rt.block_on(async {
+        vfs.readdir(model_ino).await.unwrap();
+
+        hub.fail_next_list_tree_with_status(404);
+        assert_eq!(vfs.lookup(model_ino, "missing").await.unwrap_err(), libc::ENOENT);
+
+        // The authoritative miss is negative-cached: no further Hub probes.
+        let listings = hub.list_tree_call_count();
+        assert_eq!(vfs.lookup(model_ino, "missing").await.unwrap_err(), libc::ENOENT);
+        assert_eq!(
+            hub.list_tree_call_count(),
+            listings,
+            "second lookup must hit the negative cache"
+        );
+    });
+}
+
+/// A PERMANENT HEAD failure must not kill the lookup: the targeted listing
+/// below can still resolve the path when it is a directory (the resolve
+/// endpoint is file-only). Only transient failures early-return.
+#[test]
+fn miss_probe_permanent_head_failure_still_resolves_dir_via_listing() {
+    let hub = MockHub::new();
+    let (rt, vfs, model_ino) = ckpt_model_vfs(&hub);
+
+    rt.block_on(async {
+        vfs.readdir(model_ino).await.unwrap();
+
+        // Directory added remotely after the listing was cached.
+        hub.add_file("ckpt/model/step-100/__0_0.distcp", 100, Some("hash2"), None);
+
+        // HEAD fails permanently (statusless error); the listing rescues.
+        hub.fail_next_head();
+        let attr = vfs
+            .lookup(model_ino, "step-100")
+            .await
+            .expect("dir must resolve via listing");
+        assert_eq!(attr.kind, InodeKind::Directory);
+    });
+}
+
+/// Two concurrent commit attempts on the same handle (shutdown drain
+/// overlapping a normal flush) must both succeed with a single Hub commit.
+/// The worker replies to a single Finish: without serialization the loser
+/// races a second Finish into a dead channel, reports a false EIO, and the
+/// subsequent release reverts the inode of a successfully committed file.
+#[test]
+fn concurrent_streaming_commits_are_serialized() {
+    let hub = MockHub::new();
+    hub.add_file("ckpt.distcp", 100, Some("hash1"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let ino = vfs.lookup(ROOT_INODE, "ckpt.distcp").await.unwrap().ino;
+        let fh = vfs.open(ino, true, true, Some(1)).await.unwrap();
+        write_blocking(&vfs, ino, fh, 0, b"checkpoint bytes").await.unwrap();
+
+        let (first, second) = tokio::join!(vfs.flush(ino, fh, Some(1)), vfs.flush(ino, fh, Some(1)));
+        assert_eq!(first, Ok(()), "concurrent flush must not race the commit");
+        assert_eq!(second, Ok(()), "concurrent flush must not race the commit");
+        vfs.release(fh).await.unwrap();
+    });
+    assert_eq!(hub.take_batch_log().len(), 1, "exactly one Hub commit");
+}
+
+/// Slow-path lookup with a transiently failing HEAD probe, while the parent
+/// listing is loaded by a concurrent task (simulated by holding the
+/// dir-loading lock and marking the listing loaded before releasing it).
+/// That listing may predate a remote commit and the HEAD probe that would
+/// have caught a newer file was rate-limited: the miss must surface EAGAIN,
+/// not a false ENOENT.
+#[test]
+fn slow_path_lookup_surfaces_transient_head_failure_on_concurrent_listing() {
+    let hub = MockHub::new();
+    let (rt, vfs, model_ino) = ckpt_model_vfs(&hub);
+
+    rt.block_on(async {
+        // Park the lookup's ensure_children_loaded on the dir-loading lock.
+        let dir_lock = vfs.dir_loading_lock(model_ino);
+        let guard = dir_lock.lock().await;
+
+        hub.fail_next_head_with_status(429);
+        let heads_before = hub.head_file_call_count();
+        let vfs_task = vfs.clone();
+        let lookup = tokio::spawn(async move { vfs_task.lookup(model_ino, "_READY").await });
+
+        // Wait until the lookup ran its HEAD probe (the dir lock comes next).
+        while hub.head_file_call_count() == heads_before {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // The "concurrent task" publishes a listing that predates _READY.
+        {
+            let mut inodes = vfs.inode_table.write().unwrap();
+            let entry = inodes.get_mut(model_ino).unwrap();
+            entry.children_loaded_at = Some(std::time::Instant::now());
+            entry.children_from_remote = true;
+        }
+        drop(guard);
+
+        let errno = lookup.await.unwrap().unwrap_err();
+        assert_eq!(
+            errno,
+            libc::EAGAIN,
+            "stale-listing miss under rate limiting must not be ENOENT"
+        );
+    });
+}
+
+/// Same transient HEAD failure, but the lookup itself fetches a fresh
+/// listing: the miss is authoritative — ENOENT, and negative-cached.
+#[test]
+fn slow_path_lookup_fresh_listing_wins_over_transient_head_failure() {
+    let hub = MockHub::new();
+    let (rt, vfs, model_ino) = ckpt_model_vfs(&hub);
+
+    rt.block_on(async {
+        hub.fail_next_head_with_status(429);
+        let errno = vfs.lookup(model_ino, "_READY").await.unwrap_err();
+        assert_eq!(
+            errno,
+            libc::ENOENT,
+            "fresh listing is authoritative despite the HEAD failure"
+        );
+
+        // The authoritative miss is negative-cached: no further Hub probes.
+        let listings = hub.list_tree_call_count();
+        assert_eq!(vfs.lookup(model_ino, "_READY").await.unwrap_err(), libc::ENOENT);
+        assert_eq!(hub.list_tree_call_count(), listings);
+    });
+}
+
+/// Installing a commit hook on a channel that already reached a terminal
+/// state must fulfill it on the spot: nothing else would ever fulfill it
+/// (release fast-paths terminal channels) and a live pending_commits entry
+/// would wedge every later open of the inode.
+#[test]
+fn install_commit_hook_on_terminal_channel_does_not_wedge_pending_commits() {
+    let hub = MockHub::new();
+    hub.add_file("ckpt.distcp", 100, Some("hash1"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let ino = vfs.lookup(ROOT_INODE, "ckpt.distcp").await.unwrap().ino;
+        let fh = vfs.open(ino, true, true, Some(1)).await.unwrap();
+        write_blocking(&vfs, ino, fh, 0, b"checkpoint bytes").await.unwrap();
+        vfs.flush(ino, fh, Some(1)).await.unwrap();
+        // streaming_channel_for() deliberately skips terminal channels;
+        // fetch the (still open) handle's channel directly.
+        let channel = match vfs.open_files.read().unwrap().get(&fh) {
+            Some(OpenFile::Streaming { channel, .. }) => channel.clone(),
+            _ => panic!("streaming handle still open"),
+        };
+        assert!(channel_is_terminal(&channel));
+
+        // A late deferral (dup'd fd flush racing the commit) installs after
+        // the winner fulfilled; the install must settle its own hook.
+        vfs.defer_commit(ino, &channel);
+        assert!(
+            vfs.pending_commits.lock().unwrap().get(&ino).is_none(),
+            "hook installed on a terminal channel must not linger in pending_commits"
+        );
+        vfs.await_pending_commit(ino).await.unwrap();
+        vfs.release(fh).await.unwrap();
+    });
+}

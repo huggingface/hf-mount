@@ -2,7 +2,13 @@ use std::fmt;
 
 #[derive(Debug)]
 pub enum Error {
-    Hub { message: String, status: Option<u16> },
+    Hub {
+        message: String,
+        status: Option<u16>,
+        /// Server-requested wait (IETF `RateLimit` header) on a rate-limited
+        /// response, so outer retry loops honor the Hub's reset time.
+        retry_after: Option<std::time::Duration>,
+    },
     Xet(String),
     Io(std::io::Error),
     Json(serde_json::Error),
@@ -14,6 +20,7 @@ impl Error {
         Self::Hub {
             message: msg.into(),
             status: None,
+            retry_after: None,
         }
     }
 
@@ -21,6 +28,15 @@ impl Error {
         Self::Hub {
             message: msg.into(),
             status: Some(status),
+            retry_after: None,
+        }
+    }
+
+    /// How long the server asked us to wait before retrying, when it said.
+    pub fn retry_after(&self) -> Option<std::time::Duration> {
+        match self {
+            Self::Hub { retry_after, .. } => *retry_after,
+            _ => None,
         }
     }
 
@@ -41,9 +57,22 @@ impl Error {
             // so the client stops retrying into a quota wall instead of looping.
             Some(413 | 507) => libc::ENOSPC,
             Some(403) => libc::EACCES,
-            // Rate-limited: transient, signal "try again".
-            Some(429) => libc::EAGAIN,
+            // Transient (rate limit, server timeout, 5xx overload, transport
+            // connect/timeout): signal "try again" instead of a hard I/O
+            // failure.
+            _ if self.is_transient() => libc::EAGAIN,
             _ => libc::EIO,
+        }
+    }
+
+    /// Whether retrying this error can plausibly succeed. Single source of
+    /// truth for "transient", shared with `send_with_retry`: HTTP statuses
+    /// defer to `is_retryable_status`; transport errors are transient only
+    /// for connect/timeout failures (decode or TLS failures are permanent).
+    pub fn is_transient(&self) -> bool {
+        match self {
+            Self::Http(e) => is_transient_http(e),
+            _ => self.status().is_some_and(is_retryable_status),
         }
     }
 }
@@ -54,8 +83,11 @@ impl fmt::Display for Error {
             Self::Hub {
                 message,
                 status: Some(s),
+                ..
             } => write!(f, "Hub API error ({s}): {message}"),
-            Self::Hub { message, status: None } => write!(f, "Hub API error: {message}"),
+            Self::Hub {
+                message, status: None, ..
+            } => write!(f, "Hub API error: {message}"),
             Self::Xet(msg) => write!(f, "Xet error: {msg}"),
             Self::Io(err) => write!(f, "IO error: {err}"),
             Self::Json(err) => write!(f, "JSON error: {err}"),
@@ -108,6 +140,12 @@ pub fn is_retryable_status(status: u16) -> bool {
     matches!(status, 408 | 429 | 500 | 502 | 503 | 504)
 }
 
+/// Transport failures worth retrying: connect and timeout only (decode or
+/// TLS failures are permanent).
+pub fn is_transient_http(err: &reqwest::Error) -> bool {
+    err.is_timeout() || err.is_connect()
+}
+
 pub type Result<T> = std::result::Result<T, Error>;
 
 #[cfg(test)]
@@ -120,10 +158,25 @@ mod tests {
         assert_eq!(Error::hub_status(507, "insufficient storage").to_errno(), libc::ENOSPC);
         assert_eq!(Error::hub_status(403, "forbidden").to_errno(), libc::EACCES);
         assert_eq!(Error::hub_status(429, "rate limited").to_errno(), libc::EAGAIN);
-        // Unknown status and statusless errors stay generic.
-        assert_eq!(Error::hub_status(500, "server error").to_errno(), libc::EIO);
+        assert_eq!(Error::hub_status(408, "request timeout").to_errno(), libc::EAGAIN);
+        assert_eq!(Error::hub_status(503, "overloaded").to_errno(), libc::EAGAIN);
+        // Non-retryable status and statusless errors stay generic.
+        assert_eq!(Error::hub_status(501, "not implemented").to_errno(), libc::EIO);
         assert_eq!(Error::hub("no status").to_errno(), libc::EIO);
         assert_eq!(Error::Xet("opaque".into()).to_errno(), libc::EIO);
+    }
+
+    #[test]
+    fn retry_after_only_carried_by_hub_errors() {
+        let delay = std::time::Duration::from_secs(30);
+        let hinted = Error::Hub {
+            message: "x".into(),
+            status: Some(429),
+            retry_after: Some(delay),
+        };
+        assert_eq!(hinted.retry_after(), Some(delay));
+        assert_eq!(Error::hub_status(429, "x").retry_after(), None);
+        assert_eq!(Error::Xet("x".into()).retry_after(), None);
     }
 
     #[test]
