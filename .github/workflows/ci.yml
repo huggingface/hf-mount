@@ -185,6 +185,7 @@ jobs:
         if: github.event_name == 'pull_request'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           CLEAN=$(sed 's/\x1b\[[0-9;]*m//g' pjdfstest_output.txt)
           TABLES=$(echo "$CLEAN" | awk '
@@ -257,6 +258,7 @@ jobs:
         if: github.event_name == 'pull_request'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           # Strip ANSI codes, then extract only ==== delimited blocks
           CLEAN=$(sed 's/\x1b\[[0-9;]*m//g' bench_output.txt)
