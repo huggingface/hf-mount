@@ -201,6 +201,13 @@ pub struct MountOptions {
     #[arg(long, default_value_t = false)]
     pub metadata_ttl_minimal: bool,
 
+    /// How long a lookup miss (ENOENT) is remembered before the path is
+    /// re-probed on the Hub, in milliseconds. This is a rate limit on HEAD
+    /// requests for missing paths, and the upper bound on how long a file
+    /// added remotely stays hidden from a client that probed it too early.
+    #[arg(long, default_value_t = 1_000)]
+    pub negative_ttl_ms: u64,
+
     /// Maximum number of FUSE worker threads
     #[arg(long, default_value_t = 16)]
     pub max_threads: usize,
@@ -568,7 +575,7 @@ pub fn build_with_runtime(
     );
     info!(
         "Config: advanced_writes={} overlay={} remote_read_only={} direct_io={} poll_interval={}s \
-         poll_listing_concurrency={} metadata_ttl={}ms \
+         poll_listing_concurrency={} metadata_ttl={}ms negative_ttl={}ms \
          cache_dir={:?} cache_size={} no_disk_cache={} cache_mode={:?} max_staging_size={} max_threads={} \
          flush_debounce={}ms flush_max_batch={}ms read_fetch_timeout={}ms uid={} gid={} dir_mode={:04o} \
          file_mode={:04o} filter_os_files={}",
@@ -579,6 +586,7 @@ pub fn build_with_runtime(
         options.poll_interval_secs,
         options.poll_listing_concurrency,
         options.metadata_ttl_ms,
+        options.negative_ttl_ms,
         options.cache_dir,
         options.cache_size,
         options.no_disk_cache,
@@ -614,6 +622,7 @@ pub fn build_with_runtime(
             poll_interval_secs: options.poll_interval_secs,
             poll_listing_concurrency: options.poll_listing_concurrency as usize,
             metadata_ttl,
+            negative_ttl: std::time::Duration::from_millis(options.negative_ttl_ms),
             serve_lookup_from_cache: !options.metadata_ttl_minimal,
             filter_os_files: !options.no_filter_os_files,
             direct_io: options.direct_io && !is_nfs,

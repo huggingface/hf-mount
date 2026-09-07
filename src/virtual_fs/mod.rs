@@ -34,8 +34,6 @@ const BLOCK_SIZE: u32 = 512;
 /// negative-cache pool. 1k is enough to absorb bursts; older entries roll
 /// over and a real lookup absorbs the cost on miss.
 const NEG_CACHE_CAPACITY: usize = 1_000;
-/// How long a negative-cache entry stays valid before being re-checked.
-const NEG_CACHE_TTL: Duration = Duration::from_secs(30);
 /// `notify_inval_entry` is a blocking syscall that takes the parent dir's
 /// `i_rwsem` in the kernel and walks the dcache. Issuing thousands per sweep
 /// starves concurrent FUSE ops (lookup/readdir wait on the same lock) and
@@ -119,6 +117,8 @@ pub struct VfsConfig {
     /// Must be >= 1.
     pub poll_listing_concurrency: usize,
     pub metadata_ttl: Duration,
+    /// How long a lookup miss is remembered before the path is re-probed.
+    pub negative_ttl: Duration,
     pub serve_lookup_from_cache: bool,
     pub filter_os_files: bool,
     pub direct_io: bool,
@@ -230,6 +230,10 @@ pub struct VirtualFs {
     /// How long a file's metadata is trusted before re-checking via HEAD.
     /// Matches the kernel metadata TTL so HEAD is called at most once per TTL window.
     metadata_ttl: Duration,
+    /// How long a negative-lookup entry stays valid. Caps HEAD traffic for
+    /// repeatedly-probed missing paths; also the longest a remotely-added
+    /// file stays hidden from a client that probed it before it existed.
+    negative_ttl: Duration,
     /// When false (minimal mode), every lookup triggers a HEAD request regardless
     /// of `last_revalidated`.
     /// When true, lookups within the metadata TTL window skip HEAD.
@@ -340,6 +344,7 @@ impl VirtualFs {
             shutting_down: Arc::new(AtomicBool::new(false)),
             lru_handle: Mutex::new(None),
             metadata_ttl: config.metadata_ttl,
+            negative_ttl: config.negative_ttl,
             serve_lookup_from_cache: config.serve_lookup_from_cache,
             filter_os_files: config.filter_os_files,
             direct_io: config.direct_io,
@@ -1222,7 +1227,7 @@ impl VirtualFs {
     /// Check if a path is in the negative cache (and not expired).
     fn negative_cache_check(&self, path: &str) -> bool {
         let cache = self.negative_cache.read().expect("negative_cache poisoned");
-        matches!(cache.get(path), Some(inserted) if inserted.elapsed() < NEG_CACHE_TTL)
+        matches!(cache.get(path), Some(inserted) if inserted.elapsed() < self.negative_ttl)
     }
 
     /// Remove a path from the negative cache (e.g. after create/rename).
@@ -1240,7 +1245,7 @@ impl VirtualFs {
             // Evict up to 128 expired entries (bounded scan, not full retain).
             let expired: Vec<String> = cache
                 .iter()
-                .filter(|(_, ts)| ts.elapsed() >= NEG_CACHE_TTL)
+                .filter(|(_, ts)| ts.elapsed() >= self.negative_ttl)
                 .take(128)
                 .map(|(k, _)| k.clone())
                 .collect();
@@ -1372,10 +1377,9 @@ impl VirtualFs {
                 // is authoritative. Hot path for tarball extract / xfstests
                 // creating thousands of unique names under fresh dirs.
                 //
-                // Do NOT seed the global negative cache here — its TTL is
-                // longer than metadata_ttl, and remote churn could materialize
-                // these names while the entry hides them. The listing itself
-                // is the cache for these misses.
+                // Do NOT seed the global negative cache here — remote churn
+                // could materialize these names while the entry hides them.
+                // The listing itself is the cache for these misses.
                 if local_only {
                     return Err(libc::ENOENT);
                 }
