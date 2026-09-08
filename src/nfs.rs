@@ -843,6 +843,9 @@ fn errno_to_nfs(e: i32) -> nfsstat3 {
         libc::ENOTEMPTY => nfsstat3::NFS3ERR_NOTEMPTY,
         libc::EBADF => nfsstat3::NFS3ERR_STALE,
         libc::ENOSPC => nfsstat3::NFS3ERR_NOSPC,
+        // Transient (rate limit / server overload): NFSv3's "try again later",
+        // so clients retry instead of failing hard with I/O error.
+        libc::EAGAIN => nfsstat3::NFS3ERR_JUKEBOX,
         _ => nfsstat3::NFS3ERR_IO,
     }
 }

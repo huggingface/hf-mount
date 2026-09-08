@@ -22,6 +22,10 @@ pub struct MockHub {
     pub batch_log: Mutex<Vec<Vec<BatchOp>>>,
     batch_fail_count: AtomicU32,
     batch_barrier: Mutex<Option<Arc<tokio::sync::Barrier>>>,
+    /// HTTP status for the next list_tree failure.
+    list_tree_fail_status: Mutex<Option<u16>>,
+    /// HTTP status for the next head_file failure (used with head_fail).
+    head_fail_status: Mutex<Option<u16>>,
     head_fail: AtomicBool,
     download_fail: AtomicBool,
     source: SourceKind,
@@ -36,18 +40,18 @@ pub struct MockHub {
 
 #[allow(dead_code)]
 impl MockHub {
-    pub fn new() -> Arc<Self> {
+    fn with_source(source: SourceKind) -> Arc<Self> {
         Arc::new(Self {
             tree: Mutex::new(Vec::new()),
             head_responses: Mutex::new(HashMap::new()),
             batch_log: Mutex::new(Vec::new()),
             batch_fail_count: AtomicU32::new(0),
             batch_barrier: Mutex::new(None),
+            list_tree_fail_status: Mutex::new(None),
+            head_fail_status: Mutex::new(None),
             head_fail: AtomicBool::new(false),
             download_fail: AtomicBool::new(false),
-            source: SourceKind::Bucket {
-                bucket_id: "test-bucket".to_string(),
-            },
+            source,
             default_mtime: UNIX_EPOCH,
             list_tree_calls: AtomicU32::new(0),
             head_file_calls: AtomicU32::new(0),
@@ -56,25 +60,17 @@ impl MockHub {
         })
     }
 
+    pub fn new() -> Arc<Self> {
+        Self::with_source(SourceKind::Bucket {
+            bucket_id: "test-bucket".to_string(),
+        })
+    }
+
     pub fn new_repo() -> Arc<Self> {
-        Arc::new(Self {
-            tree: Mutex::new(Vec::new()),
-            head_responses: Mutex::new(HashMap::new()),
-            batch_log: Mutex::new(Vec::new()),
-            batch_fail_count: AtomicU32::new(0),
-            batch_barrier: Mutex::new(None),
-            head_fail: AtomicBool::new(false),
-            download_fail: AtomicBool::new(false),
-            source: SourceKind::Repo {
-                repo_id: "test/repo".to_string(),
-                repo_type: crate::hub_api::RepoType::Model,
-                revision: "main".to_string(),
-            },
-            default_mtime: UNIX_EPOCH,
-            list_tree_calls: AtomicU32::new(0),
-            head_file_calls: AtomicU32::new(0),
-            probe_revision_calls: AtomicU32::new(0),
-            revision: Mutex::new(Ok("rev-0".to_string())),
+        Self::with_source(SourceKind::Repo {
+            repo_id: "test/repo".to_string(),
+            repo_type: crate::hub_api::RepoType::Model,
+            revision: "main".to_string(),
         })
     }
 
@@ -128,6 +124,19 @@ impl MockHub {
         self.head_fail.store(true, Ordering::SeqCst);
     }
 
+    /// Make the next head_file call fail with the given HTTP status (e.g.
+    /// 429 to simulate rate limiting after client-side retries).
+    pub fn fail_next_head_with_status(&self, status: u16) {
+        *self.head_fail_status.lock().unwrap() = Some(status);
+        self.head_fail.store(true, Ordering::SeqCst);
+    }
+
+    /// Make the next list_tree call fail with the given HTTP status (e.g.
+    /// 429 to simulate rate limiting after client-side retries).
+    pub fn fail_next_list_tree_with_status(&self, status: u16) {
+        *self.list_tree_fail_status.lock().unwrap() = Some(status);
+    }
+
     pub fn list_tree_call_count(&self) -> u32 {
         self.list_tree_calls.load(Ordering::SeqCst)
     }
@@ -161,10 +170,21 @@ impl MockHub {
     }
 }
 
+/// Build a mock Hub error, carrying `status` when one is configured.
+fn mock_error(status: Option<u16>, msg: &str) -> Error {
+    match status {
+        Some(status) => Error::hub_status(status, msg),
+        None => Error::hub(msg),
+    }
+}
+
 #[async_trait::async_trait]
 impl HubOps for MockHub {
     async fn list_tree(&self, prefix: &str) -> Result<Vec<TreeEntry>> {
         self.list_tree_calls.fetch_add(1, Ordering::SeqCst);
+        if let Some(status) = self.list_tree_fail_status.lock().unwrap().take() {
+            return Err(Error::hub_status(status, "mock list_tree failure"));
+        }
         let tree = self.tree.lock().unwrap();
         let prefix_slash = if prefix.is_empty() {
             String::new()
@@ -214,7 +234,8 @@ impl HubOps for MockHub {
     async fn head_file(&self, path: &str) -> Result<Option<HeadFileInfo>> {
         self.head_file_calls.fetch_add(1, Ordering::SeqCst);
         if self.head_fail.swap(false, Ordering::SeqCst) {
-            return Err(Error::hub("mock head_file failure"));
+            let status = self.head_fail_status.lock().unwrap().take();
+            return Err(mock_error(status, "mock head_file failure"));
         }
         let responses = self.head_responses.lock().unwrap();
         match responses.get(path) {
@@ -272,8 +293,7 @@ impl HubOps for MockHub {
         self.probe_revision_calls.fetch_add(1, Ordering::SeqCst);
         match &*self.revision.lock().unwrap() {
             Ok(s) => Ok(s.clone()),
-            Err((Some(status), msg)) => Err(Error::hub_status(*status, msg.clone())),
-            Err((None, msg)) => Err(Error::hub(msg.clone())),
+            Err((status, msg)) => Err(mock_error(*status, msg)),
         }
     }
 }
