@@ -322,7 +322,10 @@ pub fn split_path_prefix(raw: &str) -> std::result::Result<(&str, &str), &'stati
 
 pub(crate) fn retry_delay(attempt: u32) -> std::time::Duration {
     debug_assert!(attempt > 0, "retry_delay called with attempt=0");
-    std::time::Duration::from_millis(500 * 2u64.pow(attempt - 1))
+    // Saturating: callers cap the result (MAX_RETRY_DELAY), but a long
+    // startup retry loop can push `attempt` past 63 and 2^attempt would
+    // overflow before the cap applies.
+    std::time::Duration::from_millis(500u64.saturating_mul(2u64.saturating_pow(attempt.saturating_sub(1))))
 }
 
 /// Upper bound on any single retry sleep, whether server-hinted (RateLimit
@@ -1571,6 +1574,8 @@ mod tests {
         assert_eq!(retry_delay(1), std::time::Duration::from_millis(500));
         assert_eq!(retry_delay(2), std::time::Duration::from_millis(1000));
         assert_eq!(retry_delay(3), std::time::Duration::from_millis(2000));
+        // Saturates instead of overflowing on long retry loops.
+        assert!(retry_delay(200) >= MAX_RETRY_DELAY);
     }
 
     #[test]

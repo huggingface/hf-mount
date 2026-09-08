@@ -744,7 +744,25 @@ fn hf_mount_mounted_at(path: &Path) -> bool {
     let Ok(mountinfo) = std::fs::read("/proc/self/mountinfo") else {
         return false;
     };
-    mountinfo_has_hf_mount(&String::from_utf8_lossy(&mountinfo), path)
+    let Some(target) = resolve_mount_path(path) else {
+        return false;
+    };
+    mountinfo_has_hf_mount(&String::from_utf8_lossy(&mountinfo), &target)
+}
+
+/// Resolve the configured mount point to the path the kernel (and thus
+/// mountinfo) uses for it: trailing separators and `.` dropped, symlinks
+/// and `..` in the ancestors resolved through the filesystem — a lexical
+/// `..` collapse would name a different directory than the syscall when an
+/// ancestor is a symlink. The mount point itself stats with an error, so
+/// only its parent is canonicalized. `None` (fail closed) when the last
+/// component is not a plain name or the parent cannot be resolved.
+#[cfg(any(target_os = "linux", test))]
+fn resolve_mount_path(path: &Path) -> Option<PathBuf> {
+    let absolute: PathBuf = std::path::absolute(path).ok()?.components().collect();
+    let name = absolute.file_name()?;
+    let parent = std::fs::canonicalize(absolute.parent()?).ok()?;
+    Some(parent.join(name))
 }
 
 /// No mount table to consult off Linux: fail closed (the dead-mount recovery
@@ -755,54 +773,45 @@ fn hf_mount_mounted_at(_path: &Path) -> bool {
 }
 
 /// Parse /proc/self/mountinfo content: is the active mount at exactly
-/// `target` an hf-mount FUSE mount? Stacked mounts on one path are listed
-/// in mount order and `umount2` detaches the topmost, so only the LAST
-/// entry for the path counts — a foreign filesystem overmounted on a dead
-/// hf-mount must not get detached in its place. Direct mounts show as
-/// fstype "fuse" with source `FS_NAME` (fuser FSName); mountpod-mode mounts
-/// made by the CSI helper show as fstype `fuse.<FS_NAME>`.
+/// `target` (already resolved, see `resolve_mount_path`) an hf-mount FUSE
+/// mount? Mounts can be stacked on one path and `umount2` detaches the
+/// visible (topmost) one, so a foreign filesystem overmounted on a dead
+/// hf-mount must not get detached in its place. Line order is not stacking
+/// order (a moved mount keeps its position), so the topmost is found by
+/// topology: the entry at the path that no other entry at the path has as
+/// parent. Anything ambiguous fails closed. Direct mounts show as fstype
+/// "fuse" with source `FS_NAME` (fuser FSName); mountpod-mode mounts made
+/// by the CSI helper show as fstype `fuse.<FS_NAME>`.
 #[cfg(any(target_os = "linux", test))]
 fn mountinfo_has_hf_mount(mountinfo: &str, target: &Path) -> bool {
-    // mountinfo prints mount points normalized (absolute, no trailing slash,
-    // no `.`/`..`); the configured path may be spelled otherwise. Lexical
-    // only: the path stats with an error, so canonicalize() is not an option.
-    let target = normalize_lexically(&std::path::absolute(target).unwrap_or_else(|_| target.to_path_buf()));
     let target = target.to_string_lossy();
-    let topmost = mountinfo.lines().rev().find(|line| {
-        // Fields: id parent major:minor root MOUNT-POINT options... - FSTYPE SOURCE super_opts
-        // mountinfo octal-escapes whitespace and backslash in paths.
-        line.split(' ').nth(4).is_some_and(|mount_point| {
-            mount_point
+    // Fields: ID PARENT major:minor root MOUNT-POINT options... - FSTYPE SOURCE super_opts
+    // (mount points octal-escape whitespace and backslash).
+    let at_target: Vec<(&str, &str, &str, &str)> = mountinfo
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split(' ');
+            let (id, parent) = (fields.next()?, fields.next()?);
+            let mount_point = fields.nth(2)?;
+            let unescaped = mount_point
                 .replace("\\040", " ")
                 .replace("\\011", "\t")
                 .replace("\\012", "\n")
-                .replace("\\134", "\\")
-                == target
+                .replace("\\134", "\\");
+            if unescaped != target {
+                return None;
+            }
+            let mut after_separator = fields.skip_while(|field| *field != "-").skip(1);
+            Some((id, parent, after_separator.next()?, after_separator.next()?))
         })
-    });
-    let Some(line) = topmost else { return false };
-    let mut after_separator = line.split(' ').skip_while(|field| *field != "-").skip(1);
-    let (Some(fstype), Some(source)) = (after_separator.next(), after_separator.next()) else {
+        .collect();
+    let mut topmost = at_target
+        .iter()
+        .filter(|(id, ..)| !at_target.iter().any(|(_, parent, ..)| parent == id));
+    let (Some((_, _, fstype, source)), None) = (topmost.next(), topmost.next()) else {
         return false;
     };
-    fstype.strip_prefix("fuse.") == Some(FS_NAME) || (fstype.starts_with("fuse") && source == FS_NAME)
-}
-
-/// Collapse `.`, `..` and trailing separators without touching the filesystem.
-#[cfg(any(target_os = "linux", test))]
-fn normalize_lexically(path: &Path) -> PathBuf {
-    use std::path::Component;
-    let mut out = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                out.pop();
-            }
-            other => out.push(other),
-        }
-    }
-    out
+    fstype.strip_prefix("fuse.") == Some(FS_NAME) || (fstype.starts_with("fuse") && source == &FS_NAME)
 }
 
 /// Retry window for Hub calls made during mount startup, before the FUSE
@@ -935,14 +944,13 @@ mod tests {
 39 25 0:35 / /mnt/other rw,relatime - fuse.sshfs user@host:/ rw
 40 25 8:1 / /mnt/disk rw,relatime shared:3 - ext4 /dev/sda1 rw
 41 25 0:34 / /mnt/with\\040space rw - fuse hf-mount rw
+43 42 0:37 / /mnt/stacked rw shared:6 - nfs4 10.0.0.2:/export rw
 42 25 0:36 / /mnt/stacked rw shared:5 - fuse.hf-mount hf-mount rw
-43 25 0:37 / /mnt/stacked rw shared:6 - nfs4 10.0.0.2:/export rw
+44 25 0:38 / /mnt/covered rw shared:7 - nfs4 10.0.0.3:/export rw
+45 44 0:39 / /mnt/covered rw shared:8 - fuse hf-mount rw
 ";
         // Direct mount (fuser FSName) and mountpod mount (CSI helper subtype).
         assert!(mountinfo_has_hf_mount(mountinfo, Path::new("/mnt/hf")));
-        // Spellings mountinfo normalizes away must still match.
-        assert!(mountinfo_has_hf_mount(mountinfo, Path::new("/mnt/hf/")));
-        assert!(mountinfo_has_hf_mount(mountinfo, Path::new("/mnt/./other/../hf")));
         assert!(mountinfo_has_hf_mount(mountinfo, Path::new("/mnt/pod")));
         assert!(mountinfo_has_hf_mount(mountinfo, Path::new("/mnt/with space")));
         // A foreign FUSE filesystem is not ours.
@@ -954,8 +962,34 @@ mod tests {
         // Exact match only — a parent of a mount is not itself one.
         assert!(!mountinfo_has_hf_mount(mountinfo, Path::new("/mnt")));
         // A foreign filesystem overmounted on a dead hf-mount is the active
-        // mount: umount2 would detach it, so it must not qualify.
+        // mount: umount2 would detach it, so it must not qualify — even when
+        // it is listed before the hf-mount it covers (topology, not order).
         assert!(!mountinfo_has_hf_mount(mountinfo, Path::new("/mnt/stacked")));
+        // The reverse stack (hf-mount over a foreign mount) is ours to detach.
+        assert!(mountinfo_has_hf_mount(mountinfo, Path::new("/mnt/covered")));
+    }
+
+    #[test]
+    fn resolve_mount_path_follows_ancestor_symlinks_like_the_kernel() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("b/c")).unwrap();
+        std::os::unix::fs::symlink(root.join("b/c"), root.join("link")).unwrap();
+
+        // `link/..` is b (through the symlink), not the tmp root as a lexical
+        // collapse would say — the kernel resolves it the same way.
+        assert_eq!(
+            super::resolve_mount_path(&root.join("link/../hf")),
+            Some(root.join("b/hf"))
+        );
+        // Trailing separators and `.` are dropped; the leaf need not exist.
+        assert_eq!(
+            super::resolve_mount_path(&root.join("b/./hf/")),
+            Some(root.join("b/hf"))
+        );
+        // A leaf that is not a plain name, or an unresolvable parent, fails closed.
+        assert_eq!(super::resolve_mount_path(&root.join("b/..")), None);
+        assert_eq!(super::resolve_mount_path(&root.join("missing/hf")), None);
     }
 
     #[test]
