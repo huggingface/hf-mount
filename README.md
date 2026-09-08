@@ -228,6 +228,7 @@ The same `FUSE_NOTIFY_INVAL_INODE` writev can also wedge at **runtime** (not jus
 | `--max-threads` | `16` | Maximum FUSE worker threads (Linux only) |
 | `--metadata-ttl-ms` | `10000` | How long file metadata is cached before re-checking (ms) |
 | `--metadata-ttl-minimal` | `false` | Re-check on every access (maximum freshness, lower throughput) |
+| `--negative-ttl-ms` | `1000` | How long a lookup miss (ENOENT) is remembered before re-probing the Hub. Caps HEAD traffic for missing paths; also the longest a remotely-added file stays hidden from a client that probed it before it existed. |
 | `--flush-debounce-ms` | `2000` | Advanced writes: flush debounce delay (ms) |
 | `--flush-max-batch-window-ms` | `30000` | Advanced writes: max flush batch window (ms) |
 | `--flush-shutdown-timeout-ms` | `45000` | Advanced writes: max time the SIGTERM flush drain may run before abandoning unflushed data to guarantee exit. Must be < the pod's `terminationGracePeriodSeconds`, or a slow Hub/CAS backend keeps the FUSE connection alive past grace and strands the pod. |
@@ -305,6 +306,8 @@ Files can be stale for up to `--metadata-ttl-ms` (default 10 s) after a remote u
 
 1. **Metadata revalidation** (FUSE only) -- when the per-file TTL expires, the next access checks the Hub. If the file changed, cached data is invalidated.
 2. **Background polling** (default every 30 s) -- lists the full tree and detects additions, modifications, and deletions.
+
+A lookup of a path that does not exist yet probes the Hub directly, so a file added remotely is visible as soon as the upload lands. Repeated misses are served from a negative cache for `--negative-ttl-ms` (default 1 s) without hitting the Hub; a client that probes a path before the producer finishes uploading sees it at most that long after it lands.
 
 ### Writes
 

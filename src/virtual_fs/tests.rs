@@ -1416,6 +1416,47 @@ fn negative_cache_insert() {
     });
 }
 
+/// A path probed before it exists remotely (consumer ahead of producer) must
+/// surface once `negative_ttl` elapses.
+#[test]
+fn negative_cache_expires_after_negative_ttl() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    let rt = new_runtime();
+    let vfs = make_test_vfs(
+        hub.clone(),
+        xet.clone(),
+        TestOpts {
+            negative_ttl: Duration::from_millis(50),
+            ..Default::default()
+        },
+        &rt,
+    );
+
+    rt.block_on(async {
+        assert_eq!(vfs.lookup(ROOT_INODE, "late.txt").await.unwrap_err(), libc::ENOENT);
+        assert!(vfs.negative_cache_check("late.txt"));
+
+        // Producer lands the file while the negative entry is still fresh.
+        hub.add_file("late.txt", 100, Some("h"), None);
+        let pre_head = hub.head_file_call_count();
+        assert_eq!(vfs.lookup(ROOT_INODE, "late.txt").await.unwrap_err(), libc::ENOENT);
+        assert_eq!(
+            hub.head_file_call_count(),
+            pre_head,
+            "within TTL the neg cache skips HEAD"
+        );
+
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert!(!vfs.negative_cache_check("late.txt"));
+        let attr = vfs
+            .lookup(ROOT_INODE, "late.txt")
+            .await
+            .expect("visible after negative_ttl");
+        assert_eq!(attr.size, 100);
+    });
+}
+
 /// update_remote_file() skips dirty inodes (local writes not overwritten by poll).
 #[test]
 fn poll_dirty_files_skipped() {
