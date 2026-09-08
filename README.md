@@ -235,6 +235,7 @@ The same `FUSE_NOTIFY_INVAL_INODE` writev can also wedge at **runtime** (not jus
 | `--direct-io` | `false` | Bypass the kernel page cache (FOPEN_DIRECT_IO); every read goes through the FUSE handler. For benchmarking; not recommended in production (disables efficient mmap caching). |
 | `--no-filter-os-files` | `false` | Stop filtering OS junk files (.DS_Store, Thumbs.db, etc.) |
 | `--uid` / `--gid` | current user | Override UID/GID for mounted files |
+| `--dir-mode` / `--file-mode` | `0755` / `0644` | Octal permission bits reported for directories/files listed from the remote (which stores no POSIX metadata). Entries created through the mount keep their requested mode. Use `0777` / `0666` to let any local user write to a bucket mounted by another UID. |
 | `--fuse-owner-only` | `false` | Restrict mount access to the mounting user only (FUSE only; by default all users can access, which requires `user_allow_other` in /etc/fuse.conf) |
 | `--token-file` | | Path to a token file (re-read on each request for credential rotation) |
 | `--inode-soft-limit` | `0` | Soft cap on the in-memory inode table (0 disables). See "Bounding inode memory" below. |
