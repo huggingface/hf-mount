@@ -28,12 +28,23 @@ use staging::StagingCoordinator;
 
 /// Block size reported in stat(2) for `st_blocks` calculation.
 const BLOCK_SIZE: u32 = 512;
-/// Maximum entries in the negative-lookup cache (parent_path/name → Instant).
+/// Maximum entries in the negative-lookup cache (parent_path/name → entry).
 /// Prevents repeated Hub API calls for paths known to not exist. Each entry
 /// holds an owned `String` key, so this cache is the dominant cost of the
 /// negative-cache pool. 1k is enough to absorb bursts; older entries roll
 /// over and a real lookup absorbs the cost on miss.
 const NEG_CACHE_CAPACITY: usize = 1_000;
+
+/// A cached lookup miss. Valid while the source revision the miss was
+/// observed at is still current (`generation == VirtualFs::revision_gen`)
+/// and `inserted` is within the fallback `negative_ttl`.
+struct NegativeEntry {
+    inserted: Instant,
+    generation: u64,
+}
+
+type NegativeCache = Arc<RwLock<HashMap<String, NegativeEntry>>>;
+
 /// `notify_inval_entry` is a blocking syscall that takes the parent dir's
 /// `i_rwsem` in the kernel and walks the dcache. Issuing thousands per sweep
 /// starves concurrent FUSE ops (lookup/readdir wait on the same lock) and
@@ -117,7 +128,8 @@ pub struct VfsConfig {
     /// Must be >= 1.
     pub poll_listing_concurrency: usize,
     pub metadata_ttl: Duration,
-    /// How long a lookup miss is remembered before the path is re-probed.
+    /// Fallback expiry for a remembered lookup miss; misses are otherwise
+    /// invalidated when the poll loop sees the source revision change.
     pub negative_ttl: Duration,
     pub serve_lookup_from_cache: bool,
     pub filter_os_files: bool,
@@ -189,8 +201,17 @@ pub struct VirtualFs {
     gid: u32,
     dir_mode: u16,
     file_mode: u16,
-    /// Negative lookup cache: paths known to not exist (TTL-based).
-    negative_cache: Arc<RwLock<HashMap<String, Instant>>>,
+    /// Negative lookup cache: paths known to not exist at a given revision
+    /// generation (see [`NegativeEntry`]).
+    negative_cache: NegativeCache,
+    /// Bumped by the poll loop whenever the source revision changes (or the
+    /// revision probe fails and a full fan-out runs). Negative-cache entries
+    /// and local-only directory listings are trusted only while it matches
+    /// the generation they were recorded at, so remote additions surface as
+    /// soon as the poll sees the revision move — without re-probing each
+    /// missing path on a timer. With polling disabled it never moves and
+    /// `negative_ttl` is the only expiry.
+    revision_gen: Arc<AtomicU64>,
     /// Per-directory loading locks: serializes concurrent ensure_children_loaded() calls
     /// for the same directory so only one HTTP request is made (prevents thundering herd
     /// when Finder/Spotlight send many lookups on mount).
@@ -236,9 +257,9 @@ pub struct VirtualFs {
     /// How long a file's metadata is trusted before re-checking via HEAD.
     /// Matches the kernel metadata TTL so HEAD is called at most once per TTL window.
     metadata_ttl: Duration,
-    /// How long a negative-lookup entry stays valid. Caps HEAD traffic for
-    /// repeatedly-probed missing paths; also the longest a remotely-added
-    /// file stays hidden from a client that probed it before it existed.
+    /// Fallback expiry for negative-lookup entries; the primary invalidation
+    /// is `revision_gen` moving. Bounds how long a stale miss survives if the
+    /// revision signal is missed (probe failures, polling disabled).
     negative_ttl: Duration,
     /// When false (minimal mode), every lookup triggers a HEAD request regardless
     /// of `last_revalidated`.
@@ -265,7 +286,8 @@ impl VirtualFs {
         config: VfsConfig,
     ) -> Arc<Self> {
         let inodes = Arc::new(RwLock::new(InodeTable::new(config.inode_soft_limit > 0)));
-        let negative_cache = Arc::new(RwLock::new(HashMap::new()));
+        let negative_cache: NegativeCache = Arc::new(RwLock::new(HashMap::new()));
+        let revision_gen = Arc::new(AtomicU64::new(0));
 
         let staging = Arc::new(StagingCoordinator::new(staging_dir));
         let overlay_backing = overlay_backing.map(Arc::new);
@@ -304,6 +326,7 @@ impl VirtualFs {
             let bg_hub = hub_client.clone();
             let bg_inodes = inodes.clone();
             let bg_neg_cache = negative_cache.clone();
+            let bg_revision_gen = revision_gen.clone();
             let bg_invalidator = invalidator.clone();
             let interval = Duration::from_secs(config.poll_interval_secs);
             // Clamp to >= 1 in case a caller (library use) constructs VfsConfig directly.
@@ -313,6 +336,7 @@ impl VirtualFs {
                 bg_hub,
                 bg_inodes,
                 bg_neg_cache,
+                bg_revision_gen,
                 bg_invalidator,
                 interval,
                 listing_concurrency,
@@ -342,6 +366,7 @@ impl VirtualFs {
             dir_mode: config.dir_mode,
             file_mode: config.file_mode,
             negative_cache,
+            revision_gen,
             dir_loading_locks: Mutex::new(HashMap::new()),
             pending_commits: Mutex::new(HashMap::new()),
             flush_manager,
@@ -1329,10 +1354,14 @@ impl VirtualFs {
         });
     }
 
+    fn negative_entry_valid(&self, entry: &NegativeEntry) -> bool {
+        entry.generation == self.revision_gen.load(Ordering::Acquire) && entry.inserted.elapsed() < self.negative_ttl
+    }
+
     /// Check if a path is in the negative cache (and not expired).
     fn negative_cache_check(&self, path: &str) -> bool {
         let cache = self.negative_cache.read().expect("negative_cache poisoned");
-        matches!(cache.get(path), Some(inserted) if inserted.elapsed() < self.negative_ttl)
+        matches!(cache.get(path), Some(entry) if self.negative_entry_valid(entry))
     }
 
     /// Remove a path from the negative cache (e.g. after create/rename).
@@ -1340,17 +1369,27 @@ impl VirtualFs {
         self.negative_cache.write().expect("neg_cache poisoned").remove(path);
     }
 
+    /// Insert a path into the negative cache at the current revision
+    /// generation. For misses established by a remote probe, use
+    /// [`Self::negative_cache_insert_at`] with the generation read *before*
+    /// the probe: a revision bump that lands mid-probe must invalidate the
+    /// result, or the entry would hide the very change it raced with until
+    /// the fallback TTL.
+    fn negative_cache_insert(&self, path: String) {
+        self.negative_cache_insert_at(path, self.revision_gen.load(Ordering::Acquire));
+    }
+
     /// Insert a path into the negative cache, evicting if at capacity.
     /// Eviction is amortized: instead of scanning all entries, we sample a
     /// bounded batch to keep the write lock duration constant regardless of cache size.
-    fn negative_cache_insert(&self, path: String) {
+    fn negative_cache_insert_at(&self, path: String, generation: u64) {
         let mut cache = self.negative_cache.write().expect("neg_cache poisoned");
         let now = Instant::now();
         if cache.len() >= NEG_CACHE_CAPACITY {
             // Evict up to 128 expired entries (bounded scan, not full retain).
             let expired: Vec<String> = cache
                 .iter()
-                .filter(|(_, ts)| ts.elapsed() >= self.negative_ttl)
+                .filter(|(_, e)| !self.negative_entry_valid(e))
                 .take(128)
                 .map(|(k, _)| k.clone())
                 .collect();
@@ -1362,19 +1401,29 @@ impl VirtualFs {
                 && let Some(oldest_key) = cache
                     .iter()
                     .take(128)
-                    .min_by_key(|(_, ts)| **ts)
+                    .min_by_key(|(_, e)| e.inserted)
                     .map(|(k, _)| k.clone())
             {
                 cache.remove(&oldest_key);
             }
         }
-        cache.insert(path, now);
+        cache.insert(
+            path,
+            NegativeEntry {
+                inserted: now,
+                generation,
+            },
+        );
     }
 
     // ── VFS operations ─────────────────────────────────────────────────
 
     pub async fn lookup(&self, parent: u64, name: &str) -> VirtualFsResult<VirtualFsAttr> {
         debug!("lookup: parent={}, name={}", parent, name);
+
+        // Read before any remote probe so a miss is stamped with the revision
+        // it was actually observed against (see `negative_cache_insert`).
+        let generation = self.revision_gen.load(Ordering::Acquire);
 
         // Fast path: children already loaded → lookup directly, no allocation needed.
         // Revalidation info extracted from the lock scope so we can await outside it.
@@ -1389,8 +1438,8 @@ impl VirtualFs {
             Miss {
                 full_path: String,
                 /// True when the parent has no remote presence (locally
-                /// created in this session); HEAD/list_tree probes are
-                /// pointless and can be skipped.
+                /// created in this session) as of the current revision;
+                /// HEAD/list_tree probes are pointless and can be skipped.
                 local_only: bool,
             },
             NotLoaded,
@@ -1443,9 +1492,16 @@ impl VirtualFs {
                     // names (tarball extract, build systems, xfstests) would
                     // otherwise pay one HEAD + list_tree per name despite the
                     // cache being authoritative.
+                    //
+                    // The local-only shortcut is only trusted while the dir
+                    // was confirmed empty on the remote at the current
+                    // revision: another mount may have written into it since.
+                    // The poll fan-out re-lists it and re-arms the shortcut
+                    // (`mark_remote_checked`), so the probing window is the
+                    // fan-out duration, not the rest of the session.
                     FastResult::Miss {
                         full_path,
-                        local_only: !parent_entry.children_from_remote,
+                        local_only: !parent_entry.children_from_remote && parent_entry.remote_checked_gen == generation,
                     }
                 }
                 // No entry, no listing → slow path (HEAD then list_tree).
@@ -1477,10 +1533,11 @@ impl VirtualFs {
                     return Err(libc::ENOENT);
                 }
                 // Skip HEAD/list probes for purely-local directories
-                // (locally-mkdir'd this session, never seen on remote):
-                // there's no remote state to discover, so the cached listing
-                // is authoritative. Hot path for tarball extract / xfstests
-                // creating thousands of unique names under fresh dirs.
+                // (locally-mkdir'd this session, not seen on remote at the
+                // current revision): there's no remote state to discover, so
+                // the cached listing is authoritative. Hot path for tarball
+                // extract / xfstests creating thousands of unique names under
+                // fresh dirs.
                 //
                 // Do NOT seed the global negative cache here — remote churn
                 // could materialize these names while the entry hides them.
@@ -1518,7 +1575,8 @@ impl VirtualFs {
                     // path (buckets return an empty listing): an authoritative
                     // miss. Other permanent failures also fall through to the
                     // negative cache — pre-existing behavior, and unlike
-                    // transient ones they won't clear within NEG_CACHE_TTL.
+                    // transient ones they won't clear before the next
+                    // revision change or `negative_ttl`.
                     Err(e) => {
                         debug!("list miss-probe {} failed permanently: {}", full_path, e);
                         Vec::new()
@@ -1527,7 +1585,7 @@ impl VirtualFs {
                 if !entries.is_empty() {
                     return self.insert_dir(parent, name, &full_path);
                 }
-                self.negative_cache_insert(full_path);
+                self.negative_cache_insert_at(full_path, generation);
                 return Err(libc::ENOENT);
             }
             FastResult::NotLoaded => {} // fall through to slow path
@@ -1576,7 +1634,7 @@ impl VirtualFs {
                 // A fresh listing is authoritative regardless of the HEAD
                 // outcome: the miss is real and safe to cache.
                 if freshly_listed {
-                    self.negative_cache_insert(full_path);
+                    self.negative_cache_insert_at(full_path, generation);
                     return Err(libc::ENOENT);
                 }
                 // The listing was loaded earlier (or by a concurrent task)
@@ -1602,7 +1660,7 @@ impl VirtualFs {
     /// failure (429 rate limit, 5xx, network) is handed back so the caller
     /// returns its errno — swallowing it into ENOENT would cache a false
     /// negative that hides a freshly committed path (e.g. a `_READY` marker)
-    /// for NEG_CACHE_TTL even after the Hub recovers.
+    /// until the next revision change even after the Hub recovers.
     async fn head_probe(&self, full_path: &str) -> HeadProbe {
         match self.hub_client.head_file(full_path).await {
             Ok(Some(head)) if head.size.is_some() => HeadProbe::File(head),
@@ -3169,7 +3227,8 @@ impl VirtualFs {
                 entry.children_loaded_at = Some(Instant::now());
                 // children_from_remote stays false: a freshly-mkdir'd dir has
                 // no remote presence yet, so lookup-miss can serve ENOENT
-                // without HEAD/list_tree probes.
+                // without HEAD/list_tree probes — until the revision moves.
+                entry.remote_checked_gen = self.revision_gen.load(Ordering::Acquire);
                 if self.overlay() {
                     entry.set_dirty();
                 }

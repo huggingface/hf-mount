@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, SystemTime};
 
 use futures::stream::{self, StreamExt};
 use tracing::{debug, info, warn};
@@ -9,7 +10,7 @@ use crate::error::Error;
 use crate::hub_api::HubOps;
 
 use super::inode::{self, InodeTable};
-use super::{InvalKind, Invalidator};
+use super::{InvalKind, Invalidator, NegativeCache};
 
 /// Cap on the exponential-backoff multiplier applied to the poll interval
 /// when the Hub keeps failing with 401 (token expired) or a transient status
@@ -37,7 +38,8 @@ impl super::VirtualFs {
     pub(super) async fn poll_remote_changes(
         hub_client: Arc<dyn HubOps>,
         inodes: Arc<RwLock<InodeTable>>,
-        negative_cache: Arc<RwLock<HashMap<String, Instant>>>,
+        negative_cache: NegativeCache,
+        revision_gen: Arc<AtomicU64>,
         invalidator: Invalidator,
         interval: Duration,
         listing_concurrency: usize,
@@ -81,6 +83,12 @@ impl super::VirtualFs {
                     warn!("Revision probe failed, falling back to full poll: {e}");
                 }
             }
+
+            // Bump before the fan-out: every negative-cache entry and
+            // local-only listing recorded against the previous revision is
+            // now suspect, and a lookup racing the fan-out must not re-seed
+            // one at the old generation.
+            let generation = revision_gen.fetch_add(1, Ordering::AcqRel) + 1;
 
             // Only poll directories the user has actually visited (children_loaded).
             // This avoids fetching the entire tree for large repos where most
@@ -145,6 +153,12 @@ impl super::VirtualFs {
                 }
             }
             Self::apply_poll_diff(all_entries, &polled_prefixes, &inodes, &negative_cache, &invalidator);
+            // Successfully listed dirs are now known-good at this revision;
+            // local-only ones among them regain their probe-free miss path.
+            inodes
+                .write()
+                .expect("inodes poisoned")
+                .mark_remote_checked(&polled_prefixes, generation);
         }
     }
 
@@ -159,7 +173,7 @@ impl super::VirtualFs {
         remote_entries: Vec<crate::hub_api::TreeEntry>,
         polled_prefixes: &HashSet<String>,
         inodes: &Arc<RwLock<InodeTable>>,
-        negative_cache: &Arc<RwLock<HashMap<String, Instant>>>,
+        negative_cache: &NegativeCache,
         invalidator: &Invalidator,
     ) {
         let remote_map: HashMap<String, _> = remote_entries

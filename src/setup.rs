@@ -208,11 +208,13 @@ pub struct MountOptions {
     #[arg(long, default_value_t = false)]
     pub metadata_ttl_minimal: bool,
 
-    /// How long a lookup miss (ENOENT) is remembered before the path is
-    /// re-probed on the Hub, in milliseconds. This is a rate limit on HEAD
-    /// requests for missing paths, and the upper bound on how long a file
-    /// added remotely stays hidden from a client that probed it too early.
-    #[arg(long, default_value_t = 1_000)]
+    /// Fallback expiry for a remembered lookup miss (ENOENT), in
+    /// milliseconds. Misses are invalidated as soon as the poll loop sees the
+    /// source revision change (bucket `updatedAt` / repo head), so this only
+    /// bounds how long a stale miss survives if that signal is missed. With
+    /// `--poll-interval-secs 0` the revision is never re-probed and this is
+    /// the only expiry.
+    #[arg(long, default_value_t = 30_000)]
     pub negative_ttl_ms: u64,
 
     /// Maximum number of FUSE worker threads

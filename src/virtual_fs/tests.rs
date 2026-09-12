@@ -1457,6 +1457,103 @@ fn negative_cache_expires_after_negative_ttl() {
     });
 }
 
+/// A cached miss outlives `negative_ttl` only as long as the revision
+/// generation it was recorded at is current; a bump makes the next lookup
+/// probe again and surface the remotely-added file.
+#[test]
+fn negative_cache_invalidated_by_revision_generation() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    let rt = new_runtime();
+    let vfs = make_test_vfs(
+        hub.clone(),
+        xet.clone(),
+        TestOpts {
+            negative_ttl: Duration::from_secs(3600),
+            ..Default::default()
+        },
+        &rt,
+    );
+
+    rt.block_on(async {
+        assert_eq!(vfs.lookup(ROOT_INODE, "late.txt").await.unwrap_err(), libc::ENOENT);
+        assert!(vfs.negative_cache_check("late.txt"));
+
+        hub.add_file("late.txt", 100, Some("h"), None);
+        let pre_head = hub.head_file_call_count();
+        assert_eq!(vfs.lookup(ROOT_INODE, "late.txt").await.unwrap_err(), libc::ENOENT);
+        assert_eq!(hub.head_file_call_count(), pre_head, "same revision: no HEAD");
+
+        vfs.revision_gen.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        assert!(!vfs.negative_cache_check("late.txt"));
+        let attr = vfs
+            .lookup(ROOT_INODE, "late.txt")
+            .await
+            .expect("visible after revision change");
+        assert_eq!(attr.size, 100);
+        assert!(hub.head_file_call_count() > pre_head);
+    });
+}
+
+/// A locally-created directory serves misses without Hub probes while the
+/// revision is unchanged, but falls back to HEAD once it moves — another
+/// mount may have written into it.
+#[test]
+fn local_only_dir_reprobes_after_revision_change() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let dir = vfs.mkdir(ROOT_INODE, "out", 0o755, 1000, 1000).await.unwrap();
+        hub.add_file("out/result.txt", 42, Some("h"), None);
+
+        let pre_head = hub.head_file_call_count();
+        let pre_list = hub.list_tree_call_count();
+        assert_eq!(vfs.lookup(dir.ino, "result.txt").await.unwrap_err(), libc::ENOENT);
+        assert_eq!(hub.head_file_call_count(), pre_head, "local-only dir: no HEAD");
+        assert_eq!(hub.list_tree_call_count(), pre_list, "local-only dir: no list_tree");
+
+        vfs.revision_gen.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let attr = vfs
+            .lookup(dir.ino, "result.txt")
+            .await
+            .expect("visible after revision change");
+        assert_eq!(attr.size, 42);
+    });
+}
+
+/// A poll fan-out that lists a local-only directory re-arms its probe-free
+/// miss path at the new generation.
+#[test]
+fn poll_rearms_local_only_dir_after_listing() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let dir = vfs.mkdir(ROOT_INODE, "out", 0o755, 1000, 1000).await.unwrap();
+        let generation = vfs.revision_gen.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
+
+        let polled: std::collections::HashSet<String> = ["".to_string(), "out".to_string()].into();
+        VirtualFs::apply_poll_diff(
+            Vec::new(),
+            &polled,
+            &vfs.inode_table,
+            &vfs.negative_cache,
+            &vfs.invalidator,
+        );
+        vfs.inode_table
+            .write()
+            .unwrap()
+            .mark_remote_checked(&polled, generation);
+
+        let pre_head = hub.head_file_call_count();
+        assert_eq!(vfs.lookup(dir.ino, "missing.txt").await.unwrap_err(), libc::ENOENT);
+        assert_eq!(hub.head_file_call_count(), pre_head, "re-armed: no HEAD");
+    });
+}
+
 /// update_remote_file() skips dirty inodes (local writes not overwritten by poll).
 #[test]
 fn poll_dirty_files_skipped() {
@@ -2787,11 +2884,12 @@ fn poll_skips_list_tree_when_revision_unchanged() {
         let hub_dyn: Arc<dyn crate::hub_api::HubOps> = hub.clone();
         let inodes = vfs.inode_table.clone();
         let neg = vfs.negative_cache.clone();
+        let rev_gen = vfs.revision_gen.clone();
         let inv = vfs.invalidator.clone();
         let handle = tokio::spawn(async move {
             tokio::select! {
                 _ = VirtualFs::poll_remote_changes(
-                    hub_dyn, inodes, neg, inv,
+                    hub_dyn, inodes, neg, rev_gen, inv,
                     Duration::from_millis(10), 4,
                 ) => {}
                 _ = stop_clone.notified() => {}
@@ -2806,6 +2904,7 @@ fn poll_skips_list_tree_when_revision_unchanged() {
             baseline_list_tree,
             "list_tree must not fire when revision is unchanged"
         );
+        let gen_before = vfs.revision_gen.load(std::sync::atomic::Ordering::Acquire);
 
         // Advance the revision -> next round fans out.
         let probes_before = hub.probe_revision_call_count();
@@ -2820,6 +2919,10 @@ fn poll_skips_list_tree_when_revision_unchanged() {
         assert!(
             hub.list_tree_call_count() > baseline_list_tree,
             "list_tree must fire after revision change"
+        );
+        assert!(
+            vfs.revision_gen.load(std::sync::atomic::Ordering::Acquire) > gen_before,
+            "revision generation must advance with the revision"
         );
 
         // Probe error (non-401) -> fall back to full fan-out.

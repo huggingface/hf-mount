@@ -133,6 +133,13 @@ pub struct InodeEntry {
     /// hot path for write-heavy workloads (tarball extract, xfstests) that
     /// create thousands of unique names under freshly-mkdir'd directories.
     pub children_from_remote: bool,
+    /// Revision generation (`VirtualFs::revision_gen`) at which a locally
+    /// created directory was last confirmed to have no remote children: at
+    /// mkdir, then by each poll fan-out that successfully lists it. A newer
+    /// generation means the remote may have grown children under it, so a
+    /// lookup miss must probe the Hub rather than trust the local listing.
+    /// Only meaningful while `children_from_remote` is false.
+    pub remote_checked_gen: u64,
     pub children: Vec<DirChild>,
     /// Name → ino lookup for `lookup_child`. Kept in sync with `children`
     /// via the `add_child` / `remove_child_*` helpers so a directory with
@@ -288,6 +295,7 @@ impl InodeTable {
             dirty_generation: 0,
             children_loaded_at: None,
             children_from_remote: false,
+            remote_checked_gen: 0,
             children: Vec::new(),
             child_index: HashMap::new(),
             pending_deletes: Vec::new(),
@@ -630,6 +638,7 @@ impl InodeTable {
             // sites). Directories start unloaded until the first list.
             children_loaded_at: None,
             children_from_remote: false,
+            remote_checked_gen: 0,
             children: Vec::new(),
             child_index: HashMap::new(),
             pending_deletes: Vec::new(),
@@ -781,6 +790,18 @@ impl InodeTable {
             .filter(|e| e.kind == InodeKind::Directory && e.children_loaded())
             .map(|e| e.full_path.to_string())
             .collect()
+    }
+
+    /// Record that the directories at `prefixes` were listed from the Hub at
+    /// revision `generation` (see `InodeEntry::remote_checked_gen`).
+    pub fn mark_remote_checked(&mut self, prefixes: &HashSet<String>, generation: u64) {
+        for prefix in prefixes {
+            if let Some(ino) = self.get_dir_ino(prefix)
+                && let Some(entry) = self.inodes.get_mut(&ino)
+            {
+                entry.remote_checked_gen = generation;
+            }
+        }
     }
 
     /// Get directory inode by path.
