@@ -220,14 +220,7 @@ pub struct MountOptions {
     pub max_threads: usize,
 
     /// Maximum time (ms) a single remote chunk fetch may stall before the read
-    /// is failed with EIO. Each FUSE `read()` blocks a worker thread on a
-    /// synchronous CAS/CDN fetch; without a ceiling, a stalled fetch (e.g. a
-    /// client-aborted media seek, a hung CDN connection) parks that thread
-    /// forever. After enough stalled reads accumulate, all `max_threads`
-    /// workers are wedged and the whole mount silently stops serving cold
-    /// reads. Bounding the per-chunk wait frees the thread (and cancels the
-    /// in-flight request by dropping the stream) so the mount stays alive.
-    /// 0 disables the timeout (legacy unbounded behaviour).
+    /// is failed with EIO. 0 disables the timeout (legacy unbounded behaviour).
     #[arg(long, default_value_t = 30_000)]
     pub read_fetch_timeout_ms: u64,
 
@@ -361,7 +354,7 @@ pub fn init_tracing(daemon: bool) {
         // DOWNLOAD/reconstruction path (term fetches and whole-file downloads);
         // shard uploads use a separate client with no read_timeout, so this no
         // longer needs to be large for their sake. Keep it short so a stalled
-        // read fails fast and frees the FUSE worker thread instead of pinning it
+        // read fails fast and releases the operation slot instead of occupying it
         // for minutes — a long value here is what let stalled reads accumulate
         // and wedge the mount.
         ("HF_XET_CLIENT_READ_TIMEOUT", "30"),

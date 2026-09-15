@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
+use tokio::sync::Semaphore;
 
 use fuser::{
     Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo, InitFlags, KernelConfig,
@@ -31,6 +32,7 @@ pub struct FuseAdapter {
     advanced_writes: bool,
     /// FOPEN_DIRECT_IO flag on open/create, bypassing kernel page cache.
     direct_io: bool,
+    op_slots: Arc<Semaphore>,
 }
 
 impl FuseAdapter {
@@ -41,6 +43,7 @@ impl FuseAdapter {
         read_only: bool,
         advanced_writes: bool,
         direct_io: bool,
+        op_concurrency: usize,
     ) -> Self {
         Self {
             runtime,
@@ -49,39 +52,58 @@ impl FuseAdapter {
             read_only,
             advanced_writes,
             direct_io,
+            op_slots: Arc::new(Semaphore::new(op_concurrency.max(1))),
         }
+    }
+
+    fn dispatch<F, Fut>(&self, f: F)
+    where
+        F: FnOnce(Arc<VirtualFs>) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let vfs = self.virtual_fs.clone();
+        let slots = self.op_slots.clone();
+        self.runtime.spawn(async move {
+            let _permit = slots.acquire_owned().await.expect("operation semaphore closed");
+            f(vfs).await;
+        });
     }
 
     /// Per-open flags: DIRECT_IO bypasses the page cache; otherwise we ask
     /// the kernel to retain it across opens (safe because init() negotiates
     /// AUTO_INVAL_DATA, so the kernel invalidates on attr changes).
-    fn open_flags(&self) -> FopenFlags {
-        if self.direct_io {
+    fn open_flags(&self, writable: bool) -> FopenFlags {
+        let mut flags = if self.direct_io {
             FopenFlags::FOPEN_DIRECT_IO
         } else {
             FopenFlags::FOPEN_KEEP_CACHE
+        };
+        if !writable {
+            flags |= FopenFlags::FOPEN_NOFLUSH;
         }
+        flags
     }
+}
 
-    /// Return a `VirtualFsAttr` to the kernel while bumping the inode's
-    /// `nlookup` refcount. The bump MUST happen before `reply.entry()` so a
-    /// racing `forget` cannot observe a stale zero refcount.
-    fn reply_entry_tracked(&self, reply: ReplyEntry, attr: &VirtualFsAttr) {
-        self.virtual_fs.bump_nlookup(attr.ino);
-        reply.entry(&self.metadata_ttl, &vfs_attr_to_fuse(attr), GENERATION);
-    }
+/// Return a `VirtualFsAttr` to the kernel while bumping the inode's
+/// `nlookup` refcount. The bump MUST happen before `reply.entry()` so a
+/// racing `forget` cannot observe a stale zero refcount.
+fn reply_entry_tracked(vfs: &VirtualFs, ttl: Duration, reply: ReplyEntry, attr: &VirtualFsAttr) {
+    vfs.bump_nlookup(attr.ino);
+    reply.entry(&ttl, &vfs_attr_to_fuse(attr), GENERATION);
+}
 
-    /// Same as `reply_entry_tracked` for `ReplyCreate`.
-    fn reply_created_tracked(&self, reply: fuser::ReplyCreate, attr: &VirtualFsAttr, fh: u64, oflags: FopenFlags) {
-        self.virtual_fs.bump_nlookup(attr.ino);
-        reply.created(
-            &self.metadata_ttl,
-            &vfs_attr_to_fuse(attr),
-            GENERATION,
-            FileHandle(fh),
-            oflags,
-        );
-    }
+/// Same as `reply_entry_tracked` for `ReplyCreate`.
+fn reply_created_tracked(
+    vfs: &VirtualFs,
+    ttl: Duration,
+    reply: fuser::ReplyCreate,
+    attr: &VirtualFsAttr,
+    fh: u64,
+    oflags: FopenFlags,
+) {
+    vfs.bump_nlookup(attr.ino);
+    reply.created(&ttl, &vfs_attr_to_fuse(attr), GENERATION, FileHandle(fh), oflags);
 }
 
 fn vfs_attr_to_fuse(attr: &VirtualFsAttr) -> FileAttr {
@@ -186,47 +208,55 @@ impl Filesystem for FuseAdapter {
 
     /// Resolve a child name inside a directory → returns inode attributes.
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
-        let name = os_to_str!(name, reply);
-        match self.runtime.block_on(self.virtual_fs.lookup(parent.0, name)) {
-            Ok(attr) => self.reply_entry_tracked(reply, &attr),
-            Err(e) => reply.error(Errno::from_i32(e)),
-        }
+        let name = os_to_str!(name, reply).to_owned();
+        let ttl = self.metadata_ttl;
+        self.dispatch(move |vfs| async move {
+            match vfs.lookup(parent.0, &name).await {
+                Ok(attr) => reply_entry_tracked(&vfs, ttl, reply, &attr),
+                Err(e) => reply.error(Errno::from_i32(e)),
+            }
+        });
     }
 
     /// Balances the `bump_nlookup` issued by `reply_entry_tracked` /
     /// `reply_created_tracked` in lookup, create, mkdir and symlink.
     fn forget(&self, _req: &Request, ino: INodeNo, nlookup: u64) {
-        self.virtual_fs.forget(ino.0, nlookup);
+        self.dispatch(move |vfs| async move { vfs.forget(ino.0, nlookup) });
     }
 
     /// Get file/directory attributes (stat).
     fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
-        match self.virtual_fs.getattr(ino.0) {
-            Ok(attr) => reply.attr(&self.metadata_ttl, &vfs_attr_to_fuse(&attr)),
-            Err(e) => reply.error(Errno::from_i32(e)),
-        }
+        let ttl = self.metadata_ttl;
+        self.dispatch(move |vfs| async move {
+            match vfs.getattr(ino.0) {
+                Ok(attr) => reply.attr(&ttl, &vfs_attr_to_fuse(&attr)),
+                Err(e) => reply.error(Errno::from_i32(e)),
+            }
+        });
     }
 
     /// List directory entries. `offset` is the index of the last entry already returned;
     /// entries before it are skipped so the kernel can paginate large directories.
     fn readdir(&self, _req: &Request, ino: INodeNo, _fh: FileHandle, offset: u64, mut reply: ReplyDirectory) {
-        match self.runtime.block_on(self.virtual_fs.readdir(ino.0)) {
-            Ok(entries) => {
-                for (i, entry) in entries.into_iter().enumerate().skip(offset as usize) {
-                    let file_type = match entry.kind {
-                        InodeKind::File => FileType::RegularFile,
-                        InodeKind::Directory => FileType::Directory,
-                        InodeKind::Symlink => FileType::Symlink,
-                    };
-                    // (i + 1) is the offset cookie the kernel will pass back on the next call.
-                    if reply.add(INodeNo(entry.ino), (i + 1) as u64, file_type, entry.name) {
-                        break; // reply buffer full
+        self.dispatch(move |vfs| async move {
+            match vfs.readdir(ino.0).await {
+                Ok(entries) => {
+                    for (i, entry) in entries.into_iter().enumerate().skip(offset as usize) {
+                        let file_type = match entry.kind {
+                            InodeKind::File => FileType::RegularFile,
+                            InodeKind::Directory => FileType::Directory,
+                            InodeKind::Symlink => FileType::Symlink,
+                        };
+                        // (i + 1) is the offset cookie the kernel will pass back on the next call.
+                        if reply.add(INodeNo(entry.ino), (i + 1) as u64, file_type, entry.name) {
+                            break; // reply buffer full
+                        }
                     }
+                    reply.ok();
                 }
-                reply.ok();
+                Err(e) => reply.error(Errno::from_i32(e)),
             }
-            Err(e) => reply.error(Errno::from_i32(e)),
-        }
+        });
     }
 
     /// Open a file. Returns a file handle and FOPEN flags.
@@ -235,25 +265,23 @@ impl Filesystem for FuseAdapter {
         let writable = accmode == libc::O_WRONLY || accmode == libc::O_RDWR;
         let truncate = (flags.0 & libc::O_TRUNC) != 0;
 
-        match self
-            .runtime
-            .block_on(self.virtual_fs.open(ino.0, writable, truncate, Some(req.pid())))
-        {
-            Ok(file_handle) => {
-                // Skip DIRECT_IO only for O_RDWR in simple streaming mode:
-                // streaming handles don't support read(), so DIRECT_IO would
-                // surface EBADF on any read attempt. O_WRONLY and read-only
-                // opens are fine.
-                let rdwr = accmode == libc::O_RDWR;
-                let flags = if rdwr && !self.advanced_writes {
-                    FopenFlags::empty()
-                } else {
-                    self.open_flags()
-                };
-                reply.opened(FileHandle(file_handle), flags);
+        // Skip DIRECT_IO only for O_RDWR in simple streaming mode:
+        // streaming handles don't support read(), so DIRECT_IO would
+        // surface EBADF on any read attempt. O_WRONLY and read-only
+        // opens are fine.
+        let rdwr = accmode == libc::O_RDWR;
+        let reply_flags = if rdwr && !self.advanced_writes {
+            FopenFlags::empty()
+        } else {
+            self.open_flags(writable)
+        };
+        let pid = req.pid();
+        self.dispatch(move |vfs| async move {
+            match vfs.open(ino.0, writable, truncate, Some(pid)).await {
+                Ok(file_handle) => reply.opened(FileHandle(file_handle), reply_flags),
+                Err(e) => reply.error(Errno::from_i32(e)),
             }
-            Err(e) => reply.error(Errno::from_i32(e)),
-        }
+        });
     }
 
     /// Read data from an open file at the given offset.
@@ -268,10 +296,12 @@ impl Filesystem for FuseAdapter {
         _lock_owner: Option<fuser::LockOwner>,
         reply: ReplyData,
     ) {
-        match self.runtime.block_on(self.virtual_fs.read(fh.0, offset, size)) {
-            Ok((data, _eof)) => reply.data(&data),
-            Err(e) => reply.error(Errno::from_i32(e)),
-        }
+        self.dispatch(move |vfs| async move {
+            match vfs.read(fh.0, offset, size).await {
+                Ok((data, _eof)) => reply.data(&data),
+                Err(e) => reply.error(Errno::from_i32(e)),
+            }
+        });
     }
 
     /// Write data to an open file at the given offset.
@@ -287,31 +317,42 @@ impl Filesystem for FuseAdapter {
         _lock_owner: Option<fuser::LockOwner>,
         reply: ReplyWrite,
     ) {
-        match self.virtual_fs.write(ino.0, fh.0, offset, data) {
-            Ok(written) => reply.written(written),
-            Err(e) => reply.error(Errno::from_i32(e)),
-        }
+        let data = data.to_vec();
+        self.dispatch(move |vfs| async move {
+            match vfs.write(ino.0, fh.0, offset, data).await {
+                Ok(written) => reply.written(written),
+                Err(e) => reply.error(Errno::from_i32(e)),
+            }
+        });
     }
 
     /// Called on close(2). For streaming writes, synchronously uploads and commits.
     fn flush(&self, req: &Request, ino: INodeNo, fh: FileHandle, _lock_owner: fuser::LockOwner, reply: ReplyEmpty) {
-        match self
-            .runtime
-            .block_on(self.virtual_fs.flush(ino.0, fh.0, Some(req.pid())))
-        {
-            Ok(()) => reply.ok(),
-            Err(e) => reply.error(Errno::from_i32(e)),
+        let pid = req.pid();
+        // Exit-path FLUSH must bypass saturated operation slots in advanced-writes mode.
+        if self.advanced_writes {
+            match self.virtual_fs.check_flush_error(ino.0) {
+                Ok(()) => reply.ok(),
+                Err(e) => reply.error(Errno::from_i32(e)),
+            }
+            return;
         }
+        self.dispatch(move |vfs| async move {
+            match vfs.flush(ino.0, fh.0, Some(pid)).await {
+                Ok(()) => reply.ok(),
+                Err(e) => reply.error(Errno::from_i32(e)),
+            }
+        });
     }
 
     fn fsync(&self, req: &Request, ino: INodeNo, fh: FileHandle, _datasync: bool, reply: ReplyEmpty) {
-        match self
-            .runtime
-            .block_on(self.virtual_fs.fsync(ino.0, fh.0, Some(req.pid())))
-        {
-            Ok(()) => reply.ok(),
-            Err(e) => reply.error(Errno::from_i32(e)),
-        }
+        let pid = req.pid();
+        self.dispatch(move |vfs| async move {
+            match vfs.fsync(ino.0, fh.0, Some(pid)).await {
+                Ok(()) => reply.ok(),
+                Err(e) => reply.error(Errno::from_i32(e)),
+            }
+        });
     }
 
     /// Called when all references to a file handle are closed. Triggers async flush to Hub.
@@ -325,10 +366,12 @@ impl Filesystem for FuseAdapter {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        match self.runtime.block_on(self.virtual_fs.release(fh.0)) {
-            Ok(()) => reply.ok(),
-            Err(e) => reply.error(Errno::from_i32(e)),
-        }
+        self.dispatch(move |vfs| async move {
+            match vfs.release(fh.0).await {
+                Ok(()) => reply.ok(),
+                Err(e) => reply.error(Errno::from_i32(e)),
+            }
+        });
     }
 
     /// Create and open a new file in one call (O_CREAT).
@@ -342,78 +385,79 @@ impl Filesystem for FuseAdapter {
         flags: i32,
         reply: fuser::ReplyCreate,
     ) {
-        let name = os_to_str!(name, reply);
+        let name = os_to_str!(name, reply).to_owned();
         let effective_mode = (mode & !umask & 0o7777) as u16;
-        match self.runtime.block_on(self.virtual_fs.create(
-            parent.0,
-            name,
-            effective_mode,
-            req.uid(),
-            req.gid(),
-            Some(req.pid()),
-        )) {
-            Ok((attr, file_handle)) => {
-                // Same guard as open(): skip DIRECT_IO for O_RDWR in simple
-                // streaming mode (handle is write-only, reads would EBADF).
-                let rdwr = (flags & libc::O_ACCMODE) == libc::O_RDWR;
-                let oflags = if rdwr && !self.advanced_writes {
-                    FopenFlags::empty()
-                } else {
-                    self.open_flags()
-                };
-                self.reply_created_tracked(reply, &attr, file_handle, oflags);
+        // Same guard as open(): skip DIRECT_IO for O_RDWR in simple
+        // streaming mode (handle is write-only, reads would EBADF).
+        let rdwr = (flags & libc::O_ACCMODE) == libc::O_RDWR;
+        let oflags = if rdwr && !self.advanced_writes {
+            FopenFlags::empty()
+        } else {
+            self.open_flags(true)
+        };
+        let ttl = self.metadata_ttl;
+        let (uid, gid, pid) = (req.uid(), req.gid(), req.pid());
+        self.dispatch(move |vfs| async move {
+            match vfs.create(parent.0, &name, effective_mode, uid, gid, Some(pid)).await {
+                Ok((attr, file_handle)) => reply_created_tracked(&vfs, ttl, reply, &attr, file_handle, oflags),
+                Err(e) => reply.error(Errno::from_i32(e)),
             }
-            Err(e) => reply.error(Errno::from_i32(e)),
-        }
+        });
     }
 
     /// Create a new directory.
     fn mkdir(&self, req: &Request, parent: INodeNo, name: &OsStr, mode: u32, umask: u32, reply: ReplyEntry) {
-        let name = os_to_str!(name, reply);
+        let name = os_to_str!(name, reply).to_owned();
         let effective_mode = (mode & !umask & 0o7777) as u16;
-        match self.runtime.block_on(
-            self.virtual_fs
-                .mkdir(parent.0, name, effective_mode, req.uid(), req.gid()),
-        ) {
-            Ok(attr) => self.reply_entry_tracked(reply, &attr),
-            Err(e) => reply.error(Errno::from_i32(e)),
-        }
+        let ttl = self.metadata_ttl;
+        let (uid, gid) = (req.uid(), req.gid());
+        self.dispatch(move |vfs| async move {
+            match vfs.mkdir(parent.0, &name, effective_mode, uid, gid).await {
+                Ok(attr) => reply_entry_tracked(&vfs, ttl, reply, &attr),
+                Err(e) => reply.error(Errno::from_i32(e)),
+            }
+        });
     }
 
     /// Remove a file.
     fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
-        let name = os_to_str!(name, reply);
-        match self.runtime.block_on(self.virtual_fs.unlink(parent.0, name)) {
-            Ok(()) => reply.ok(),
-            Err(e) => reply.error(Errno::from_i32(e)),
-        }
+        let name = os_to_str!(name, reply).to_owned();
+        self.dispatch(move |vfs| async move {
+            match vfs.unlink(parent.0, &name).await {
+                Ok(()) => reply.ok(),
+                Err(e) => reply.error(Errno::from_i32(e)),
+            }
+        });
     }
 
     /// Create a symbolic link.
     fn symlink(&self, req: &Request, parent: INodeNo, link_name: &OsStr, target: &std::path::Path, reply: ReplyEntry) {
-        let link_name = os_to_str!(link_name, reply);
+        let link_name = os_to_str!(link_name, reply).to_owned();
         let target = match target.to_str() {
-            Some(t) => t,
+            Some(t) => t.to_owned(),
             None => {
                 reply.error(Errno::EINVAL);
                 return;
             }
         };
-        match self.runtime.block_on(
-            self.virtual_fs
-                .symlink(parent.0, link_name, target, 0o777, req.uid(), req.gid()),
-        ) {
-            Ok(attr) => self.reply_entry_tracked(reply, &attr),
-            Err(e) => reply.error(Errno::from_i32(e)),
-        }
+        let ttl = self.metadata_ttl;
+        let (uid, gid) = (req.uid(), req.gid());
+        self.dispatch(move |vfs| async move {
+            match vfs.symlink(parent.0, &link_name, &target, 0o777, uid, gid).await {
+                Ok(attr) => reply_entry_tracked(&vfs, ttl, reply, &attr),
+                Err(e) => reply.error(Errno::from_i32(e)),
+            }
+        });
     }
 
     /// Read the target of a symbolic link.
     fn readlink(&self, _req: &Request, ino: INodeNo, reply: ReplyData) {
-        match self.virtual_fs.readlink(ino.0) {
-            Ok(target) => reply.data(target.as_bytes()),
-            Err(e) => reply.error(Errno::from_i32(e)),
-        }
+        self.dispatch(move |vfs| async move {
+            match vfs.readlink(ino.0) {
+                Ok(target) => reply.data(target.as_bytes()),
+                Err(e) => reply.error(Errno::from_i32(e)),
+            }
+        });
     }
 
     /// Hard link, implemented as a server-side copy: a new Hub entry pointing at
@@ -421,20 +465,25 @@ impl Filesystem for FuseAdapter {
     /// so st_ino differs from the source; callers like the *arr import pipelines
     /// only need the instant copy semantics.
     fn link(&self, _req: &Request, ino: INodeNo, newparent: INodeNo, newname: &OsStr, reply: ReplyEntry) {
-        let newname = os_to_str!(newname, reply);
-        match self.runtime.block_on(self.virtual_fs.link(ino.0, newparent.0, newname)) {
-            Ok(attr) => self.reply_entry_tracked(reply, &attr),
-            Err(e) => reply.error(Errno::from_i32(e)),
-        }
+        let newname = os_to_str!(newname, reply).to_owned();
+        let ttl = self.metadata_ttl;
+        self.dispatch(move |vfs| async move {
+            match vfs.link(ino.0, newparent.0, &newname).await {
+                Ok(attr) => reply_entry_tracked(&vfs, ttl, reply, &attr),
+                Err(e) => reply.error(Errno::from_i32(e)),
+            }
+        });
     }
 
     /// Remove an empty directory.
     fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
-        let name = os_to_str!(name, reply);
-        match self.runtime.block_on(self.virtual_fs.rmdir(parent.0, name)) {
-            Ok(()) => reply.ok(),
-            Err(e) => reply.error(Errno::from_i32(e)),
-        }
+        let name = os_to_str!(name, reply).to_owned();
+        self.dispatch(move |vfs| async move {
+            match vfs.rmdir(parent.0, &name).await {
+                Ok(()) => reply.ok(),
+                Err(e) => reply.error(Errno::from_i32(e)),
+            }
+        });
     }
 
     /// Rename/move a file or directory.
@@ -457,21 +506,20 @@ impl Filesystem for FuseAdapter {
             return;
         }
 
-        let name = os_to_str!(name, reply);
-        let newname = os_to_str!(newname, reply);
+        let name = os_to_str!(name, reply).to_owned();
+        let newname = os_to_str!(newname, reply).to_owned();
 
         #[cfg(target_os = "linux")]
         let no_replace = flags.contains(fuser::RenameFlags::RENAME_NOREPLACE);
         #[cfg(not(target_os = "linux"))]
         let no_replace = false;
 
-        match self
-            .runtime
-            .block_on(self.virtual_fs.rename(parent.0, name, newparent.0, newname, no_replace))
-        {
-            Ok(()) => reply.ok(),
-            Err(e) => reply.error(Errno::from_i32(e)),
-        }
+        self.dispatch(move |vfs| async move {
+            match vfs.rename(parent.0, &name, newparent.0, &newname, no_replace).await {
+                Ok(()) => reply.ok(),
+                Err(e) => reply.error(Errno::from_i32(e)),
+            }
+        });
     }
 
     /// Set file attributes (size, mode, uid, gid, timestamps).
@@ -497,47 +545,51 @@ impl Filesystem for FuseAdapter {
             TimeOrNow::SpecificTime(st) => st,
             TimeOrNow::Now => SystemTime::now(),
         };
-        match self.runtime.block_on(self.virtual_fs.setattr(
-            ino.0,
-            size,
-            mode.map(|m| (m & 0o7777) as u16),
-            uid,
-            gid,
-            atime.map(resolve_time),
-            mtime.map(resolve_time),
-        )) {
-            Ok(attr) => reply.attr(&self.metadata_ttl, &vfs_attr_to_fuse(&attr)),
-            Err(e) => reply.error(Errno::from_i32(e)),
-        }
+        let mode = mode.map(|m| (m & 0o7777) as u16);
+        let atime = atime.map(resolve_time);
+        let mtime = mtime.map(resolve_time);
+        let ttl = self.metadata_ttl;
+        self.dispatch(move |vfs| async move {
+            match vfs.setattr(ino.0, size, mode, uid, gid, atime, mtime).await {
+                Ok(attr) => reply.attr(&ttl, &vfs_attr_to_fuse(&attr)),
+                Err(e) => reply.error(Errno::from_i32(e)),
+            }
+        });
     }
 
     /// Open a directory (allocates a handle for readdir).
     fn opendir(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
-        match self.virtual_fs.getattr(ino.0) {
-            Ok(attr) if attr.kind == InodeKind::Directory => {
-                // Pin the dir against eviction until the matching releasedir.
-                // Otherwise a concurrent force-evict could drop the inode
-                // between opendir and the readdir that follows.
-                self.virtual_fs.bump_open_handles(ino.0);
-                reply.opened(FileHandle(self.virtual_fs.alloc_file_handle()), FopenFlags::empty());
+        self.dispatch(move |vfs| async move {
+            match vfs.getattr(ino.0) {
+                Ok(attr) if attr.kind == InodeKind::Directory => {
+                    // Pin the dir against eviction until the matching releasedir.
+                    // Otherwise a concurrent force-evict could drop the inode
+                    // between opendir and the readdir that follows.
+                    vfs.bump_open_handles(ino.0);
+                    reply.opened(FileHandle(vfs.alloc_file_handle()), FopenFlags::empty());
+                }
+                Ok(_) => reply.error(Errno::ENOTDIR),
+                Err(e) => reply.error(Errno::from_i32(e)),
             }
-            Ok(_) => reply.error(Errno::ENOTDIR),
-            Err(e) => reply.error(Errno::from_i32(e)),
-        }
+        });
     }
 
     /// Release a directory handle. Drops the refcount bumped by `opendir`.
     fn releasedir(&self, _req: &Request, ino: INodeNo, _fh: FileHandle, _flags: OpenFlags, reply: ReplyEmpty) {
-        self.virtual_fs.drop_open_handles(ino.0);
-        reply.ok();
+        self.dispatch(move |vfs| async move {
+            vfs.drop_open_handles(ino.0);
+            reply.ok();
+        });
     }
 
     /// Filesystem statistics (df). Reports 42 PB for fun
     fn statfs(&self, _req: &Request, _ino: INodeNo, reply: ReplyStatfs) {
         const BLOCK_SIZE: u32 = 512;
         const BLOCKS: u64 = 42 * 1024 * 1024 * 1024 * 1024 * 1024 / BLOCK_SIZE as u64; // 42 PB
-        //           blocks, bfree,  bavail, files, ffree, bsize,      namelen, frsize
-        reply.statfs(BLOCKS, BLOCKS, BLOCKS, 0, 0, BLOCK_SIZE, 255, 0);
+        self.dispatch(move |_vfs| async move {
+            //           blocks, bfree,  bavail, files, ffree, bsize,      namelen, frsize
+            reply.statfs(BLOCKS, BLOCKS, BLOCKS, 0, 0, BLOCK_SIZE, 255, 0);
+        });
     }
 
     /// Called on unmount. Flushes pending writes and stops background tasks.
@@ -600,14 +652,6 @@ pub fn mount_fuse(
     daemon_guard: Option<&mut DaemonGuard>,
     fuse_fds: Vec<OwnedFd>,
 ) -> Result<FuseSession, io::Error> {
-    let adapter = FuseAdapter::new(
-        setup.runtime.clone(),
-        setup.virtual_fs.clone(),
-        setup.metadata_ttl,
-        setup.read_only,
-        setup.advanced_writes,
-        setup.direct_io,
-    );
     let mount_point = &setup.mount_point;
 
     let mut config = fuser::Config::default();
@@ -672,6 +716,16 @@ pub fn mount_fuse(
             config.n_threads = Some(fuse_fds.len());
         }
     }
+
+    let adapter = FuseAdapter::new(
+        setup.runtime.clone(),
+        setup.virtual_fs.clone(),
+        setup.metadata_ttl,
+        setup.read_only,
+        setup.advanced_writes,
+        setup.direct_io,
+        config.n_threads.unwrap_or(1),
+    );
 
     let session = if fuse_fds.is_empty() {
         fuser::Session::new(adapter, mount_point, &config).inspect_err(|e| {
