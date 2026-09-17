@@ -2,6 +2,7 @@ pub mod cached_xet_client;
 pub mod daemon;
 pub mod error;
 pub mod file_cache;
+pub mod follow;
 #[cfg(feature = "fuse")]
 pub mod fuse;
 pub mod hub_api;

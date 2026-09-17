@@ -88,6 +88,24 @@ pub trait HubOps: Send + Sync {
     async fn probe_revision(&self) -> Result<String> {
         Err(Error::hub("probe_revision not implemented"))
     }
+
+    /// Open the bucket live-follow SSE stream (`GET /api/buckets/{id}/events`).
+    ///
+    /// `cursor` resumes strictly after a previously received opaque cursor;
+    /// `since` (ISO8601, e.g. the last `updatedAt` seen) replays changes from
+    /// that instant; with neither, only live changes stream (callers pass at
+    /// most one). Errors carry the HTTP status: 400/404 mean this deployment
+    /// doesn't serve the feed and the caller falls back to polling
+    /// permanently; a 503 carries the server's `Retry-After` hint via
+    /// [`Error::retry_after`]. The default impl reports 404 so mocks and
+    /// non-bucket sources use the poll fallback.
+    async fn follow_events(
+        &self,
+        _cursor: Option<&str>,
+        _since: Option<&str>,
+    ) -> Result<Box<dyn crate::follow::FollowStreamOps>> {
+        Err(Error::hub_status(404, "live-follow not supported"))
+    }
 }
 
 // ── Repo / Bucket types ───────────────────────────────────────────────
@@ -261,6 +279,10 @@ pub struct HubApiClient {
     /// Client that does NOT follow redirects — used for HEAD requests where we
     /// need response headers from the Hub (not from the CAS redirect target).
     head_client: Client,
+    /// Client for the live-follow SSE stream: no whole-request timeout (the
+    /// stream is long-lived by design), a per-read timeout instead. The
+    /// server pings every 30s, so 90s of silence means a dead connection.
+    follow_client: Client,
     endpoint: String,
     token: Option<String>,
     /// Path to a file containing the API token. Re-read periodically so
@@ -441,9 +463,9 @@ async fn send_with_retry(
     }
 }
 
-fn make_clients(backend: &str) -> (Client, Client) {
+fn make_clients(backend: &str) -> (Client, Client, Client) {
     let user_agent = format!("hf-mount/{}; fs/{}", env!("CARGO_PKG_VERSION"), backend);
-    // Idle pool / keep-alive shared across both clients so a hung Hub doesn't
+    // Idle pool / keep-alive shared across the clients so a hung Hub doesn't
     // freeze the poll loop and TLS handshakes are amortized across rounds.
     let base = || {
         reqwest::Client::builder()
@@ -461,7 +483,14 @@ fn make_clients(backend: &str) -> (Client, Client) {
         .timeout(Duration::from_secs(30))
         .build()
         .expect("failed to build head_client");
-    (client, head_client)
+    // See HubApiClient::follow_client: a whole-request timeout would cut the
+    // SSE stream mid-session, so bound each body read instead — the server's
+    // 30s pings keep a healthy connection under the 90s ceiling.
+    let follow_client = base()
+        .read_timeout(Duration::from_secs(90))
+        .build()
+        .expect("failed to build follow_client");
+    (client, head_client, follow_client)
 }
 
 impl HubApiClient {
@@ -476,7 +505,7 @@ impl HubApiClient {
         path_prefix: String,
         backend: &str,
     ) -> Result<Arc<Self>> {
-        let (client, head_client) = make_clients(backend);
+        let (client, head_client, follow_client) = make_clients(backend);
         let endpoint = endpoint.trim_end_matches('/').to_string();
 
         let (source, last_modified) = match source {
@@ -540,6 +569,7 @@ impl HubApiClient {
         Ok(Arc::new(Self {
             client,
             head_client,
+            follow_client,
             endpoint,
             token: token.map(|t| t.to_string()),
             token_file,
@@ -552,10 +582,11 @@ impl HubApiClient {
 
     /// Create a client for a HuggingFace bucket.
     pub fn new(endpoint: &str, token: Option<&str>, bucket_id: &str, backend: &str) -> Arc<Self> {
-        let (client, head_client) = make_clients(backend);
+        let (client, head_client, follow_client) = make_clients(backend);
         Arc::new(Self {
             client,
             head_client,
+            follow_client,
             endpoint: endpoint.trim_end_matches('/').to_string(),
             token: token.map(|t| t.to_string()),
             token_file: None,
@@ -689,6 +720,63 @@ impl HubApiClient {
                 .updated_at
                 .ok_or_else(|| Error::hub("revision probe: bucket response missing updatedAt")),
         }
+    }
+
+    /// Open the bucket live-follow SSE stream. See [`HubOps::follow_events`]
+    /// for the contract; this is the transport: `GET
+    /// /api/buckets/{id}/events` with `Accept: text/event-stream` (mandatory
+    /// — the server 400s without it) and the same bearer auth as tree calls.
+    /// No `send_with_retry`: a 503 here has dedicated semantics (this pod
+    /// doesn't serve the feed or is catching up; honor its `Retry-After`,
+    /// default 10s at the caller) and everything else is either permanent
+    /// (400/404 → poll fallback) or handled by the caller's reconnect loop.
+    pub async fn follow_events(
+        &self,
+        cursor: Option<&str>,
+        since: Option<&str>,
+    ) -> Result<Box<dyn crate::follow::FollowStreamOps>> {
+        let SourceKind::Bucket { bucket_id } = &self.source else {
+            // Repos have no live-follow feed; report what an older Hub would.
+            return Err(Error::hub_status(404, "live-follow is only available for buckets"));
+        };
+        let mut url = format!("{}/api/buckets/{}/events", self.endpoint, bucket_id);
+        // Opaque cursor / ISO8601 instant land in a query value: encode
+        // conservatively (everything but alphanumerics).
+        if let Some(cursor) = cursor {
+            url.push_str("?cursor=");
+            url.extend(utf8_percent_encode(cursor, percent_encoding::NON_ALPHANUMERIC));
+        } else if let Some(since) = since {
+            url.push_str("?since=");
+            url.extend(utf8_percent_encode(since, percent_encoding::NON_ALPHANUMERIC));
+        }
+        let resp = self
+            .auth(self.follow_client.get(&url))
+            .header("accept", "text/event-stream")
+            .send()
+            .await
+            .map_err(Error::Http)?;
+        let status = resp.status().as_u16();
+        if status == 503 {
+            let retry_after = resp
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .map(Duration::from_secs);
+            return Err(Error::Hub {
+                message: "live-follow: feed unavailable on this pod (503)".to_string(),
+                status: Some(503),
+                retry_after,
+            });
+        }
+        if !resp.status().is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(Error::hub_status(status, format!("live-follow: {status} {body}")));
+        }
+        Ok(Box::new(crate::follow::HttpFollowStream::new(
+            resp,
+            self.path_prefix.clone(),
+        )))
     }
 
     /// List tree entries at the given prefix (single directory level).
@@ -1124,6 +1212,13 @@ impl HubOps for HubApiClient {
     async fn probe_revision(&self) -> Result<String> {
         self.probe_revision().await
     }
+    async fn follow_events(
+        &self,
+        cursor: Option<&str>,
+        since: Option<&str>,
+    ) -> Result<Box<dyn crate::follow::FollowStreamOps>> {
+        self.follow_events(cursor, since).await
+    }
 }
 
 /// Fields read from `/api/{type}/{id}` for the cheap-probe path. For repos,
@@ -1363,10 +1458,11 @@ mod tests {
     // ── prefixed_path / strip_path_prefix tests ───────────────────────
 
     fn make_test_client(prefix: &str, token_file: Option<PathBuf>) -> HubApiClient {
-        let (client, head_client) = make_clients("test");
+        let (client, head_client, follow_client) = make_clients("test");
         HubApiClient {
             client,
             head_client,
+            follow_client,
             endpoint: "https://huggingface.co".to_string(),
             token: Some("static-token".to_string()),
             token_file,
