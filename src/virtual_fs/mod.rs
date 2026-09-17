@@ -116,6 +116,12 @@ pub struct VfsConfig {
     /// Maximum concurrent tree-listing requests per poll round.
     /// Must be >= 1.
     pub poll_listing_concurrency: usize,
+    /// Subscribe to the Hub's bucket live-follow event stream (SSE) so remote
+    /// changes are applied as they happen, skipping the periodic probe +
+    /// fan-out while the stream is healthy. Falls back to interval polling
+    /// automatically when the Hub doesn't serve the feed (older deployments,
+    /// repo sources). Only used when polling is enabled (interval > 0).
+    pub live_follow: bool,
     pub metadata_ttl: Duration,
     /// How long a lookup miss is remembered before the path is re-probed.
     pub negative_ttl: Duration,
@@ -316,6 +322,7 @@ impl VirtualFs {
                 bg_invalidator,
                 interval,
                 listing_concurrency,
+                config.live_follow,
             )))
         } else {
             None

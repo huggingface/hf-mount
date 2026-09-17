@@ -225,6 +225,7 @@ The same `FUSE_NOTIFY_INVAL_INODE` writev can also wedge at **runtime** (not jus
 | `--advanced-writes` | `false` | Enable staging files + async flush (random writes, seek, overwrite) |
 | `--poll-interval-secs` | `30` | Remote change polling interval (0 to disable) |
 | `--poll-listing-concurrency` | `4` | Max concurrent tree-listing requests per poll round. Main knob to throttle load on the Hub `/api` endpoint; lower it in shared environments where many mounts poll in parallel. |
+| `--live-follow` | `true` | Subscribe to the Hub's bucket live-follow event stream (SSE): remote changes are applied to loaded directories as they happen, and the periodic poll fan-out is skipped while the stream is healthy. Falls back to interval polling automatically when the Hub doesn't serve the feed (older deployments, repo mounts). Disable with `--live-follow=false`. |
 | `--max-threads` | `16` | Maximum FUSE worker threads (Linux only) |
 | `--metadata-ttl-ms` | `10000` | How long file metadata is cached before re-checking (ms) |
 | `--metadata-ttl-minimal` | `false` | Re-check on every access (maximum freshness, lower throughput) |
@@ -292,20 +293,21 @@ RUST_LOG=hf_mount=debug hf-mount-fuse repo gpt2 /mnt/gpt2
 - **Subfolder mounting** -- mount only a subdirectory (e.g. `user/model/ckpt/v2`)
 - **Simple writes** (default) -- append-only, in-memory, synchronous upload on close
 - **Advanced writes** (`--advanced-writes`) -- staging files on disk, random writes + seek, async debounced flush
-- **Remote sync** -- background polling detects remote changes and updates the local view
+- **Remote sync** -- a live-follow event stream (buckets) plus background polling keep the local view in sync with remote changes
 - **POSIX metadata** -- chmod, chown, timestamps, symlinks (in-memory only, lost on unmount)
 - **Overlay mode** (`--overlay`) -- mount point doubles as a writable local layer; remote stays read-only
 
 ## Consistency model
 
-hf-mount provides **eventual consistency** with remote changes. There is no push notification from the Hub; all freshness relies on client-side polling.
+hf-mount provides **eventual consistency** with remote changes. For buckets, a live-follow event stream pushes remote changes to the mount as they happen; per-file revalidation and interval polling cover repos, older Hub deployments, and gaps in the stream.
 
 ### Reads
 
-Files can be stale for up to `--metadata-ttl-ms` (default 10 s) after a remote update. Two mechanisms detect changes:
+Files can be stale for up to `--metadata-ttl-ms` (default 10 s) after a remote update. Three mechanisms detect changes:
 
-1. **Metadata revalidation** (FUSE only) -- when the per-file TTL expires, the next access checks the Hub. If the file changed, cached data is invalidated.
-2. **Background polling** (default every 30 s) -- lists the full tree and detects additions, modifications, and deletions.
+1. **Live-follow stream** (buckets, default on, `--live-follow`) -- subscribes to the Hub's `/api/buckets/{id}/events` SSE feed; adds, updates, and deletes land in already-loaded directories within about a second of the remote commit. On any stream interruption the client reconnects with its last cursor; when the server can't resume (its replay buffer covers ~15 min), one full poll round reconciles before re-subscribing. If the Hub doesn't serve the feed, the mount falls back to interval polling for the session.
+2. **Metadata revalidation** (FUSE only) -- when the per-file TTL expires, the next access checks the Hub. If the file changed, cached data is invalidated.
+3. **Background polling** (default every 30 s) -- lists the full tree and detects additions, modifications, and deletions. Skipped entirely while the live-follow stream is healthy.
 
 A lookup of a path that does not exist yet probes the Hub directly, so a file added remotely is visible as soon as the upload lands. Repeated misses are served from a negative cache for `--negative-ttl-ms` (default 1 s) without hitting the Hub; a client that probes a path before the producer finishes uploading sees it at most that long after it lands.
 

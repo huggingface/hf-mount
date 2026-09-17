@@ -6,9 +6,10 @@ use futures::stream::{self, StreamExt};
 use tracing::{debug, info, warn};
 
 use crate::error::Error;
+use crate::follow::{FollowChange, FollowEvent, FollowOp};
 use crate::hub_api::HubOps;
 
-use super::inode::{self, InodeTable};
+use super::inode::{self, InodeKind, InodeTable};
 use super::{InvalKind, Invalidator};
 
 /// Cap on the exponential-backoff multiplier applied to the poll interval
@@ -41,13 +42,34 @@ impl super::VirtualFs {
         invalidator: Invalidator,
         interval: Duration,
         listing_concurrency: usize,
+        live_follow: bool,
     ) {
-        // Exponent applied to `interval` while the Hub keeps failing (401 or
-        // transient statuses). Reset to 0 as soon as we see a successful round.
-        let mut backoff_exp: u32 = 0;
         // None forces a full fan-out next round; primed with an initial probe so
         // a freshly mounted source doesn't redundantly re-list once.
         let mut last_revision: Option<String> = hub_client.probe_revision().await.ok();
+
+        // Prefer the Hub's bucket live-follow SSE feed: while the stream is
+        // healthy, per-file changes are applied as they happen and the
+        // probe + fan-out below never runs. `follow_remote_changes` returns
+        // only when the endpoint is permanently unavailable (400/404: older
+        // Hub deployment, or a repo source) — then the interval poll below
+        // takes over unchanged.
+        if live_follow {
+            Self::follow_remote_changes(
+                &hub_client,
+                &inodes,
+                &negative_cache,
+                &invalidator,
+                listing_concurrency,
+                &mut last_revision,
+            )
+            .await;
+            info!("Live-follow endpoint unavailable for this source; using interval polling");
+        }
+
+        // Exponent applied to `interval` while the Hub keeps failing (401 or
+        // transient statuses). Reset to 0 as soon as we see a successful round.
+        let mut backoff_exp: u32 = 0;
         loop {
             tokio::time::sleep(interval.saturating_mul(1u32 << backoff_exp)).await;
 
@@ -82,41 +104,8 @@ impl super::VirtualFs {
                 }
             }
 
-            // Only poll directories the user has actually visited (children_loaded).
-            // This avoids fetching the entire tree for large repos where most
-            // directories have never been accessed.
-            let prefixes = inodes.read().expect("inodes poisoned").loaded_dir_prefixes();
-            // buffer_unordered yields out of order, so carry the prefix alongside the result.
-            let results: Vec<(String, _)> = stream::iter(prefixes)
-                .map(|prefix| {
-                    let client = hub_client.clone();
-                    async move {
-                        let result = client.list_tree(&prefix).await;
-                        (prefix, result)
-                    }
-                })
-                .buffer_unordered(listing_concurrency)
-                .collect()
-                .await;
-            let mut all_entries = Vec::new();
-            let mut polled_prefixes = HashSet::new();
-            let mut failed_prefixes = Vec::new();
-            let mut saw_backoff_status = false;
-            for (prefix, result) in results {
-                match result {
-                    Ok(entries) => {
-                        polled_prefixes.insert(prefix);
-                        all_entries.extend(entries);
-                    }
-                    Err(e) => {
-                        if should_back_off(&e) {
-                            saw_backoff_status = true;
-                        }
-                        warn!("Remote poll failed for prefix '{prefix}': {e}");
-                        failed_prefixes.push(prefix);
-                    }
-                }
-            }
+            let saw_backoff_status =
+                Self::poll_round(&hub_client, &inodes, &negative_cache, &invalidator, listing_concurrency).await;
             if saw_backoff_status {
                 backoff_exp = (backoff_exp + 1).min(MAX_BACKOFF_EXP);
                 warn!(
@@ -127,24 +116,328 @@ impl super::VirtualFs {
                 info!("Remote poll recovered, resetting backoff");
                 backoff_exp = 0;
             }
-            // For failed prefixes, check if the parent was polled successfully
-            // and the dir no longer appears in its listing. If so, the dir was
-            // deleted remotely — mark it as polled so its files get cleaned up.
-            // Sort by depth (parents first) so nested deletions cascade correctly.
-            failed_prefixes.sort_by_key(|p| p.matches('/').count());
-            for failed in &failed_prefixes {
-                let parent = failed.rsplit_once('/').map_or("", |(p, _)| p);
-                if polled_prefixes.contains(parent) {
-                    let dir_still_exists = all_entries
-                        .iter()
-                        .any(|e| e.entry_type == "directory" && e.path == *failed);
-                    if !dir_still_exists {
-                        info!("Remote directory deletion detected: {}", failed);
-                        polled_prefixes.insert(failed.clone());
+        }
+    }
+
+    /// One full reconcile round: list every loaded directory prefix and diff
+    /// the result against the inode table. Returns `true` when a listing
+    /// failed with a status the caller should back off on (401/transient).
+    pub(super) async fn poll_round(
+        hub_client: &Arc<dyn HubOps>,
+        inodes: &Arc<RwLock<InodeTable>>,
+        negative_cache: &Arc<RwLock<HashMap<String, Instant>>>,
+        invalidator: &Invalidator,
+        listing_concurrency: usize,
+    ) -> bool {
+        // Only poll directories the user has actually visited (children_loaded).
+        // This avoids fetching the entire tree for large repos where most
+        // directories have never been accessed.
+        let prefixes = inodes.read().expect("inodes poisoned").loaded_dir_prefixes();
+        // buffer_unordered yields out of order, so carry the prefix alongside the result.
+        let results: Vec<(String, _)> = stream::iter(prefixes)
+            .map(|prefix| {
+                let client = hub_client.clone();
+                async move {
+                    let result = client.list_tree(&prefix).await;
+                    (prefix, result)
+                }
+            })
+            .buffer_unordered(listing_concurrency)
+            .collect()
+            .await;
+        let mut all_entries = Vec::new();
+        let mut polled_prefixes = HashSet::new();
+        let mut failed_prefixes = Vec::new();
+        let mut saw_backoff_status = false;
+        for (prefix, result) in results {
+            match result {
+                Ok(entries) => {
+                    polled_prefixes.insert(prefix);
+                    all_entries.extend(entries);
+                }
+                Err(e) => {
+                    if should_back_off(&e) {
+                        saw_backoff_status = true;
+                    }
+                    warn!("Remote poll failed for prefix '{prefix}': {e}");
+                    failed_prefixes.push(prefix);
+                }
+            }
+        }
+        // For failed prefixes, check if the parent was polled successfully
+        // and the dir no longer appears in its listing. If so, the dir was
+        // deleted remotely — mark it as polled so its files get cleaned up.
+        // Sort by depth (parents first) so nested deletions cascade correctly.
+        failed_prefixes.sort_by_key(|p| p.matches('/').count());
+        for failed in &failed_prefixes {
+            let parent = failed.rsplit_once('/').map_or("", |(p, _)| p);
+            if polled_prefixes.contains(parent) {
+                let dir_still_exists = all_entries
+                    .iter()
+                    .any(|e| e.entry_type == "directory" && e.path == *failed);
+                if !dir_still_exists {
+                    info!("Remote directory deletion detected: {}", failed);
+                    polled_prefixes.insert(failed.clone());
+                }
+            }
+        }
+        Self::apply_poll_diff(all_entries, &polled_prefixes, inodes, negative_cache, invalidator);
+        saw_backoff_status
+    }
+
+    /// Drive the bucket live-follow SSE feed (see `crate::follow`). Returns
+    /// only when the endpoint is permanently unavailable (400/404) so the
+    /// caller can fall back to interval polling; every other failure retries
+    /// here. While a stream is healthy this fully replaces the periodic
+    /// probe + fan-out.
+    ///
+    /// Resume protocol: reconnect with the last received cursor (server
+    /// resumes strictly after it). Without a cursor — first connect, or the
+    /// server buffer expired (`reset`) — re-probe `updatedAt`: if the bucket
+    /// moved since `last_revision`, one full poll round reconciles, then the
+    /// subscription starts from the fresh `updatedAt` (`since=`) so nothing
+    /// between the round and the subscription is missed.
+    async fn follow_remote_changes(
+        hub_client: &Arc<dyn HubOps>,
+        inodes: &Arc<RwLock<InodeTable>>,
+        negative_cache: &Arc<RwLock<HashMap<String, Instant>>>,
+        invalidator: &Invalidator,
+        listing_concurrency: usize,
+        last_revision: &mut Option<String>,
+    ) {
+        /// Wait before reconnecting after a failed connect (503 without a
+        /// `Retry-After` hint, network error, …).
+        const DEFAULT_RETRY: Duration = Duration::from_secs(10);
+        /// A stream that dies this quickly after connecting (without the
+        /// server directing the end) is not healthy: pause before
+        /// reconnecting so a broken feed doesn't become a hot loop against
+        /// the Hub.
+        const MIN_SESSION: Duration = Duration::from_secs(2);
+        const RECONNECT_PAUSE: Duration = Duration::from_secs(5);
+
+        let mut cursor: Option<String> = None;
+        loop {
+            if cursor.is_none() {
+                match hub_client.probe_revision().await {
+                    Ok(rev) => {
+                        if last_revision.as_ref() != Some(&rev) {
+                            debug!("live-follow: no cursor and revision moved; running a full poll round");
+                            Self::poll_round(hub_client, inodes, negative_cache, invalidator, listing_concurrency)
+                                .await;
+                        }
+                        *last_revision = Some(rev);
+                    }
+                    Err(e) => debug!("live-follow: revision probe failed ({e}); resuming from the last known one"),
+                }
+            }
+            let since = if cursor.is_none() { last_revision.clone() } else { None };
+            let mut stream = match hub_client.follow_events(cursor.as_deref(), since.as_deref()).await {
+                Ok(stream) => stream,
+                // Older Hub deployment (404) or a request it refuses to serve
+                // (400): the feed will not appear mid-mount, fall back for good.
+                Err(e) if matches!(e.status(), Some(400) | Some(404)) => {
+                    debug!("live-follow: endpoint not available ({e})");
+                    return;
+                }
+                Err(e) => {
+                    let delay = e.retry_after().unwrap_or(DEFAULT_RETRY);
+                    warn!("live-follow: connect failed ({e}); retrying in {delay:?}");
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+            };
+            let connected_at = Instant::now();
+            // reset/reconnect are server-directed ends: reconnect immediately
+            // (their cadence is server-controlled). Anything else that ends
+            // the stream gets the MIN_SESSION guard below.
+            let mut server_directed_end = false;
+            loop {
+                match stream.next_event().await {
+                    Ok(Some(FollowEvent::Ready { cursor: c })) => {
+                        debug!("live-follow: ready (cursor={c:?})");
+                        // Absent cursor = feed has seen no change yet; keep
+                        // the current resume point.
+                        if c.is_some() {
+                            cursor = c;
+                        }
+                    }
+                    Ok(Some(FollowEvent::Changes { cursor: c, changes })) => {
+                        debug!("live-follow: applying {} change(s)", changes.len());
+                        Self::apply_follow_changes(&changes, inodes, negative_cache, invalidator);
+                        cursor = Some(c);
+                    }
+                    Ok(Some(FollowEvent::Reset)) => {
+                        info!("live-follow: resume point older than the server buffer; re-listing");
+                        cursor = None; // next connect: probe + full round + fresh `since`
+                        server_directed_end = true;
+                        break;
+                    }
+                    Ok(Some(FollowEvent::Reconnect { cursor: c })) => {
+                        debug!("live-follow: server asked to reconnect (cursor={c:?})");
+                        if c.is_some() {
+                            cursor = c;
+                        }
+                        server_directed_end = true;
+                        break;
+                    }
+                    // Any other end of stream (TCP close, read timeout after
+                    // missed pings, transport error) = reconnect with the
+                    // last cursor received.
+                    Ok(None) => {
+                        debug!("live-follow: stream ended; reconnecting");
+                        break;
+                    }
+                    Err(e) => {
+                        warn!("live-follow: stream error ({e}); reconnecting");
+                        break;
                     }
                 }
             }
-            Self::apply_poll_diff(all_entries, &polled_prefixes, &inodes, &negative_cache, &invalidator);
+            if !server_directed_end && connected_at.elapsed() < MIN_SESSION {
+                tokio::time::sleep(RECONNECT_PAUSE).await;
+            }
+        }
+    }
+
+    /// Apply one live-follow `changes` batch.
+    ///
+    /// v1 semantics, mirroring what `apply_poll_diff` derives from a full
+    /// re-list — but per changed path instead of per loaded directory:
+    /// - Drop the cached listing of the nearest *loaded* ancestor directory
+    ///   of every changed path (`invalidate_children`), so the next
+    ///   lookup/readdir re-lists just the affected directories.
+    /// - Files already materialized in the inode table are updated/removed
+    ///   in place (reusing the poll-diff mutation path, including the
+    ///   open-handles `AttrOnly` invalidation rule from #195) so content
+    ///   hand-off doesn't wait for a TTL. Dirty inodes are never touched —
+    ///   local writes win until flushed.
+    /// - `add`/`update` clear negative-cache entries for the path and every
+    ///   ancestor, so a consumer that probed the path before it existed sees
+    ///   it on the next lookup instead of after `--negative-ttl-ms`.
+    pub(super) fn apply_follow_changes(
+        changes: &[FollowChange],
+        inodes: &Arc<RwLock<InodeTable>>,
+        negative_cache: &Arc<RwLock<HashMap<String, Instant>>>,
+        invalidator: &Invalidator,
+    ) {
+        let mut inos_to_invalidate: Vec<(u64, InvalKind)> = Vec::new();
+        let mut dirs_to_invalidate: HashSet<u64> = HashSet::new();
+        {
+            let mut inode_table = inodes.write().expect("inodes poisoned");
+            for change in changes {
+                // Nearest existing ancestor directory: if its children are
+                // loaded, its cached listing is now stale (an entry appeared,
+                // changed, or vanished — possibly behind an intermediate dir
+                // we never materialized). Unloaded dirs need nothing: their
+                // first listing will be fresh.
+                let mut ancestor: &str = &change.path;
+                loop {
+                    ancestor = ancestor.rsplit_once('/').map_or("", |(parent, _)| parent);
+                    let dir_ino = if ancestor.is_empty() {
+                        Some(inode::ROOT_INODE)
+                    } else {
+                        inode_table.get_dir_ino(ancestor)
+                    };
+                    if let Some(dir_ino) = dir_ino {
+                        if inode_table.is_children_loaded(dir_ino) {
+                            dirs_to_invalidate.insert(dir_ino);
+                        }
+                        break;
+                    }
+                }
+
+                // In-place apply for files already materialized at this path.
+                let existing = inode_table
+                    .get_by_path(&change.path)
+                    .filter(|e| e.kind == InodeKind::File)
+                    .map(|e| (e.inode, e.is_dirty(), e.xet_hash.clone(), e.size));
+                let Some((ino, is_dirty, local_hash, local_size)) = existing else {
+                    continue;
+                };
+                if is_dirty {
+                    continue; // local writes take precedence until flushed
+                }
+                match change.op {
+                    FollowOp::Delete => {
+                        let (parent_ino, name) = match inode_table.get(ino) {
+                            Some(entry) => (entry.parent, entry.name.clone()),
+                            None => continue,
+                        };
+                        // Same open-handles rules as apply_poll_diff: keep the
+                        // inode as a nameless orphan for open readers, and
+                        // never issue a blocking page invalidation against an
+                        // inode whose folios an in-flight read may hold (#195).
+                        let ino_kind = if inode_table.has_open_handles(ino) {
+                            inode_table.unlink_one(parent_ino, &name);
+                            InvalKind::AttrOnly
+                        } else {
+                            inode_table.remove(ino);
+                            InvalKind::Pages
+                        };
+                        info!("live-follow: remote deletion of {}", change.path);
+                        inos_to_invalidate.push((parent_ino, InvalKind::Pages));
+                        inos_to_invalidate.push((ino, ino_kind));
+                    }
+                    FollowOp::Add | FollowOp::Update => {
+                        // An update carries only the fields that changed;
+                        // absent fields keep their current value (an omitted
+                        // xetHash means "unchanged or not readable with this
+                        // token", never "cleared").
+                        let new_hash = change.xet_hash.clone().or(local_hash);
+                        let new_size = change.size.unwrap_or(local_size);
+                        let mtime = change
+                            .mtime
+                            .as_deref()
+                            .or(change.uploaded_at.as_deref())
+                            .map(crate::hub_api::mtime_from_str)
+                            .unwrap_or_else(SystemTime::now);
+                        inode_table.update_remote_file(ino, new_hash, None, new_size, mtime);
+                        let kind = if inode_table.has_open_handles(ino) {
+                            InvalKind::AttrOnly
+                        } else {
+                            InvalKind::Pages
+                        };
+                        info!("live-follow: remote update of {}", change.path);
+                        inos_to_invalidate.push((ino, kind));
+                    }
+                }
+            }
+
+            for dir_ino in &dirs_to_invalidate {
+                inode_table.invalidate_children(*dir_ino);
+            }
+        }
+
+        // An added/updated path must be visible on the next lookup: clear
+        // the negative cache for the path and every ancestor dir (any of
+        // them may have been probed and cached as missing before existing).
+        {
+            let mut nc = negative_cache.write().expect("neg_cache poisoned");
+            for change in changes {
+                if change.op == FollowOp::Delete {
+                    continue;
+                }
+                let mut path: &str = &change.path;
+                loop {
+                    nc.remove(path);
+                    match path.rsplit_once('/') {
+                        Some((parent, _)) => path = parent,
+                        None => break,
+                    }
+                }
+            }
+        }
+
+        // Kernel invalidation outside the lock scope (see apply_poll_diff):
+        // directories drop their cached readdir pages so the next readdir
+        // re-fetches through the now-invalidated listing.
+        if let Some(invalidate) = invalidator.get() {
+            for (ino, kind) in &inos_to_invalidate {
+                invalidate(*ino, *kind);
+            }
+            for dir_ino in &dirs_to_invalidate {
+                invalidate(*dir_ino, InvalKind::Pages);
+            }
         }
     }
 

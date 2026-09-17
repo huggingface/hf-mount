@@ -1,6 +1,6 @@
 //! Mock implementations for unit testing VirtualFs.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -10,6 +10,7 @@ use bytes::Bytes;
 use xet_data::processing::XetFileInfo;
 
 use crate::error::{Error, Result};
+use crate::follow::{FollowEvent, FollowStreamOps};
 use crate::hub_api::{BatchOp, HeadFileInfo, HubOps, SourceKind, TreeEntry};
 use crate::overlay::OverlayBacking;
 use crate::xet::{DownloadStreamOps, StagingDir, StreamingWriterOps, XetOps};
@@ -36,6 +37,23 @@ pub struct MockHub {
     /// `Ok(rev)` returns the token; `Err((status, msg))` rebuilds an
     /// `Error::Hub` with that status so the poll loop's 401-branch still fires.
     revision: Mutex<std::result::Result<String, (Option<u16>, String)>>,
+    /// When false (default), follow_events reports 404 (endpoint absent) so
+    /// callers exercise the poll fallback.
+    follow_enabled: AtomicBool,
+    /// Scripted items served (in order) by every mock follow stream. When the
+    /// script runs dry the stream waits for more items to be pushed — like a
+    /// healthy but quiet SSE connection.
+    follow_script: Arc<Mutex<VecDeque<MockFollowItem>>>,
+    /// `(cursor, since)` of every follow_events connect, in order.
+    follow_connects: Mutex<Vec<(Option<String>, Option<String>)>>,
+}
+
+/// Scripted item for [`MockHub`]'s follow stream.
+#[allow(dead_code)]
+pub enum MockFollowItem {
+    Event(FollowEvent),
+    /// Stream ends without a server-directed reconnect (`Ok(None)`).
+    End,
 }
 
 #[allow(dead_code)]
@@ -57,6 +75,9 @@ impl MockHub {
             head_file_calls: AtomicU32::new(0),
             probe_revision_calls: AtomicU32::new(0),
             revision: Mutex::new(Ok("rev-0".to_string())),
+            follow_enabled: AtomicBool::new(false),
+            follow_script: Arc::new(Mutex::new(VecDeque::new())),
+            follow_connects: Mutex::new(Vec::new()),
         })
     }
 
@@ -167,6 +188,21 @@ impl MockHub {
 
     pub fn take_batch_log(&self) -> Vec<Vec<BatchOp>> {
         std::mem::take(&mut *self.batch_log.lock().unwrap())
+    }
+
+    /// Serve the live-follow feed (default: 404 → poll fallback).
+    pub fn enable_follow(&self) {
+        self.follow_enabled.store(true, Ordering::SeqCst);
+    }
+
+    /// Append an item to the follow-stream script.
+    pub fn push_follow(&self, item: MockFollowItem) {
+        self.follow_script.lock().unwrap().push_back(item);
+    }
+
+    /// `(cursor, since)` of every follow_events connect so far.
+    pub fn follow_connect_log(&self) -> Vec<(Option<String>, Option<String>)> {
+        self.follow_connects.lock().unwrap().clone()
     }
 }
 
@@ -294,6 +330,40 @@ impl HubOps for MockHub {
         match &*self.revision.lock().unwrap() {
             Ok(s) => Ok(s.clone()),
             Err((status, msg)) => Err(mock_error(*status, msg)),
+        }
+    }
+
+    async fn follow_events(&self, cursor: Option<&str>, since: Option<&str>) -> Result<Box<dyn FollowStreamOps>> {
+        if !self.follow_enabled.load(Ordering::SeqCst) {
+            return Err(Error::hub_status(404, "mock: live-follow not supported"));
+        }
+        self.follow_connects
+            .lock()
+            .unwrap()
+            .push((cursor.map(str::to_string), since.map(str::to_string)));
+        Ok(Box::new(MockFollowStream {
+            script: self.follow_script.clone(),
+        }))
+    }
+}
+
+/// Follow stream serving [`MockHub`]'s shared script. An empty script means
+/// "healthy but quiet": the stream polls for new items instead of ending, so
+/// tests can drive it incrementally.
+struct MockFollowStream {
+    script: Arc<Mutex<VecDeque<MockFollowItem>>>,
+}
+
+#[async_trait::async_trait]
+impl FollowStreamOps for MockFollowStream {
+    async fn next_event(&mut self) -> Result<Option<FollowEvent>> {
+        loop {
+            let item = self.script.lock().unwrap().pop_front();
+            match item {
+                Some(MockFollowItem::Event(event)) => return Ok(Some(event)),
+                Some(MockFollowItem::End) => return Ok(None),
+                None => tokio::time::sleep(Duration::from_millis(5)).await,
+            }
         }
     }
 }
@@ -674,6 +744,7 @@ pub fn make_test_vfs(
             file_mode: opts.file_mode,
             poll_interval_secs: 0,
             poll_listing_concurrency: 4,
+            live_follow: false,
             metadata_ttl: opts.metadata_ttl,
             negative_ttl: opts.negative_ttl,
             serve_lookup_from_cache: opts.serve_lookup_from_cache,
@@ -722,6 +793,7 @@ pub fn make_overlay_test_vfs_with_root(
             file_mode: 0o644,
             poll_interval_secs: 0,
             poll_listing_concurrency: 4,
+            live_follow: false,
             metadata_ttl: Duration::from_secs(1),
             negative_ttl: Duration::from_secs(1),
             serve_lookup_from_cache: false,

@@ -165,6 +165,15 @@ pub struct MountOptions {
     #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u32).range(1..))]
     pub poll_listing_concurrency: u32,
 
+    /// Subscribe to the Hub's bucket live-follow event stream (SSE) so remote
+    /// changes are applied as they happen instead of waiting for the next
+    /// poll round. Falls back to interval polling automatically when the Hub
+    /// doesn't serve the feed (older deployments, repo mounts). Only
+    /// meaningful when polling is enabled (`--poll-interval-secs > 0`).
+    /// Disable with `--live-follow=false`.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub live_follow: bool,
+
     /// Maximum size in bytes for the on-disk chunk cache.
     #[arg(long, default_value_t = 10_000_000_000)]
     pub cache_size: u64,
@@ -628,7 +637,7 @@ pub fn build_with_runtime(
     );
     info!(
         "Config: advanced_writes={} overlay={} remote_read_only={} direct_io={} poll_interval={}s \
-         poll_listing_concurrency={} metadata_ttl={}ms negative_ttl={}ms \
+         poll_listing_concurrency={} live_follow={} metadata_ttl={}ms negative_ttl={}ms \
          cache_dir={:?} cache_size={} no_disk_cache={} cache_mode={:?} max_staging_size={} max_threads={} \
          flush_debounce={}ms flush_max_batch={}ms read_fetch_timeout={}ms uid={} gid={} dir_mode={:04o} \
          file_mode={:04o} filter_os_files={}",
@@ -638,6 +647,7 @@ pub fn build_with_runtime(
         options.direct_io,
         options.poll_interval_secs,
         options.poll_listing_concurrency,
+        options.live_follow,
         options.metadata_ttl_ms,
         options.negative_ttl_ms,
         options.cache_dir,
@@ -674,6 +684,7 @@ pub fn build_with_runtime(
             file_mode: options.file_mode,
             poll_interval_secs: options.poll_interval_secs,
             poll_listing_concurrency: options.poll_listing_concurrency as usize,
+            live_follow: options.live_follow,
             metadata_ttl,
             negative_ttl: std::time::Duration::from_millis(options.negative_ttl_ms),
             serve_lookup_from_cache: !options.metadata_ttl_minimal,
