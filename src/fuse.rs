@@ -55,12 +55,16 @@ impl FuseAdapter {
     /// Per-open flags: DIRECT_IO bypasses the page cache; otherwise we ask
     /// the kernel to retain it across opens (safe because init() negotiates
     /// AUTO_INVAL_DATA, so the kernel invalidates on attr changes).
-    fn open_flags(&self) -> FopenFlags {
-        if self.direct_io {
+    fn open_flags(&self, writable: bool) -> FopenFlags {
+        let mut flags = if self.direct_io {
             FopenFlags::FOPEN_DIRECT_IO
         } else {
             FopenFlags::FOPEN_KEEP_CACHE
+        };
+        if !writable {
+            flags |= FopenFlags::FOPEN_NOFLUSH;
         }
+        flags
     }
 
     /// Return a `VirtualFsAttr` to the kernel while bumping the inode's
@@ -248,7 +252,7 @@ impl Filesystem for FuseAdapter {
                 let flags = if rdwr && !self.advanced_writes {
                     FopenFlags::empty()
                 } else {
-                    self.open_flags()
+                    self.open_flags(writable)
                 };
                 reply.opened(FileHandle(file_handle), flags);
             }
@@ -359,7 +363,7 @@ impl Filesystem for FuseAdapter {
                 let oflags = if rdwr && !self.advanced_writes {
                     FopenFlags::empty()
                 } else {
-                    self.open_flags()
+                    self.open_flags(true)
                 };
                 self.reply_created_tracked(reply, &attr, file_handle, oflags);
             }
