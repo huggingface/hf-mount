@@ -2834,12 +2834,10 @@ fn poll_skips_list_tree_when_revision_unchanged() {
         let probes_before = hub.probe_revision_call_count();
         hub.set_revision("rev-b");
         // Wait until at least one more probe + one fan-out.
-        for _ in 0..50 {
-            if hub.probe_revision_call_count() > probes_before && hub.list_tree_call_count() > baseline_list_tree {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        wait_until(|| {
+            hub.probe_revision_call_count() > probes_before && hub.list_tree_call_count() > baseline_list_tree
+        })
+        .await;
         assert!(
             hub.list_tree_call_count() > baseline_list_tree,
             "list_tree must fire after revision change"
@@ -2848,12 +2846,7 @@ fn poll_skips_list_tree_when_revision_unchanged() {
         // Probe error (non-401) -> fall back to full fan-out.
         let lists_before = hub.list_tree_call_count();
         hub.fail_revision(None, "simulated probe failure");
-        for _ in 0..50 {
-            if hub.list_tree_call_count() > lists_before {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        wait_until(|| hub.list_tree_call_count() > lists_before).await;
         assert!(
             hub.list_tree_call_count() > lists_before,
             "list_tree must fire when probe fails (fallback)"
@@ -3129,8 +3122,9 @@ fn follow_resume_point_refused_resubscribes_from_scratch() {
     rt.block_on(async {
         let (stop, handle) = spawn_poll_loop(&vfs, &hub, true);
         wait_until(|| !hub.follow_connect_log().is_empty()).await;
-        // Everything carrying a resume point is now refused.
-        hub.fail_follow_resume(Some((400, "unknown cursor format")));
+        // The next two connects (cursor, then since) are refused.
+        hub.fail_next_follow_connect(400);
+        hub.fail_next_follow_connect(400);
         wait_until(|| hub.follow_connect_log().len() >= 4).await;
         let log = hub.follow_connect_log();
         assert!(log.len() >= 4, "expected the resume cascade, got {log:?}");

@@ -12,28 +12,56 @@ use crate::hub_api::HubOps;
 use super::inode::{InodeKind, InodeTable};
 use super::{InvalKind, Invalidator};
 
-/// Cap on the exponential-backoff multiplier applied to the poll interval
-/// when the Hub keeps failing with 401 (token expired) or a transient status
-/// (429/5xx — polling harder only feeds the storm and starves interactive
-/// lookups of quota). With `interval = 30s` and `MAX_BACKOFF_EXP = 6`, the
-/// max delay between polls becomes `30s * 2^6 = 32 min`.
-const MAX_BACKOFF_EXP: u32 = 6;
+/// Exponential backoff shared by the remote-change loops: `base * 2^exp`,
+/// with the exponent capped so a Hub that keeps failing with 401 (token
+/// expired) or a transient status (429/5xx — polling harder only feeds the
+/// storm and starves interactive lookups of quota) is retried at most every
+/// `base * 64` (32 min for the 30s poll interval, ~10 min for the 10s
+/// live-follow connect retry).
+struct Backoff {
+    base: Duration,
+    exp: u32,
+}
 
-/// Record a remote metadata change on a materialized file and queue its
-/// kernel invalidation. An inode with open handles may have an in-flight
-/// read holding its folio locks; a full page invalidation would block in
-/// the kernel waiting on that lock and deadlock against the read (#195), so
-/// such inodes get an attribute-only invalidation that never touches pages.
-fn update_remote_file(
-    inode_table: &mut InodeTable,
-    ino: u64,
-    hash: Option<String>,
-    etag: Option<String>,
-    size: u64,
-    mtime: SystemTime,
-    inos_to_invalidate: &mut Vec<(u64, InvalKind)>,
-) {
-    inode_table.update_remote_file(ino, hash, etag, size, mtime);
+impl Backoff {
+    const MAX_EXP: u32 = 6;
+
+    fn new(base: Duration) -> Self {
+        Self { base, exp: 0 }
+    }
+
+    /// Delay for the next attempt at the current level.
+    fn delay(&self) -> Duration {
+        self.base.saturating_mul(1u32 << self.exp)
+    }
+
+    /// Delay to sleep now, then escalate for the attempt after it.
+    fn next(&mut self) -> Duration {
+        let delay = self.delay();
+        self.exp = (self.exp + 1).min(Self::MAX_EXP);
+        delay
+    }
+
+    /// Ceiling for server-hinted waits in this loop.
+    fn max_delay(&self) -> Duration {
+        self.base.saturating_mul(1u32 << Self::MAX_EXP)
+    }
+
+    fn is_backing_off(&self) -> bool {
+        self.exp > 0
+    }
+
+    fn reset(&mut self) {
+        self.exp = 0;
+    }
+}
+
+/// Queue the kernel invalidation for a file whose remote metadata changed.
+/// An inode with open handles may have an in-flight read holding its folio
+/// locks; a full page invalidation would block in the kernel waiting on
+/// that lock and deadlock against the read (#195), so such inodes get an
+/// attribute-only invalidation that never touches pages.
+fn queue_file_invalidation(inode_table: &InodeTable, ino: u64, inos_to_invalidate: &mut Vec<(u64, InvalKind)>) {
     let kind = if inode_table.has_open_handles(ino) {
         InvalKind::AttrOnly
     } else {
@@ -51,22 +79,19 @@ fn remove_remote_file(inode_table: &mut InodeTable, ino: u64, inos_to_invalidate
         Some(entry) => (entry.parent, entry.name.clone()),
         None => return false,
     };
-    let ino_kind = if inode_table.has_open_handles(ino) {
+    inos_to_invalidate.push((parent_ino, InvalKind::Pages));
+    // Decide the invalidation kind while the inode is still in the table.
+    queue_file_invalidation(inode_table, ino, inos_to_invalidate);
+    if inode_table.has_open_handles(ino) {
         // Unlink the pathname but keep the inode as orphan (nlink=0)
         // so open handles can still read/fstat. release() will clean
         // up the orphan. Without this, the file stays visible by name
         // and a recreated file at the same path would collide.
         inode_table.unlink_one(parent_ino, &name);
-        info!("Remote deletion of ino={ino}: unlinked path, kept orphan (open handles)");
-        // Open handles → an in-flight read may hold this inode's
-        // folios; never issue a blocking page invalidation against it (#195).
-        InvalKind::AttrOnly
+        debug!("Remote deletion of ino={ino}: unlinked path, kept orphan (open handles)");
     } else {
         inode_table.remove(ino);
-        InvalKind::Pages
-    };
-    inos_to_invalidate.push((parent_ino, InvalKind::Pages));
-    inos_to_invalidate.push((ino, ino_kind));
+    }
     true
 }
 
@@ -127,9 +152,6 @@ impl super::VirtualFs {
                 &mut last_revision,
             )
             .await;
-            if interval.is_some() {
-                info!("Live-follow feed unavailable for this source; using interval polling");
-            }
         }
         let Some(interval) = interval else {
             warn!(
@@ -137,12 +159,15 @@ impl super::VirtualFs {
             );
             return;
         };
+        if live_follow {
+            info!("Live-follow feed unavailable for this source; using interval polling");
+        }
 
-        // Exponent applied to `interval` while the Hub keeps failing (401 or
-        // transient statuses). Reset to 0 as soon as we see a successful round.
-        let mut backoff_exp: u32 = 0;
+        // Slows the rounds down while the Hub keeps failing (401 or transient
+        // statuses); reset as soon as we see a successful round.
+        let mut backoff = Backoff::new(interval);
         loop {
-            tokio::time::sleep(interval.saturating_mul(1u32 << backoff_exp)).await;
+            tokio::time::sleep(backoff.delay()).await;
 
             match hub_client.probe_revision().await {
                 Ok(rev) => {
@@ -150,9 +175,9 @@ impl super::VirtualFs {
                     // backoff even when the revision is unchanged, otherwise a
                     // healthy-but-quiet mount stays at the max poll interval
                     // until the next remote change.
-                    if backoff_exp > 0 {
+                    if backoff.is_backing_off() {
                         info!("Revision probe recovered, resetting backoff");
-                        backoff_exp = 0;
+                        backoff.reset();
                     }
                     if last_revision.as_ref() == Some(&rev) {
                         debug!("Revision unchanged ({rev}); skipping tree fan-out");
@@ -163,11 +188,11 @@ impl super::VirtualFs {
                 }
                 Err(e) => {
                     if should_back_off(&e) {
-                        backoff_exp = (backoff_exp + 1).min(MAX_BACKOFF_EXP);
+                        backoff.next();
                         warn!(
                             "Revision probe saw {}; backing off next poll to {:?}",
                             e,
-                            interval.saturating_mul(1u32 << backoff_exp)
+                            backoff.delay()
                         );
                         continue;
                     }
@@ -178,14 +203,14 @@ impl super::VirtualFs {
             let round =
                 Self::poll_round(&hub_client, &inodes, &negative_cache, &invalidator, listing_concurrency).await;
             if round.saw_backoff_status {
-                backoff_exp = (backoff_exp + 1).min(MAX_BACKOFF_EXP);
+                backoff.next();
                 warn!(
                     "Remote poll saw 401/transient failures; backing off next poll to {:?}",
-                    interval.saturating_mul(1u32 << backoff_exp)
+                    backoff.delay()
                 );
-            } else if backoff_exp > 0 {
+            } else if backoff.is_backing_off() {
                 info!("Remote poll recovered, resetting backoff");
-                backoff_exp = 0;
+                backoff.reset();
             }
         }
     }
@@ -269,15 +294,12 @@ impl super::VirtualFs {
     /// exponential backoff. While a stream is healthy this fully replaces
     /// the periodic probe + fan-out.
     ///
-    /// Resume protocol: reconnect with the last received cursor (server
-    /// resumes strictly after it). Without a cursor — the server buffer
-    /// expired (`reset`), the resume point was refused, or a stream ended
-    /// before handing one out — re-probe `updatedAt`: if the bucket moved
-    /// since `last_revision`, one full poll round reconciles (retried until
-    /// it completes), then the subscription starts from the fresh
+    /// Resume protocol: reconnect with the last received cursor (the server
+    /// resumes strictly after it). Without one, re-probe `updatedAt`: if the
+    /// bucket moved since `last_revision`, one full poll round reconciles
+    /// (retried until complete), then the subscription starts from the fresh
     /// `updatedAt` (`since=`) so nothing between the round and the
-    /// subscription is missed. The first connect skips the probe when the
-    /// caller just primed `last_revision` against a freshly listed mount.
+    /// subscription is missed.
     async fn follow_remote_changes(
         hub_client: &Arc<dyn HubOps>,
         inodes: &Arc<RwLock<InodeTable>>,
@@ -286,10 +308,19 @@ impl super::VirtualFs {
         listing_concurrency: usize,
         last_revision: &mut Option<String>,
     ) {
-        /// Base delay between attempts while the feed keeps failing (connect
-        /// error, incomplete reconcile, stream dead before `ready`); doubled
-        /// per consecutive failure up to `MAX_BACKOFF_EXP` (~10 min), reset
-        /// by a `ready`. A server `Retry-After`/`RateLimit` hint overrides it.
+        /// Where the next subscription resumes from.
+        enum Resume {
+            /// Strictly after this server cursor.
+            Cursor(String),
+            /// From `last_revision` (`since=`), after a probe + reconcile.
+            Since,
+            /// Live only: the server refused `since=`. One-shot — the next
+            /// session goes back to `Since` so a dropped stream reconciles.
+            Live,
+        }
+        /// Base delay while the feed keeps failing (connect error,
+        /// incomplete reconcile, stream dead before `ready`), escalated by
+        /// [`Backoff`] and reset by a `ready`.
         const RETRY_BASE: Duration = Duration::from_secs(10);
         /// Minimum pause before any reconnect, server-directed included, so a
         /// pod rotating clients in a tight loop can't drive a hot loop.
@@ -299,16 +330,14 @@ impl super::VirtualFs {
         /// this many times in a row mean the feed is unusable here.
         const MAX_SESSIONS_WITHOUT_READY: u32 = 3;
 
-        let mut cursor: Option<String> = None;
+        let mut resume = Resume::Since;
         // The caller primed `last_revision` right before the first connect;
         // only re-probe there if that priming failed.
-        let mut needs_probe = last_revision.is_none();
-        // Set when the server refused `since=`: subscribe live instead.
-        let mut resume_live_only = false;
-        let mut backoff_exp: u32 = 0;
+        let mut skip_probe = last_revision.is_some();
+        let mut backoff = Backoff::new(RETRY_BASE);
         let mut sessions_without_ready: u32 = 0;
         loop {
-            if cursor.is_none() && needs_probe {
+            if matches!(resume, Resume::Since) && !std::mem::take(&mut skip_probe) {
                 match hub_client.probe_revision().await {
                     Ok(rev) => {
                         if last_revision.as_ref() != Some(&rev) {
@@ -317,8 +346,7 @@ impl super::VirtualFs {
                                 Self::poll_round(hub_client, inodes, negative_cache, invalidator, listing_concurrency)
                                     .await;
                             if !round.complete {
-                                let delay = RETRY_BASE.saturating_mul(1 << backoff_exp);
-                                backoff_exp = (backoff_exp + 1).min(MAX_BACKOFF_EXP);
+                                let delay = backoff.next();
                                 warn!("live-follow: reconcile round incomplete; retrying in {delay:?}");
                                 tokio::time::sleep(delay).await;
                                 continue;
@@ -329,70 +357,73 @@ impl super::VirtualFs {
                     Err(e) => debug!("live-follow: revision probe failed ({e}); resuming from the last known one"),
                 }
             }
-            needs_probe = true;
-            let since = if cursor.is_none() && !resume_live_only {
-                last_revision.clone()
-            } else {
-                None
+            let (cursor, since) = match &resume {
+                Resume::Cursor(c) => (Some(c.as_str()), None),
+                Resume::Since => (None, last_revision.as_deref()),
+                Resume::Live => (None, None),
             };
-            resume_live_only = false;
-            let mut stream = match hub_client.follow_events(cursor.as_deref(), since.as_deref()).await {
+            let mut stream = match hub_client.follow_events(cursor, since).await {
                 Ok(Some(stream)) => stream,
                 // Repo source, older Hub deployment, or a non-SSE answer: the
                 // feed will not appear mid-mount, fall back for good.
                 Ok(None) => return,
                 // The server refused the request itself. A refused resume
                 // point (cursor encoding changed by a deploy, `since` too
-                // old/unparseable) is retried from scratch: reconcile, then
-                // subscribe with `since`, then live. A bare subscribe refused
-                // means the feed isn't usable here.
+                // old/unparseable) is retried one step further back; a bare
+                // subscribe refused means the feed isn't usable here.
                 Err(e) if e.status() == Some(400) => {
-                    if cursor.is_none() && since.is_none() {
-                        warn!("live-follow: subscribe refused ({e}); falling back to polling");
-                        return;
-                    }
-                    warn!("live-follow: resume point refused ({e}); re-listing and re-subscribing");
-                    resume_live_only = since.is_some();
-                    cursor = None;
+                    resume = match resume {
+                        Resume::Cursor(_) => Resume::Since,
+                        Resume::Since => Resume::Live,
+                        Resume::Live => {
+                            warn!("live-follow: subscribe refused ({e}); falling back to polling");
+                            return;
+                        }
+                    };
+                    warn!("live-follow: resume point refused ({e}); re-subscribing further back");
                     continue;
                 }
                 Err(e) => {
                     let delay = e
                         .retry_after()
-                        .unwrap_or_else(|| RETRY_BASE.saturating_mul(1 << backoff_exp));
-                    backoff_exp = (backoff_exp + 1).min(MAX_BACKOFF_EXP);
+                        .map(|hint| hint.min(backoff.max_delay()))
+                        .unwrap_or_else(|| backoff.next());
                     warn!("live-follow: connect failed ({e}); retrying in {delay:?}");
                     tokio::time::sleep(delay).await;
                     continue;
                 }
             };
+            // A session is healthy once the server sent `ready`; reset and
+            // reconnect are server-directed ends and count as healthy too.
             let mut got_ready = false;
-            // reset/reconnect are server-directed ends; anything else is
-            // judged by whether the session ever became healthy (`ready`).
-            let server_directed_end = loop {
+            let healthy = loop {
                 match stream.next_event().await {
                     // An absent cursor on ready/reconnect means the feed has
                     // seen no change yet: keep the current resume point.
                     Ok(Some(FollowEvent::Ready { cursor: c })) => {
                         debug!("live-follow: ready (cursor={c:?})");
-                        cursor = c.or(cursor);
+                        if let Some(c) = c {
+                            resume = Resume::Cursor(c);
+                        }
                         got_ready = true;
-                        backoff_exp = 0;
+                        backoff.reset();
                         sessions_without_ready = 0;
                     }
                     Ok(Some(FollowEvent::Changes { cursor: c, changes })) => {
                         debug!("live-follow: applying {} change(s)", changes.len());
                         Self::apply_follow_changes(&changes, inodes, negative_cache, invalidator);
-                        cursor = Some(c);
+                        resume = Resume::Cursor(c);
                     }
                     Ok(Some(FollowEvent::Reset)) => {
                         info!("live-follow: resume point older than the server buffer; re-listing");
-                        cursor = None; // next connect: probe + full round + fresh `since`
+                        resume = Resume::Since;
                         break true;
                     }
                     Ok(Some(FollowEvent::Reconnect { cursor: c })) => {
                         debug!("live-follow: server asked to reconnect (cursor={c:?})");
-                        cursor = c.or(cursor);
+                        if let Some(c) = c {
+                            resume = Resume::Cursor(c);
+                        }
                         break true;
                     }
                     // Any other end of stream (TCP close, read timeout after
@@ -400,15 +431,18 @@ impl super::VirtualFs {
                     // last cursor received.
                     Ok(None) => {
                         debug!("live-follow: stream ended; reconnecting");
-                        break false;
+                        break got_ready;
                     }
                     Err(e) => {
                         warn!("live-follow: stream error ({e}); reconnecting");
-                        break false;
+                        break got_ready;
                     }
                 }
             };
-            if got_ready || server_directed_end {
+            if matches!(resume, Resume::Live) {
+                resume = Resume::Since;
+            }
+            if healthy {
                 tokio::time::sleep(RECONNECT_FLOOR).await;
                 continue;
             }
@@ -419,8 +453,7 @@ impl super::VirtualFs {
                 warn!("live-follow: {sessions_without_ready} streams ended before `ready`; falling back to polling");
                 return;
             }
-            let delay = RETRY_BASE.saturating_mul(1 << backoff_exp);
-            backoff_exp = (backoff_exp + 1).min(MAX_BACKOFF_EXP);
+            let delay = backoff.next();
             warn!("live-follow: stream ended before `ready`; reconnecting in {delay:?}");
             tokio::time::sleep(delay).await;
         }
@@ -451,29 +484,21 @@ impl super::VirtualFs {
     ) {
         let mut inos_to_invalidate: Vec<(u64, InvalKind)> = Vec::new();
         let mut dirs_to_invalidate: HashSet<u64> = HashSet::new();
+        let mut applied: Vec<(&str, &str)> = Vec::new();
         {
             let mut inode_table = inodes.write().expect("inodes poisoned");
             for change in changes {
-                let existing = inode_table
+                let materialized = inode_table
                     .get_by_path(&change.path)
                     .filter(|e| e.kind == InodeKind::File)
-                    .map(|e| {
-                        (
-                            e.inode,
-                            e.is_dirty(),
-                            e.xet_hash.clone(),
-                            e.etag.clone(),
-                            e.size,
-                            e.mtime,
-                        )
-                    });
-                let Some((ino, is_dirty, local_hash, local_etag, local_size, local_mtime)) = existing else {
+                    .map(|e| (e.inode, e.is_dirty()));
+                let Some((ino, is_dirty)) = materialized else {
                     // Not materialized: an entry appeared or vanished in the
                     // nearest existing ancestor directory (possibly behind an
                     // intermediate dir we never listed), so its cached listing
                     // is stale. Unloaded dirs need nothing: their first listing
                     // will be fresh.
-                    let dir_ino = inode_table.nearest_dir_ancestor(&change.path);
+                    let (dir_ino, _) = inode_table.nearest_dir_ancestor(&change.path);
                     if inode_table.is_children_loaded(dir_ino) {
                         dirs_to_invalidate.insert(dir_ino);
                     }
@@ -485,7 +510,7 @@ impl super::VirtualFs {
                 match change.op {
                     FollowOp::Delete => {
                         if remove_remote_file(&mut inode_table, ino, &mut inos_to_invalidate) {
-                            info!("live-follow: remote deletion of {}", change.path);
+                            applied.push(("deletion", &change.path));
                         }
                     }
                     FollowOp::Add | FollowOp::Update => {
@@ -493,23 +518,15 @@ impl super::VirtualFs {
                         // absent fields keep their current value (an omitted
                         // xetHash means "unchanged or not readable with this
                         // token", never "cleared").
-                        let new_hash = change.xet_hash.clone().or(local_hash);
-                        let new_size = change.size.unwrap_or(local_size);
                         let mtime = change
                             .mtime
                             .as_deref()
                             .or(change.uploaded_at.as_deref())
-                            .map_or(local_mtime, crate::hub_api::mtime_from_str);
-                        update_remote_file(
-                            &mut inode_table,
-                            ino,
-                            new_hash,
-                            local_etag,
-                            new_size,
-                            mtime,
-                            &mut inos_to_invalidate,
-                        );
-                        info!("live-follow: remote update of {}", change.path);
+                            .map(crate::hub_api::mtime_from_str);
+                        if inode_table.merge_remote_file(ino, change.xet_hash.clone(), change.size, mtime) {
+                            queue_file_invalidation(&inode_table, ino, &mut inos_to_invalidate);
+                            applied.push(("update", &change.path));
+                        }
                     }
                 }
             }
@@ -518,6 +535,9 @@ impl super::VirtualFs {
                 inode_table.invalidate_children(*dir_ino);
             }
         }
+        for (what, path) in applied {
+            info!("live-follow: remote {what} of {path}");
+        }
 
         // An added/updated path must be visible on the next lookup: clear
         // the negative cache for the path and every ancestor dir (any of
@@ -525,6 +545,9 @@ impl super::VirtualFs {
         {
             let mut nc = negative_cache.write().expect("neg_cache poisoned");
             for change in changes.iter().filter(|c| c.op != FollowOp::Delete) {
+                if nc.is_empty() {
+                    break;
+                }
                 let mut path: &str = &change.path;
                 loop {
                     nc.remove(path);
@@ -640,15 +663,8 @@ impl super::VirtualFs {
             let mut inode_table = inodes.write().expect("inodes poisoned");
 
             for update in updates {
-                update_remote_file(
-                    &mut inode_table,
-                    update.ino,
-                    update.hash,
-                    update.etag,
-                    update.size,
-                    update.mtime,
-                    &mut inos_to_invalidate,
-                );
+                inode_table.update_remote_file(update.ino, update.hash, update.etag, update.size, update.mtime);
+                queue_file_invalidation(&inode_table, update.ino, &mut inos_to_invalidate);
             }
 
             // Re-checked under the write lock by the helper: the inode may
@@ -665,12 +681,11 @@ impl super::VirtualFs {
             let mut dir_paths_to_invalidate = Vec::new();
             for path in &all_remote_paths {
                 if inode_table.get_by_path(path).is_none() {
-                    let dir_ino = inode_table.nearest_dir_ancestor(path);
+                    let (dir_ino, dir_path) = inode_table.nearest_dir_ancestor(path);
                     // Only invalidate if this directory was already loaded.
                     // If not loaded, the "missing" file is just unexplored.
                     if inode_table.is_children_loaded(dir_ino) && dirs_to_invalidate.insert(dir_ino) {
-                        let dir_path = inode_table.get(dir_ino).map(|e| e.full_path.to_string());
-                        dir_paths_to_invalidate.push(dir_path.unwrap_or_default());
+                        dir_paths_to_invalidate.push(dir_path.to_string());
                     }
                 }
             }

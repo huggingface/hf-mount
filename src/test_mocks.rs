@@ -45,9 +45,9 @@ pub struct MockHub {
     /// script runs dry the stream waits for more items to be pushed — like a
     /// healthy but quiet SSE connection.
     follow_script: Arc<Mutex<VecDeque<Option<FollowEvent>>>>,
-    /// `(status, message)` every follow_events connect that carries a
-    /// resume point (cursor or since) fails with while set.
-    follow_resume_error: Mutex<Option<(u16, String)>>,
+    /// Statuses the next follow_events connects fail with, one per connect
+    /// (in order); an empty queue means connects succeed.
+    follow_connect_failures: Mutex<VecDeque<u16>>,
     /// `(cursor, since)` of every follow_events connect, in order.
     follow_connects: Mutex<Vec<(Option<String>, Option<String>)>>,
 }
@@ -73,7 +73,7 @@ impl MockHub {
             revision: Mutex::new(Ok("rev-0".to_string())),
             follow_enabled: AtomicBool::new(false),
             follow_script: Arc::new(Mutex::new(VecDeque::new())),
-            follow_resume_error: Mutex::new(None),
+            follow_connect_failures: Mutex::new(VecDeque::new()),
             follow_connects: Mutex::new(Vec::new()),
         })
     }
@@ -203,10 +203,10 @@ impl MockHub {
         self.follow_script.lock().unwrap().push_back(None);
     }
 
-    /// Make every follow_events connect carrying a cursor or `since` fail
-    /// with this status until cleared; bare subscribes still succeed.
-    pub fn fail_follow_resume(&self, error: Option<(u16, &str)>) {
-        *self.follow_resume_error.lock().unwrap() = error.map(|(status, msg)| (status, msg.to_string()));
+    /// Fail the next follow_events connect with this status (queued, in
+    /// order, one per connect).
+    pub fn fail_next_follow_connect(&self, status: u16) {
+        self.follow_connect_failures.lock().unwrap().push_back(status);
     }
 
     /// `(cursor, since)` of every follow_events connect so far.
@@ -354,10 +354,8 @@ impl HubOps for MockHub {
             .lock()
             .unwrap()
             .push((cursor.map(str::to_string), since.map(str::to_string)));
-        if (cursor.is_some() || since.is_some())
-            && let Some((status, msg)) = self.follow_resume_error.lock().unwrap().clone()
-        {
-            return Err(Error::hub_status(status, msg));
+        if let Some(status) = self.follow_connect_failures.lock().unwrap().pop_front() {
+            return Err(mock_error(Some(status), "mock: follow connect refused"));
         }
         Ok(Some(Box::new(MockFollowStream {
             script: self.follow_script.clone(),

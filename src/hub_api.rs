@@ -352,26 +352,30 @@ pub(crate) fn retry_delay(attempt: u32) -> std::time::Duration {
     std::time::Duration::from_millis(500u64.saturating_mul(2u64.saturating_pow(attempt.saturating_sub(1))))
 }
 
-/// Upper bound on any single retry sleep, whether server-hinted (RateLimit
-/// header) or exponential.
+/// Upper bound on a single in-request retry sleep, whether server-hinted
+/// (RateLimit / Retry-After header) or exponential.
 pub(crate) const MAX_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Server-requested wait before retrying, capped at `MAX_RETRY_DELAY`: the
-/// IETF `RateLimit` header's `t=<seconds>` (time until window reset, what
-/// moon-landing sends on 429; format
+/// A response header as a string, when present and ASCII.
+fn header_str<'a>(headers: &'a reqwest::header::HeaderMap, name: &str) -> Option<&'a str> {
+    headers.get(name).and_then(|v| v.to_str().ok())
+}
+
+/// Server-requested wait before retrying, uncapped (each retry loop applies
+/// its own ceiling): the IETF `RateLimit` header's `t=<seconds>` (time until
+/// window reset, what moon-landing sends on 429; format
 /// `"resource_type";r=<remaining>;t=<seconds_until_reset>`), else a
 /// `Retry-After: <seconds>` header (what the live-follow endpoint sends on
 /// 503). A zero hint means the window already reset: no hint, use the
 /// backoff schedule rather than retrying immediately.
 fn parse_retry_delay(headers: &reqwest::header::HeaderMap) -> Option<std::time::Duration> {
-    let header_str = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
-    let ratelimit_secs = header_str("ratelimit").and_then(|value| {
+    let ratelimit_secs = header_str(headers, "ratelimit").and_then(|value| {
         value
             .split(';')
             .find_map(|part| part.trim().strip_prefix("t=")?.parse::<u64>().ok())
     });
-    let secs = ratelimit_secs.or_else(|| header_str("retry-after")?.trim().parse::<u64>().ok())?;
-    (secs > 0).then(|| std::time::Duration::from_secs(secs).min(MAX_RETRY_DELAY))
+    let secs = ratelimit_secs.or_else(|| header_str(headers, "retry-after")?.trim().parse::<u64>().ok())?;
+    (secs > 0).then(|| std::time::Duration::from_secs(secs))
 }
 
 /// Build an authenticated GET request during client initialization (before HubApiClient exists).
@@ -443,7 +447,9 @@ async fn send_with_retry(
                 let status = resp.status().as_u16();
                 let hinted_delay = parse_retry_delay(resp.headers());
                 if is_retryable_status(status) && attempt <= MAX_RETRIES {
-                    let delay = hinted_delay.unwrap_or_else(|| retry_delay(attempt));
+                    let delay = hinted_delay
+                        .unwrap_or_else(|| retry_delay(attempt))
+                        .min(MAX_RETRY_DELAY);
                     warn!("{context}: transient error ({status}), retry {attempt}/{MAX_RETRIES} in {delay:?}");
                     tokio::time::sleep(delay).await;
                     continue;
@@ -767,11 +773,7 @@ impl HubApiClient {
         // A 200 that isn't an event stream (a proxy or intermediate Hub
         // build answering with HTML/JSON) would never yield an event: treat
         // it as "feed not served" rather than reconnecting forever.
-        let content_type = resp
-            .headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or_default();
+        let content_type = header_str(resp.headers(), "content-type").unwrap_or_default();
         if !content_type.starts_with("text/event-stream") {
             warn!("live-follow: endpoint answered with content-type {content_type:?}, not an event stream");
             return Ok(None);
@@ -1673,9 +1675,6 @@ mod tests {
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert("retry-after", "7".parse().unwrap());
         assert_eq!(parse_retry_delay(&headers), Some(std::time::Duration::from_secs(7)));
-        // Capped like the RateLimit hint.
-        headers.insert("retry-after", "86400".parse().unwrap());
-        assert_eq!(parse_retry_delay(&headers), Some(MAX_RETRY_DELAY));
         // RateLimit wins when both are present.
         headers.insert("ratelimit", r#""hub_api";r=0;t=3"#.parse().unwrap());
         assert_eq!(parse_retry_delay(&headers), Some(std::time::Duration::from_secs(3)));
@@ -1712,7 +1711,8 @@ mod tests {
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert("ratelimit", r#""hub_api";r=0;t=45"#.parse().unwrap());
         let duration = parse_retry_delay(&headers).unwrap();
-        assert_eq!(duration, std::time::Duration::from_secs(30)); // capped
+        // Raw hint: each retry loop applies its own ceiling.
+        assert_eq!(duration, std::time::Duration::from_secs(45));
     }
 
     #[test]

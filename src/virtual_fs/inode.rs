@@ -783,21 +783,52 @@ impl InodeTable {
             .collect()
     }
 
-    /// Inode of the nearest materialized ancestor directory of `path` (the
-    /// root when no intermediate directory exists in the table). Used by the
-    /// remote-change paths to find whose cached listing a new or vanished
-    /// entry makes stale.
-    pub fn nearest_dir_ancestor(&self, path: &str) -> u64 {
+    /// Inode and path of the nearest materialized ancestor directory of
+    /// `path` (the root when no intermediate directory exists in the table).
+    /// Used by the remote-change paths to find whose cached listing a new or
+    /// vanished entry makes stale.
+    pub fn nearest_dir_ancestor<'a>(&self, path: &'a str) -> (u64, &'a str) {
         let mut ancestor = path;
         loop {
             ancestor = ancestor.rsplit_once('/').map_or("", |(parent, _)| parent);
             if let Some(dir_ino) = self.get_dir_ino(ancestor) {
-                return dir_ino;
+                return (dir_ino, ancestor);
             }
             if ancestor.is_empty() {
-                return ROOT_INODE;
+                return (ROOT_INODE, "");
             }
         }
+    }
+
+    /// Merge a partial remote metadata update into a materialized file:
+    /// `None` fields keep their current value. Skips dirty files (local
+    /// writes win until flushed). Returns true if applied.
+    pub fn merge_remote_file(
+        &mut self,
+        ino: u64,
+        hash: Option<String>,
+        size: Option<u64>,
+        mtime: Option<SystemTime>,
+    ) -> bool {
+        let Some(entry) = self.inodes.get_mut(&ino) else {
+            return false;
+        };
+        if entry.is_dirty() {
+            return false;
+        }
+        if let Some(hash) = hash {
+            entry.xet_hash = Some(hash);
+        }
+        if let Some(size) = size {
+            entry.size = size;
+        }
+        if let Some(mtime) = mtime {
+            entry.mtime = mtime;
+        }
+        // Remote moved under us; the staging cache (if any) no longer
+        // matches xet_hash (see update_remote_file).
+        entry.staging_is_current = false;
+        true
     }
 
     /// Get directory inode by path.
