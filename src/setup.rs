@@ -171,7 +171,7 @@ pub struct MountOptions {
     /// doesn't serve the feed (older deployments, repo mounts). Only
     /// meaningful when polling is enabled (`--poll-interval-secs > 0`).
     /// Disable with `--live-follow=false`.
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     pub live_follow: bool,
 
     /// Maximum size in bytes for the on-disk chunk cache.

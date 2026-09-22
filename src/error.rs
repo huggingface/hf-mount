@@ -5,8 +5,9 @@ pub enum Error {
     Hub {
         message: String,
         status: Option<u16>,
-        /// Server-requested wait (IETF `RateLimit` header) on a rate-limited
-        /// response, so outer retry loops honor the Hub's reset time.
+        /// Server-requested wait (IETF `RateLimit` or `Retry-After` header)
+        /// on a rate-limited/unavailable response, so outer retry loops honor
+        /// the Hub's hint.
         retry_after: Option<std::time::Duration>,
     },
     Xet(String),

@@ -40,20 +40,12 @@ pub struct MockHub {
     /// When false (default), follow_events reports 404 (endpoint absent) so
     /// callers exercise the poll fallback.
     follow_enabled: AtomicBool,
-    /// Scripted items served (in order) by every mock follow stream. When the
-    /// script runs dry the stream waits for more items to be pushed — like a
-    /// healthy but quiet SSE connection.
-    follow_script: Arc<Mutex<VecDeque<MockFollowItem>>>,
+    /// Scripted events served (in order) by every mock follow stream. When
+    /// the script runs dry the stream waits for more events to be pushed —
+    /// like a healthy but quiet SSE connection.
+    follow_script: Arc<Mutex<VecDeque<FollowEvent>>>,
     /// `(cursor, since)` of every follow_events connect, in order.
     follow_connects: Mutex<Vec<(Option<String>, Option<String>)>>,
-}
-
-/// Scripted item for [`MockHub`]'s follow stream.
-#[allow(dead_code)]
-pub enum MockFollowItem {
-    Event(FollowEvent),
-    /// Stream ends without a server-directed reconnect (`Ok(None)`).
-    End,
 }
 
 #[allow(dead_code)]
@@ -195,9 +187,9 @@ impl MockHub {
         self.follow_enabled.store(true, Ordering::SeqCst);
     }
 
-    /// Append an item to the follow-stream script.
-    pub fn push_follow(&self, item: MockFollowItem) {
-        self.follow_script.lock().unwrap().push_back(item);
+    /// Append an event to the follow-stream script.
+    pub fn push_follow(&self, event: FollowEvent) {
+        self.follow_script.lock().unwrap().push_back(event);
     }
 
     /// `(cursor, since)` of every follow_events connect so far.
@@ -348,20 +340,19 @@ impl HubOps for MockHub {
 }
 
 /// Follow stream serving [`MockHub`]'s shared script. An empty script means
-/// "healthy but quiet": the stream polls for new items instead of ending, so
+/// "healthy but quiet": the stream polls for new events instead of ending, so
 /// tests can drive it incrementally.
 struct MockFollowStream {
-    script: Arc<Mutex<VecDeque<MockFollowItem>>>,
+    script: Arc<Mutex<VecDeque<FollowEvent>>>,
 }
 
 #[async_trait::async_trait]
 impl FollowStreamOps for MockFollowStream {
     async fn next_event(&mut self) -> Result<Option<FollowEvent>> {
         loop {
-            let item = self.script.lock().unwrap().pop_front();
-            match item {
-                Some(MockFollowItem::Event(event)) => return Ok(Some(event)),
-                Some(MockFollowItem::End) => return Ok(None),
+            let event = self.script.lock().unwrap().pop_front();
+            match event {
+                Some(event) => return Ok(Some(event)),
                 None => tokio::time::sleep(Duration::from_millis(5)).await,
             }
         }

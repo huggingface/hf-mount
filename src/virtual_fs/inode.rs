@@ -783,6 +783,23 @@ impl InodeTable {
             .collect()
     }
 
+    /// Inode of the nearest materialized ancestor directory of `path` (the
+    /// root when no intermediate directory exists in the table). Used by the
+    /// remote-change paths to find whose cached listing a new or vanished
+    /// entry makes stale.
+    pub fn nearest_dir_ancestor(&self, path: &str) -> u64 {
+        let mut ancestor = path;
+        loop {
+            ancestor = ancestor.rsplit_once('/').map_or("", |(parent, _)| parent);
+            if let Some(dir_ino) = self.get_dir_ino(ancestor) {
+                return dir_ino;
+            }
+            if ancestor.is_empty() {
+                return ROOT_INODE;
+            }
+        }
+    }
+
     /// Get directory inode by path.
     pub fn get_dir_ino(&self, path: &str) -> Option<u64> {
         self.path_to_inode.get(path).copied().and_then(|ino| {

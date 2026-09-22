@@ -354,22 +354,22 @@ pub(crate) fn retry_delay(attempt: u32) -> std::time::Duration {
 /// header) or exponential.
 pub(crate) const MAX_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Parse the IETF `RateLimit` header for `t=<seconds>` (time until window reset), capped at 30s.
-/// Format: `"resource_type";r=<remaining>;t=<seconds_until_reset>`
-/// This is what moon-landing sends on 429 responses.
+/// Server-requested wait before retrying, capped at `MAX_RETRY_DELAY`: the
+/// IETF `RateLimit` header's `t=<seconds>` (time until window reset, what
+/// moon-landing sends on 429; format
+/// `"resource_type";r=<remaining>;t=<seconds_until_reset>`), else a
+/// `Retry-After: <seconds>` header (what the live-follow endpoint sends on
+/// 503). A zero hint means the window already reset: no hint, use the
+/// backoff schedule rather than retrying immediately.
 fn parse_retry_delay(headers: &reqwest::header::HeaderMap) -> Option<std::time::Duration> {
-    let value = headers.get("ratelimit")?.to_str().ok()?;
-    for part in value.split(';') {
-        let part = part.trim();
-        if let Some(secs_str) = part.strip_prefix("t=")
-            && let Ok(secs) = secs_str.parse::<u64>()
-        {
-            // t=0 means the window already reset: no hint, use the backoff
-            // schedule rather than retrying immediately.
-            return (secs > 0).then(|| std::time::Duration::from_secs(secs).min(MAX_RETRY_DELAY));
-        }
-    }
-    None
+    let header_str = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+    let ratelimit_secs = header_str("ratelimit").and_then(|value| {
+        value
+            .split(';')
+            .find_map(|part| part.trim().strip_prefix("t=")?.parse::<u64>().ok())
+    });
+    let secs = ratelimit_secs.or_else(|| header_str("retry-after")?.trim().parse::<u64>().ok())?;
+    (secs > 0).then(|| std::time::Duration::from_secs(secs).min(MAX_RETRY_DELAY))
 }
 
 /// Build an authenticated GET request during client initialization (before HubApiClient exists).
@@ -727,9 +727,10 @@ impl HubApiClient {
     /// /api/buckets/{id}/events` with `Accept: text/event-stream` (mandatory
     /// — the server 400s without it) and the same bearer auth as tree calls.
     /// No `send_with_retry`: a 503 here has dedicated semantics (this pod
-    /// doesn't serve the feed or is catching up; honor its `Retry-After`,
-    /// default 10s at the caller) and everything else is either permanent
-    /// (400/404 → poll fallback) or handled by the caller's reconnect loop.
+    /// doesn't serve the feed or is catching up; its `Retry-After` is
+    /// surfaced through [`Error::retry_after`], default 10s at the caller)
+    /// and everything else is either permanent (400/404 → poll fallback) or
+    /// handled by the caller's reconnect loop.
     pub async fn follow_events(
         &self,
         cursor: Option<&str>,
@@ -739,39 +740,25 @@ impl HubApiClient {
             // Repos have no live-follow feed; report what an older Hub would.
             return Err(Error::hub_status(404, "live-follow is only available for buckets"));
         };
-        let mut url = format!("{}/api/buckets/{}/events", self.endpoint, bucket_id);
-        // Opaque cursor / ISO8601 instant land in a query value: encode
-        // conservatively (everything but alphanumerics).
-        if let Some(cursor) = cursor {
-            url.push_str("?cursor=");
-            url.extend(utf8_percent_encode(cursor, percent_encoding::NON_ALPHANUMERIC));
-        } else if let Some(since) = since {
-            url.push_str("?since=");
-            url.extend(utf8_percent_encode(since, percent_encoding::NON_ALPHANUMERIC));
-        }
-        let resp = self
+        let url = format!("{}/api/buckets/{}/events", self.endpoint, bucket_id);
+        let mut req = self
             .auth(self.follow_client.get(&url))
-            .header("accept", "text/event-stream")
-            .send()
-            .await
-            .map_err(Error::Http)?;
-        let status = resp.status().as_u16();
-        if status == 503 {
-            let retry_after = resp
-                .headers()
-                .get("retry-after")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.trim().parse::<u64>().ok())
-                .map(Duration::from_secs);
+            .header("accept", "text/event-stream");
+        if let Some(cursor) = cursor {
+            req = req.query(&[("cursor", cursor)]);
+        } else if let Some(since) = since {
+            req = req.query(&[("since", since)]);
+        }
+        let resp = req.send().await.map_err(Error::Http)?;
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let retry_after = parse_retry_delay(resp.headers());
+            let body = resp.text().await.unwrap_or_default();
             return Err(Error::Hub {
-                message: "live-follow: feed unavailable on this pod (503)".to_string(),
-                status: Some(503),
+                message: format!("live-follow: {status} {body}"),
+                status: Some(status),
                 retry_after,
             });
-        }
-        if !resp.status().is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(Error::hub_status(status, format!("live-follow: {status} {body}")));
         }
         Ok(Box::new(crate::follow::HttpFollowStream::new(
             resp,
@@ -1663,6 +1650,19 @@ mod tests {
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert("ratelimit", r#""hub_api";r=0;t=0"#.parse().unwrap());
         assert_eq!(parse_retry_delay(&headers), None);
+    }
+
+    #[test]
+    fn parse_retry_delay_falls_back_to_retry_after() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("retry-after", "7".parse().unwrap());
+        assert_eq!(parse_retry_delay(&headers), Some(std::time::Duration::from_secs(7)));
+        // Capped like the RateLimit hint.
+        headers.insert("retry-after", "86400".parse().unwrap());
+        assert_eq!(parse_retry_delay(&headers), Some(MAX_RETRY_DELAY));
+        // RateLimit wins when both are present.
+        headers.insert("ratelimit", r#""hub_api";r=0;t=3"#.parse().unwrap());
+        assert_eq!(parse_retry_delay(&headers), Some(std::time::Duration::from_secs(3)));
     }
 
     #[test]

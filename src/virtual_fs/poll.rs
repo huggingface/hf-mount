@@ -9,7 +9,7 @@ use crate::error::Error;
 use crate::follow::{FollowChange, FollowEvent, FollowOp};
 use crate::hub_api::HubOps;
 
-use super::inode::{self, InodeKind, InodeTable};
+use super::inode::{InodeKind, InodeTable};
 use super::{InvalKind, Invalidator};
 
 /// Cap on the exponential-backoff multiplier applied to the poll interval
@@ -18,6 +18,57 @@ use super::{InvalKind, Invalidator};
 /// lookups of quota). With `interval = 30s` and `MAX_BACKOFF_EXP = 6`, the
 /// max delay between polls becomes `30s * 2^6 = 32 min`.
 const MAX_BACKOFF_EXP: u32 = 6;
+
+/// Record a remote metadata change on a materialized file and queue its
+/// kernel invalidation. An inode with open handles may have an in-flight
+/// read holding its folio locks; a full page invalidation would block in
+/// the kernel waiting on that lock and deadlock against the read (#195), so
+/// such inodes get an attribute-only invalidation that never touches pages.
+fn update_remote_file(
+    inode_table: &mut InodeTable,
+    ino: u64,
+    hash: Option<String>,
+    etag: Option<String>,
+    size: u64,
+    mtime: SystemTime,
+    inos_to_invalidate: &mut Vec<(u64, InvalKind)>,
+) {
+    inode_table.update_remote_file(ino, hash, etag, size, mtime);
+    let kind = if inode_table.has_open_handles(ino) {
+        InvalKind::AttrOnly
+    } else {
+        InvalKind::Pages
+    };
+    inos_to_invalidate.push((ino, kind));
+}
+
+/// Drop a remotely deleted file from the inode table and queue the parent
+/// directory + inode invalidations. Returns `false` when the inode is gone
+/// or dirty (local writes take precedence until flushed).
+fn remove_remote_file(inode_table: &mut InodeTable, ino: u64, inos_to_invalidate: &mut Vec<(u64, InvalKind)>) -> bool {
+    let (parent_ino, name) = match inode_table.get(ino) {
+        Some(entry) if entry.is_dirty() => return false,
+        Some(entry) => (entry.parent, entry.name.clone()),
+        None => return false,
+    };
+    let ino_kind = if inode_table.has_open_handles(ino) {
+        // Unlink the pathname but keep the inode as orphan (nlink=0)
+        // so open handles can still read/fstat. release() will clean
+        // up the orphan. Without this, the file stays visible by name
+        // and a recreated file at the same path would collide.
+        inode_table.unlink_one(parent_ino, &name);
+        info!("Remote deletion of ino={ino}: unlinked path, kept orphan (open handles)");
+        // Open handles → an in-flight read may hold this inode's
+        // folios; never issue a blocking page invalidation against it (#195).
+        InvalKind::AttrOnly
+    } else {
+        inode_table.remove(ino);
+        InvalKind::Pages
+    };
+    inos_to_invalidate.push((parent_ino, InvalKind::Pages));
+    inos_to_invalidate.push((ino, ino_kind));
+    true
+}
 
 /// Statuses that should slow the poll loop down: expired token (401) or any
 /// transient failure (rate limit / server overload) where re-polling at full
@@ -53,7 +104,8 @@ impl super::VirtualFs {
         // probe + fan-out below never runs. `follow_remote_changes` returns
         // only when the endpoint is permanently unavailable (400/404: older
         // Hub deployment, or a repo source) — then the interval poll below
-        // takes over unchanged.
+        // takes over unchanged. The follow loop uses the probe above as its
+        // own baseline and doesn't re-probe before the first connect.
         if live_follow {
             Self::follow_remote_changes(
                 &hub_client,
@@ -192,11 +244,13 @@ impl super::VirtualFs {
     /// probe + fan-out.
     ///
     /// Resume protocol: reconnect with the last received cursor (server
-    /// resumes strictly after it). Without a cursor — first connect, or the
-    /// server buffer expired (`reset`) — re-probe `updatedAt`: if the bucket
-    /// moved since `last_revision`, one full poll round reconciles, then the
-    /// subscription starts from the fresh `updatedAt` (`since=`) so nothing
-    /// between the round and the subscription is missed.
+    /// resumes strictly after it). Without a cursor — the server buffer
+    /// expired (`reset`), or a stream ended before handing one out — re-probe
+    /// `updatedAt`: if the bucket moved since `last_revision`, one full poll
+    /// round reconciles, then the subscription starts from the fresh
+    /// `updatedAt` (`since=`) so nothing between the round and the
+    /// subscription is missed. The first connect skips the probe: the caller
+    /// just primed `last_revision` against a freshly listed mount.
     async fn follow_remote_changes(
         hub_client: &Arc<dyn HubOps>,
         inodes: &Arc<RwLock<InodeTable>>,
@@ -216,8 +270,12 @@ impl super::VirtualFs {
         const RECONNECT_PAUSE: Duration = Duration::from_secs(5);
 
         let mut cursor: Option<String> = None;
+        let mut first_connect = true;
         loop {
-            if cursor.is_none() {
+            // The caller primed `last_revision` right before the first
+            // connect; only re-probe there if that priming failed.
+            let primed = first_connect && last_revision.is_some();
+            if cursor.is_none() && !primed {
                 match hub_client.probe_revision().await {
                     Ok(rev) => {
                         if last_revision.as_ref() != Some(&rev) {
@@ -230,6 +288,7 @@ impl super::VirtualFs {
                     Err(e) => debug!("live-follow: revision probe failed ({e}); resuming from the last known one"),
                 }
             }
+            first_connect = false;
             let since = if cursor.is_none() { last_revision.clone() } else { None };
             let mut stream = match hub_client.follow_events(cursor.as_deref(), since.as_deref()).await {
                 Ok(stream) => stream,
@@ -250,16 +309,13 @@ impl super::VirtualFs {
             // reset/reconnect are server-directed ends: reconnect immediately
             // (their cadence is server-controlled). Anything else that ends
             // the stream gets the MIN_SESSION guard below.
-            let mut server_directed_end = false;
-            loop {
+            let server_directed_end = loop {
                 match stream.next_event().await {
+                    // An absent cursor on ready/reconnect means the feed has
+                    // seen no change yet: keep the current resume point.
                     Ok(Some(FollowEvent::Ready { cursor: c })) => {
                         debug!("live-follow: ready (cursor={c:?})");
-                        // Absent cursor = feed has seen no change yet; keep
-                        // the current resume point.
-                        if c.is_some() {
-                            cursor = c;
-                        }
+                        cursor = c.or(cursor);
                     }
                     Ok(Some(FollowEvent::Changes { cursor: c, changes })) => {
                         debug!("live-follow: applying {} change(s)", changes.len());
@@ -269,30 +325,26 @@ impl super::VirtualFs {
                     Ok(Some(FollowEvent::Reset)) => {
                         info!("live-follow: resume point older than the server buffer; re-listing");
                         cursor = None; // next connect: probe + full round + fresh `since`
-                        server_directed_end = true;
-                        break;
+                        break true;
                     }
                     Ok(Some(FollowEvent::Reconnect { cursor: c })) => {
                         debug!("live-follow: server asked to reconnect (cursor={c:?})");
-                        if c.is_some() {
-                            cursor = c;
-                        }
-                        server_directed_end = true;
-                        break;
+                        cursor = c.or(cursor);
+                        break true;
                     }
                     // Any other end of stream (TCP close, read timeout after
                     // missed pings, transport error) = reconnect with the
                     // last cursor received.
                     Ok(None) => {
                         debug!("live-follow: stream ended; reconnecting");
-                        break;
+                        break false;
                     }
                     Err(e) => {
                         warn!("live-follow: stream error ({e}); reconnecting");
-                        break;
+                        break false;
                     }
                 }
-            }
+            };
             if !server_directed_end && connected_at.elapsed() < MIN_SESSION {
                 tokio::time::sleep(RECONNECT_PAUSE).await;
             }
@@ -303,14 +355,16 @@ impl super::VirtualFs {
     ///
     /// v1 semantics, mirroring what `apply_poll_diff` derives from a full
     /// re-list — but per changed path instead of per loaded directory:
-    /// - Drop the cached listing of the nearest *loaded* ancestor directory
-    ///   of every changed path (`invalidate_children`), so the next
-    ///   lookup/readdir re-lists just the affected directories.
     /// - Files already materialized in the inode table are updated/removed
-    ///   in place (reusing the poll-diff mutation path, including the
-    ///   open-handles `AttrOnly` invalidation rule from #195) so content
-    ///   hand-off doesn't wait for a TTL. Dirty inodes are never touched —
-    ///   local writes win until flushed.
+    ///   in place through the same mutation primitives as the poll diff
+    ///   (including the open-handles `AttrOnly` invalidation rule from #195)
+    ///   so content hand-off doesn't wait for a TTL. Dirty inodes are never
+    ///   touched — local writes win until flushed.
+    /// - Every other path (not materialized, or a directory) drops the
+    ///   cached listing of its nearest *loaded* ancestor directory
+    ///   (`invalidate_children`), so the next lookup/readdir re-lists just
+    ///   that directory. In-place mutations keep the listing consistent, so
+    ///   a hot directory isn't re-listed on every batch.
     /// - `add`/`update` clear negative-cache entries for the path and every
     ///   ancestor, so a consumer that probed the path before it existed sees
     ///   it on the next lookup instead of after `--negative-ttl-ms`.
@@ -325,33 +379,29 @@ impl super::VirtualFs {
         {
             let mut inode_table = inodes.write().expect("inodes poisoned");
             for change in changes {
-                // Nearest existing ancestor directory: if its children are
-                // loaded, its cached listing is now stale (an entry appeared,
-                // changed, or vanished — possibly behind an intermediate dir
-                // we never materialized). Unloaded dirs need nothing: their
-                // first listing will be fresh.
-                let mut ancestor: &str = &change.path;
-                loop {
-                    ancestor = ancestor.rsplit_once('/').map_or("", |(parent, _)| parent);
-                    let dir_ino = if ancestor.is_empty() {
-                        Some(inode::ROOT_INODE)
-                    } else {
-                        inode_table.get_dir_ino(ancestor)
-                    };
-                    if let Some(dir_ino) = dir_ino {
-                        if inode_table.is_children_loaded(dir_ino) {
-                            dirs_to_invalidate.insert(dir_ino);
-                        }
-                        break;
-                    }
-                }
-
-                // In-place apply for files already materialized at this path.
                 let existing = inode_table
                     .get_by_path(&change.path)
                     .filter(|e| e.kind == InodeKind::File)
-                    .map(|e| (e.inode, e.is_dirty(), e.xet_hash.clone(), e.size));
-                let Some((ino, is_dirty, local_hash, local_size)) = existing else {
+                    .map(|e| {
+                        (
+                            e.inode,
+                            e.is_dirty(),
+                            e.xet_hash.clone(),
+                            e.etag.clone(),
+                            e.size,
+                            e.mtime,
+                        )
+                    });
+                let Some((ino, is_dirty, local_hash, local_etag, local_size, local_mtime)) = existing else {
+                    // Not materialized: an entry appeared or vanished in the
+                    // nearest existing ancestor directory (possibly behind an
+                    // intermediate dir we never listed), so its cached listing
+                    // is stale. Unloaded dirs need nothing: their first listing
+                    // will be fresh.
+                    let dir_ino = inode_table.nearest_dir_ancestor(&change.path);
+                    if inode_table.is_children_loaded(dir_ino) {
+                        dirs_to_invalidate.insert(dir_ino);
+                    }
                     continue;
                 };
                 if is_dirty {
@@ -359,24 +409,9 @@ impl super::VirtualFs {
                 }
                 match change.op {
                     FollowOp::Delete => {
-                        let (parent_ino, name) = match inode_table.get(ino) {
-                            Some(entry) => (entry.parent, entry.name.clone()),
-                            None => continue,
-                        };
-                        // Same open-handles rules as apply_poll_diff: keep the
-                        // inode as a nameless orphan for open readers, and
-                        // never issue a blocking page invalidation against an
-                        // inode whose folios an in-flight read may hold (#195).
-                        let ino_kind = if inode_table.has_open_handles(ino) {
-                            inode_table.unlink_one(parent_ino, &name);
-                            InvalKind::AttrOnly
-                        } else {
-                            inode_table.remove(ino);
-                            InvalKind::Pages
-                        };
-                        info!("live-follow: remote deletion of {}", change.path);
-                        inos_to_invalidate.push((parent_ino, InvalKind::Pages));
-                        inos_to_invalidate.push((ino, ino_kind));
+                        if remove_remote_file(&mut inode_table, ino, &mut inos_to_invalidate) {
+                            info!("live-follow: remote deletion of {}", change.path);
+                        }
                     }
                     FollowOp::Add | FollowOp::Update => {
                         // An update carries only the fields that changed;
@@ -389,16 +424,17 @@ impl super::VirtualFs {
                             .mtime
                             .as_deref()
                             .or(change.uploaded_at.as_deref())
-                            .map(crate::hub_api::mtime_from_str)
-                            .unwrap_or_else(SystemTime::now);
-                        inode_table.update_remote_file(ino, new_hash, None, new_size, mtime);
-                        let kind = if inode_table.has_open_handles(ino) {
-                            InvalKind::AttrOnly
-                        } else {
-                            InvalKind::Pages
-                        };
+                            .map_or(local_mtime, crate::hub_api::mtime_from_str);
+                        update_remote_file(
+                            &mut inode_table,
+                            ino,
+                            new_hash,
+                            local_etag,
+                            new_size,
+                            mtime,
+                            &mut inos_to_invalidate,
+                        );
                         info!("live-follow: remote update of {}", change.path);
-                        inos_to_invalidate.push((ino, kind));
                     }
                 }
             }
@@ -413,10 +449,7 @@ impl super::VirtualFs {
         // them may have been probed and cached as missing before existing).
         {
             let mut nc = negative_cache.write().expect("neg_cache poisoned");
-            for change in changes {
-                if change.op == FollowOp::Delete {
-                    continue;
-                }
+            for change in changes.iter().filter(|c| c.op != FollowOp::Delete) {
                 let mut path: &str = &change.path;
                 loop {
                     nc.remove(path);
@@ -526,58 +559,27 @@ impl super::VirtualFs {
         }
 
         // Phase 2: Apply mutations under lock, collect inodes to invalidate.
-        // An inode with open handles may have an in-flight read holding its
-        // folio locks; a full page invalidation would block in the kernel
-        // waiting on that lock and deadlock against the read (#195), so such
-        // inodes get an attribute-only invalidation that never touches pages.
         let mut inos_to_invalidate: Vec<(u64, InvalKind)> = Vec::new();
         let dirs_to_invalidate_kernel: Vec<u64>;
         {
             let mut inode_table = inodes.write().expect("inodes poisoned");
 
-            for update in &updates {
-                inode_table.update_remote_file(
+            for update in updates {
+                update_remote_file(
+                    &mut inode_table,
                     update.ino,
-                    update.hash.clone(),
-                    update.etag.clone(),
+                    update.hash,
+                    update.etag,
                     update.size,
                     update.mtime,
+                    &mut inos_to_invalidate,
                 );
-                let kind = if inode_table.has_open_handles(update.ino) {
-                    InvalKind::AttrOnly
-                } else {
-                    InvalKind::Pages
-                };
-                inos_to_invalidate.push((update.ino, kind));
             }
 
+            // Re-checked under the write lock by the helper: the inode may
+            // have been removed or dirtied since the read-lock snapshot.
             for ino in &deletions {
-                // Re-check under write lock: inode may have been removed or
-                // dirtied between the read-lock snapshot and now.
-                let (parent_ino, name) = match inode_table.get(*ino) {
-                    Some(entry) if entry.is_dirty() => continue,
-                    Some(entry) => (entry.parent, entry.name.clone()),
-                    None => continue,
-                };
-                let ino_kind = if inode_table.has_open_handles(*ino) {
-                    // Unlink the pathname but keep the inode as orphan (nlink=0)
-                    // so open handles can still read/fstat. release() will clean
-                    // up the orphan. Without this, the file stays visible by name
-                    // and a recreated file at the same path would collide.
-                    inode_table.unlink_one(parent_ino, &name);
-                    info!(
-                        "Remote deletion of ino={}: unlinked path, kept orphan (open handles)",
-                        ino
-                    );
-                    // Open handles → an in-flight read may hold this inode's
-                    // folios; never issue a blocking page invalidation against it.
-                    InvalKind::AttrOnly
-                } else {
-                    inode_table.remove(*ino);
-                    InvalKind::Pages
-                };
-                inos_to_invalidate.push((parent_ino, InvalKind::Pages));
-                inos_to_invalidate.push((*ino, ino_kind));
+                remove_remote_file(&mut inode_table, *ino, &mut inos_to_invalidate);
             }
 
             // Phase 3: New remote entries (files AND directories) -> invalidate parent dir.
@@ -588,28 +590,12 @@ impl super::VirtualFs {
             let mut dir_paths_to_invalidate = Vec::new();
             for path in &all_remote_paths {
                 if inode_table.get_by_path(path).is_none() {
-                    let mut ancestor: &str = path;
-                    loop {
-                        ancestor = match ancestor.rsplit_once('/') {
-                            Some((parent, _)) => parent,
-                            None => "",
-                        };
-                        if let Some(dir_ino) = inode_table.get_dir_ino(ancestor) {
-                            // Only invalidate if this directory was already loaded.
-                            // If not loaded, the "missing" file is just unexplored.
-                            if inode_table.is_children_loaded(dir_ino) && dirs_to_invalidate.insert(dir_ino) {
-                                dir_paths_to_invalidate.push(ancestor.to_string());
-                            }
-                            break;
-                        }
-                        if ancestor.is_empty() {
-                            if inode_table.is_children_loaded(inode::ROOT_INODE)
-                                && dirs_to_invalidate.insert(inode::ROOT_INODE)
-                            {
-                                dir_paths_to_invalidate.push(String::new());
-                            }
-                            break;
-                        }
+                    let dir_ino = inode_table.nearest_dir_ancestor(path);
+                    // Only invalidate if this directory was already loaded.
+                    // If not loaded, the "missing" file is just unexplored.
+                    if inode_table.is_children_loaded(dir_ino) && dirs_to_invalidate.insert(dir_ino) {
+                        let dir_path = inode_table.get(dir_ino).map(|e| e.full_path.to_string());
+                        dir_paths_to_invalidate.push(dir_path.unwrap_or_default());
                     }
                 }
             }

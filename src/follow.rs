@@ -49,8 +49,6 @@ pub struct FollowChange {
     /// back to `uploaded_at`.
     #[serde(default)]
     pub mtime: Option<String>,
-    #[serde(default)]
-    pub mtime_nanos: Option<u64>,
 }
 
 /// A parsed event from the live-follow feed.
@@ -97,6 +95,9 @@ pub struct SseEvent {
 #[derive(Default)]
 pub struct SseParser {
     buf: Vec<u8>,
+    /// Bytes before this offset hold no `\n`: a long line arriving in many
+    /// chunks is scanned once, not once per chunk.
+    scanned: usize,
     event: String,
     data: String,
 }
@@ -105,10 +106,13 @@ impl SseParser {
     pub fn push(&mut self, chunk: &[u8]) -> Vec<SseEvent> {
         self.buf.extend_from_slice(chunk);
         let mut events = Vec::new();
-        while let Some(pos) = self.buf.iter().position(|&b| b == b'\n') {
-            let line_bytes: Vec<u8> = self.buf.drain(..=pos).collect();
-            let line = String::from_utf8_lossy(&line_bytes);
-            let line = line.trim_end_matches(['\n', '\r']);
+        let mut consumed = 0;
+        while let Some(pos) = self.buf[self.scanned..].iter().position(|&b| b == b'\n') {
+            let end = self.scanned + pos;
+            let line = String::from_utf8_lossy(&self.buf[consumed..end]);
+            let line = line.trim_end_matches('\r');
+            consumed = end + 1;
+            self.scanned = consumed;
 
             if line.is_empty() {
                 // Blank line dispatches the accumulated event.
@@ -139,6 +143,8 @@ impl SseParser {
                 _ => {}
             }
         }
+        self.buf.drain(..consumed);
+        self.scanned = self.buf.len();
         events
     }
 }
@@ -147,7 +153,7 @@ impl SseParser {
 /// malformed payloads yield `None` (logged) so a newer server can add event
 /// types without breaking older clients.
 pub fn parse_follow_event(raw: &SseEvent) -> Option<FollowEvent> {
-    #[derive(Deserialize, Default)]
+    #[derive(Deserialize)]
     struct CursorOnly {
         #[serde(default)]
         cursor: Option<String>,
@@ -157,21 +163,18 @@ pub fn parse_follow_event(raw: &SseEvent) -> Option<FollowEvent> {
         cursor: String,
         changes: Vec<FollowChange>,
     }
-    let cursor_only = |data: &str| -> std::result::Result<CursorOnly, serde_json::Error> {
-        if data.is_empty() {
-            Ok(CursorOnly::default())
-        } else {
-            serde_json::from_str(data)
-        }
-    };
+    // `ready`/`reconnect` may come with an empty payload.
+    let cursor_data = if raw.data.is_empty() { "{}" } else { &raw.data };
     let parsed = match raw.event.as_str() {
-        "ready" => cursor_only(&raw.data).map(|c| FollowEvent::Ready { cursor: c.cursor }),
+        "ready" => serde_json::from_str::<CursorOnly>(cursor_data).map(|c| FollowEvent::Ready { cursor: c.cursor }),
         "changes" => serde_json::from_str::<ChangesData>(&raw.data).map(|d| FollowEvent::Changes {
             cursor: d.cursor,
             changes: d.changes,
         }),
-        "reset" => return Some(FollowEvent::Reset),
-        "reconnect" => cursor_only(&raw.data).map(|c| FollowEvent::Reconnect { cursor: c.cursor }),
+        "reset" => Ok(FollowEvent::Reset),
+        "reconnect" => {
+            serde_json::from_str::<CursorOnly>(cursor_data).map(|c| FollowEvent::Reconnect { cursor: c.cursor })
+        }
         other => {
             warn!("live-follow: ignoring unknown event type {other:?}");
             return None;
@@ -180,7 +183,13 @@ pub fn parse_follow_event(raw: &SseEvent) -> Option<FollowEvent> {
     match parsed {
         Ok(event) => Some(event),
         Err(e) => {
-            warn!("live-follow: malformed {} payload ({e}): {}", raw.event, raw.data);
+            // A `changes` payload can be large: log a prefix only.
+            let head: String = raw.data.chars().take(200).collect();
+            warn!(
+                "live-follow: malformed {} payload ({e}), {} bytes: {head}",
+                raw.event,
+                raw.data.len()
+            );
             None
         }
     }
@@ -210,24 +219,20 @@ impl HttpFollowStream {
 
     /// Apply the subfolder prefix to a batch (see `HubApiClient::list_tree`,
     /// which strips the same prefix from tree entries).
-    fn rebase(&self, event: FollowEvent) -> FollowEvent {
+    fn rebase(&self, changes: &mut Vec<FollowChange>) {
         if self.path_prefix.is_empty() {
-            return event;
+            return;
         }
-        match event {
-            FollowEvent::Changes { cursor, changes } => {
-                let changes = changes
-                    .into_iter()
-                    .filter_map(|mut change| {
-                        let rel = crate::hub_api::strict_descendant_rel(&change.path, &self.path_prefix)?;
-                        change.path = rel.to_string();
-                        Some(change)
-                    })
-                    .collect();
-                FollowEvent::Changes { cursor, changes }
-            }
-            other => other,
-        }
+        changes.retain_mut(
+            |change| match crate::hub_api::strict_descendant_rel(&change.path, &self.path_prefix) {
+                Some(rel) => {
+                    let start = change.path.len() - rel.len();
+                    change.path.drain(..start);
+                    true
+                }
+                None => false,
+            },
+        );
     }
 }
 
@@ -241,8 +246,10 @@ impl FollowStreamOps for HttpFollowStream {
             match self.stream.next().await {
                 Some(Ok(chunk)) => {
                     for raw in self.parser.push(&chunk) {
-                        if let Some(event) = parse_follow_event(&raw) {
-                            let event = self.rebase(event);
+                        if let Some(mut event) = parse_follow_event(&raw) {
+                            if let FollowEvent::Changes { changes, .. } = &mut event {
+                                self.rebase(changes);
+                            }
                             self.queued.push_back(event);
                         }
                     }
@@ -258,14 +265,10 @@ impl FollowStreamOps for HttpFollowStream {
 mod tests {
     use super::*;
 
-    fn parse_all(parser: &mut SseParser, input: &str) -> Vec<SseEvent> {
-        parser.push(input.as_bytes())
-    }
-
     #[test]
     fn sse_parser_single_event() {
         let mut parser = SseParser::default();
-        let events = parse_all(&mut parser, "event: ready\ndata: {\"cursor\":\"c1\"}\n\n");
+        let events = parser.push(b"event: ready\ndata: {\"cursor\":\"c1\"}\n\n");
         assert_eq!(
             events,
             vec![SseEvent {
@@ -294,12 +297,9 @@ mod tests {
     fn sse_parser_ignores_comments_and_crlf() {
         let mut parser = SseParser::default();
         // Ping comments (the feed's 30s keep-alives) produce nothing.
-        assert!(parse_all(&mut parser, ": ping\n\n").is_empty());
+        assert!(parser.push(b": ping\n\n").is_empty());
         // CRLF line endings are accepted.
-        let events = parse_all(
-            &mut parser,
-            "event: reset\r\ndata: {\"reason\":\"cursor_too_old\"}\r\n\r\n",
-        );
+        let events = parser.push(b"event: reset\r\ndata: {\"reason\":\"cursor_too_old\"}\r\n\r\n");
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event, "reset");
     }
@@ -307,10 +307,8 @@ mod tests {
     #[test]
     fn sse_parser_multiple_events_per_chunk() {
         let mut parser = SseParser::default();
-        let events = parse_all(
-            &mut parser,
-            "event: ready\ndata: {}\n\n: ping\n\nevent: reconnect\ndata: {\"cursor\":\"c9\"}\n\n",
-        );
+        let events =
+            parser.push(b"event: ready\ndata: {}\n\n: ping\n\nevent: reconnect\ndata: {\"cursor\":\"c9\"}\n\n");
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].event, "ready");
         assert_eq!(events[1].event, "reconnect");
@@ -319,7 +317,7 @@ mod tests {
     #[test]
     fn sse_parser_joins_multi_line_data() {
         let mut parser = SseParser::default();
-        let events = parse_all(&mut parser, "event: x\ndata: a\ndata: b\n\n");
+        let events = parser.push(b"event: x\ndata: a\ndata: b\n\n");
         assert_eq!(events[0].data, "a\nb");
     }
 

@@ -4,7 +4,7 @@ use super::inode::ROOT_INODE;
 use super::*;
 use crate::follow::{FollowChange, FollowEvent, FollowOp};
 use crate::hub_api::HeadFileInfo;
-use crate::test_mocks::{MockFollowItem, MockHub, MockXet, TestOpts, make_overlay_test_vfs_with_root, make_test_vfs};
+use crate::test_mocks::{MockHub, MockXet, TestOpts, make_overlay_test_vfs_with_root, make_test_vfs};
 
 /// Create a fresh overlay temp dir, removing any stale contents from previous runs.
 fn fresh_overlay_dir(name: &str) -> std::path::PathBuf {
@@ -2765,6 +2765,42 @@ fn unlink_cleans_staging() {
 
 // ── poll_remote_changes ─────────────────────────────────────────────
 
+/// Run `poll_remote_changes` (10ms interval) in the background until the
+/// returned `Notify` fires.
+fn spawn_poll_loop(
+    vfs: &std::sync::Arc<VirtualFs>,
+    hub: &std::sync::Arc<MockHub>,
+    live_follow: bool,
+) -> (Arc<tokio::sync::Notify>, tokio::task::JoinHandle<()>) {
+    let stop = Arc::new(tokio::sync::Notify::new());
+    let stop_clone = stop.clone();
+    let hub_dyn: Arc<dyn crate::hub_api::HubOps> = hub.clone();
+    let inodes = vfs.inode_table.clone();
+    let neg = vfs.negative_cache.clone();
+    let inv = vfs.invalidator.clone();
+    let handle = tokio::spawn(async move {
+        tokio::select! {
+            _ = VirtualFs::poll_remote_changes(
+                hub_dyn, inodes, neg, inv,
+                Duration::from_millis(10), 4, live_follow,
+            ) => {}
+            _ = stop_clone.notified() => {}
+        }
+    });
+    (stop, handle)
+}
+
+/// Poll `cond` every 10ms for up to 5s. Returns whether it became true.
+async fn wait_until(mut cond: impl FnMut() -> bool) -> bool {
+    for _ in 0..500 {
+        if cond() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    false
+}
+
 /// poll_remote_changes calls probe_revision once per round and skips the
 /// tree-listing fan-out when the value is unchanged. When the revision
 /// advances, list_tree fires again. When the probe returns a non-401 error,
@@ -2783,21 +2819,7 @@ fn poll_skips_list_tree_when_revision_unchanged() {
         // The lookup above triggered ensure_children_loaded -> 1 list_tree call.
         let baseline_list_tree = hub.list_tree_call_count();
 
-        let stop = Arc::new(tokio::sync::Notify::new());
-        let stop_clone = stop.clone();
-        let hub_dyn: Arc<dyn crate::hub_api::HubOps> = hub.clone();
-        let inodes = vfs.inode_table.clone();
-        let neg = vfs.negative_cache.clone();
-        let inv = vfs.invalidator.clone();
-        let handle = tokio::spawn(async move {
-            tokio::select! {
-                _ = VirtualFs::poll_remote_changes(
-                    hub_dyn, inodes, neg, inv,
-                    Duration::from_millis(10), 4, false,
-                ) => {}
-                _ = stop_clone.notified() => {}
-            }
-        });
+        let (stop, handle) = spawn_poll_loop(&vfs, &hub, false);
 
         // Let 5 rounds run with identical revision -> probe fires, list_tree does not.
         tokio::time::sleep(Duration::from_millis(80)).await;
@@ -2852,7 +2874,6 @@ fn follow_change(path: &str, op: FollowOp) -> FollowChange {
         xet_hash: None,
         uploaded_at: None,
         mtime: None,
-        mtime_nanos: None,
     }
 }
 
@@ -2892,7 +2913,7 @@ fn follow_add_invalidates_loaded_dir_and_negative_cache() {
 
 /// An `update` for an already-materialized clean file is applied in place;
 /// fields absent from the change keep their current value (a bare re-upload
-/// carries only `uploadedAt` and must not clear the hash or size).
+/// carries only `uploadedAt` and must not clear the hash, size or mtime).
 #[test]
 fn follow_update_applies_in_place_and_merges_fields() {
     let hub = MockHub::new();
@@ -2919,10 +2940,30 @@ fn follow_update_applies_in_place_and_merges_fields() {
         let mut change = follow_change("file.txt", FollowOp::Update);
         change.uploaded_at = Some("2026-05-01T00:00:01Z".to_string());
         VirtualFs::apply_follow_changes(&[change], &vfs.inode_table, &vfs.negative_cache, &vfs.invalidator);
+        let mtime_after_reupload = vfs.inode_table.read().unwrap().get(attr.ino).unwrap().mtime;
+        assert_eq!(
+            mtime_after_reupload,
+            crate::hub_api::mtime_from_str("2026-05-01T00:00:01Z")
+        );
+
+        // Size-only delta: no mtime nor uploadedAt keeps the current mtime.
+        let mut change = follow_change("file.txt", FollowOp::Update);
+        change.size = Some(100);
+        VirtualFs::apply_follow_changes(&[change], &vfs.inode_table, &vfs.negative_cache, &vfs.invalidator);
         let inodes = vfs.inode_table.read().unwrap();
         let entry = inodes.get(attr.ino).unwrap();
-        assert_eq!(entry.size, 99);
+        assert_eq!(entry.size, 100);
         assert_eq!(entry.xet_hash.as_deref(), Some("h2"));
+        assert_eq!(
+            entry.mtime, mtime_after_reupload,
+            "absent mtime must keep the current one"
+        );
+        // Applied in place: the parent listing is still consistent, so a hot
+        // directory isn't re-listed on every batch.
+        assert!(
+            inodes.is_children_loaded(ROOT_INODE),
+            "in-place update must keep root's listing"
+        );
     });
 }
 
@@ -2996,14 +3037,14 @@ fn follow_stream_reconnects_with_cursor_and_relists_on_reset() {
     hub.set_revision("rev-a");
     hub.enable_follow();
     // Session 1: ready → one change batch → server-directed reconnect.
-    hub.push_follow(MockFollowItem::Event(FollowEvent::Ready {
+    hub.push_follow(FollowEvent::Ready {
         cursor: Some("c1".to_string()),
-    }));
-    hub.push_follow(MockFollowItem::Event(FollowEvent::Changes {
+    });
+    hub.push_follow(FollowEvent::Changes {
         cursor: "c2".to_string(),
         changes: vec![follow_change("new.txt", FollowOp::Add)],
-    }));
-    hub.push_follow(MockFollowItem::Event(FollowEvent::Reconnect { cursor: None }));
+    });
+    hub.push_follow(FollowEvent::Reconnect { cursor: None });
     let xet = MockXet::new();
     let (rt, vfs) = vfs_simple(&hub, &xet);
 
@@ -3011,29 +3052,10 @@ fn follow_stream_reconnects_with_cursor_and_relists_on_reset() {
         // Root was pre-loaded at mount → loaded_dir_prefixes is non-empty.
         let baseline_list_tree = hub.list_tree_call_count();
 
-        let stop = Arc::new(tokio::sync::Notify::new());
-        let stop_clone = stop.clone();
-        let hub_dyn: Arc<dyn crate::hub_api::HubOps> = hub.clone();
-        let inodes = vfs.inode_table.clone();
-        let neg = vfs.negative_cache.clone();
-        let inv = vfs.invalidator.clone();
-        let handle = tokio::spawn(async move {
-            tokio::select! {
-                _ = VirtualFs::poll_remote_changes(
-                    hub_dyn, inodes, neg, inv,
-                    Duration::from_millis(10), 4, true,
-                ) => {}
-                _ = stop_clone.notified() => {}
-            }
-        });
+        let (stop, handle) = spawn_poll_loop(&vfs, &hub, true);
 
         // Wait for the reconnect after session 1.
-        for _ in 0..500 {
-            if hub.follow_connect_log().len() >= 2 {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        wait_until(|| hub.follow_connect_log().len() >= 2).await;
         let log = hub.follow_connect_log();
         assert!(log.len() >= 2, "expected a reconnect, got {log:?}");
         // First connect: no cursor yet → since = last known updatedAt.
@@ -3055,13 +3077,8 @@ fn follow_stream_reconnects_with_cursor_and_relists_on_reset() {
 
         // The server buffer expired while the bucket moved on.
         hub.set_revision("rev-b");
-        hub.push_follow(MockFollowItem::Event(FollowEvent::Reset));
-        for _ in 0..500 {
-            if hub.follow_connect_log().len() >= 3 {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        hub.push_follow(FollowEvent::Reset);
+        wait_until(|| hub.follow_connect_log().len() >= 3).await;
         let log = hub.follow_connect_log();
         assert!(log.len() >= 3, "expected a re-subscribe after reset, got {log:?}");
         assert!(
@@ -3090,43 +3107,20 @@ fn follow_unsupported_falls_back_to_polling() {
 
     rt.block_on(async {
         let baseline_list_tree = hub.list_tree_call_count();
-        let stop = Arc::new(tokio::sync::Notify::new());
-        let stop_clone = stop.clone();
-        let hub_dyn: Arc<dyn crate::hub_api::HubOps> = hub.clone();
-        let inodes = vfs.inode_table.clone();
-        let neg = vfs.negative_cache.clone();
-        let inv = vfs.invalidator.clone();
-        let handle = tokio::spawn(async move {
-            tokio::select! {
-                _ = VirtualFs::poll_remote_changes(
-                    hub_dyn, inodes, neg, inv,
-                    Duration::from_millis(10), 4, true,
-                ) => {}
-                _ = stop_clone.notified() => {}
-            }
-        });
+        let (stop, handle) = spawn_poll_loop(&vfs, &hub, true);
 
-        // The poll loop takes over: probes fire per round (beyond the two
-        // startup probes), no fan-out while the revision holds still.
-        for _ in 0..500 {
-            if hub.probe_revision_call_count() >= 5 {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert!(hub.probe_revision_call_count() >= 5, "poll loop must keep probing");
+        // The poll loop takes over: probes fire per round (beyond the
+        // startup probe), no fan-out while the revision holds still.
+        assert!(
+            wait_until(|| hub.probe_revision_call_count() >= 5).await,
+            "poll loop must keep probing"
+        );
         assert_eq!(hub.list_tree_call_count(), baseline_list_tree);
 
         // A revision change still triggers the fan-out.
         hub.set_revision("rev-b");
-        for _ in 0..500 {
-            if hub.list_tree_call_count() > baseline_list_tree {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
         assert!(
-            hub.list_tree_call_count() > baseline_list_tree,
+            wait_until(|| hub.list_tree_call_count() > baseline_list_tree).await,
             "fan-out must fire on revision change"
         );
 
