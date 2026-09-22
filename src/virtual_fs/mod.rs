@@ -120,7 +120,8 @@ pub struct VfsConfig {
     /// changes are applied as they happen, skipping the periodic probe +
     /// fan-out while the stream is healthy. Falls back to interval polling
     /// automatically when the Hub doesn't serve the feed (older deployments,
-    /// repo sources). Only used when polling is enabled (interval > 0).
+    /// repo sources); with polling disabled too, remote changes are then
+    /// only seen through per-file revalidation.
     pub live_follow: bool,
     pub metadata_ttl: Duration,
     /// How long a lookup miss is remembered before the path is re-probed.
@@ -304,14 +305,15 @@ impl VirtualFs {
         // Create open_files before poll task so we can share with it
         let open_files: Arc<RwLock<HashMap<u64, OpenFile>>> = Arc::new(RwLock::new(HashMap::new()));
 
-        // Spawn remote change polling task (if interval > 0)
+        // Spawn the remote change task when either sync mechanism is on:
+        // interval polling (interval > 0) or the live-follow feed.
         let invalidator: Invalidator = Arc::new(OnceLock::new());
-        let poll_handle = if config.poll_interval_secs > 0 {
+        let poll_handle = if config.poll_interval_secs > 0 || config.live_follow {
             let bg_hub = hub_client.clone();
             let bg_inodes = inodes.clone();
             let bg_neg_cache = negative_cache.clone();
             let bg_invalidator = invalidator.clone();
-            let interval = Duration::from_secs(config.poll_interval_secs);
+            let interval = (config.poll_interval_secs > 0).then(|| Duration::from_secs(config.poll_interval_secs));
             // Clamp to >= 1 in case a caller (library use) constructs VfsConfig directly.
             let listing_concurrency = config.poll_listing_concurrency.max(1);
 

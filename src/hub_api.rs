@@ -6,7 +6,7 @@ use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use xet_client::cas_client::auth::{AuthError, TokenInfo, TokenRefresher};
 
 use crate::error::{Error, Result, is_retryable_status, is_transient_http};
@@ -94,17 +94,19 @@ pub trait HubOps: Send + Sync {
     /// `cursor` resumes strictly after a previously received opaque cursor;
     /// `since` (ISO8601, e.g. the last `updatedAt` seen) replays changes from
     /// that instant; with neither, only live changes stream (callers pass at
-    /// most one). Errors carry the HTTP status: 400/404 mean this deployment
-    /// doesn't serve the feed and the caller falls back to polling
-    /// permanently; a 503 carries the server's `Retry-After` hint via
-    /// [`Error::retry_after`]. The default impl reports 404 so mocks and
-    /// non-bucket sources use the poll fallback.
+    /// most one). `Ok(None)` means this source or deployment doesn't serve
+    /// the feed (repo source, 404, non-SSE response): the caller falls back
+    /// to polling permanently. Errors carry the HTTP status (a 400 means the
+    /// request itself was refused, e.g. an unparseable resume point) and, on
+    /// 503/429, the server's wait hint via [`Error::retry_after`]. The
+    /// default impl reports the feed as absent so mocks and non-bucket
+    /// sources use the poll fallback.
     async fn follow_events(
         &self,
         _cursor: Option<&str>,
         _since: Option<&str>,
-    ) -> Result<Box<dyn crate::follow::FollowStreamOps>> {
-        Err(Error::hub_status(404, "live-follow not supported"))
+    ) -> Result<Option<Box<dyn crate::follow::FollowStreamOps>>> {
+        Ok(None)
     }
 }
 
@@ -728,17 +730,15 @@ impl HubApiClient {
     /// — the server 400s without it) and the same bearer auth as tree calls.
     /// No `send_with_retry`: a 503 here has dedicated semantics (this pod
     /// doesn't serve the feed or is catching up; its `Retry-After` is
-    /// surfaced through [`Error::retry_after`], default 10s at the caller)
-    /// and everything else is either permanent (400/404 → poll fallback) or
-    /// handled by the caller's reconnect loop.
+    /// surfaced through [`Error::retry_after`]) and everything else is
+    /// handled by the caller's reconnect/backoff loop.
     pub async fn follow_events(
         &self,
         cursor: Option<&str>,
         since: Option<&str>,
-    ) -> Result<Box<dyn crate::follow::FollowStreamOps>> {
+    ) -> Result<Option<Box<dyn crate::follow::FollowStreamOps>>> {
         let SourceKind::Bucket { bucket_id } = &self.source else {
-            // Repos have no live-follow feed; report what an older Hub would.
-            return Err(Error::hub_status(404, "live-follow is only available for buckets"));
+            return Ok(None); // repos have no live-follow feed
         };
         let url = format!("{}/api/buckets/{}/events", self.endpoint, bucket_id);
         let mut req = self
@@ -750,8 +750,12 @@ impl HubApiClient {
             req = req.query(&[("since", since)]);
         }
         let resp = req.send().await.map_err(Error::Http)?;
+        let status = resp.status().as_u16();
+        if status == 404 {
+            debug!("live-follow: endpoint not served by this Hub (404)");
+            return Ok(None);
+        }
         if !resp.status().is_success() {
-            let status = resp.status().as_u16();
             let retry_after = parse_retry_delay(resp.headers());
             let body = resp.text().await.unwrap_or_default();
             return Err(Error::Hub {
@@ -760,10 +764,22 @@ impl HubApiClient {
                 retry_after,
             });
         }
-        Ok(Box::new(crate::follow::HttpFollowStream::new(
+        // A 200 that isn't an event stream (a proxy or intermediate Hub
+        // build answering with HTML/JSON) would never yield an event: treat
+        // it as "feed not served" rather than reconnecting forever.
+        let content_type = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        if !content_type.starts_with("text/event-stream") {
+            warn!("live-follow: endpoint answered with content-type {content_type:?}, not an event stream");
+            return Ok(None);
+        }
+        Ok(Some(Box::new(crate::follow::HttpFollowStream::new(
             resp,
             self.path_prefix.clone(),
-        )))
+        ))))
     }
 
     /// List tree entries at the given prefix (single directory level).
@@ -1203,7 +1219,7 @@ impl HubOps for HubApiClient {
         &self,
         cursor: Option<&str>,
         since: Option<&str>,
-    ) -> Result<Box<dyn crate::follow::FollowStreamOps>> {
+    ) -> Result<Option<Box<dyn crate::follow::FollowStreamOps>>> {
         self.follow_events(cursor, since).await
     }
 }

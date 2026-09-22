@@ -2782,7 +2782,7 @@ fn spawn_poll_loop(
         tokio::select! {
             _ = VirtualFs::poll_remote_changes(
                 hub_dyn, inodes, neg, inv,
-                Duration::from_millis(10), 4, live_follow,
+                Some(Duration::from_millis(10)), 4, live_follow,
             ) => {}
             _ = stop_clone.notified() => {}
         }
@@ -3026,17 +3026,17 @@ fn follow_change_under_unloaded_dir_is_noop() {
 }
 
 /// End-to-end follow-loop transitions against the scripted mock feed:
-/// changes apply while the stream is healthy (no probe/fan-out), a
-/// server-directed reconnect resumes with the last received cursor, and a
-/// `reset` runs one full poll round before re-subscribing from the fresh
-/// `updatedAt`.
+/// changes apply while the stream is healthy (no probe/fan-out), a plain
+/// end of stream (TCP close) and a server-directed reconnect both resume
+/// with the last received cursor, and a `reset` runs one full poll round
+/// before re-subscribing from the fresh `updatedAt`.
 #[test]
 fn follow_stream_reconnects_with_cursor_and_relists_on_reset() {
     let hub = MockHub::new();
     hub.add_file("file.txt", 10, Some("h1"), None);
     hub.set_revision("rev-a");
     hub.enable_follow();
-    // Session 1: ready → one change batch → server-directed reconnect.
+    // Session 1: ready → one change batch → the connection drops.
     hub.push_follow(FollowEvent::Ready {
         cursor: Some("c1".to_string()),
     });
@@ -3044,31 +3044,47 @@ fn follow_stream_reconnects_with_cursor_and_relists_on_reset() {
         cursor: "c2".to_string(),
         changes: vec![follow_change("new.txt", FollowOp::Add)],
     });
-    hub.push_follow(FollowEvent::Reconnect { cursor: None });
+    hub.end_follow_stream();
+    // Session 2: ready → server-directed reconnect with a newer cursor.
+    hub.push_follow(FollowEvent::Ready {
+        cursor: Some("c2".to_string()),
+    });
+    hub.push_follow(FollowEvent::Reconnect {
+        cursor: Some("c5".to_string()),
+    });
     let xet = MockXet::new();
     let (rt, vfs) = vfs_simple(&hub, &xet);
 
     rt.block_on(async {
         // Root was pre-loaded at mount → loaded_dir_prefixes is non-empty.
         let baseline_list_tree = hub.list_tree_call_count();
+        let baseline_probes = hub.probe_revision_call_count();
 
         let (stop, handle) = spawn_poll_loop(&vfs, &hub, true);
 
-        // Wait for the reconnect after session 1.
-        wait_until(|| hub.follow_connect_log().len() >= 2).await;
+        // Wait for session 3 (after the drop and the server-directed reconnect).
+        wait_until(|| hub.follow_connect_log().len() >= 3).await;
         let log = hub.follow_connect_log();
-        assert!(log.len() >= 2, "expected a reconnect, got {log:?}");
+        assert!(log.len() >= 3, "expected two reconnects, got {log:?}");
         // First connect: no cursor yet → since = last known updatedAt.
         assert_eq!(log[0], (None, Some("rev-a".to_string())));
-        // The reconnect resumes strictly after the last received cursor.
+        // A dropped stream resumes strictly after the last received cursor.
         assert_eq!(log[1], (Some("c2".to_string()), None));
+        // A server-directed reconnect resumes from the cursor it carried.
+        assert_eq!(log[2], (Some("c5".to_string()), None));
         // The change batch was applied (root's cached listing dropped) and no
-        // poll fan-out ran while the stream was healthy.
+        // probe or poll fan-out ran while the stream was healthy: the startup
+        // probe primed the baseline, cursor reconnects don't re-probe.
         assert!(!vfs.inode_table.read().unwrap().is_children_loaded(ROOT_INODE));
         assert_eq!(
             hub.list_tree_call_count(),
             baseline_list_tree,
             "no fan-out while the stream is healthy"
+        );
+        assert_eq!(
+            hub.probe_revision_call_count(),
+            baseline_probes + 1,
+            "only the startup probe"
         );
 
         // Re-load root so the reset's reconcile round has a prefix to list.
@@ -3078,15 +3094,61 @@ fn follow_stream_reconnects_with_cursor_and_relists_on_reset() {
         // The server buffer expired while the bucket moved on.
         hub.set_revision("rev-b");
         hub.push_follow(FollowEvent::Reset);
-        wait_until(|| hub.follow_connect_log().len() >= 3).await;
+        wait_until(|| hub.follow_connect_log().len() >= 4).await;
         let log = hub.follow_connect_log();
-        assert!(log.len() >= 3, "expected a re-subscribe after reset, got {log:?}");
+        assert!(log.len() >= 4, "expected a re-subscribe after reset, got {log:?}");
         assert!(
             hub.list_tree_call_count() > lists_before_reset,
             "reset must trigger one full re-list"
         );
         // The new subscription starts from the fresh updatedAt.
-        assert_eq!(log[2], (None, Some("rev-b".to_string())));
+        assert_eq!(log[3], (None, Some("rev-b".to_string())));
+
+        stop.notify_one();
+        let _ = handle.await;
+    });
+}
+
+/// A 400 on a resume point (cursor or `since` the server no longer accepts)
+/// doesn't disable live-follow: the client re-lists if the bucket moved and
+/// re-subscribes from scratch, first with `since`, then live. Only a bare
+/// subscribe refused falls back to polling.
+#[test]
+fn follow_resume_point_refused_resubscribes_from_scratch() {
+    let hub = MockHub::new();
+    hub.add_file("file.txt", 10, Some("h1"), None);
+    hub.set_revision("rev-a");
+    hub.enable_follow();
+    hub.push_follow(FollowEvent::Ready {
+        cursor: Some("c1".to_string()),
+    });
+    hub.end_follow_stream();
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let (stop, handle) = spawn_poll_loop(&vfs, &hub, true);
+        wait_until(|| !hub.follow_connect_log().is_empty()).await;
+        // Everything carrying a resume point is now refused.
+        hub.fail_follow_resume(Some((400, "unknown cursor format")));
+        wait_until(|| hub.follow_connect_log().len() >= 4).await;
+        let log = hub.follow_connect_log();
+        assert!(log.len() >= 4, "expected the resume cascade, got {log:?}");
+        assert_eq!(log[1], (Some("c1".to_string()), None), "cursor resume refused");
+        assert_eq!(log[2], (None, Some("rev-a".to_string())), "since resume refused");
+        assert_eq!(log[3], (None, None), "live subscribe accepted");
+
+        // The live session becomes healthy and the loop is still following:
+        // a later change lands.
+        hub.push_follow(FollowEvent::Ready { cursor: None });
+        hub.push_follow(FollowEvent::Changes {
+            cursor: "c9".to_string(),
+            changes: vec![follow_change("new.txt", FollowOp::Add)],
+        });
+        assert!(
+            wait_until(|| !vfs.inode_table.read().unwrap().is_children_loaded(ROOT_INODE)).await,
+            "changes must still apply after the resume cascade"
+        );
 
         stop.notify_one();
         let _ = handle.await;

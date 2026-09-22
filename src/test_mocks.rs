@@ -37,13 +37,17 @@ pub struct MockHub {
     /// `Ok(rev)` returns the token; `Err((status, msg))` rebuilds an
     /// `Error::Hub` with that status so the poll loop's 401-branch still fires.
     revision: Mutex<std::result::Result<String, (Option<u16>, String)>>,
-    /// When false (default), follow_events reports 404 (endpoint absent) so
+    /// When false (default), follow_events reports the feed as absent so
     /// callers exercise the poll fallback.
     follow_enabled: AtomicBool,
-    /// Scripted events served (in order) by every mock follow stream. When
-    /// the script runs dry the stream waits for more events to be pushed —
-    /// like a healthy but quiet SSE connection.
-    follow_script: Arc<Mutex<VecDeque<FollowEvent>>>,
+    /// Scripted items served (in order) by every mock follow stream: an
+    /// event, or `None` to end the current stream like a TCP close. When the
+    /// script runs dry the stream waits for more items to be pushed — like a
+    /// healthy but quiet SSE connection.
+    follow_script: Arc<Mutex<VecDeque<Option<FollowEvent>>>>,
+    /// `(status, message)` every follow_events connect that carries a
+    /// resume point (cursor or since) fails with while set.
+    follow_resume_error: Mutex<Option<(u16, String)>>,
     /// `(cursor, since)` of every follow_events connect, in order.
     follow_connects: Mutex<Vec<(Option<String>, Option<String>)>>,
 }
@@ -69,6 +73,7 @@ impl MockHub {
             revision: Mutex::new(Ok("rev-0".to_string())),
             follow_enabled: AtomicBool::new(false),
             follow_script: Arc::new(Mutex::new(VecDeque::new())),
+            follow_resume_error: Mutex::new(None),
             follow_connects: Mutex::new(Vec::new()),
         })
     }
@@ -182,14 +187,26 @@ impl MockHub {
         std::mem::take(&mut *self.batch_log.lock().unwrap())
     }
 
-    /// Serve the live-follow feed (default: 404 → poll fallback).
+    /// Serve the live-follow feed (default: absent → poll fallback).
     pub fn enable_follow(&self) {
         self.follow_enabled.store(true, Ordering::SeqCst);
     }
 
     /// Append an event to the follow-stream script.
     pub fn push_follow(&self, event: FollowEvent) {
-        self.follow_script.lock().unwrap().push_back(event);
+        self.follow_script.lock().unwrap().push_back(Some(event));
+    }
+
+    /// End the current follow stream without a server-directed reconnect
+    /// (`Ok(None)`, like a TCP close) once the script reaches this point.
+    pub fn end_follow_stream(&self) {
+        self.follow_script.lock().unwrap().push_back(None);
+    }
+
+    /// Make every follow_events connect carrying a cursor or `since` fail
+    /// with this status until cleared; bare subscribes still succeed.
+    pub fn fail_follow_resume(&self, error: Option<(u16, &str)>) {
+        *self.follow_resume_error.lock().unwrap() = error.map(|(status, msg)| (status, msg.to_string()));
     }
 
     /// `(cursor, since)` of every follow_events connect so far.
@@ -325,17 +342,26 @@ impl HubOps for MockHub {
         }
     }
 
-    async fn follow_events(&self, cursor: Option<&str>, since: Option<&str>) -> Result<Box<dyn FollowStreamOps>> {
+    async fn follow_events(
+        &self,
+        cursor: Option<&str>,
+        since: Option<&str>,
+    ) -> Result<Option<Box<dyn FollowStreamOps>>> {
         if !self.follow_enabled.load(Ordering::SeqCst) {
-            return Err(Error::hub_status(404, "mock: live-follow not supported"));
+            return Ok(None);
         }
         self.follow_connects
             .lock()
             .unwrap()
             .push((cursor.map(str::to_string), since.map(str::to_string)));
-        Ok(Box::new(MockFollowStream {
+        if (cursor.is_some() || since.is_some())
+            && let Some((status, msg)) = self.follow_resume_error.lock().unwrap().clone()
+        {
+            return Err(Error::hub_status(status, msg));
+        }
+        Ok(Some(Box::new(MockFollowStream {
             script: self.follow_script.clone(),
-        }))
+        })))
     }
 }
 
@@ -343,16 +369,17 @@ impl HubOps for MockHub {
 /// "healthy but quiet": the stream polls for new events instead of ending, so
 /// tests can drive it incrementally.
 struct MockFollowStream {
-    script: Arc<Mutex<VecDeque<FollowEvent>>>,
+    script: Arc<Mutex<VecDeque<Option<FollowEvent>>>>,
 }
 
 #[async_trait::async_trait]
 impl FollowStreamOps for MockFollowStream {
     async fn next_event(&mut self) -> Result<Option<FollowEvent>> {
         loop {
-            let event = self.script.lock().unwrap().pop_front();
-            match event {
-                Some(event) => return Ok(Some(event)),
+            let item = self.script.lock().unwrap().pop_front();
+            match item {
+                Some(Some(event)) => return Ok(Some(event)),
+                Some(None) => return Ok(None),
                 None => tokio::time::sleep(Duration::from_millis(5)).await,
             }
         }

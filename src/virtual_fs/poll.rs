@@ -70,6 +70,16 @@ fn remove_remote_file(inode_table: &mut InodeTable, ino: u64, inos_to_invalidate
     true
 }
 
+/// Outcome of one `poll_round`.
+pub(super) struct PollRound {
+    /// A listing failed with a status the caller should back off on
+    /// (401/transient).
+    pub saw_backoff_status: bool,
+    /// Every loaded prefix was listed or confirmed deleted, so the inode
+    /// table now mirrors the remote for the directories it has loaded.
+    pub complete: bool,
+}
+
 /// Statuses that should slow the poll loop down: expired token (401) or any
 /// transient failure (rate limit / server overload) where re-polling at full
 /// rate only makes things worse.
@@ -91,7 +101,7 @@ impl super::VirtualFs {
         inodes: Arc<RwLock<InodeTable>>,
         negative_cache: Arc<RwLock<HashMap<String, Instant>>>,
         invalidator: Invalidator,
-        interval: Duration,
+        interval: Option<Duration>,
         listing_concurrency: usize,
         live_follow: bool,
     ) {
@@ -102,10 +112,11 @@ impl super::VirtualFs {
         // Prefer the Hub's bucket live-follow SSE feed: while the stream is
         // healthy, per-file changes are applied as they happen and the
         // probe + fan-out below never runs. `follow_remote_changes` returns
-        // only when the endpoint is permanently unavailable (400/404: older
-        // Hub deployment, or a repo source) — then the interval poll below
-        // takes over unchanged. The follow loop uses the probe above as its
-        // own baseline and doesn't re-probe before the first connect.
+        // only when the feed is unusable for this source (older Hub
+        // deployment, repo source, refused subscribe) — then the interval
+        // poll below takes over unchanged. The follow loop uses the probe
+        // above as its own baseline and doesn't re-probe before the first
+        // connect.
         if live_follow {
             Self::follow_remote_changes(
                 &hub_client,
@@ -116,8 +127,16 @@ impl super::VirtualFs {
                 &mut last_revision,
             )
             .await;
-            info!("Live-follow endpoint unavailable for this source; using interval polling");
+            if interval.is_some() {
+                info!("Live-follow feed unavailable for this source; using interval polling");
+            }
         }
+        let Some(interval) = interval else {
+            warn!(
+                "Live-follow feed unavailable for this source and polling is disabled; remote changes won't be detected"
+            );
+            return;
+        };
 
         // Exponent applied to `interval` while the Hub keeps failing (401 or
         // transient statuses). Reset to 0 as soon as we see a successful round.
@@ -156,9 +175,9 @@ impl super::VirtualFs {
                 }
             }
 
-            let saw_backoff_status =
+            let round =
                 Self::poll_round(&hub_client, &inodes, &negative_cache, &invalidator, listing_concurrency).await;
-            if saw_backoff_status {
+            if round.saw_backoff_status {
                 backoff_exp = (backoff_exp + 1).min(MAX_BACKOFF_EXP);
                 warn!(
                     "Remote poll saw 401/transient failures; backing off next poll to {:?}",
@@ -172,15 +191,14 @@ impl super::VirtualFs {
     }
 
     /// One full reconcile round: list every loaded directory prefix and diff
-    /// the result against the inode table. Returns `true` when a listing
-    /// failed with a status the caller should back off on (401/transient).
+    /// the result against the inode table.
     pub(super) async fn poll_round(
         hub_client: &Arc<dyn HubOps>,
         inodes: &Arc<RwLock<InodeTable>>,
         negative_cache: &Arc<RwLock<HashMap<String, Instant>>>,
         invalidator: &Invalidator,
         listing_concurrency: usize,
-    ) -> bool {
+    ) -> PollRound {
         // Only poll directories the user has actually visited (children_loaded).
         // This avoids fetching the entire tree for large repos where most
         // directories have never been accessed.
@@ -233,24 +251,33 @@ impl super::VirtualFs {
                 }
             }
         }
+        // A failed prefix that wasn't confirmed deleted leaves its files
+        // unreconciled this round.
+        let complete = failed_prefixes.iter().all(|p| polled_prefixes.contains(p));
         Self::apply_poll_diff(all_entries, &polled_prefixes, inodes, negative_cache, invalidator);
-        saw_backoff_status
+        PollRound {
+            saw_backoff_status,
+            complete,
+        }
     }
 
     /// Drive the bucket live-follow SSE feed (see `crate::follow`). Returns
-    /// only when the endpoint is permanently unavailable (400/404) so the
-    /// caller can fall back to interval polling; every other failure retries
-    /// here. While a stream is healthy this fully replaces the periodic
-    /// probe + fan-out.
+    /// only when the feed is unusable for this source — not served (repo
+    /// source, older Hub, non-SSE answer), a bare subscribe refused (400),
+    /// or streams that keep ending before `ready` — so the caller can fall
+    /// back to interval polling; every other failure retries here with
+    /// exponential backoff. While a stream is healthy this fully replaces
+    /// the periodic probe + fan-out.
     ///
     /// Resume protocol: reconnect with the last received cursor (server
     /// resumes strictly after it). Without a cursor — the server buffer
-    /// expired (`reset`), or a stream ended before handing one out — re-probe
-    /// `updatedAt`: if the bucket moved since `last_revision`, one full poll
-    /// round reconciles, then the subscription starts from the fresh
+    /// expired (`reset`), the resume point was refused, or a stream ended
+    /// before handing one out — re-probe `updatedAt`: if the bucket moved
+    /// since `last_revision`, one full poll round reconciles (retried until
+    /// it completes), then the subscription starts from the fresh
     /// `updatedAt` (`since=`) so nothing between the round and the
-    /// subscription is missed. The first connect skips the probe: the caller
-    /// just primed `last_revision` against a freshly listed mount.
+    /// subscription is missed. The first connect skips the probe when the
+    /// caller just primed `last_revision` against a freshly listed mount.
     async fn follow_remote_changes(
         hub_client: &Arc<dyn HubOps>,
         inodes: &Arc<RwLock<InodeTable>>,
@@ -259,56 +286,89 @@ impl super::VirtualFs {
         listing_concurrency: usize,
         last_revision: &mut Option<String>,
     ) {
-        /// Wait before reconnecting after a failed connect (503 without a
-        /// `Retry-After` hint, network error, …).
-        const DEFAULT_RETRY: Duration = Duration::from_secs(10);
-        /// A stream that dies this quickly after connecting (without the
-        /// server directing the end) is not healthy: pause before
-        /// reconnecting so a broken feed doesn't become a hot loop against
-        /// the Hub.
-        const MIN_SESSION: Duration = Duration::from_secs(2);
-        const RECONNECT_PAUSE: Duration = Duration::from_secs(5);
+        /// Base delay between attempts while the feed keeps failing (connect
+        /// error, incomplete reconcile, stream dead before `ready`); doubled
+        /// per consecutive failure up to `MAX_BACKOFF_EXP` (~10 min), reset
+        /// by a `ready`. A server `Retry-After`/`RateLimit` hint overrides it.
+        const RETRY_BASE: Duration = Duration::from_secs(10);
+        /// Minimum pause before any reconnect, server-directed included, so a
+        /// pod rotating clients in a tight loop can't drive a hot loop.
+        const RECONNECT_FLOOR: Duration = Duration::from_secs(1);
+        /// Streams that connect but end without ever sending `ready` (a
+        /// buffering proxy hitting the read timeout, a pod closing on accept)
+        /// this many times in a row mean the feed is unusable here.
+        const MAX_SESSIONS_WITHOUT_READY: u32 = 3;
 
         let mut cursor: Option<String> = None;
-        let mut first_connect = true;
+        // The caller primed `last_revision` right before the first connect;
+        // only re-probe there if that priming failed.
+        let mut needs_probe = last_revision.is_none();
+        // Set when the server refused `since=`: subscribe live instead.
+        let mut resume_live_only = false;
+        let mut backoff_exp: u32 = 0;
+        let mut sessions_without_ready: u32 = 0;
         loop {
-            // The caller primed `last_revision` right before the first
-            // connect; only re-probe there if that priming failed.
-            let primed = first_connect && last_revision.is_some();
-            if cursor.is_none() && !primed {
+            if cursor.is_none() && needs_probe {
                 match hub_client.probe_revision().await {
                     Ok(rev) => {
                         if last_revision.as_ref() != Some(&rev) {
                             debug!("live-follow: no cursor and revision moved; running a full poll round");
-                            Self::poll_round(hub_client, inodes, negative_cache, invalidator, listing_concurrency)
-                                .await;
+                            let round =
+                                Self::poll_round(hub_client, inodes, negative_cache, invalidator, listing_concurrency)
+                                    .await;
+                            if !round.complete {
+                                let delay = RETRY_BASE.saturating_mul(1 << backoff_exp);
+                                backoff_exp = (backoff_exp + 1).min(MAX_BACKOFF_EXP);
+                                warn!("live-follow: reconcile round incomplete; retrying in {delay:?}");
+                                tokio::time::sleep(delay).await;
+                                continue;
+                            }
                         }
                         *last_revision = Some(rev);
                     }
                     Err(e) => debug!("live-follow: revision probe failed ({e}); resuming from the last known one"),
                 }
             }
-            first_connect = false;
-            let since = if cursor.is_none() { last_revision.clone() } else { None };
+            needs_probe = true;
+            let since = if cursor.is_none() && !resume_live_only {
+                last_revision.clone()
+            } else {
+                None
+            };
+            resume_live_only = false;
             let mut stream = match hub_client.follow_events(cursor.as_deref(), since.as_deref()).await {
-                Ok(stream) => stream,
-                // Older Hub deployment (404) or a request it refuses to serve
-                // (400): the feed will not appear mid-mount, fall back for good.
-                Err(e) if matches!(e.status(), Some(400) | Some(404)) => {
-                    debug!("live-follow: endpoint not available ({e})");
-                    return;
+                Ok(Some(stream)) => stream,
+                // Repo source, older Hub deployment, or a non-SSE answer: the
+                // feed will not appear mid-mount, fall back for good.
+                Ok(None) => return,
+                // The server refused the request itself. A refused resume
+                // point (cursor encoding changed by a deploy, `since` too
+                // old/unparseable) is retried from scratch: reconcile, then
+                // subscribe with `since`, then live. A bare subscribe refused
+                // means the feed isn't usable here.
+                Err(e) if e.status() == Some(400) => {
+                    if cursor.is_none() && since.is_none() {
+                        warn!("live-follow: subscribe refused ({e}); falling back to polling");
+                        return;
+                    }
+                    warn!("live-follow: resume point refused ({e}); re-listing and re-subscribing");
+                    resume_live_only = since.is_some();
+                    cursor = None;
+                    continue;
                 }
                 Err(e) => {
-                    let delay = e.retry_after().unwrap_or(DEFAULT_RETRY);
+                    let delay = e
+                        .retry_after()
+                        .unwrap_or_else(|| RETRY_BASE.saturating_mul(1 << backoff_exp));
+                    backoff_exp = (backoff_exp + 1).min(MAX_BACKOFF_EXP);
                     warn!("live-follow: connect failed ({e}); retrying in {delay:?}");
                     tokio::time::sleep(delay).await;
                     continue;
                 }
             };
-            let connected_at = Instant::now();
-            // reset/reconnect are server-directed ends: reconnect immediately
-            // (their cadence is server-controlled). Anything else that ends
-            // the stream gets the MIN_SESSION guard below.
+            let mut got_ready = false;
+            // reset/reconnect are server-directed ends; anything else is
+            // judged by whether the session ever became healthy (`ready`).
             let server_directed_end = loop {
                 match stream.next_event().await {
                     // An absent cursor on ready/reconnect means the feed has
@@ -316,6 +376,9 @@ impl super::VirtualFs {
                     Ok(Some(FollowEvent::Ready { cursor: c })) => {
                         debug!("live-follow: ready (cursor={c:?})");
                         cursor = c.or(cursor);
+                        got_ready = true;
+                        backoff_exp = 0;
+                        sessions_without_ready = 0;
                     }
                     Ok(Some(FollowEvent::Changes { cursor: c, changes })) => {
                         debug!("live-follow: applying {} change(s)", changes.len());
@@ -345,9 +408,21 @@ impl super::VirtualFs {
                     }
                 }
             };
-            if !server_directed_end && connected_at.elapsed() < MIN_SESSION {
-                tokio::time::sleep(RECONNECT_PAUSE).await;
+            if got_ready || server_directed_end {
+                tokio::time::sleep(RECONNECT_FLOOR).await;
+                continue;
             }
+            // Ended before `ready` without the server directing it: the feed
+            // isn't healthy. Back off, and give up on it after a few in a row.
+            sessions_without_ready += 1;
+            if sessions_without_ready >= MAX_SESSIONS_WITHOUT_READY {
+                warn!("live-follow: {sessions_without_ready} streams ended before `ready`; falling back to polling");
+                return;
+            }
+            let delay = RETRY_BASE.saturating_mul(1 << backoff_exp);
+            backoff_exp = (backoff_exp + 1).min(MAX_BACKOFF_EXP);
+            warn!("live-follow: stream ended before `ready`; reconnecting in {delay:?}");
+            tokio::time::sleep(delay).await;
         }
     }
 

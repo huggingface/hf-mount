@@ -225,7 +225,7 @@ The same `FUSE_NOTIFY_INVAL_INODE` writev can also wedge at **runtime** (not jus
 | `--advanced-writes` | `false` | Enable staging files + async flush (random writes, seek, overwrite) |
 | `--poll-interval-secs` | `30` | Remote change polling interval (0 to disable) |
 | `--poll-listing-concurrency` | `4` | Max concurrent tree-listing requests per poll round. Main knob to throttle load on the Hub `/api` endpoint; lower it in shared environments where many mounts poll in parallel. |
-| `--live-follow` | `true` | Subscribe to the Hub's bucket live-follow event stream (SSE): remote changes are applied to loaded directories as they happen, and the periodic poll fan-out is skipped while the stream is healthy. Falls back to interval polling automatically when the Hub doesn't serve the feed (older deployments, repo mounts). Disable with `--live-follow=false`. |
+| `--live-follow` | `true` | Subscribe to the Hub's bucket live-follow event stream (SSE): remote changes are applied to loaded directories as they happen, and the periodic poll fan-out is skipped while the stream is healthy. Falls back to interval polling automatically when the Hub doesn't serve the feed (older deployments, repo mounts). Works with `--poll-interval-secs 0` too (no fallback then). Disable with `--live-follow=false`. |
 | `--max-threads` | `16` | Maximum FUSE worker threads (Linux only) |
 | `--metadata-ttl-ms` | `10000` | How long file metadata is cached before re-checking (ms) |
 | `--metadata-ttl-minimal` | `false` | Re-check on every access (maximum freshness, lower throughput) |
@@ -305,7 +305,7 @@ hf-mount provides **eventual consistency** with remote changes. For buckets, a l
 
 Files can be stale for up to `--metadata-ttl-ms` (default 10 s) after a remote update. Three mechanisms detect changes:
 
-1. **Live-follow stream** (buckets, default on, `--live-follow`) -- subscribes to the Hub's `/api/buckets/{id}/events` SSE feed; adds, updates, and deletes land in already-loaded directories within about a second of the remote commit. On any stream interruption the client reconnects with its last cursor; when the server can't resume (its replay buffer covers ~15 min), one full poll round reconciles before re-subscribing. If the Hub doesn't serve the feed, the mount falls back to interval polling for the session.
+1. **Live-follow stream** (buckets, default on, `--live-follow`) -- subscribes to the Hub's `/api/buckets/{id}/events` SSE feed; adds, updates, and deletes land in already-loaded directories within about a second of the remote commit. On any stream interruption the client reconnects with its last cursor; when the server can't resume (its replay buffer covers ~15 min), one full poll round reconciles before re-subscribing. Reconnects back off exponentially (10 s base, honoring `Retry-After`). If the Hub doesn't serve the feed, or streams keep dying before the initial `ready`, the mount falls back to interval polling for the session.
 2. **Metadata revalidation** (FUSE only) -- when the per-file TTL expires, the next access checks the Hub. If the file changed, cached data is invalidated.
 3. **Background polling** (default every 30 s) -- lists the full tree and detects additions, modifications, and deletions. Skipped entirely while the live-follow stream is healthy.
 

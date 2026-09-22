@@ -168,9 +168,9 @@ pub struct MountOptions {
     /// Subscribe to the Hub's bucket live-follow event stream (SSE) so remote
     /// changes are applied as they happen instead of waiting for the next
     /// poll round. Falls back to interval polling automatically when the Hub
-    /// doesn't serve the feed (older deployments, repo mounts). Only
-    /// meaningful when polling is enabled (`--poll-interval-secs > 0`).
-    /// Disable with `--live-follow=false`.
+    /// doesn't serve the feed (older deployments, repo mounts). Works with
+    /// `--poll-interval-secs 0` too (no fallback then). Disable with
+    /// `--live-follow=false`.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     pub live_follow: bool,
 
