@@ -2904,6 +2904,34 @@ fn follow_add_invalidates_loaded_dir_and_negative_cache() {
     });
 }
 
+/// A late follow event for a path that is no longer materialized drops the
+/// root listing. The re-list must not prune a directory created locally by
+/// `mkdir`: the Hub has no object for an empty directory, so it is never in
+/// the listing (regression: `test_fuse_simple_writes` hit ENOENT on
+/// `rmdir` because the directory vanished between `mkdir` and `rmdir`).
+#[test]
+fn follow_relist_keeps_locally_created_empty_dir() {
+    let hub = MockHub::new();
+    hub.add_file("a.txt", 3, Some("h1"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        vfs.readdir(ROOT_INODE).await.unwrap();
+        let dir = vfs.mkdir(ROOT_INODE, "rmtest", 0o755, 1000, 1000).await.unwrap();
+
+        let change = follow_change("old_name.txt", FollowOp::Delete);
+        VirtualFs::apply_follow_changes(&[change], &vfs.inode_table, &vfs.negative_cache, &vfs.invalidator);
+        assert!(!vfs.inode_table.read().unwrap().is_children_loaded(ROOT_INODE));
+
+        let attr = vfs.lookup(ROOT_INODE, "rmtest").await.unwrap();
+        assert_eq!(attr.ino, dir.ino);
+        assert!(vfs.inode_table.read().unwrap().is_children_loaded(ROOT_INODE));
+        vfs.rmdir(ROOT_INODE, "rmtest").await.unwrap();
+        assert!(vfs.inode_table.read().unwrap().get(dir.ino).is_none());
+    });
+}
+
 /// An `update` for an already-materialized clean file is applied in place;
 /// fields absent from the change keep their current value (a bare re-upload
 /// carries only `uploadedAt` and must not clear the hash, size or mtime).

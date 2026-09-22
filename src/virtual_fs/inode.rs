@@ -133,6 +133,12 @@ pub struct InodeEntry {
     /// hot path for write-heavy workloads (tarball extract, xfstests) that
     /// create thousands of unique names under freshly-mkdir'd directories.
     pub children_from_remote: bool,
+    /// True for directories created by `mkdir` in this session. The Hub has
+    /// no object for an empty directory, so a re-list of the parent never
+    /// returns it; without this marker the stale-children prune in
+    /// `ensure_children_loaded` would drop it as soon as a remote change
+    /// invalidates the parent's listing.
+    pub created_locally: bool,
     pub children: Vec<DirChild>,
     /// Name → ino lookup for `lookup_child`. Kept in sync with `children`
     /// via the `add_child` / `remove_child_*` helpers so a directory with
@@ -288,6 +294,7 @@ impl InodeTable {
             dirty_generation: 0,
             children_loaded_at: None,
             children_from_remote: false,
+            created_locally: false,
             children: Vec::new(),
             child_index: HashMap::new(),
             pending_deletes: Vec::new(),
@@ -630,6 +637,7 @@ impl InodeTable {
             // sites). Directories start unloaded until the first list.
             children_loaded_at: None,
             children_from_remote: false,
+            created_locally: false,
             children: Vec::new(),
             child_index: HashMap::new(),
             pending_deletes: Vec::new(),

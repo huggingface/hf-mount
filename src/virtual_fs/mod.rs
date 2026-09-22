@@ -1014,8 +1014,9 @@ impl VirtualFs {
         }
 
         // Remove stale children: entries that existed locally but are no longer
-        // in the Hub listing. Skip dirty files (local writes take precedence) and
-        // files with open handles (in-flight reads/writes).
+        // in the Hub listing. Skip dirty files (local writes take precedence),
+        // files with open handles (in-flight reads/writes), and directories
+        // created locally (an empty directory has no Hub object to be listed).
         if let Some(parent) = inodes.get(parent_ino) {
             let stale: Vec<u64> = parent
                 .children
@@ -1025,7 +1026,7 @@ impl VirtualFs {
                     if in_listing {
                         return false;
                     }
-                    inodes.get(c.ino).is_some_and(|e| !e.is_dirty())
+                    inodes.get(c.ino).is_some_and(|e| !e.is_dirty() && !e.created_locally)
                 })
                 .map(|c| c.ino)
                 .collect();
@@ -3176,6 +3177,7 @@ impl VirtualFs {
             );
             if let Some(entry) = inodes.get_mut(ino) {
                 entry.children_loaded_at = Some(Instant::now());
+                entry.created_locally = true;
                 // children_from_remote stays false: a freshly-mkdir'd dir has
                 // no remote presence yet, so lookup-miss can serve ENOENT
                 // without HEAD/list_tree probes.
