@@ -95,20 +95,26 @@ jobs:
       - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
       - name: Create and push manifest
         run: |
-          BASE="${{ inputs.tag_base }}"
-          TAGS="-t ${{ env.IMAGE }}:${BASE}"
-          if [[ "${{ inputs.push_latest }}" == "true" ]]; then
-            TAGS="${TAGS} -t ${{ env.IMAGE }}:latest"
+          BASE="${INPUTS_TAG_BASE}"
+          TAGS="-t ${IMAGE}:${BASE}"
+          if [[ "${INPUTS_PUSH_LATEST}" == "true" ]]; then
+            TAGS="${TAGS} -t ${IMAGE}:latest"
           fi
           docker buildx imagetools create $TAGS \
-            "${{ env.IMAGE }}:${BASE}-amd64" \
-            "${{ env.IMAGE }}:${BASE}-arm64"
+            "${IMAGE}:${BASE}-amd64" \
+            "${IMAGE}:${BASE}-arm64"
+        env:
+          INPUTS_TAG_BASE: ${{ inputs.tag_base }}
+          INPUTS_PUSH_LATEST: ${{ inputs.push_latest }}
 
       - name: Summary
         run: |
           echo "### Docker image pushed" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "\`${{ env.IMAGE }}:${{ inputs.tag_base }}\`" >> "$GITHUB_STEP_SUMMARY"
-          if [[ "${{ inputs.push_latest }}" == "true" ]]; then
-            echo "\`${{ env.IMAGE }}:latest\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`${IMAGE}:${INPUTS_TAG_BASE}\`" >> "$GITHUB_STEP_SUMMARY"
+          if [[ "${INPUTS_PUSH_LATEST}" == "true" ]]; then
+            echo "\`${IMAGE}:latest\`" >> "$GITHUB_STEP_SUMMARY"
           fi
+        env:
+          INPUTS_TAG_BASE: ${{ inputs.tag_base }}
+          INPUTS_PUSH_LATEST: ${{ inputs.push_latest }}

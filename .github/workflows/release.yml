@@ -71,20 +71,23 @@ jobs:
       - name: Resolve bump type
         id: bump
         run: |
-          if [ "${{ inputs.bump }}" = "auto" ]; then
-            BUMP="${{ steps.detect.outputs.detected }}"
+          if [ "${INPUTS_BUMP}" = "auto" ]; then
+            BUMP="${STEPS_DETECT_OUTPUTS_DETECTED}"
           else
-            BUMP="${{ inputs.bump }}"
+            BUMP="${INPUTS_BUMP}"
           fi
           echo "type=$BUMP" >> "$GITHUB_OUTPUT"
           echo "Using bump type: $BUMP"
+        env:
+          INPUTS_BUMP: ${{ inputs.bump }}
+          STEPS_DETECT_OUTPUTS_DETECTED: ${{ steps.detect.outputs.detected }}
 
       - name: Compute new version
         id: version
         run: |
           CURRENT=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)"/\1/')
           IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
-          case "${{ steps.bump.outputs.type }}" in
+          case "${STEPS_BUMP_OUTPUTS_TYPE}" in
             major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
             minor) MINOR=$((MINOR + 1)); PATCH=0 ;;
             patch) PATCH=$((PATCH + 1)) ;;
@@ -93,6 +96,8 @@ jobs:
           echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
           echo "new=$NEW" >> "$GITHUB_OUTPUT"
           echo "tag=v${NEW}" >> "$GITHUB_OUTPUT"
+        env:
+          STEPS_BUMP_OUTPUTS_TYPE: ${{ steps.bump.outputs.type }}
 
       - name: Summary
         run: |
@@ -100,13 +105,20 @@ jobs:
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "| | |" >> "$GITHUB_STEP_SUMMARY"
           echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
-          echo "| **Current** | v${{ steps.version.outputs.current }} |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| **New** | ${{ steps.version.outputs.tag }} |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| **Bump** | ${{ steps.bump.outputs.type }} |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| **Auto-detected** | ${{ steps.detect.outputs.detected }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Current** | v${STEPS_VERSION_OUTPUTS_CURRENT} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **New** | ${STEPS_VERSION_OUTPUTS_TAG} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Bump** | ${STEPS_BUMP_OUTPUTS_TYPE} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Auto-detected** | ${STEPS_DETECT_OUTPUTS_DETECTED} |" >> "$GITHUB_STEP_SUMMARY"
+        env:
+          STEPS_VERSION_OUTPUTS_CURRENT: ${{ steps.version.outputs.current }}
+          STEPS_VERSION_OUTPUTS_TAG: ${{ steps.version.outputs.tag }}
+          STEPS_BUMP_OUTPUTS_TYPE: ${{ steps.bump.outputs.type }}
+          STEPS_DETECT_OUTPUTS_DETECTED: ${{ steps.detect.outputs.detected }}
 
       - name: Bump Cargo.toml
-        run: sed -i "0,/^version = \".*\"/s//version = \"${{ steps.version.outputs.new }}\"/" Cargo.toml
+        run: sed -i "0,/^version = \".*\"/s//version = \"${STEPS_VERSION_OUTPUTS_NEW}\"/" Cargo.toml
+        env:
+          STEPS_VERSION_OUTPUTS_NEW: ${{ steps.version.outputs.new }}
 
       - name: Update Cargo.lock
         run: cargo generate-lockfile
@@ -116,9 +128,11 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add Cargo.toml Cargo.lock
-          git commit -m "chore: release ${{ steps.version.outputs.tag }}"
-          git tag "${{ steps.version.outputs.tag }}"
+          git commit -m "chore: release ${STEPS_VERSION_OUTPUTS_TAG}"
+          git tag "${STEPS_VERSION_OUTPUTS_TAG}"
           git push origin main --tags
+        env:
+          STEPS_VERSION_OUTPUTS_TAG: ${{ steps.version.outputs.tag }}
 
   build-linux:
     permissions:
@@ -244,7 +258,7 @@ jobs:
     steps:
       - id: compute
         run: |
-          NEW_TAG="${{ needs.bump.outputs.new_tag }}"
+          NEW_TAG="${NEEDS_BUMP_OUTPUTS_NEW_TAG}"
           if [[ -n "$NEW_TAG" ]]; then
             BASE="$NEW_TAG"
           elif [[ "${GITHUB_REF}" == refs/tags/* ]]; then
@@ -258,6 +272,8 @@ jobs:
           fi
           echo "base=$BASE" >> "$GITHUB_OUTPUT"
           echo "push_latest=$PUSH_LATEST" >> "$GITHUB_OUTPUT"
+        env:
+          NEEDS_BUMP_OUTPUTS_NEW_TAG: ${{ needs.bump.outputs.new_tag }}
 
   docker:
     needs: [bump, docker-tag]
