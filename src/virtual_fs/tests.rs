@@ -23,8 +23,6 @@ fn new_runtime() -> tokio::runtime::Runtime {
         .unwrap()
 }
 
-/// Call VirtualFs::write from a blocking thread (required because write() uses
-/// blocking_send() which panics if called from within the tokio runtime).
 async fn write_blocking(
     vfs: &std::sync::Arc<VirtualFs>,
     ino: u64,
@@ -32,11 +30,7 @@ async fn write_blocking(
     offset: u64,
     data: &[u8],
 ) -> VirtualFsResult<u32> {
-    let vfs = vfs.clone();
-    let data = data.to_vec();
-    tokio::task::spawn_blocking(move || vfs.write(ino, fh, offset, &data))
-        .await
-        .unwrap()
+    vfs.write(ino, fh, offset, data.to_vec()).await
 }
 
 /// Poll write_blocking until an in-flight commit rejects the write with EIO
@@ -4473,7 +4467,7 @@ fn fsync_between_writes_stays_dirty() {
         vfs.fsync(ino, fh, None).await.unwrap();
         assert!(vfs.inode_table.read().unwrap().get(ino).unwrap().is_dirty());
 
-        let result = vfs.write(ino, fh, 0, b"more");
+        let result = vfs.write(ino, fh, 0, b"more".to_vec()).await;
         assert!(result.is_ok(), "write after fsync should succeed");
         assert!(vfs.inode_table.read().unwrap().get(ino).unwrap().is_dirty());
 
@@ -6953,6 +6947,89 @@ fn install_commit_hook_on_terminal_channel_does_not_wedge_pending_commits() {
             "hook installed on a terminal channel must not linger in pending_commits"
         );
         vfs.await_pending_commit(ino).await.unwrap();
+        vfs.release(fh).await.unwrap();
+    });
+}
+
+#[test]
+fn streaming_write_yields_under_backpressure_and_rechecks_offset() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+    rt.block_on(async {
+        let (attr, fh) = vfs
+            .create(ROOT_INODE, "backpressure.bin", 0o644, 1000, 1000, None)
+            .await
+            .unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        tx.send(WriteMsg::Data(vec![])).await.unwrap();
+        {
+            let mut files = vfs.open_files.write().unwrap();
+            let Some(OpenFile::Streaming { channel, .. }) = files.get_mut(&fh) else {
+                panic!("expected streaming handle");
+            };
+            Arc::get_mut(channel).unwrap().tx = tx;
+        }
+
+        let first = vfs.write(attr.ino, fh, 0, b"first".to_vec());
+        let second = vfs.write(attr.ino, fh, 0, b"second".to_vec());
+        tokio::pin!(first, second);
+        assert!(futures::poll!(first.as_mut()).is_pending());
+        assert!(futures::poll!(second.as_mut()).is_pending());
+        assert_eq!(vfs.getattr(attr.ino).unwrap().size, 0);
+
+        rx.recv().await.unwrap();
+        assert_eq!(first.await.unwrap(), 5);
+        match rx.recv().await.unwrap() {
+            WriteMsg::Data(data) => assert_eq!(data, b"first"),
+            _ => panic!("expected data"),
+        }
+        assert_eq!(second.await.unwrap_err(), libc::EINVAL);
+        assert_eq!(vfs.getattr(attr.ino).unwrap().size, 5);
+        vfs.open_files.write().unwrap().remove(&fh);
+    });
+}
+
+#[test]
+fn local_write_uses_blocking_pool_and_finishes_metadata_after_cancellation() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .max_blocking_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let vfs = make_test_vfs(
+        MockHub::new(),
+        MockXet::new(),
+        TestOpts {
+            advanced_writes: true,
+            ..Default::default()
+        },
+        &rt,
+    );
+    rt.block_on(async {
+        let (attr, fh) = vfs
+            .create(ROOT_INODE, "local.bin", 0o644, 1000, 1000, None)
+            .await
+            .unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (unblock_tx, unblock_rx) = std::sync::mpsc::channel();
+        let blocker = rt.spawn_blocking(move || {
+            started_tx.send(()).unwrap();
+            unblock_rx.recv().unwrap();
+        });
+        started_rx.await.unwrap();
+        {
+            let write = vfs.write(attr.ino, fh, 0, b"payload".to_vec());
+            tokio::pin!(write);
+            assert!(futures::poll!(write.as_mut()).is_pending());
+            assert_eq!(vfs.getattr(attr.ino).unwrap().size, 0);
+        }
+        unblock_tx.send(()).unwrap();
+        blocker.await.unwrap();
+        let (data, _) = vfs.read(fh, 0, 7).await.unwrap();
+        assert_eq!(&data[..], b"payload");
+        assert_eq!(vfs.getattr(attr.ino).unwrap().size, 7);
+        assert!(vfs.inode_table.read().unwrap().get(attr.ino).unwrap().is_dirty());
         vfs.release(fh).await.unwrap();
     });
 }

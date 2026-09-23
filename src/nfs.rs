@@ -291,7 +291,7 @@ impl NFSFileSystem for NFSAdapter {
         // (which materializes the staging file), then retry the write.
         let existing = self.handle_pool.lock().expect("handle_pool poisoned").peek(id);
         if let Some(fh) = existing {
-            match self.virtual_fs.write(id, fh, offset, data) {
+            match self.virtual_fs.write(id, fh, offset, data.to_vec()).await {
                 Ok(_) => {
                     self.virtual_fs.schedule_flush(id);
                     return self
@@ -335,7 +335,7 @@ impl NFSFileSystem for NFSAdapter {
             .open(id, true, false, None)
             .await
             .map_err(errno_to_nfs)?;
-        if let Err(e) = self.virtual_fs.write(id, fh, offset, data) {
+        if let Err(e) = self.virtual_fs.write(id, fh, offset, data.to_vec()).await {
             // Write failed — release the fh we opened so we don't leak it.
             let _ = self.virtual_fs.release(fh).await;
             return Err(errno_to_nfs(e));

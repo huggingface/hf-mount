@@ -136,10 +136,8 @@ pub struct VfsConfig {
     /// grace period. Must be < terminationGracePeriodSeconds, otherwise a slow
     /// Hub/CAS backend wedges the FUSE connection and strands the pod.
     pub flush_shutdown_timeout: Duration,
-    /// Upper bound on a single remote chunk fetch during a read. A stalled
-    /// fetch otherwise parks the FUSE worker thread that issued the `read()`
-    /// indefinitely; once all worker threads are parked the mount silently
-    /// wedges. `Duration::ZERO` disables the bound (legacy behaviour).
+    /// Upper bound on a single remote chunk fetch during a read.
+    /// `Duration::ZERO` disables the bound (legacy behaviour).
     pub read_fetch_timeout: Duration,
     /// 0 disables the LRU evictor.
     pub inode_soft_limit: usize,
@@ -1267,13 +1265,9 @@ impl VirtualFs {
             libc::EIO
         })?;
 
-        // Bounded channel provides backpressure so a fast writer doesn't queue
-        // unbounded memory. Slots are sized by the negotiated FUSE max_write
+        // Slots are sized by the negotiated FUSE max_write
         // (16 MiB, see fuse.rs set_max_write), NOT the typical ~128KB write:
-        // 8 slots × 16 MiB = 128 MiB ceiling per open write handle. Keep this
-        // small — under a stalled CAS the daemon's RSS is this backlog plus
-        // xet-core's in-flight xorbs. blocking_send is safe here: FUSE
-        // threads are not tokio workers.
+        // 8 slots × 16 MiB = 128 MiB ceiling for this channel.
         let (tx, rx) = tokio::sync::mpsc::channel::<WriteMsg>(8);
         let error: Arc<std::sync::Mutex<Option<crate::error::Error>>> = Arc::new(std::sync::Mutex::new(None));
         self.runtime
@@ -1759,10 +1753,16 @@ impl VirtualFs {
             }
         };
         if let Some(file) = overlay_file {
-            return file.sync_all().map_err(|e| {
-                error!("Overlay fsync failed for ino={}: {}", ino, e);
-                libc::EIO
-            });
+            return self
+                .runtime
+                .spawn_blocking(move || {
+                    file.sync_all().map_err(|e| {
+                        error!("Overlay fsync failed for ino={}: {}", ino, e);
+                        libc::EIO
+                    })
+                })
+                .await
+                .map_err(|_| libc::EIO)?;
         }
         self.schedule_flush(ino);
         Ok(())
@@ -1781,7 +1781,7 @@ impl VirtualFs {
         }
     }
 
-    /// Must be called after every `reply.entry()` / `reply.created()`, or
+    /// Must be called before every `reply.entry()` / `reply.created()`, or
     /// the kernel and our `nlookup` will drift and a later `forget()` will
     /// underflow. Also touches for LRU so actively-looked-up inodes aren't
     /// immediately evicted.
@@ -2274,14 +2274,6 @@ impl VirtualFs {
                 let mut failed = false;
                 let mut stream_eof = false;
                 while (total as u64) < plan.fetch_size {
-                    // Bound each chunk read. A FUSE `read()` runs on a worker
-                    // thread blocked in `block_on` on this future; if the
-                    // CAS/CDN connection stalls (client-aborted seek, hung
-                    // socket), an unbounded `next()` parks that thread forever.
-                    // Enough stalled reads exhaust all worker threads and the
-                    // mount silently stops serving cold reads. The timeout frees
-                    // the thread, and dropping `stream` on the way out cancels
-                    // the in-flight request.
                     let next = match self.read_fetch_timeout {
                         Duration::ZERO => stream.next().await,
                         timeout => match tokio::time::timeout(timeout, stream.next()).await {
@@ -2289,7 +2281,7 @@ impl VirtualFs {
                             Err(_elapsed) => {
                                 error!(
                                     "prefetch: stream read timed out after {:?} at cursor={}, got={}/{}, \
-                                     attempt={}/{}, hash={} — aborting fetch to free the FUSE worker thread",
+                                     attempt={}/{}, hash={} — aborting fetch",
                                     timeout,
                                     cursor,
                                     total,
@@ -2394,25 +2386,30 @@ impl VirtualFs {
 
         match read_target {
             ReadTarget::LocalFd(file) => {
-                let file_descriptor = file.as_raw_fd();
-                let mut buf = BytesMut::zeroed(size as usize);
-                // SAFETY: fd is valid (Arc<File> keeps it alive), buf is correctly sized.
-                // pread is thread-safe (atomic offset, no shared seek cursor).
-                let n = unsafe {
-                    libc::pread(
-                        file_descriptor,
-                        buf.as_mut_ptr() as *mut libc::c_void,
-                        size as usize,
-                        offset as i64,
-                    )
-                };
-                if n < 0 {
-                    Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO))
-                } else {
-                    buf.truncate(n as usize);
-                    let eof = (n as u32) < size;
-                    Ok((buf.freeze(), eof))
-                }
+                self.runtime
+                    .spawn_blocking(move || {
+                        let file_descriptor = file.as_raw_fd();
+                        let mut buf = BytesMut::zeroed(size as usize);
+                        // SAFETY: fd is valid (Arc<File> keeps it alive), buf is correctly sized.
+                        // pread is thread-safe (atomic offset, no shared seek cursor).
+                        let n = unsafe {
+                            libc::pread(
+                                file_descriptor,
+                                buf.as_mut_ptr() as *mut libc::c_void,
+                                size as usize,
+                                offset as i64,
+                            )
+                        };
+                        if n < 0 {
+                            Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO))
+                        } else {
+                            buf.truncate(n as usize);
+                            let eof = (n as u32) < size;
+                            Ok((buf.freeze(), eof))
+                        }
+                    })
+                    .await
+                    .map_err(|_| libc::EIO)?
             }
             ReadTarget::Remote { prefetch } => {
                 let mut prefetch_state = prefetch.lock().await;
@@ -2491,7 +2488,7 @@ impl VirtualFs {
         }
     }
 
-    pub fn write(&self, ino: u64, file_handle: u64, offset: u64, data: &[u8]) -> VirtualFsResult<u32> {
+    pub async fn write(&self, ino: u64, file_handle: u64, offset: u64, data: Vec<u8>) -> VirtualFsResult<u32> {
         debug!(
             "write: ino={}, fh={}, offset={}, len={}",
             ino,
@@ -2534,34 +2531,41 @@ impl VirtualFs {
 
         match target {
             WriteTarget::Local { file, ino: handle_ino } => {
-                let file_descriptor = file.as_raw_fd();
-                let n = unsafe {
-                    libc::pwrite(
-                        file_descriptor,
-                        data.as_ptr() as *const libc::c_void,
-                        data.len(),
-                        offset as i64,
-                    )
-                };
+                let inode_table = self.inode_table.clone();
+                let staging = self.staging.clone();
+                self.runtime
+                    .spawn_blocking(move || {
+                        let file_descriptor = file.as_raw_fd();
+                        let n = unsafe {
+                            libc::pwrite(
+                                file_descriptor,
+                                data.as_ptr() as *const libc::c_void,
+                                data.len(),
+                                offset as i64,
+                            )
+                        };
 
-                if n < 0 {
-                    Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO))
-                } else {
-                    let written = n as u32;
-                    let new_end = offset + written as u64;
-                    let mut inodes = self.inode_table.write().expect("inodes poisoned");
-                    if let Some(entry) = inodes.get_mut(handle_ino) {
-                        if new_end > entry.size {
-                            if let Some(sd) = self.staging.dir() {
-                                sd.resize_bytes(entry.size, new_end);
+                        if n < 0 {
+                            Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO))
+                        } else {
+                            let written = n as u32;
+                            let new_end = offset + written as u64;
+                            let mut inodes = inode_table.write().expect("inodes poisoned");
+                            if let Some(entry) = inodes.get_mut(handle_ino) {
+                                if new_end > entry.size {
+                                    if let Some(sd) = staging.dir() {
+                                        sd.resize_bytes(entry.size, new_end);
+                                    }
+                                    entry.size = new_end;
+                                }
+                                entry.set_dirty();
                             }
-                            entry.size = new_end;
+                            inodes.touch(handle_ino);
+                            Ok(written)
                         }
-                        entry.set_dirty();
-                    }
-                    inodes.touch(handle_ino);
-                    Ok(written)
-                }
+                    })
+                    .await
+                    .map_err(|_| libc::EIO)?
             }
             WriteTarget::Streaming {
                 ino: handle_ino,
@@ -2572,19 +2576,9 @@ impl VirtualFs {
                     return Err(err.to_errno());
                 }
 
-                // Enforce append-only: offset must match bytes written so far
-                let expected = channel.bytes_written.load(Ordering::Relaxed);
-                if offset != expected {
-                    debug!(
-                        "streaming write: non-sequential offset={} (expected {}), ino={}",
-                        offset, expected, handle_ino
-                    );
-                    return Err(libc::EINVAL);
-                }
-
                 let len = data.len();
                 // Reserve the channel slot BEFORE taking the state mutex: the
-                // backpressure wait (32-slot channel, worker draining at
+                // backpressure wait (8-slot channel, worker draining at
                 // network speed) must not run while holding the lock every
                 // commit path contends on. permit.send() cannot block, so the
                 // state check and the enqueue below stay atomic under the
@@ -2592,17 +2586,10 @@ impl VirtualFs {
                 // this Data lands ahead of Finish (and joins the commit), or
                 // the write observes Committing/Committed and fails loudly
                 // instead of being silently dropped behind Finish.
-                let closed = || {
+                let permit = channel.tx.reserve().await.map_err(|_| {
                     error!("streaming channel closed for ino={}", handle_ino);
                     libc::EIO
-                };
-                let permit = match channel.tx.try_reserve() {
-                    Ok(permit) => permit,
-                    Err(tokio::sync::mpsc::error::TrySendError::Full(())) => {
-                        self.runtime.block_on(channel.tx.reserve()).map_err(|_| closed())?
-                    }
-                    Err(tokio::sync::mpsc::error::TrySendError::Closed(())) => return Err(closed()),
-                };
+                })?;
                 {
                     let state = channel.state.lock().expect("state poisoned");
                     match &*state {
@@ -2612,9 +2599,19 @@ impl VirtualFs {
                             return Err(libc::EIO);
                         }
                     }
-                    permit.send(WriteMsg::Data(data.to_vec()));
+                    // Enforce append-only: offset must match bytes written so far
+                    let expected = channel.bytes_written.load(Ordering::Relaxed);
+                    if offset != expected {
+                        debug!(
+                            "streaming write: non-sequential offset={} (expected {}), ino={}",
+                            offset, expected, handle_ino
+                        );
+                        return Err(libc::EINVAL);
+                    }
+
+                    permit.send(WriteMsg::Data(data));
+                    channel.bytes_written.fetch_add(len as u64, Ordering::Relaxed);
                 }
-                channel.bytes_written.fetch_add(len as u64, Ordering::Relaxed);
 
                 let new_size = offset + len as u64;
                 let mut inodes = self.inode_table.write().expect("inodes poisoned");
@@ -2681,6 +2678,10 @@ impl VirtualFs {
             return self.commit_streaming_now(ino, &channel).await;
         }
 
+        self.check_flush_error(ino)
+    }
+
+    pub(crate) fn check_flush_error(&self, ino: u64) -> VirtualFsResult<()> {
         // Advanced writes mode: check if a previous async flush failed
         if let Some(fm) = &self.flush_manager
             && let Some(err_msg) = fm.check_error(ino)
@@ -4448,9 +4449,7 @@ enum CommitState {
     Failed(String),
 }
 
-/// Channel-based streaming handle. Decouples the sync write() caller from the
-/// async add_data() pipeline: writes enqueue data into a bounded channel
-/// (avoids deadlock when tokio worker threads are saturated by FUSE block_on calls),
+/// Channel-based streaming handle. Writes enqueue data into a bounded channel;
 /// a background tokio task drains it and feeds the CAS cleaner.
 struct StreamingChannel {
     tx: tokio::sync::mpsc::Sender<WriteMsg>,
