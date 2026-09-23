@@ -10,9 +10,6 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
   cancel-in-progress: true
 
-permissions:
-  contents: read
-  pull-requests: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -20,8 +17,12 @@ env:
   # token owner's personal account. The token must have write access to it.
   HF_BUCKET_NAMESPACE: infra-workloads
 
+permissions: {}
+
 jobs:
   lint-test:
+    permissions:
+      contents: read
     name: Lint & Unit Tests
     runs-on:
       group: hf-mount-ci-pub
@@ -68,6 +69,8 @@ jobs:
         run: cargo test --lib --features fuse,nfs
 
   smoke-test:
+    permissions:
+      contents: read
     name: Smoke Tests (FUSE + NFS)
     runs-on:
       group: hf-mount-ci-pub
@@ -101,6 +104,8 @@ jobs:
         run: unset HF_TOKEN && cargo test --release --test repo_ops -- --test-threads=1 --nocapture
 
   fsx:
+    permissions:
+      contents: read
     name: fsx (data integrity)
     runs-on:
       group: hf-mount-ci-pub
@@ -125,6 +130,8 @@ jobs:
         run: cargo test --release --test fsx -- --test-threads=1 --nocapture
 
   xfstests:
+    permissions:
+      contents: read
     name: xfstests (filesystem exerciser)
     runs-on:
       group: hf-mount-ci-pub-m5dn-24xlarge
@@ -149,6 +156,9 @@ jobs:
         run: cargo test --release --test xfstests -- --test-threads=1 --nocapture
 
   pjdfstest:
+    permissions:
+      contents: read
+      pull-requests: write
     name: POSIX Compliance (pjdfstest)
     runs-on:
       group: hf-mount-ci-pub
@@ -220,6 +230,9 @@ jobs:
           fi
 
   bench:
+    permissions:
+      contents: read
+      pull-requests: write
     name: Benchmarks
     runs-on:
       group: hf-mount-ci-pub

@@ -29,6 +29,8 @@ jobs:
   # because tag pushes signed by GITHUB_TOKEN don't cascade into a new
   # workflow run — so we can't rely on the `push: tags` trigger firing.
   bump:
+    permissions:
+      contents: write
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-22.04
     outputs:
@@ -119,6 +121,8 @@ jobs:
           git push origin main --tags
 
   build-linux:
+    permissions:
+      contents: read
     name: Build Linux (${{ matrix.target }})
     needs: [bump]
     if: |
@@ -175,6 +179,8 @@ jobs:
           path: dist/
 
   build-macos:
+    permissions:
+      contents: read
     name: Build macOS (${{ matrix.arch }})
     needs: [bump]
     if: |
@@ -228,6 +234,7 @@ jobs:
   # release wins, then a manually-pushed tag, else fall back to sha-<sha>.
   # `latest` only on stable releases (tag matches `v\d` and has no `-`).
   docker-tag:
+    permissions: {}
     needs: [bump]
     if: always() && needs.bump.result != 'failure'
     runs-on: ubuntu-22.04
@@ -262,6 +269,8 @@ jobs:
       push_latest: ${{ needs.docker-tag.outputs.push_latest == 'true' }}
 
   release:
+    permissions:
+      contents: write
     name: Create Release
     needs: [bump, build-linux, build-macos]
     if: |
