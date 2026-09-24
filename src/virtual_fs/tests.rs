@@ -3130,6 +3130,46 @@ fn follow_stream_reconnects_with_cursor_and_relists_on_reset() {
     });
 }
 
+/// A `reset` on a `since=` subscription (bucket idle past the server buffer)
+/// re-subscribes live instead of resending the same `since`; the live
+/// session's `ready` re-probes and reconciles a change that landed before the
+/// subscription, then later reconnects resume from its cursor.
+#[test]
+fn follow_reset_on_idle_since_resubscribes_live() {
+    let hub = MockHub::new();
+    hub.add_file("file.txt", 10, Some("h1"), None);
+    hub.set_revision("rev-a");
+    hub.enable_follow();
+    hub.push_follow(FollowEvent::Reset);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let (stop, handle) = spawn_poll_loop(&vfs, &hub, true);
+        wait_until(|| hub.follow_connect_log().len() >= 2).await;
+        let log = hub.follow_connect_log();
+        assert_eq!(log[0], (None, Some("rev-a".to_string())));
+        assert_eq!(log[1], (None, None), "an idle reset must not resend the same since");
+
+        let lists_before = hub.list_tree_call_count();
+        hub.set_revision("rev-b");
+        hub.push_follow(FollowEvent::Ready {
+            cursor: Some("c1".to_string()),
+        });
+        assert!(
+            wait_until(|| hub.list_tree_call_count() > lists_before).await,
+            "a revision moved before the live subscription must reconcile"
+        );
+
+        hub.end_follow_stream();
+        wait_until(|| hub.follow_connect_log().len() >= 3).await;
+        assert_eq!(hub.follow_connect_log()[2], (Some("c1".to_string()), None));
+
+        stop.notify_one();
+        let _ = handle.await;
+    });
+}
+
 /// A 400 on a resume point (cursor or `since` the server no longer accepts)
 /// doesn't disable live-follow: the client re-lists if the bucket moved and
 /// re-subscribes from scratch, first with `since`, then live. Only a bare
