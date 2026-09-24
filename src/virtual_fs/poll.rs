@@ -299,10 +299,9 @@ impl super::VirtualFs {
     /// bucket moved since `last_revision`, one full poll round reconciles
     /// (retried until complete), then the subscription starts from the fresh
     /// `updatedAt` (`since=`) so nothing between the round and the
-    /// subscription is missed. A `reset` on a `since=` subscription means the
-    /// bucket has been idle past the server buffer: the next subscription is
-    /// live-only, and its `ready` re-probes to catch a change that landed
-    /// between the probe and the subscribe.
+    /// subscription is missed. A Hub that resets a `since=` at the bucket's
+    /// own `updatedAt` (idle past its buffer) keeps doing so until the bucket
+    /// moves: those resubscribes back off instead of repeating every second.
     async fn follow_remote_changes(
         hub_client: &Arc<dyn HubOps>,
         inodes: &Arc<RwLock<InodeTable>>,
@@ -317,8 +316,8 @@ impl super::VirtualFs {
             Cursor(String),
             /// From `last_revision` (`since=`), after a probe + reconcile.
             Since,
-            /// Live only: the server refused or reset `since=`. One-shot — the
-            /// next session goes back to `Since` so a dropped stream reconciles.
+            /// Live only: the server refused `since=`. One-shot — the next
+            /// session goes back to `Since` so a dropped stream reconciles.
             Live,
         }
         /// Base delay while the feed keeps failing (connect error,
@@ -338,6 +337,9 @@ impl super::VirtualFs {
         // only re-probe there if that priming failed.
         let mut skip_probe = last_revision.is_some();
         let mut backoff = Backoff::new(RETRY_BASE);
+        // Caps at ~64 s: at most a probe + connect per minute on an idle
+        // bucket, whose next change still lands within about a poll interval.
+        let mut since_reset_backoff = Backoff::new(RECONNECT_FLOOR);
         let mut sessions_without_ready: u32 = 0;
         loop {
             if matches!(resume, Resume::Since) && !std::mem::take(&mut skip_probe) {
@@ -397,7 +399,7 @@ impl super::VirtualFs {
                 }
             };
             let subscribed_since = matches!(resume, Resume::Since);
-            let subscribed_live = matches!(resume, Resume::Live);
+            let mut since_reset = false;
             // A session is healthy once the server sent `ready`; reset and
             // reconnect are server-directed ends and count as healthy too.
             let mut got_ready = false;
@@ -407,22 +409,12 @@ impl super::VirtualFs {
                     // seen no change yet: keep the current resume point.
                     Ok(Some(FollowEvent::Ready { cursor: c })) => {
                         debug!("live-follow: ready (cursor={c:?})");
-                        if subscribed_live && !got_ready {
-                            Self::reconcile_live_gap(
-                                hub_client,
-                                inodes,
-                                negative_cache,
-                                invalidator,
-                                listing_concurrency,
-                                last_revision,
-                            )
-                            .await;
-                        }
                         if let Some(c) = c {
                             resume = Resume::Cursor(c);
                         }
                         got_ready = true;
                         backoff.reset();
+                        since_reset_backoff.reset();
                         sessions_without_ready = 0;
                     }
                     Ok(Some(FollowEvent::Changes { cursor: c, changes })) => {
@@ -430,17 +422,10 @@ impl super::VirtualFs {
                         Self::apply_follow_changes(&changes, inodes, negative_cache, invalidator);
                         resume = Resume::Cursor(c);
                     }
-                    // `since=` is reconciled up to the current `updatedAt`, so
-                    // a reset there only means the bucket is idle: resubscribing
-                    // with the same `since` would be reset again.
-                    Ok(Some(FollowEvent::Reset)) if subscribed_since => {
-                        debug!("live-follow: bucket idle past the server buffer; re-subscribing live");
-                        resume = Resume::Live;
-                        break true;
-                    }
                     Ok(Some(FollowEvent::Reset)) => {
                         info!("live-follow: resume point older than the server buffer; re-listing");
                         resume = Resume::Since;
+                        since_reset = subscribed_since;
                         break true;
                     }
                     Ok(Some(FollowEvent::Reconnect { cursor: c })) => {
@@ -463,11 +448,16 @@ impl super::VirtualFs {
                     }
                 }
             };
-            if subscribed_live && matches!(resume, Resume::Live) {
+            if matches!(resume, Resume::Live) {
                 resume = Resume::Since;
             }
             if healthy {
-                tokio::time::sleep(RECONNECT_FLOOR).await;
+                let delay = if since_reset {
+                    since_reset_backoff.next()
+                } else {
+                    RECONNECT_FLOOR
+                };
+                tokio::time::sleep(delay).await;
                 continue;
             }
             // Ended before `ready` without the server directing it: the feed
@@ -480,37 +470,6 @@ impl super::VirtualFs {
             let delay = backoff.next();
             warn!("live-follow: stream ended before `ready`; reconnecting in {delay:?}");
             tokio::time::sleep(delay).await;
-        }
-    }
-
-    /// On `ready` of a live-only subscription, reconcile a change that landed
-    /// after the last probe but before the subscription: neither the feed nor
-    /// a previous round carries it.
-    async fn reconcile_live_gap(
-        hub_client: &Arc<dyn HubOps>,
-        inodes: &Arc<RwLock<InodeTable>>,
-        negative_cache: &Arc<RwLock<HashMap<String, Instant>>>,
-        invalidator: &Invalidator,
-        listing_concurrency: usize,
-        last_revision: &mut Option<String>,
-    ) {
-        match hub_client.probe_revision().await {
-            Ok(rev) if last_revision.as_ref() == Some(&rev) => {}
-            Ok(rev) => {
-                debug!("live-follow: revision moved before the live subscription; running a full poll round");
-                let round =
-                    Self::poll_round(hub_client, inodes, negative_cache, invalidator, listing_concurrency).await;
-                if round.complete {
-                    *last_revision = Some(rev);
-                } else {
-                    warn!(
-                        "live-follow: live-gap reconcile round incomplete; the next resume without a cursor retries it"
-                    );
-                }
-            }
-            Err(e) => warn!(
-                "live-follow: live-gap revision probe failed ({e}); changes before the subscription may be missed"
-            ),
         }
     }
 
