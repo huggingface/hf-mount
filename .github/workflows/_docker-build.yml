@@ -50,7 +50,7 @@ jobs:
       # The runner is native amd64, so the build loads into the local image store, which
       # is the only place the Wiz CLI reads. The push is therefore gated on the scan, and
       # the pushed digest is registered so cluster admission recognises the image.
-      - uses: huggingface/wiz-image-action/build-push@v1
+      - uses: huggingface/wiz-image-action/build-push@53a5b4af184193adf1773753f29b3f903445e31b # v1.3.0
         with:
           image: ${{ env.IMAGE }}:${{ inputs.tag_base }}-amd64
           context: .
@@ -78,7 +78,7 @@ jobs:
       # The runner is native arm64, so the build loads into the local image store, which
       # is the only place the Wiz CLI reads. The push is therefore gated on the scan, and
       # the pushed digest is registered so cluster admission recognises the image.
-      - uses: huggingface/wiz-image-action/build-push@v1
+      - uses: huggingface/wiz-image-action/build-push@53a5b4af184193adf1773753f29b3f903445e31b # v1.3.0
         with:
           image: ${{ env.IMAGE }}:${{ inputs.tag_base }}-arm64
           context: .

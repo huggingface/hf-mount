@@ -70,21 +70,26 @@ jobs:
 
       - name: Resolve bump type
         id: bump
+        env:
+          INPUT_BUMP: ${{ inputs.bump }}
+          DETECTED_BUMP: ${{ steps.detect.outputs.detected }}
         run: |
-          if [ "${{ inputs.bump }}" = "auto" ]; then
-            BUMP="${{ steps.detect.outputs.detected }}"
+          if [ "$INPUT_BUMP" = "auto" ]; then
+            BUMP="$DETECTED_BUMP"
           else
-            BUMP="${{ inputs.bump }}"
+            BUMP="$INPUT_BUMP"
           fi
           echo "type=$BUMP" >> "$GITHUB_OUTPUT"
           echo "Using bump type: $BUMP"
 
       - name: Compute new version
         id: version
+        env:
+          BUMP_TYPE: ${{ steps.bump.outputs.type }}
         run: |
           CURRENT=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)"/\1/')
           IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
-          case "${{ steps.bump.outputs.type }}" in
+          case "$BUMP_TYPE" in
             major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
             minor) MINOR=$((MINOR + 1)); PATCH=0 ;;
             patch) PATCH=$((PATCH + 1)) ;;
@@ -95,29 +100,38 @@ jobs:
           echo "tag=v${NEW}" >> "$GITHUB_OUTPUT"
 
       - name: Summary
+        env:
+          CURRENT_VERSION: ${{ steps.version.outputs.current }}
+          NEW_TAG: ${{ steps.version.outputs.tag }}
+          BUMP_TYPE: ${{ steps.bump.outputs.type }}
+          DETECTED_BUMP: ${{ steps.detect.outputs.detected }}
         run: |
           echo "### Release Summary" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "| | |" >> "$GITHUB_STEP_SUMMARY"
           echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
-          echo "| **Current** | v${{ steps.version.outputs.current }} |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| **New** | ${{ steps.version.outputs.tag }} |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| **Bump** | ${{ steps.bump.outputs.type }} |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| **Auto-detected** | ${{ steps.detect.outputs.detected }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Current** | v${CURRENT_VERSION} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **New** | ${NEW_TAG} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Bump** | ${BUMP_TYPE} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Auto-detected** | ${DETECTED_BUMP} |" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Bump Cargo.toml
-        run: sed -i "0,/^version = \".*\"/s//version = \"${{ steps.version.outputs.new }}\"/" Cargo.toml
+        env:
+          NEW_VERSION: ${{ steps.version.outputs.new }}
+        run: sed -i "0,/^version = \".*\"/s//version = \"${NEW_VERSION}\"/" Cargo.toml
 
       - name: Update Cargo.lock
         run: cargo generate-lockfile
 
       - name: Commit, tag, and push
+        env:
+          NEW_TAG: ${{ steps.version.outputs.tag }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add Cargo.toml Cargo.lock
-          git commit -m "chore: release ${{ steps.version.outputs.tag }}"
-          git tag "${{ steps.version.outputs.tag }}"
+          git commit -m "chore: release ${NEW_TAG}"
+          git tag "${NEW_TAG}"
           git push origin main --tags
 
   build-linux:
@@ -243,8 +257,10 @@ jobs:
       push_latest: ${{ steps.compute.outputs.push_latest }}
     steps:
       - id: compute
+        env:
+          BUMP_NEW_TAG: ${{ needs.bump.outputs.new_tag }}
         run: |
-          NEW_TAG="${{ needs.bump.outputs.new_tag }}"
+          NEW_TAG="$BUMP_NEW_TAG"
           if [[ -n "$NEW_TAG" ]]; then
             BASE="$NEW_TAG"
           elif [[ "${GITHUB_REF}" == refs/tags/* ]]; then
@@ -294,9 +310,11 @@ jobs:
       - name: Create release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.bump.outputs.new_tag || github.ref_name }}
+          REPO: ${{ github.repository }}
         run: |
-          TAG="${{ needs.bump.outputs.new_tag || github.ref_name }}"
+          TAG="$RELEASE_TAG"
           gh release create "$TAG" artifacts/* \
-            --repo "${{ github.repository }}" \
+            --repo "$REPO" \
             --title "$TAG" \
             --generate-notes
