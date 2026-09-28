@@ -359,12 +359,16 @@ pub fn init_tracing(daemon: bool) {
     let upload_cap = XET_UPLOAD_CONCURRENCY_CAP.to_string();
     for (k, v) in [
         ("HF_XET_CLIENT_AC_INITIAL_DOWNLOAD_CONCURRENCY", "16"),
+        // Let the adaptive controller scale far enough to saturate fast links
+        // under many concurrent readers (xet-core's default cap is 64).
+        ("HF_XET_CLIENT_AC_MAX_DOWNLOAD_CONCURRENCY", "124"),
         ("HF_XET_CLIENT_AC_MIN_BYTES_REQUIRED_FOR_ADJUSTMENT", "4194304"),
         ("HF_XET_RECONSTRUCTION_MIN_RECONSTRUCTION_FETCH_SIZE", "8388608"),
         ("HF_XET_RECONSTRUCTION_MIN_PREFETCH_BUFFER", "8388608"),
         ("HF_XET_RECONSTRUCTION_TARGET_BLOCK_COMPLETION_TIME", "30"),
         ("HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_SIZE", "134217728"),
-        ("HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT", "268435456"),
+        // Also the budget split between per-stream read buffers (see xet.rs).
+        ("HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT", "1073741824"),
         // Per-read inactivity timeout for CAS/CDN transfers (resets on every byte
         // received, so slow-but-progressing reads are fine). This governs the
         // DOWNLOAD/reconstruction path (term fetches and whole-file downloads);
