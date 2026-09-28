@@ -50,7 +50,7 @@ jobs:
       # The runner is native amd64, so the build loads into the local image store, which
       # is the only place the Wiz CLI reads. The push is therefore gated on the scan, and
       # the pushed digest is registered so cluster admission recognises the image.
-      - uses: huggingface/wiz-image-action/build-push@v1
+      - uses: huggingface/wiz-image-action/build-push@53a5b4af184193adf1773753f29b3f903445e31b # v1.3.0
         with:
           image: ${{ env.IMAGE }}:${{ inputs.tag_base }}-amd64
           context: .
@@ -78,7 +78,7 @@ jobs:
       # The runner is native arm64, so the build loads into the local image store, which
       # is the only place the Wiz CLI reads. The push is therefore gated on the scan, and
       # the pushed digest is registered so cluster admission recognises the image.
-      - uses: huggingface/wiz-image-action/build-push@v1
+      - uses: huggingface/wiz-image-action/build-push@53a5b4af184193adf1773753f29b3f903445e31b # v1.3.0
         with:
           image: ${{ env.IMAGE }}:${{ inputs.tag_base }}-arm64
           context: .
@@ -101,21 +101,27 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
       - name: Create and push manifest
+        env:
+          TAG_BASE: ${{ inputs.tag_base }}
+          PUSH_LATEST: ${{ inputs.push_latest }}
         run: |
-          BASE="${{ inputs.tag_base }}"
-          TAGS="-t ${{ env.IMAGE }}:${BASE}"
-          if [[ "${{ inputs.push_latest }}" == "true" ]]; then
-            TAGS="${TAGS} -t ${{ env.IMAGE }}:latest"
+          BASE="${TAG_BASE}"
+          TAGS="-t ${IMAGE}:${BASE}"
+          if [[ "${PUSH_LATEST}" == "true" ]]; then
+            TAGS="${TAGS} -t ${IMAGE}:latest"
           fi
           docker buildx imagetools create $TAGS \
-            "${{ env.IMAGE }}:${BASE}-amd64" \
-            "${{ env.IMAGE }}:${BASE}-arm64"
+            "${IMAGE}:${BASE}-amd64" \
+            "${IMAGE}:${BASE}-arm64"
 
       - name: Summary
+        env:
+          TAG_BASE: ${{ inputs.tag_base }}
+          PUSH_LATEST: ${{ inputs.push_latest }}
         run: |
           echo "### Docker image pushed" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "\`${{ env.IMAGE }}:${{ inputs.tag_base }}\`" >> "$GITHUB_STEP_SUMMARY"
-          if [[ "${{ inputs.push_latest }}" == "true" ]]; then
-            echo "\`${{ env.IMAGE }}:latest\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`${IMAGE}:${TAG_BASE}\`" >> "$GITHUB_STEP_SUMMARY"
+          if [[ "${PUSH_LATEST}" == "true" ]]; then
+            echo "\`${IMAGE}:latest\`" >> "$GITHUB_STEP_SUMMARY"
           fi
