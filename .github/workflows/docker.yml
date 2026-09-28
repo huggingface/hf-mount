@@ -17,5 +17,4 @@ jobs:
     with:
       tag_base: sha-${{ github.sha }}
       push_latest: false
-    secrets:
-      wiz-client-secret: ${{ secrets.WIZ_CLI_CLIENT_SECRET }}
+    secrets: inherit

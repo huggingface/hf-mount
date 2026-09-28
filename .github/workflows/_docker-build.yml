@@ -20,9 +20,6 @@ on:
         required: false
         type: boolean
         default: false
-    secrets:
-      wiz-client-secret:
-        required: true
 
 env:
   REGISTRY: ghcr.io
@@ -47,9 +44,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
-      # The runner is native amd64, so the build loads into the local image store, which
-      # is the only place the Wiz CLI reads. The push is therefore gated on the scan, and
-      # the pushed digest is registered so cluster admission recognises the image.
+      # Native amd64 runner, so the image loads locally and the scan gates the push.
       - uses: huggingface/wiz-image-action/build-push@53a5b4af184193adf1773753f29b3f903445e31b # v1.3.0
         with:
           image: ${{ env.IMAGE }}:${{ inputs.tag_base }}-amd64
@@ -57,7 +52,7 @@ jobs:
           cache-to: type=registry,ref=${{ env.IMAGE }}-cache:amd64,mode=max
           cache-from: type=registry,ref=${{ env.IMAGE }}-cache:amd64
           clientId: ${{ vars.WIZ_CLI_CLIENT_ID }}
-          clientSecret: ${{ secrets.wiz-client-secret }}
+          clientSecret: ${{ secrets.WIZ_CLI_CLIENT_SECRET }}
 
   arm64:
     permissions:
@@ -75,9 +70,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
-      # The runner is native arm64, so the build loads into the local image store, which
-      # is the only place the Wiz CLI reads. The push is therefore gated on the scan, and
-      # the pushed digest is registered so cluster admission recognises the image.
+      # Native arm64 runner, so the image loads locally and the scan gates the push.
       - uses: huggingface/wiz-image-action/build-push@53a5b4af184193adf1773753f29b3f903445e31b # v1.3.0
         with:
           image: ${{ env.IMAGE }}:${{ inputs.tag_base }}-arm64
@@ -85,7 +78,7 @@ jobs:
           cache-to: type=registry,ref=${{ env.IMAGE }}-cache:arm64,mode=max
           cache-from: type=registry,ref=${{ env.IMAGE }}-cache:arm64
           clientId: ${{ vars.WIZ_CLI_CLIENT_ID }}
-          clientSecret: ${{ secrets.wiz-client-secret }}
+          clientSecret: ${{ secrets.WIZ_CLI_CLIENT_SECRET }}
 
   manifest:
     permissions:
