@@ -44,11 +44,18 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      # Expires the apt upgrade layer weekly instead of at the next base-image bump, so
+      # a rebuild actually picks up the Debian security updates.
+      - name: Compute the apt cache key (ISO week)
+        id: apt_refresh
+        run: echo "week=$(date -u +%G-W%V)" >> "$GITHUB_OUTPUT"
       # Native amd64 runner, so the image loads locally and the scan gates the push.
       - uses: huggingface/wiz-image-action/build-push@53a5b4af184193adf1773753f29b3f903445e31b # v1.3.0
         with:
           image: ${{ env.IMAGE }}:${{ inputs.tag_base }}-amd64
           context: .
+          build-args: |
+            APT_REFRESH=${{ steps.apt_refresh.outputs.week }}
           cache-to: type=registry,ref=${{ env.IMAGE }}-cache:amd64,mode=max
           cache-from: type=registry,ref=${{ env.IMAGE }}-cache:amd64
           clientId: ${{ vars.WIZ_CLI_CLIENT_ID }}
@@ -70,11 +77,18 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      # Expires the apt upgrade layer weekly instead of at the next base-image bump, so
+      # a rebuild actually picks up the Debian security updates.
+      - name: Compute the apt cache key (ISO week)
+        id: apt_refresh
+        run: echo "week=$(date -u +%G-W%V)" >> "$GITHUB_OUTPUT"
       # Native arm64 runner, so the image loads locally and the scan gates the push.
       - uses: huggingface/wiz-image-action/build-push@53a5b4af184193adf1773753f29b3f903445e31b # v1.3.0
         with:
           image: ${{ env.IMAGE }}:${{ inputs.tag_base }}-arm64
           context: .
+          build-args: |
+            APT_REFRESH=${{ steps.apt_refresh.outputs.week }}
           cache-to: type=registry,ref=${{ env.IMAGE }}-cache:arm64,mode=max
           cache-from: type=registry,ref=${{ env.IMAGE }}-cache:arm64
           clientId: ${{ vars.WIZ_CLI_CLIENT_ID }}

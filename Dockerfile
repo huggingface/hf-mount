@@ -27,7 +27,14 @@ RUN cargo build --release --no-default-features --features fuse,vendored-openssl
 
 # Runtime
 FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends libfuse3-3 ca-certificates && rm -rf /var/lib/apt/lists/*
+# `upgrade` pulls the Debian security updates the base image is behind on at build
+# time (2026-09-28: openssl/libssl3 3.0.20-1~deb12u2 shipped while 3.0.22-1~deb12u1
+# fixed CVE-2026-75803), so a rebuild is enough to clear an OS-package CVE. The layer
+# is cached in the registry: APT_REFRESH is set to the ISO week by the build, so the
+# cache expires weekly instead of at the next base-image bump. BuildKit only misses
+# the cache where the ARG is used, hence the echo.
+ARG APT_REFRESH=unset
+RUN echo "apt refresh: ${APT_REFRESH}" && apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends libfuse3-3 ca-certificates && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /build/target/release/hf-mount-fuse /usr/local/bin/
 COPY --from=builder /build/target/release/hf-mount-fuse-sidecar /usr/local/bin/
 ENTRYPOINT ["/usr/local/bin/hf-mount-fuse"]
