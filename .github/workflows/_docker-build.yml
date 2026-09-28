@@ -20,6 +20,9 @@ on:
         required: false
         type: boolean
         default: false
+    secrets:
+      wiz-client-secret:
+        required: true
 
 env:
   REGISTRY: ghcr.io
@@ -44,15 +47,17 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
-      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+      # The runner is native amd64, so the build loads into the local image store, which
+      # is the only place the Wiz CLI reads. The push is therefore gated on the scan, and
+      # the pushed digest is registered so cluster admission recognises the image.
+      - uses: huggingface/wiz-image-action/build-push@v1
         with:
+          image: ${{ env.IMAGE }}:${{ inputs.tag_base }}-amd64
           context: .
-          platforms: linux/amd64
-          push: true
-          tags: ${{ env.IMAGE }}:${{ inputs.tag_base }}-amd64
-          provenance: false
           cache-to: type=registry,ref=${{ env.IMAGE }}-cache:amd64,mode=max
           cache-from: type=registry,ref=${{ env.IMAGE }}-cache:amd64
+          clientId: ${{ vars.WIZ_CLI_CLIENT_ID }}
+          clientSecret: ${{ secrets.wiz-client-secret }}
 
   arm64:
     permissions:
@@ -70,15 +75,17 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
-      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+      # The runner is native arm64, so the build loads into the local image store, which
+      # is the only place the Wiz CLI reads. The push is therefore gated on the scan, and
+      # the pushed digest is registered so cluster admission recognises the image.
+      - uses: huggingface/wiz-image-action/build-push@v1
         with:
+          image: ${{ env.IMAGE }}:${{ inputs.tag_base }}-arm64
           context: .
-          platforms: linux/arm64
-          push: true
-          tags: ${{ env.IMAGE }}:${{ inputs.tag_base }}-arm64
-          provenance: false
           cache-to: type=registry,ref=${{ env.IMAGE }}-cache:arm64,mode=max
           cache-from: type=registry,ref=${{ env.IMAGE }}-cache:arm64
+          clientId: ${{ vars.WIZ_CLI_CLIENT_ID }}
+          clientSecret: ${{ secrets.wiz-client-secret }}
 
   manifest:
     permissions:
