@@ -344,7 +344,9 @@ fn xet_env_defaults(upload_cap: &str) -> Vec<(&'static str, &str)> {
     vec![
         ("HF_XET_CLIENT_AC_INITIAL_DOWNLOAD_CONCURRENCY", "16"),
         ("HF_XET_CLIENT_AC_MIN_BYTES_REQUIRED_FOR_ADJUSTMENT", "4194304"),
-        ("HF_XET_RECONSTRUCTION_MIN_RECONSTRUCTION_FETCH_SIZE", "8388608"),
+        // One reconstruction query per remote read fetch (at most 32 MiB,
+        // see virtual_fs/remote_reader.rs).
+        ("HF_XET_RECONSTRUCTION_MIN_RECONSTRUCTION_FETCH_SIZE", "33554432"),
         ("HF_XET_RECONSTRUCTION_MIN_PREFETCH_BUFFER", "8388608"),
         ("HF_XET_RECONSTRUCTION_TARGET_BLOCK_COMPLETION_TIME", "30s"),
         ("HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_SIZE", "134217728"),

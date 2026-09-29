@@ -136,6 +136,49 @@ async fn test_fuse_deep_cold_read() {
     }
 }
 
+/// Parallel page faults on one memory-mapped remote file (how transformers
+/// and torch load checkpoints) are served concurrently and correctly, even
+/// with few FUSE worker threads.
+#[tokio::test]
+async fn test_fuse_parallel_mmap_read() {
+    let mut content = vec![0u8; 48 << 20];
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    for chunk in content.chunks_mut(8) {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        chunk.copy_from_slice(&state.to_le_bytes()[..chunk.len()]);
+    }
+    let guard = match common::setup_bucket_with_file("fuse-mmap-read", "model.bin", &content).await {
+        Some(g) => g,
+        None => return,
+    };
+
+    let mount_point = format!("/tmp/hf-mount-mmap-mnt-{}", std::process::id());
+    let cache_dir = format!("/tmp/hf-mount-mmap-cache-{}", std::process::id());
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let child = common::mount_bucket(
+            &guard.bucket_id,
+            &mount_point,
+            &cache_dir,
+            &["--read-only", "--max-threads", "4", "--no-disk-cache"],
+        );
+        let op = common::fs_tests::assert_parallel_mmap_read(&mount_point, "model.bin", &content, 16);
+        common::unmount(&mount_point, child, 30);
+        op
+    }));
+
+    std::fs::remove_dir_all(&mount_point).ok();
+    std::fs::remove_dir_all(&cache_dir).ok();
+
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => panic!("parallel mmap read test failed: {}", e),
+        Err(e) => std::panic::resume_unwind(e),
+    }
+}
+
 /// Test HEAD revalidation: remote file changes are detected via lookup() HEAD
 /// A directory uploaded remotely after the parent's listing was cached
 /// (poll disabled, so no background refresh) must still be discoverable

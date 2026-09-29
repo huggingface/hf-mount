@@ -387,7 +387,7 @@ impl FollowStreamOps for MockFollowStream {
 // ── MockXet ───────────────────────────────────────────────────────────
 
 pub struct MockXet {
-    files: Mutex<HashMap<String, Vec<u8>>>,
+    files: Mutex<HashMap<String, Arc<Vec<u8>>>>,
     pub next_hash: AtomicU64,
     writer_create_fail: AtomicBool,
     upload_fail: AtomicBool,
@@ -400,8 +400,10 @@ pub struct MockXet {
     /// When true, opened streams hang on `next()` (simulates a stalled CAS/CDN
     /// connection) so the read-fetch timeout path can be exercised.
     stall_stream: AtomicBool,
-    /// Log of (offset, end) pairs passed to download_stream_boxed.
-    pub stream_calls: Mutex<Vec<(u64, Option<u64>)>>,
+    /// Log of (offset, end, cached) passed to download_stream_boxed.
+    pub stream_calls: Mutex<Vec<(u64, u64, bool)>>,
+    /// Delay before an opened stream yields its first chunk (CAS latency).
+    stream_delay: Mutex<Option<Duration>>,
     /// Count of download_to_file calls (used to assert staging cache reuse).
     pub download_to_file_calls: AtomicU64,
     /// Test hook to pause `upload_files` mid-call so the test can drive
@@ -431,6 +433,7 @@ impl MockXet {
             range_empty_count: AtomicU32::new(0),
             stall_stream: AtomicBool::new(false),
             stream_calls: Mutex::new(Vec::new()),
+            stream_delay: Mutex::new(None),
             download_to_file_calls: AtomicU64::new(0),
             upload_gate: Mutex::new(None),
             uploads_inflight: AtomicU32::new(0),
@@ -450,7 +453,10 @@ impl MockXet {
     }
 
     pub fn add_file(&self, hash: &str, content: &[u8]) {
-        self.files.lock().unwrap().insert(hash.to_string(), content.to_vec());
+        self.files
+            .lock()
+            .unwrap()
+            .insert(hash.to_string(), Arc::new(content.to_vec()));
     }
 
     pub fn fail_next_writer_create(&self) {
@@ -479,6 +485,11 @@ impl MockXet {
     /// connection that neither delivers data nor errors.
     pub fn stall_stream_reads(&self) {
         self.stall_stream.store(true, Ordering::SeqCst);
+    }
+
+    /// Make every opened stream wait `delay` before its first chunk.
+    pub fn set_stream_delay(&self, delay: Duration) {
+        *self.stream_delay.lock().unwrap() = Some(delay);
     }
 
     fn next_hash_string(&self) -> String {
@@ -510,7 +521,7 @@ impl XetOps for MockXet {
             if let Some(parent) = dest.parent() {
                 std::fs::create_dir_all(parent).ok();
             }
-            std::fs::write(dest, content).map_err(Error::Io)?;
+            std::fs::write(dest, content.as_slice()).map_err(Error::Io)?;
         }
         Ok(())
     }
@@ -534,7 +545,7 @@ impl XetOps for MockXet {
             let content = std::fs::read(path).map_err(Error::Io)?;
             let hash = self.next_hash_string();
             let size = content.len() as u64;
-            self.files.lock().unwrap().insert(hash.clone(), content);
+            self.files.lock().unwrap().insert(hash.clone(), Arc::new(content));
             results.push(XetFileInfo::new(hash, size));
         }
         Ok(results)
@@ -550,9 +561,10 @@ impl XetOps for MockXet {
         &self,
         file_info: &XetFileInfo,
         offset: u64,
-        end: Option<u64>,
+        end: u64,
+        cached: bool,
     ) -> Result<Box<dyn DownloadStreamOps>> {
-        self.stream_calls.lock().unwrap().push((offset, end));
+        self.stream_calls.lock().unwrap().push((offset, end, cached));
 
         if self.stall_stream.load(Ordering::SeqCst) {
             return Ok(Box::new(StallingDownloadStream));
@@ -567,20 +579,21 @@ impl XetOps for MockXet {
         if prev_empty > 0 {
             self.range_empty_count.fetch_sub(1, Ordering::SeqCst);
             return Ok(Box::new(MockDownloadStream {
-                data: Vec::new(),
+                data: Arc::new(Vec::new()),
                 offset: 0,
                 end: 0,
                 chunk_size: 4096,
+                delay: None,
             }));
         }
         let files = self.files.lock().unwrap();
         let content = files.get(file_info.hash()).cloned().unwrap_or_default();
-        let bounded_end = end.map(|e| e as usize).unwrap_or(content.len());
         Ok(Box::new(MockDownloadStream {
             data: content,
             offset: offset as usize,
-            end: bounded_end,
+            end: end as usize,
             chunk_size: 4096,
+            delay: *self.stream_delay.lock().unwrap(),
         }))
     }
 }
@@ -620,16 +633,21 @@ impl StreamingWriterOps for MockStreamingWriter {
 // ── MockDownloadStream ────────────────────────────────────────────────
 
 pub struct MockDownloadStream {
-    data: Vec<u8>,
+    data: Arc<Vec<u8>>,
     offset: usize,
     /// Upper bound (exclusive) on data this stream will serve.
     end: usize,
     chunk_size: usize,
+    /// Wait before the first chunk.
+    delay: Option<Duration>,
 }
 
 #[async_trait::async_trait]
 impl DownloadStreamOps for MockDownloadStream {
     async fn next(&mut self) -> Result<Option<Bytes>> {
+        if let Some(delay) = self.delay.take() {
+            tokio::time::sleep(delay).await;
+        }
         if self.offset >= self.end.min(self.data.len()) {
             return Ok(None);
         }
