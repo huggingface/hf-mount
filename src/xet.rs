@@ -22,11 +22,14 @@ pub trait XetOps: Send + Sync {
     async fn create_streaming_writer(&self) -> Result<Box<dyn StreamingWriterOps>>;
     async fn download_to_file(&self, xet_hash: &str, file_size: u64, dest: &Path) -> Result<()>;
     async fn upload_files(&self, paths: &[&Path]) -> Result<Vec<XetFileInfo>>;
+    /// Stream bytes `[offset, end)` of a file. `cached` routes the transfer
+    /// through the on-disk chunk cache, when one is configured.
     fn download_stream_boxed(
         &self,
         file_info: &XetFileInfo,
         offset: u64,
-        end: Option<u64>,
+        end: u64,
+        cached: bool,
     ) -> Result<Box<dyn DownloadStreamOps>>;
     /// Pre-warm the reconstruction cache for a file by fetching its full plan.
     /// Errors are silently ignored — this is best-effort.
@@ -58,8 +61,7 @@ pub struct XetSessions {
     upload_config: Option<Arc<TranslatorConfig>>,
     /// Kept separately from `session` for bounded range downloads via `FileReconstructor`.
     cas_client: Arc<dyn Client>,
-    /// Chunk cache attached to unbounded streams; bounded range downloads skip it
-    /// to avoid pulling whole xorbs for small range requests.
+    /// Chunk cache attached to downloads that ask for it (read-ahead).
     chunk_cache: Option<Arc<dyn ChunkCache>>,
 }
 
@@ -80,22 +82,22 @@ impl XetSessions {
         })
     }
 
-    /// Start a streaming download for a byte range.
-    /// When `end` is `Some`, only bytes `[offset, end)` are fetched (bounded range).
-    /// When `end` is `None`, fetches from `offset` to end of file (unbounded stream).
-    pub fn download_stream(&self, file_info: &XetFileInfo, offset: u64, end: Option<u64>) -> Result<DownloadStream> {
+    /// Start a streaming download of bytes `[offset, end)`. `cached` attaches
+    /// the chunk cache: worth it for read-ahead, not for isolated random
+    /// reads, which would fill the disk cache with ranges nobody re-reads.
+    pub fn download_stream(
+        &self,
+        file_info: &XetFileInfo,
+        offset: u64,
+        end: u64,
+        cached: bool,
+    ) -> Result<DownloadStream> {
         let hash = file_info
             .merkle_hash()
             .map_err(|e| Error::Xet(format!("invalid hash: {e}")))?;
-        let is_unbounded = end.is_none();
-        let file_size = file_info.file_size().unwrap_or(u64::MAX);
-        let end = end.unwrap_or(file_size);
         let mut reconstructor =
             FileReconstructor::new(&self.ctx, &self.cas_client, hash).with_byte_range(FileRange::new(offset, end));
-        // Attach chunk cache only to the unbounded stream path: the xorb disk
-        // cache pulls full xorbs (~64MB) even for small range requests, which
-        // is wasteful for random reads. Sequential reads (unbounded) benefit.
-        if is_unbounded && let Some(cache) = self.chunk_cache.as_ref() {
+        if cached && let Some(cache) = self.chunk_cache.as_ref() {
             reconstructor = reconstructor.with_chunk_cache(cache.clone());
         }
         Ok(reconstructor.reconstruct_to_stream())
@@ -144,9 +146,10 @@ impl XetOps for XetSessions {
         &self,
         file_info: &XetFileInfo,
         offset: u64,
-        end: Option<u64>,
+        end: u64,
+        cached: bool,
     ) -> Result<Box<dyn DownloadStreamOps>> {
-        let stream = self.download_stream(file_info, offset, end)?;
+        let stream = self.download_stream(file_info, offset, end, cached)?;
         Ok(Box::new(DownloadStreamWrapper(stream)))
     }
 

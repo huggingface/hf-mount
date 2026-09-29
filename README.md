@@ -342,7 +342,7 @@ A lookup of a path that does not exist yet probes the Hub directly, so a file ad
 
 hf-mount sits between your application and the Hugging Face Hub. It presents a standard filesystem interface (FUSE or NFS) and translates file operations into Hub API calls and storage fetches.
 
-Reads go through an adaptive prefetch buffer that starts small and grows with sequential access. Writes are uploaded to HF storage and committed via the Hub API. A background poll loop keeps the local view in sync with remote changes.
+Reads fetch remote data in blocks, several ranges at a time, with a read-ahead window that grows for each sequential stream, so parallel readers of one file (such as memory-mapped model loaders) do not wait on each other. Writes are uploaded to HF storage and committed via the Hub API. A background poll loop keeps the local view in sync with remote changes.
 
 Built on [xet-core](https://github.com/huggingface/xet-core) for content-addressed storage and efficient file transfers, and [fuser](https://github.com/cberner/fuser) for the FUSE implementation.
 
