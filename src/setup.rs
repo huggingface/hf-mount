@@ -337,6 +337,36 @@ fn user_fixed_upload_concurrency() -> bool {
     std::env::var("HF_XET_FIXED_UPLOAD_CONCURRENCY").is_ok()
 }
 
+/// xet-core settings tuned for interactive FUSE reads (not batch downloads),
+/// applied as env defaults by `init_tracing`. xet-core ignores a value it
+/// cannot parse, so durations need a unit (`30s`, not `30`).
+fn xet_env_defaults(upload_cap: &str) -> Vec<(&'static str, &str)> {
+    vec![
+        ("HF_XET_CLIENT_AC_INITIAL_DOWNLOAD_CONCURRENCY", "16"),
+        ("HF_XET_CLIENT_AC_MIN_BYTES_REQUIRED_FOR_ADJUSTMENT", "4194304"),
+        ("HF_XET_RECONSTRUCTION_MIN_RECONSTRUCTION_FETCH_SIZE", "8388608"),
+        ("HF_XET_RECONSTRUCTION_MIN_PREFETCH_BUFFER", "8388608"),
+        ("HF_XET_RECONSTRUCTION_TARGET_BLOCK_COMPLETION_TIME", "30s"),
+        ("HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_SIZE", "134217728"),
+        ("HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT", "268435456"),
+        // Per-read inactivity timeout for CAS/CDN transfers (resets on every byte
+        // received, so slow-but-progressing reads are fine). This governs the
+        // DOWNLOAD/reconstruction path (term fetches and whole-file downloads);
+        // shard uploads use a separate client with no read_timeout, so this no
+        // longer needs to be large for their sake. Keep it short so a stalled
+        // read fails fast and frees the FUSE worker thread instead of pinning it
+        // for minutes — a long value here is what let stalled reads accumulate
+        // and wedge the mount.
+        ("HF_XET_CLIENT_READ_TIMEOUT", "30s"),
+        // Upload tuning: skip slow adaptive concurrency ramp-up, but CAP the
+        // adaptive controller's upper bound (see XET_UPLOAD_CONCURRENCY_CAP).
+        ("HF_XET_CLIENT_AC_INITIAL_UPLOAD_CONCURRENCY", upload_cap),
+        ("HF_XET_CLIENT_AC_MAX_UPLOAD_CONCURRENCY", upload_cap),
+        // Larger ingestion blocks = fewer CDC calls
+        ("HF_XET_DATA_INGESTION_BLOCK_SIZE", "16777216"),
+    ]
+}
+
 /// Initialize tracing and xet-core env vars.
 /// No threads are spawned. Safe to fork() after this returns.
 pub fn init_tracing(daemon: bool) {
@@ -355,32 +385,8 @@ pub fn init_tracing(daemon: bool) {
         tracing_subscriber::fmt().with_env_filter(filter).with_ansi(ansi).init();
     }
 
-    // Tune xet-core for interactive FUSE reads (not batch downloads).
     let upload_cap = XET_UPLOAD_CONCURRENCY_CAP.to_string();
-    for (k, v) in [
-        ("HF_XET_CLIENT_AC_INITIAL_DOWNLOAD_CONCURRENCY", "16"),
-        ("HF_XET_CLIENT_AC_MIN_BYTES_REQUIRED_FOR_ADJUSTMENT", "4194304"),
-        ("HF_XET_RECONSTRUCTION_MIN_RECONSTRUCTION_FETCH_SIZE", "8388608"),
-        ("HF_XET_RECONSTRUCTION_MIN_PREFETCH_BUFFER", "8388608"),
-        ("HF_XET_RECONSTRUCTION_TARGET_BLOCK_COMPLETION_TIME", "30"),
-        ("HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_SIZE", "134217728"),
-        ("HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT", "268435456"),
-        // Per-read inactivity timeout for CAS/CDN transfers (resets on every byte
-        // received, so slow-but-progressing reads are fine). This governs the
-        // DOWNLOAD/reconstruction path (term fetches and whole-file downloads);
-        // shard uploads use a separate client with no read_timeout, so this no
-        // longer needs to be large for their sake. Keep it short so a stalled
-        // read fails fast and frees the FUSE worker thread instead of pinning it
-        // for minutes — a long value here is what let stalled reads accumulate
-        // and wedge the mount.
-        ("HF_XET_CLIENT_READ_TIMEOUT", "30"),
-        // Upload tuning: skip slow adaptive concurrency ramp-up, but CAP the
-        // adaptive controller's upper bound (see XET_UPLOAD_CONCURRENCY_CAP).
-        ("HF_XET_CLIENT_AC_INITIAL_UPLOAD_CONCURRENCY", upload_cap.as_str()),
-        ("HF_XET_CLIENT_AC_MAX_UPLOAD_CONCURRENCY", upload_cap.as_str()),
-        // Larger ingestion blocks = fewer CDC calls
-        ("HF_XET_DATA_INGESTION_BLOCK_SIZE", "16777216"),
-    ] {
+    for (k, v) in xet_env_defaults(&upload_cap) {
         // xet-runtime consults HF_XET_FIXED_UPLOAD_CONCURRENCY only when the
         // canonical AC variables are absent — defaulting the canonical names
         // would silently turn a user-fixed concurrency into an adaptive one.
@@ -977,8 +983,9 @@ pub(crate) fn unmount_fuse(mount_point: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{mountinfo_has_hf_mount, parse_mode, validate_revision};
+    use super::{XET_UPLOAD_CONCURRENCY_CAP, mountinfo_has_hf_mount, parse_mode, validate_revision, xet_env_defaults};
     use std::path::Path;
+    use xet_runtime::config::XetConfig;
 
     #[test]
     fn mountinfo_matches_hf_mount_mounts_only() {
@@ -1084,5 +1091,25 @@ mod tests {
         for bad in ["a@b", "a:b", "a~b", "a^b", "a%b", "a+b", "main/../etc"] {
             assert!(validate_revision(bad).is_err(), "should reject {bad:?}");
         }
+    }
+
+    /// Each default must parse as its `HF_XET_<GROUP>_<FIELD>` setting: xet-core
+    /// ignores a value it cannot parse and a setting it no longer knows.
+    #[test]
+    fn xet_env_defaults_are_accepted_by_xet_core() {
+        let upload_cap = XET_UPLOAD_CONCURRENCY_CAP.to_string();
+        let rejected: Vec<String> = xet_env_defaults(&upload_cap)
+            .into_iter()
+            .filter_map(|(key, value)| {
+                let (group, field) = key
+                    .strip_prefix("HF_XET_")
+                    .and_then(|rest| rest.split_once('_'))
+                    .unwrap_or_else(|| panic!("{key} is not HF_XET_<GROUP>_<FIELD>"));
+                let path = format!("{}.{}", group.to_lowercase(), field.to_lowercase());
+                let result = XetConfig::default().with_config(&path, value);
+                result.err().map(|err| format!("{key}={value}: {err}"))
+            })
+            .collect();
+        assert!(rejected.is_empty(), "rejected by xet-core: {rejected:#?}");
     }
 }
