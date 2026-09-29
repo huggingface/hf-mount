@@ -232,6 +232,7 @@ The same `FUSE_NOTIFY_INVAL_INODE` writev can also wedge at **runtime** (not jus
 | `--negative-ttl-ms` | `1000` | How long a lookup miss (ENOENT) is remembered before re-probing the Hub. Caps HEAD traffic for missing paths; also the longest a remotely-added file stays hidden from a client that probed it before it existed. |
 | `--flush-debounce-ms` | `2000` | Advanced writes: flush debounce delay (ms) |
 | `--flush-max-batch-window-ms` | `30000` | Advanced writes: max flush batch window (ms) |
+| `--flush-interval-secs` | `0` | Advanced writes: also flush open dirty files every N seconds, so long-lived writers (logs, incremental checkpoints) publish without closing. Readers may see a partially written file. Must exceed the flush debounce. `0` = flush on close/fsync only. |
 | `--flush-shutdown-timeout-ms` | `45000` | Advanced writes: max time the SIGTERM flush drain may run before abandoning unflushed data to guarantee exit. Must be < the pod's `terminationGracePeriodSeconds`, or a slow Hub/CAS backend keeps the FUSE connection alive past grace and strands the pod. |
 | `--no-disk-cache` | `false` | Disable local chunk cache (every read fetches from HF) |
 | `--direct-io` | `false` | Bypass the kernel page cache (FOPEN_DIRECT_IO); every read goes through the FUSE handler. For benchmarking; not recommended in production (disables efficient mmap caching). |

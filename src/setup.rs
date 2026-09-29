@@ -245,6 +245,16 @@ pub struct MountOptions {
     #[arg(long, default_value_t = 2_000)]
     pub flush_debounce_ms: u64,
 
+    /// Advanced writes: flush open dirty files every N seconds, so a
+    /// long-lived writer (a training log, an incrementally written checkpoint)
+    /// publishes without closing the file. Each cycle re-uploads the whole
+    /// staging file (CAS dedup keeps the network cost to the new chunks) and
+    /// may publish a partially written file. Must be larger than the flush
+    /// debounce, otherwise the continuous re-enqueue keeps postponing the
+    /// batch to the max batch window. 0 disables (flush on close/fsync only).
+    #[arg(long, default_value_t = 0)]
+    pub flush_interval_secs: u64,
+
     /// Maximum flush batch window in milliseconds. A dirty file will be flushed
     /// within this time regardless of ongoing writes resetting the debounce.
     #[arg(long, default_value_t = 30_000)]
@@ -613,6 +623,12 @@ pub fn build_with_runtime(
     if is_nfs && options.direct_io {
         info!("--direct-io is ignored for NFS mounts (no NFS equivalent)");
     }
+    if options.flush_interval_secs > 0 && !advanced_writes {
+        panic!("--flush-interval-secs requires --advanced-writes (streaming writes are committed on close only)");
+    }
+    if options.flush_interval_secs > 0 && options.flush_interval_secs * 1000 <= options.flush_debounce_ms {
+        panic!("--flush-interval-secs must be larger than --flush-debounce-ms");
+    }
 
     let backend_name = if is_nfs { "nfs" } else { "fuse" };
     let subfolder_info = if hub_client.path_prefix().is_empty() {
@@ -692,6 +708,7 @@ pub fn build_with_runtime(
             direct_io: options.direct_io && !is_nfs,
             flush_debounce: std::time::Duration::from_millis(options.flush_debounce_ms),
             flush_max_batch_window: std::time::Duration::from_millis(options.flush_max_batch_window_ms),
+            flush_interval: std::time::Duration::from_secs(options.flush_interval_secs),
             flush_shutdown_timeout: std::time::Duration::from_millis(options.flush_shutdown_timeout_ms),
             read_fetch_timeout: std::time::Duration::from_millis(options.read_fetch_timeout_ms),
             // NFS clients use inode numbers as stable file IDs; evicting an

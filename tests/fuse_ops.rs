@@ -249,3 +249,68 @@ async fn test_fuse_revalidation() {
         panic!("FUSE revalidation test failed: {}", e);
     }
 }
+
+/// A writer that never closes its file still gets published: with
+/// `--flush-interval-secs`, the open dirty file reaches the Hub, and grows
+/// there as more data is appended.
+#[tokio::test]
+async fn test_fuse_periodic_flush_publishes_open_file() {
+    let guard = match common::setup_bucket("fuse-periodic-flush").await {
+        Some(g) => g,
+        None => return,
+    };
+
+    let mount_point = format!("/tmp/hf-mount-pf-mnt-{}", std::process::id());
+    let cache_dir = format!("/tmp/hf-mount-pf-cache-{}", std::process::id());
+
+    let hub = guard.hub.clone();
+    let wait_for_size = move |expected: u64| {
+        let hub = hub.clone();
+        async move {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                let entries = common::fs_tests::list_tree_all(&hub).await?;
+                if entries.iter().any(|e| e.path == "live.log" && e.size == Some(expected)) {
+                    return Ok::<(), String>(());
+                }
+                if std::time::Instant::now() > deadline {
+                    return Err(format!("live.log did not reach {expected} bytes on the Hub within 30s"));
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+        }
+    };
+
+    let child = common::mount_bucket(
+        &guard.bucket_id,
+        &mount_point,
+        &cache_dir,
+        &[
+            "--advanced-writes",
+            "--flush-interval-secs",
+            "1",
+            "--flush-debounce-ms",
+            "200",
+        ],
+    );
+
+    let result: Result<(), String> = async {
+        use std::io::Write;
+        let mut file = std::fs::File::create(format!("{mount_point}/live.log")).map_err(|e| format!("create: {e}"))?;
+        file.write_all(b"line1\n").map_err(|e| format!("write: {e}"))?;
+        wait_for_size(6).await?;
+        file.write_all(b"line2\n").map_err(|e| format!("write: {e}"))?;
+        wait_for_size(12).await?;
+        drop(file);
+        Ok(())
+    }
+    .await;
+
+    common::unmount(&mount_point, child, 30);
+    std::fs::remove_dir_all(&mount_point).ok();
+    std::fs::remove_dir_all(&cache_dir).ok();
+
+    if let Err(e) = result {
+        panic!("periodic flush test failed: {e}");
+    }
+}

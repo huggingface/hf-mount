@@ -42,7 +42,7 @@ pub fn assert_deep_read_and_intermediate_readdir(mount_point: &str, rel_path: &s
 
 /// List all files on the Hub, descending into subdirectories.
 /// Needed because list_tree is non-recursive (single directory level).
-async fn list_tree_all(hub: &hf_mount::hub_api::HubApiClient) -> Result<Vec<hf_mount::hub_api::TreeEntry>, String> {
+pub async fn list_tree_all(hub: &hf_mount::hub_api::HubApiClient) -> Result<Vec<hf_mount::hub_api::TreeEntry>, String> {
     let mut entries = Vec::new();
     let mut dirs_to_visit = vec!["".to_string()];
     while let Some(dir) = dirs_to_visit.pop() {

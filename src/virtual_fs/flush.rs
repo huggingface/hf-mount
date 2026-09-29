@@ -42,11 +42,33 @@ impl FlushManager {
         runtime: &tokio::runtime::Handle,
         debounce: Duration,
         max_batch_window: Duration,
+        interval: Duration,
     ) -> Self {
         let errors = Arc::new(Mutex::new(HashMap::new()));
         let pending_deletes = Arc::new(Mutex::new(Vec::new()));
 
         let (tx, rx) = mpsc::unbounded_channel::<FlushSignal>();
+        if !interval.is_zero() {
+            // Periodic flush of open dirty files (long-lived writers never
+            // release()). A weak sender so this task cannot keep the channel
+            // open past shutdown; it exits once the flush loop is gone.
+            let weak_tx = tx.downgrade();
+            let inodes = inodes.clone();
+            runtime.spawn(async move {
+                let mut ticker = tokio::time::interval(interval);
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    ticker.tick().await;
+                    let Some(tx) = weak_tx.upgrade() else { return };
+                    let dirty = inodes.read().expect("inodes poisoned").dirty_inos();
+                    for ino in dirty {
+                        if tx.send(FlushSignal::Dirty(ino)).is_err() {
+                            return;
+                        }
+                    }
+                }
+            });
+        }
         let bg_errors = errors.clone();
         let bg_deletes = pending_deletes.clone();
         let bg_hub = hub_client.clone();
