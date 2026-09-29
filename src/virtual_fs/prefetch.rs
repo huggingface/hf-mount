@@ -240,7 +240,8 @@ impl PrefetchState {
         // In forward-only mode, skip seek window population (just discard).
         if !self.forward_only {
             let seek_end = self.seek_start + self.seek_data.len() as u64;
-            let contiguous = self.seek_data.is_empty() || seek_end == self.buf_start;
+            // An empty window has no offset yet: the reset branch takes it from buf_start.
+            let contiguous = !self.seek_data.is_empty() && seek_end == self.buf_start;
 
             if contiguous && to_move <= SEEK_WINDOW {
                 self.copy_chunks_to_seek(0, to_move);

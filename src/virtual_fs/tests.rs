@@ -2583,6 +2583,39 @@ fn read_seek_backward() {
     });
 }
 
+/// A seek window first filled from a mid-file buffer keeps that buffer's file
+/// offsets: a later read at offset 0 must not be served from it.
+#[test]
+fn read_seek_window_filled_mid_file() {
+    let hub = MockHub::new();
+    let content: Vec<u8> = (0..1_000_000u32).map(|i| (i % 251) as u8).collect();
+    hub.add_file("model.bin", content.len() as u64, Some("model_hash"), None);
+    let xet = MockXet::new();
+    xet.add_file("model_hash", &content);
+    let (rt, vfs) = vfs_readonly(&hub, &xet);
+
+    rt.block_on(async {
+        let attr = vfs.lookup(ROOT_INODE, "model.bin").await.unwrap();
+        let fh = vfs.open(attr.ino, false, false, None).await.unwrap();
+
+        // First read far from 0: the stream starts there.
+        vfs.read(fh, 600_000, 4096).await.unwrap();
+        // Backward seek: a bounded range download fills the forward buffer.
+        vfs.read(fh, 200_000, 8192).await.unwrap();
+        // The next read drains that buffer into the still empty seek window.
+        vfs.read(fh, 208_192, 4096).await.unwrap();
+
+        let (data, _) = vfs.read(fh, 0, 4096).await.unwrap();
+        assert!(
+            data[..] == content[..4096],
+            "offset 0 returned bytes starting with {:?}",
+            &data[..8]
+        );
+
+        vfs.release(fh).await.unwrap();
+    });
+}
+
 /// Range download that fails once then succeeds on retry.
 #[test]
 fn read_range_retry_on_error() {
