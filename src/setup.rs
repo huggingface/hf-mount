@@ -364,6 +364,10 @@ fn xet_env_defaults(upload_cap: &str) -> Vec<(&'static str, &str)> {
         ("HF_XET_CLIENT_AC_MAX_UPLOAD_CONCURRENCY", upload_cap),
         // Larger ingestion blocks = fewer CDC calls
         ("HF_XET_DATA_INGESTION_BLOCK_SIZE", "16777216"),
+        // Upload sessions await their terminal telemetry document (up to 2 s
+        // by default) in finalize(), which a synchronous close() would pay on
+        // every write. Send it detached instead: the daemon outlives the POST.
+        ("HF_XET_TELEMETRY_FINAL_FLUSH_TIMEOUT", "0s"),
     ]
 }
 
