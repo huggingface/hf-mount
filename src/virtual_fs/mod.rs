@@ -131,8 +131,7 @@ pub struct VfsConfig {
     pub direct_io: bool,
     pub flush_debounce: Duration,
     pub flush_max_batch_window: Duration,
-    /// Advanced writes: period at which open dirty files are enqueued for
-    /// flush, so long-lived writers publish without closing. Zero disables.
+    /// Advanced writes: periodic flush of open dirty files. Zero disables.
     pub flush_interval: Duration,
     /// Max time the SIGTERM shutdown drain may spend flushing dirty data before
     /// abandoning it to guarantee the process exits within the pod's termination

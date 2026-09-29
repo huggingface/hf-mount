@@ -42,7 +42,7 @@ pub fn assert_deep_read_and_intermediate_readdir(mount_point: &str, rel_path: &s
 
 /// List all files on the Hub, descending into subdirectories.
 /// Needed because list_tree is non-recursive (single directory level).
-pub async fn list_tree_all(hub: &hf_mount::hub_api::HubApiClient) -> Result<Vec<hf_mount::hub_api::TreeEntry>, String> {
+async fn list_tree_all(hub: &hf_mount::hub_api::HubApiClient) -> Result<Vec<hf_mount::hub_api::TreeEntry>, String> {
     let mut entries = Vec::new();
     let mut dirs_to_visit = vec!["".to_string()];
     while let Some(dir) = dirs_to_visit.pop() {
@@ -913,4 +913,40 @@ pub async fn run_revalidation_test(
 
     eprintln!("  [revalidation] passed");
     Ok(())
+}
+
+/// Poll the Hub (HEAD) until `path` reports `expected` bytes, or time out.
+pub async fn wait_for_hub_size(
+    hub: &hf_mount::hub_api::HubApiClient,
+    path: &str,
+    expected: u64,
+    timeout: std::time::Duration,
+) -> Result<(), String> {
+    tokio::time::timeout(timeout, async {
+        loop {
+            let info = hub
+                .head_file(path)
+                .await
+                .map_err(|e| format!("head_file({path}): {e}"))?;
+            if info.and_then(|i| i.size) == Some(expected) {
+                return Ok(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+    })
+    .await
+    .map_err(|_| format!("{path} did not reach {expected} bytes on the Hub within {timeout:?}"))?
+}
+
+/// A writer that never closes its file still gets published with
+/// `--flush-interval-ms`: the open dirty file reaches the Hub, and grows
+/// there as more data is appended.
+pub async fn run_periodic_flush_tests(mount_point: &str, hub: &hf_mount::hub_api::HubApiClient) -> Result<(), String> {
+    use std::io::Write;
+    let timeout = std::time::Duration::from_secs(30);
+    let mut file = std::fs::File::create(format!("{mount_point}/live.log")).map_err(|e| format!("create: {e}"))?;
+    file.write_all(b"line1\n").map_err(|e| format!("write: {e}"))?;
+    wait_for_hub_size(hub, "live.log", 6, timeout).await?;
+    file.write_all(b"line2\n").map_err(|e| format!("write: {e}"))?;
+    wait_for_hub_size(hub, "live.log", 12, timeout).await
 }
