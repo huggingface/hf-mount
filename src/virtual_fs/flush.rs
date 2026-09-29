@@ -17,6 +17,9 @@ enum FlushSignal {
     Dirty(u64),
     /// Wake the loop to drain pending remote deletes (no dirty inode attached).
     WakeDeletes,
+    /// Close the batch being collected now (periodic flush), instead of
+    /// waiting for the debounce to expire.
+    Tick,
 }
 
 // ── FlushManager ──────────────────────────────────────────────────────
@@ -55,14 +58,13 @@ impl FlushManager {
             let weak_tx = tx.downgrade();
             let inodes = inodes.clone();
             runtime.spawn(async move {
-                let mut ticker = tokio::time::interval(interval);
-                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 loop {
-                    ticker.tick().await;
+                    tokio::time::sleep(interval).await;
                     let Some(tx) = weak_tx.upgrade() else { return };
                     let dirty = inodes.read().expect("inodes poisoned").dirty_inos();
-                    for ino in dirty {
-                        if tx.send(FlushSignal::Dirty(ino)).is_err() {
+                    let signals = dirty.into_iter().map(FlushSignal::Dirty).chain([FlushSignal::Tick]);
+                    for signal in signals {
+                        if tx.send(signal).is_err() {
                             return;
                         }
                     }
@@ -236,6 +238,7 @@ async fn flush_loop(
     loop {
         // Wait for the first signal
         let first = match rx.recv().await {
+            Some(FlushSignal::Tick) => continue, // nothing was dirty
             Some(sig) => sig,
             None => return, // channel closed, exit
         };
@@ -252,6 +255,7 @@ async fn flush_loop(
             }
             let timeout = debounce.min(remaining);
             match tokio::time::timeout(timeout, rx.recv()).await {
+                Ok(Some(FlushSignal::Tick)) => break, // periodic flush: batch closes now
                 Ok(Some(sig)) => signals.push(sig),
                 _ => break, // timeout (debounce expired) or channel closed
             }
@@ -265,7 +269,7 @@ async fn flush_loop(
             .into_iter()
             .filter_map(|sig| match sig {
                 FlushSignal::Dirty(ino) => Some(ino),
-                FlushSignal::WakeDeletes => None,
+                FlushSignal::WakeDeletes | FlushSignal::Tick => None,
             })
             .collect();
 
