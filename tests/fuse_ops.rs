@@ -288,9 +288,9 @@ async fn test_fuse_revalidation() {
 }
 
 /// Many cold sequential readers at once, more readers than FUSE worker
-/// threads, files larger than the initial read-ahead window so every stream
-/// outlives its first fetch. Regression test for #234: readers must not
-/// starve each other for download buffer, and no read may time out or fail.
+/// threads, each file read in many fetches under the shared read-ahead
+/// budget. Regression test for #234: readers must not starve each other for
+/// download buffer, and no read may time out or fail.
 #[tokio::test]
 async fn test_fuse_parallel_cold_reads() {
     const FILE_COUNT: usize = 24;

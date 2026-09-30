@@ -2588,7 +2588,7 @@ fn rename_source_enoent() {
     });
 }
 
-// ── read range / prefetch ───────────────────────────────────────────
+// ── read range / read-ahead ─────────────────────────────────────────
 
 /// Sequential reads from a xet file.
 #[test]
