@@ -171,16 +171,16 @@ dependencies = [
  "cc",
  "cfg-if",
  "constant_time_eq",
- "cpufeatures 0.3.1",
+ "cpufeatures",
 ]
 
 [[package]]
 name = "block-buffer"
-version = "0.10.4"
+version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3078c7629b62d3f0439517fa394996acacc5cbc91c5a20d8c658e77abd503a71"
+checksum = "d2f6c7dbe95a6ed67ad9f18e57daf93a2f034c524b99fd2b76d18fdfeb6660aa"
 dependencies = [
- "generic-array",
+ "hybrid-array",
 ]
 
 [[package]]
@@ -288,7 +288,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "65c35e4b699c7e15ccbe7ee35c005e4fc0a278d22238a2857e6ce2dadeda1b06"
 dependencies = [
  "cfg-if",
- "cpufeatures 0.3.1",
+ "cpufeatures",
  "rand_core 0.10.1",
 ]
 
@@ -380,6 +380,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "const-oid"
+version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a6ef517f0926dd24a1582492c791b6a4818a4d94e789a334894aa15b0d12f55c"
+
+[[package]]
 name = "const-str"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -443,15 +449,6 @@ dependencies = [
 
 [[package]]
 name = "cpufeatures"
-version = "0.2.17"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "59ed5838eebb26a2bb2e58f6d5b5316989ae9d08bab10e0e6d103e656d1b0280"
-dependencies = [
- "libc",
-]
-
-[[package]]
-name = "cpufeatures"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5ca28b0ae3115b884660db4118d803791fd6756b6e88f39c0f3f7859060d7566"
@@ -485,12 +482,11 @@ checksum = "a31eee39dddec8330830986fcd7625edb5a24ec90ea038215273bbc3adb08ac6"
 
 [[package]]
 name = "crypto-common"
-version = "0.1.7"
+version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "78c8292055d1c1df0cce5d180393dc8cce0abec0a7102adb6c7b1eef6016d60a"
+checksum = "ce6e4c961d6cd6c9a86db418387425e8bdeaf05b3c8bc1411e6dca4c252f1453"
 dependencies = [
- "generic-array",
- "typenum",
+ "hybrid-array",
 ]
 
 [[package]]
@@ -522,11 +518,12 @@ checksum = "7cd812cc2bc1d69d4764bd80df88b4317eaef9e773c75226407d9bc0876b211c"
 
 [[package]]
 name = "digest"
-version = "0.10.7"
+version = "0.11.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9ed9a281f7bc9b7576e61468ba615a66a5c8cfdff42420a70aa82701a3b1e292"
+checksum = "f1dd6dbb5841937940781866fa1281a1ff7bd3bf827091440879f9994983d5c2"
 dependencies = [
  "block-buffer",
+ "const-oid",
  "crypto-common",
 ]
 
@@ -799,16 +796,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "616e8f476a586f1b078d9eece21f7a071f27997e709e2b471f5697deea53bda9"
 
 [[package]]
-name = "generic-array"
-version = "0.14.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "85649ca51fd72272d7821adaf274ad91c288277713d9c18820d8499a7ff69e9a"
-dependencies = [
- "typenum",
- "version_check",
-]
-
-[[package]]
 name = "getrandom"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -979,6 +966,15 @@ name = "humantime"
 version = "2.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "15cdd26707701c53297e2fa6afb323d55fbc1d0810c3aec078ae3ef0424c3c15"
+
+[[package]]
+name = "hybrid-array"
+version = "0.4.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "27f864f10dfb56725ce5ce5472bc52252c8f93a4ab86327122cebf62c5f59a17"
+dependencies = [
+ "typenum",
+]
 
 [[package]]
 name = "hyper"
@@ -1606,6 +1602,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2a180dd8642fa45cdb7dd721cd4c11b1cadd4929ce112ebd8b9f5803cc79d536"
 dependencies = [
  "bitflags",
+ "dispatch2",
+ "objc2",
 ]
 
 [[package]]
@@ -1615,6 +1613,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ef25abbcd74fb2609453eb695bd2f860d389e457f67dc17cafc8b8cbc89d0c33"
 
 [[package]]
+name = "objc2-foundation"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e3e0adef53c21f888deb4fa59fc59f7eb17404926ee8a6f59f5df0fd7f9f3272"
+dependencies = [
+ "bitflags",
+ "objc2",
+]
+
+[[package]]
 name = "objc2-io-kit"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1622,6 +1630,17 @@ checksum = "33fafba39597d6dc1fb709123dfa8289d39406734be322956a69f0931c73bb15"
 dependencies = [
  "libc",
  "objc2-core-foundation",
+]
+
+[[package]]
+name = "objc2-open-directory"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bb82bed227edf5201dfedf072bba4015a33d3d4a98519837295a90f0a23f676d"
+dependencies = [
+ "objc2",
+ "objc2-core-foundation",
+ "objc2-foundation",
 ]
 
 [[package]]
@@ -2405,23 +2424,13 @@ dependencies = [
 
 [[package]]
 name = "sha2"
-version = "0.10.9"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a7507d819769d01a365ab707794a4084392c824f54a7a6a7862f8c3d0892b283"
+checksum = "446ba717509524cb3f22f17ecc096f10f4822d76ab5c0b9822c5f9c284e825f4"
 dependencies = [
  "cfg-if",
- "cpufeatures 0.2.17",
+ "cpufeatures",
  "digest",
- "sha2-asm",
-]
-
-[[package]]
-name = "sha2-asm"
-version = "0.6.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b845214d6175804686b2bd482bcffe96651bb2d1200742b712003504a2dac1ab"
-dependencies = [
- "cc",
 ]
 
 [[package]]
@@ -2582,15 +2591,16 @@ dependencies = [
 
 [[package]]
 name = "sysinfo"
-version = "0.38.4"
+version = "0.39.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "92ab6a2f8bfe508deb3c6406578252e491d299cbbf3bc0529ecc3313aee4a52f"
+checksum = "d2071df9448915b71c4fe6d25deaf1c22f12bd234f01540b77312bb8e41361e6"
 dependencies = [
  "libc",
  "memchr",
  "ntapi",
  "objc2-core-foundation",
  "objc2-io-kit",
+ "objc2-open-directory",
  "windows",
 ]
 
@@ -3059,12 +3069,6 @@ name = "vcpkg"
 version = "0.2.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
-
-[[package]]
-name = "version_check"
-version = "0.9.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "walkdir"
@@ -3592,18 +3596,18 @@ checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
 
 [[package]]
 name = "xet-client"
-version = "1.5.2"
-source = "git+https://github.com/huggingface/xet-core.git?rev=0e4740050f3dc26c263ca3d170c179c78ce16f55#0e4740050f3dc26c263ca3d170c179c78ce16f55"
+version = "1.6.0"
+source = "git+https://github.com/huggingface/xet-core.git?rev=388c93cca8a18e43d8c6425853bbb2c9d8413f74#388c93cca8a18e43d8c6425853bbb2c9d8413f74"
 dependencies = [
  "anyhow",
  "async-trait",
  "base64 0.22.1",
  "bytes",
+ "chrono",
  "crc32fast",
  "futures",
  "http",
  "hyper",
- "lazy_static",
  "more-asserts",
  "rand 0.10.3",
  "redb",
@@ -3621,6 +3625,7 @@ dependencies = [
  "tracing",
  "url",
  "urlencoding",
+ "uuid",
  "web-time",
  "xet-core-structures",
  "xet-runtime",
@@ -3628,8 +3633,8 @@ dependencies = [
 
 [[package]]
 name = "xet-core-structures"
-version = "1.5.2"
-source = "git+https://github.com/huggingface/xet-core.git?rev=0e4740050f3dc26c263ca3d170c179c78ce16f55#0e4740050f3dc26c263ca3d170c179c78ce16f55"
+version = "1.6.0"
+source = "git+https://github.com/huggingface/xet-core.git?rev=388c93cca8a18e43d8c6425853bbb2c9d8413f74#388c93cca8a18e43d8c6425853bbb2c9d8413f74"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -3642,7 +3647,6 @@ dependencies = [
  "getrandom 0.4.3",
  "heapify",
  "itertools",
- "lazy_static",
  "lz4_flex",
  "more-asserts",
  "rand 0.10.3",
@@ -3661,8 +3665,8 @@ dependencies = [
 
 [[package]]
 name = "xet-data"
-version = "1.5.2"
-source = "git+https://github.com/huggingface/xet-core.git?rev=0e4740050f3dc26c263ca3d170c179c78ce16f55#0e4740050f3dc26c263ca3d170c179c78ce16f55"
+version = "1.6.0"
+source = "git+https://github.com/huggingface/xet-core.git?rev=388c93cca8a18e43d8c6425853bbb2c9d8413f74#388c93cca8a18e43d8c6425853bbb2c9d8413f74"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3671,7 +3675,6 @@ dependencies = [
  "gearhash",
  "http",
  "itertools",
- "lazy_static",
  "more-asserts",
  "rand 0.10.3",
  "serde",
@@ -3693,8 +3696,8 @@ dependencies = [
 
 [[package]]
 name = "xet-runtime"
-version = "1.5.2"
-source = "git+https://github.com/huggingface/xet-core.git?rev=0e4740050f3dc26c263ca3d170c179c78ce16f55#0e4740050f3dc26c263ca3d170c179c78ce16f55"
+version = "1.6.0"
+source = "git+https://github.com/huggingface/xet-core.git?rev=388c93cca8a18e43d8c6425853bbb2c9d8413f74#388c93cca8a18e43d8c6425853bbb2c9d8413f74"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3708,7 +3711,6 @@ dependencies = [
  "git-version",
  "humantime",
  "konst",
- "lazy_static",
  "libc",
  "more-asserts",
  "oneshot",
