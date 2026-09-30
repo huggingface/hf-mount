@@ -228,14 +228,10 @@ pub struct MountOptions {
     #[arg(long, default_value_t = 16)]
     pub max_threads: usize,
 
-    /// Maximum time (ms) a single remote chunk fetch may stall before the read
-    /// is failed with EIO. Each FUSE `read()` blocks a worker thread on a
-    /// synchronous CAS/CDN fetch; without a ceiling, a stalled fetch (e.g. a
-    /// client-aborted media seek, a hung CDN connection) parks that thread
-    /// forever. After enough stalled reads accumulate, all `max_threads`
-    /// workers are wedged and the whole mount silently stops serving cold
-    /// reads. Bounding the per-chunk wait frees the thread (and cancels the
-    /// in-flight request by dropping the stream) so the mount stays alive.
+    /// Maximum time (ms) a remote fetch may wait for its next chunk of data.
+    /// A fetch that stalls longer (e.g. on a hung CDN connection) is cancelled
+    /// and retried, and after its last attempt the reads that wait for its
+    /// data fail with EIO instead of hanging forever.
     /// 0 disables the timeout (legacy unbounded behaviour).
     #[arg(long, default_value_t = 30_000)]
     pub read_fetch_timeout_ms: u64,

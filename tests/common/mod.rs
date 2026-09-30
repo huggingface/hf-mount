@@ -3,7 +3,7 @@
 pub mod bench;
 pub mod fs_tests;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -262,20 +262,26 @@ pub async fn build_write_config(hub: &Arc<hf_mount::hub_api::HubApiClient>) -> A
     )
 }
 
-/// Upload a single file to CAS via an upload session.
-pub async fn upload_file(config: Arc<TranslatorConfig>, staged_path: &Path) -> XetFileInfo {
+/// Upload files to CAS in one upload session.
+pub async fn upload_files(config: Arc<TranslatorConfig>, staged_paths: &[PathBuf]) -> Vec<XetFileInfo> {
     let upload_session = FileUploadSession::new(config)
         .await
         .expect("FileUploadSession::new failed");
 
-    let files = vec![(staged_path.to_path_buf(), Sha256Policy::Skip)];
-    let mut results = upload_session.upload_files(files).await.expect("upload_files failed");
-
-    let file_info = results.pop().expect("upload returned no file info");
+    let files = staged_paths.iter().map(|path| (path.clone(), Sha256Policy::Skip));
+    let file_infos = upload_session.upload_files(files).await.expect("upload_files failed");
 
     upload_session.finalize().await.expect("finalize failed");
 
-    file_info
+    file_infos
+}
+
+/// Upload a single file to CAS via an upload session.
+pub async fn upload_file(config: Arc<TranslatorConfig>, staged_path: &Path) -> XetFileInfo {
+    upload_files(config, &[staged_path.to_path_buf()])
+        .await
+        .pop()
+        .expect("upload returned no file info")
 }
 
 /// Spawn hf-mount-fuse as a child process, wait until the mountpoint is live.
@@ -684,14 +690,7 @@ pub async fn seed_parallel_read_files(
         })
         .collect();
 
-    let upload_session = FileUploadSession::new(write_config)
-        .await
-        .expect("FileUploadSession::new failed");
-    let infos = upload_session
-        .upload_files(staged.iter().map(|p| (p.clone(), Sha256Policy::Skip)))
-        .await
-        .expect("upload_files failed");
-    upload_session.finalize().await.expect("finalize failed");
+    let infos = upload_files(write_config, &staged).await;
     assert_eq!(infos.len(), count);
 
     let rel_paths: Vec<String> = (0..count).map(|i| format!("par/f_{i:02}.bin")).collect();
