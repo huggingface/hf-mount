@@ -404,6 +404,8 @@ pub struct MockXet {
     pub stream_calls: Mutex<Vec<(u64, u64, bool)>>,
     /// Delay before an opened stream yields its first chunk (CAS latency).
     stream_delay: Mutex<Option<Duration>>,
+    /// A stream whose range covers this offset waits this long instead.
+    slow_offset: Mutex<Option<(u64, Duration)>>,
     /// Count of download_to_file calls (used to assert staging cache reuse).
     pub download_to_file_calls: AtomicU64,
     /// Test hook to pause `upload_files` mid-call so the test can drive
@@ -434,6 +436,7 @@ impl MockXet {
             stall_stream: AtomicBool::new(false),
             stream_calls: Mutex::new(Vec::new()),
             stream_delay: Mutex::new(None),
+            slow_offset: Mutex::new(None),
             download_to_file_calls: AtomicU64::new(0),
             upload_gate: Mutex::new(None),
             uploads_inflight: AtomicU32::new(0),
@@ -490,6 +493,12 @@ impl MockXet {
     /// Make every opened stream wait `delay` before its first chunk.
     pub fn set_stream_delay(&self, delay: Duration) {
         *self.stream_delay.lock().unwrap() = Some(delay);
+    }
+
+    /// Make the streams whose range covers `offset` wait `delay` before
+    /// their first chunk.
+    pub fn set_slow_offset(&self, offset: u64, delay: Duration) {
+        *self.slow_offset.lock().unwrap() = Some((offset, delay));
     }
 
     fn next_hash_string(&self) -> String {
@@ -593,7 +602,10 @@ impl XetOps for MockXet {
             offset: offset as usize,
             end: end as usize,
             chunk_size: 4096,
-            delay: *self.stream_delay.lock().unwrap(),
+            delay: match *self.slow_offset.lock().unwrap() {
+                Some((at, delay)) if offset <= at && at < end => Some(delay),
+                _ => *self.stream_delay.lock().unwrap(),
+            },
         }))
     }
 }
