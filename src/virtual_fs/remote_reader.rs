@@ -14,7 +14,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
@@ -133,12 +133,18 @@ struct State {
     /// Blocks in the order reads first touched them: eviction order of
     /// `behind_bytes`.
     behind: VecDeque<u64>,
-    /// `ahead_bytes` as last reported to the mount budget.
+    /// Bytes of this reader counted in the mount budget: `ahead_bytes` as
+    /// last reported, plus read-ahead reserved for fetches about to start.
     reported_ahead: u64,
+    /// Counted among the readers holding read-ahead.
+    holding: bool,
     /// Reads planned so far: the clock of `last_used`.
     tick: u64,
-    /// When the last read was planned.
-    last_read: Option<tokio::time::Instant>,
+    /// When a read last touched a block for the first time or stopped
+    /// waiting for a fetch: re-reads of blocks at hand do not count.
+    progress_at: Option<tokio::time::Instant>,
+    /// Reads waiting for fetches.
+    waiting: u32,
     /// A task waits to drop the read-ahead once the reader stops reading.
     idle_watch: bool,
     /// Last stream id handed out.
@@ -165,10 +171,13 @@ struct FetchRun {
 
 /// Read-ahead memory of a mount, split evenly between the readers that hold
 /// read-ahead: the first files read cannot keep a budget that files opened
-/// later then never get.
+/// later then never get. Read-ahead is reserved before its fetches start, so
+/// the readers together stay within the capacity.
 pub(crate) struct ReadAheadBudget {
     /// Readers holding read-ahead (pending or unread blocks).
     readers: AtomicU64,
+    /// Bytes the readers hold or have reserved.
+    held: AtomicU64,
     limit: u64,
 }
 
@@ -176,6 +185,7 @@ impl ReadAheadBudget {
     pub(crate) fn new(limit: u64) -> Arc<Self> {
         Arc::new(Self {
             readers: AtomicU64::new(0),
+            held: AtomicU64::new(0),
             limit,
         })
     }
@@ -185,6 +195,25 @@ impl ReadAheadBudget {
     fn share(&self, holding: bool) -> u64 {
         let readers = self.readers.load(Ordering::Relaxed) + u64::from(!holding);
         (self.limit / readers.max(1)).max(MIN_AHEAD_SHARE)
+    }
+
+    /// Read-ahead bytes all readers may hold together: the limit, or the
+    /// smallest share of each reader when that is more.
+    fn capacity(&self, holding: bool) -> u64 {
+        let readers = self.readers.load(Ordering::Relaxed) + u64::from(!holding);
+        self.limit.max(readers * MIN_AHEAD_SHARE)
+    }
+
+    /// Reserve up to `bytes` of read-ahead within the capacity. Returns the
+    /// bytes reserved.
+    fn reserve(&self, bytes: u64, holding: bool) -> u64 {
+        let capacity = self.capacity(holding);
+        let mut reserved = 0;
+        let _ = self.held.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |held| {
+            reserved = bytes.min(capacity.saturating_sub(held));
+            Some(held + reserved)
+        });
+        reserved
     }
 }
 
@@ -239,6 +268,7 @@ impl RemoteReader {
 
         let (mut parts, waits) = self.plan(first, last);
         if !waits.is_empty() {
+            let _waiting = Waiting(self);
             let started = std::time::Instant::now();
             for (index, mut fill) in waits {
                 let fill = match fill.wait_for(Option::is_some).await {
@@ -279,11 +309,11 @@ impl RemoteReader {
         let state = &mut *guard;
         state.tick += 1;
         let tick = state.tick;
-        state.last_read = Some(tokio::time::Instant::now());
 
         let mut parts = Vec::with_capacity((last - first + 1) as usize);
         let mut waits = Vec::new();
         let mut runs: Vec<(u64, u64, bool)> = Vec::new();
+        let mut progress = false;
         for block in first..=last {
             let index = (block - first) as usize;
             match state.blocks.get_mut(&block) {
@@ -293,6 +323,7 @@ impl RemoteReader {
                     let data = data.clone();
                     if first_read {
                         state.mark_read(block, data.len() as u64);
+                        progress = true;
                     }
                     parts.push(Some(data));
                 }
@@ -300,12 +331,17 @@ impl RemoteReader {
                     *demanded = true;
                     waits.push((index, fill.clone()));
                     parts.push(None);
+                    progress = true;
                 }
                 None => {
                     push_block(&mut runs, block, false, first);
                     parts.push(None);
+                    progress = true;
                 }
             }
+        }
+        if progress {
+            state.progress_at = Some(tokio::time::Instant::now());
         }
 
         let mut stream = None;
@@ -315,6 +351,15 @@ impl RemoteReader {
         }
         for (block, fill) in self.start_fetches(state, runs, stream, Some(last)) {
             waits.push(((block - first) as usize, fill));
+        }
+        if !waits.is_empty() {
+            state.waiting += 1;
+        }
+        // The share shrinks as other readers start: give back what no
+        // stream of this reader is heading to.
+        let limit = self.ahead_limit(state);
+        if state.ahead_bytes > limit {
+            self.make_room(state, 0, 0, limit);
         }
         self.evict_behind(state);
         self.report_ahead(state);
@@ -396,7 +441,7 @@ impl RemoteReader {
     /// so that fetching goes on while its reads wait for a slower fetch.
     /// Only for streams that have read sequentially for a while: a stream
     /// made of one read (a record header) would keep fetching for nothing.
-    /// Not once the reader stopped reading: that would fetch again what
+    /// Not once the reader is idle: that would fetch again what
     /// `drop_read_ahead` dropped.
     fn refill(self: &Arc<Self>, id: u64) {
         let mut guard = self.state.lock().expect("reader state poisoned");
@@ -405,10 +450,7 @@ impl RemoteReader {
             return;
         };
         let stream = &state.streams[index];
-        if !stream.is_live(state.tick)
-            || stream.last_block - stream.first_block < INITIAL_WINDOW
-            || state.last_read.is_some_and(|at| at.elapsed() >= IDLE_DROP)
-        {
+        if !stream.is_live(state.tick) || stream.last_block - stream.first_block < INITIAL_WINDOW || state.idle() {
             return;
         }
         if let Some((start, end)) = state.read_ahead_range(index, self.block_count()) {
@@ -416,17 +458,24 @@ impl RemoteReader {
             self.extend_read_ahead(state, index, start, end, &mut runs);
             self.start_fetches(state, runs, Some(id), None);
             self.report_ahead(state);
+            self.watch_idle(state);
         }
+    }
+
+    /// Read-ahead bytes this reader may hold.
+    fn ahead_limit(&self, state: &State) -> u64 {
+        self.max_ahead_bytes.min(self.budget.share(state.holding))
     }
 
     /// Shrink a read-ahead range `[start, end)` so that the bytes ahead stay
     /// within the budgets, first dropping fetched blocks no read touched and
-    /// no stream is heading to (read-ahead of a stream that moved on).
-    /// Returns the new end: `start` when the budget leaves room for less than
-    /// `run` blocks (capped at a quarter of the budget), so that a stream held
-    /// back by it fetches in runs worth a round trip, not block by block.
+    /// no stream is heading to (read-ahead of a stream that moved on), and
+    /// reserve the bytes of what is left in the mount budget. Returns the new
+    /// end: `start` when the budget leaves room for less than `run` blocks
+    /// (capped at a quarter of the budget), so that a stream held back by it
+    /// fetches in runs worth a round trip, not block by block.
     fn trim_read_ahead(&self, state: &mut State, start: u64, end: u64, run: u64) -> u64 {
-        let limit = self.max_ahead_bytes.min(self.budget.share(state.reported_ahead > 0));
+        let limit = self.ahead_limit(state);
         // Only a range that may not fit is worth counting and making room for.
         if state.ahead_bytes + end.saturating_sub(start) * BLOCK_SIZE > limit {
             self.make_room(state, start, end, limit);
@@ -435,21 +484,31 @@ impl RemoteReader {
         // its whole range has arrived, so fetches finish out of order: the
         // other half holds data fetched past a slow fetch, and new fetches
         // start while a read waits for it instead of the network idling.
-        let mut budget = limit
+        let allowed = limit
             .saturating_sub(state.ahead_bytes)
             .min((limit / 2).saturating_sub(state.pending_bytes));
+        self.report_ahead(state);
+        let reserved = self.budget.reserve(allowed, state.holding);
         let run = run.min(limit / BLOCK_SIZE / 4).max(1);
+        let (mut new_end, mut taken) = (end, 0);
         for block in start..end {
             if state.blocks.contains_key(&block) {
                 continue;
             }
             let len = self.block_len(block);
-            if len > budget {
-                return if block - start >= run { block } else { start };
+            if taken + len > reserved {
+                new_end = if block - start >= run { block } else { start };
+                break;
             }
-            budget -= len;
+            taken += len;
         }
-        end
+        if new_end == start {
+            taken = 0;
+        }
+        // The fetches about to start add `taken` to `ahead_bytes`.
+        self.budget.held.fetch_sub(reserved - taken, Ordering::Relaxed);
+        state.reported_ahead += taken;
+        new_end
     }
 
     /// Drop fetched blocks no read touched and no stream is heading to
@@ -557,16 +616,25 @@ impl RemoteReader {
         self.report_ahead(state);
     }
 
-    /// Count this reader among the readers holding read-ahead while it
-    /// holds some.
+    /// Report the read-ahead of this reader to the mount budget: its bytes,
+    /// and whether it counts among the readers holding some.
     fn report_ahead(&self, state: &mut State) {
-        let (was, now) = (state.reported_ahead > 0, state.ahead_bytes > 0);
-        if now && !was {
-            self.budget.readers.fetch_add(1, Ordering::Relaxed);
-        } else if was && !now {
-            self.budget.readers.fetch_sub(1, Ordering::Relaxed);
+        let (now, before) = (state.ahead_bytes, state.reported_ahead);
+        if now > before {
+            self.budget.held.fetch_add(now - before, Ordering::Relaxed);
+        } else {
+            self.budget.held.fetch_sub(before - now, Ordering::Relaxed);
         }
-        state.reported_ahead = state.ahead_bytes;
+        state.reported_ahead = now;
+        let holding = now > 0;
+        if holding != state.holding {
+            if holding {
+                self.budget.readers.fetch_add(1, Ordering::Relaxed);
+            } else {
+                self.budget.readers.fetch_sub(1, Ordering::Relaxed);
+            }
+            state.holding = holding;
+        }
     }
 
     /// Start the task that drops the read-ahead once the reader stops
@@ -596,19 +664,37 @@ impl RemoteReader {
 
 impl Drop for RemoteReader {
     fn drop(&mut self) {
+        let state = self.state.get_mut().unwrap_or_else(PoisonError::into_inner);
         // Cancel read-ahead nobody will read.
-        if let Ok(state) = self.state.get_mut() {
-            for task in state.fetches.drain(..) {
-                task.abort();
-            }
-            if state.reported_ahead > 0 {
-                self.budget.readers.fetch_sub(1, Ordering::Relaxed);
-            }
+        for task in state.fetches.drain(..) {
+            task.abort();
+        }
+        self.budget.held.fetch_sub(state.reported_ahead, Ordering::Relaxed);
+        if state.holding {
+            self.budget.readers.fetch_sub(1, Ordering::Relaxed);
         }
     }
 }
 
+/// A read waiting for fetches: its reader is not idle until the read ends,
+/// cancelled or not.
+struct Waiting<'a>(&'a RemoteReader);
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        let mut state = self.0.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.waiting -= 1;
+        state.progress_at = Some(tokio::time::Instant::now());
+    }
+}
+
 impl State {
+    /// No read waits for a fetch, and none reached a new block for
+    /// `IDLE_DROP`: the streams of the reader have most likely stopped.
+    fn idle(&self) -> bool {
+        self.waiting == 0 && self.progress_at.is_none_or(|at| at.elapsed() >= IDLE_DROP)
+    }
+
     /// A read touched `block` (`len` bytes, fetched) for the first time.
     fn mark_read(&mut self, block: u64, len: u64) {
         self.ahead_bytes -= len;
@@ -799,8 +885,8 @@ fn assemble(parts: &[Option<Bytes>], skip: u64, len: usize) -> Bytes {
     out.freeze()
 }
 
-/// Drop the read-ahead of `reader` once it has not read for `IDLE_DROP`,
-/// then end when it holds none.
+/// Drop the read-ahead of `reader` once it is idle, then end when it holds
+/// none.
 async fn drop_read_ahead_when_idle(reader: Weak<RemoteReader>) {
     loop {
         let wake_at = {
@@ -808,8 +894,10 @@ async fn drop_read_ahead_when_idle(reader: Weak<RemoteReader>) {
             let mut guard = reader.state.lock().expect("reader state poisoned");
             let state = &mut *guard;
             let now = tokio::time::Instant::now();
-            let idle_at = state.last_read.map_or(now, |at| at + IDLE_DROP);
-            if idle_at > now {
+            let idle_at = state.progress_at.map_or(now, |at| at + IDLE_DROP);
+            if state.waiting > 0 {
+                now + IDLE_DROP
+            } else if idle_at > now {
                 idle_at
             } else {
                 reader.drop_read_ahead(state);
@@ -817,8 +905,8 @@ async fn drop_read_ahead_when_idle(reader: Weak<RemoteReader>) {
                     state.idle_watch = false;
                     return;
                 }
-                // Blocks still in flight: drop them once they arrive.
-                now + IDLE_DROP
+                // Blocks still in flight: drop them soon after they arrive.
+                now + IDLE_DROP / 10
             }
         };
         tokio::time::sleep_until(wake_at).await;
@@ -1254,6 +1342,46 @@ mod tests {
         assert_eq!(budget.share(true), MIN_AHEAD_SHARE);
     }
 
+    /// Readers that start at once stay within the mount budget together,
+    /// although the first ones asked while their share was larger.
+    #[tokio::test]
+    async fn readers_stay_within_the_mount_budget() {
+        let xet = MockXet::new();
+        let content = pattern(128 * BLOCK_SIZE as usize);
+        xet.add_file("hash", &content);
+        let budget = ReadAheadBudget::new(16 * MIN_AHEAD_SHARE);
+        let readers: Vec<_> = (0..16)
+            .map(|_| {
+                RemoteReader::new(
+                    "hash".into(),
+                    content.len() as u64,
+                    xet.clone(),
+                    Duration::from_secs(5),
+                    false,
+                    budget.clone(),
+                )
+            })
+            .collect();
+
+        for reader in &readers {
+            reader.read(0, 1).await.unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let ahead: u64 = readers
+            .iter()
+            .map(|reader| reader.state.lock().unwrap().ahead_bytes)
+            .sum();
+        assert!(
+            ahead <= budget.capacity(true),
+            "{} MiB ahead, capacity {} MiB",
+            ahead >> 20,
+            budget.capacity(true) >> 20
+        );
+        assert_eq!(budget.held.load(Ordering::Relaxed), ahead);
+        drop(readers);
+        assert_eq!(budget.held.load(Ordering::Relaxed), 0);
+    }
+
     /// A reader counts toward the split while it holds read-ahead, and
     /// stops counting when its handle closes.
     #[tokio::test]
@@ -1282,8 +1410,8 @@ mod tests {
         reader.read(0, 4096).await.unwrap();
         tokio::time::sleep(IDLE_DROP / 2).await;
         assert!(ahead(&reader) > 0);
-        // A read restarts the delay.
-        reader.read(4096, 4096).await.unwrap();
+        // A read of a new block restarts the delay.
+        reader.read(BLOCK_SIZE, 4096).await.unwrap();
         tokio::time::sleep(IDLE_DROP * 3 / 4).await;
         assert!(ahead(&reader) > 0);
         tokio::time::sleep(IDLE_DROP / 2).await;
@@ -1294,6 +1422,55 @@ mod tests {
         let offset = 8 * BLOCK_SIZE;
         let (data, _) = reader.read(offset, 4096).await.unwrap();
         assert!(data[..] == content[offset as usize..offset as usize + 4096]);
+    }
+
+    /// Re-reads of a block at hand do not keep the read-ahead of a reader:
+    /// only reads that reach new blocks count as activity.
+    #[tokio::test(start_paused = true)]
+    async fn rereads_do_not_keep_the_read_ahead() {
+        let xet = MockXet::new();
+        let content = pattern(64 * BLOCK_SIZE as usize);
+        let reader = reader_for(&xet, &content, false);
+
+        reader.read(0, 1).await.unwrap();
+        for _ in 0..4 {
+            tokio::time::sleep(IDLE_DROP / 2).await;
+            reader.read(0, 1).await.unwrap();
+        }
+        assert_eq!(reader.state.lock().unwrap().ahead_bytes, 0);
+    }
+
+    /// A read that waits long for a slow fetch does not make its reader look
+    /// idle: the blocks fetched ahead before it stay until the read is done.
+    #[tokio::test(start_paused = true)]
+    async fn waiting_read_keeps_the_read_ahead() {
+        let xet = MockXet::new();
+        let content = pattern(512 * BLOCK_SIZE as usize);
+        xet.add_file("hash", &content);
+        let reader = RemoteReader::new(
+            "hash".into(),
+            content.len() as u64,
+            xet.clone(),
+            Duration::ZERO,
+            false,
+            ReadAheadBudget::new(MAX_TOTAL_AHEAD_BYTES),
+        );
+        let ahead = |reader: &Arc<RemoteReader>| reader.state.lock().unwrap().ahead_bytes;
+
+        reader.read(0, 4096).await.unwrap();
+        xet.set_stream_delay(IDLE_DROP * 3);
+        let far = 400 * BLOCK_SIZE;
+        let slow = {
+            let reader = reader.clone();
+            tokio::spawn(async move { reader.read(far, 4096).await })
+        };
+        tokio::time::sleep(IDLE_DROP * 3 / 2).await;
+        assert!(ahead(&reader) > BLOCK_SIZE, "read-ahead dropped while a read waits");
+
+        let (data, _) = slow.await.unwrap().unwrap();
+        assert!(data[..] == content[far as usize..far as usize + 4096]);
+        tokio::time::sleep(IDLE_DROP * 3 / 2).await;
+        assert_eq!(ahead(&reader), 0);
     }
 
     /// When a stream stops reading (its read waits for a slow fetch), the
