@@ -4386,13 +4386,17 @@ fn stream_calls_record_read_ahead_and_seek_ranges() {
 
         let calls = xet.stream_calls.lock().unwrap().clone();
         assert_eq!(calls[0].0, 0, "first call should start at offset 0");
+        let read_ahead: u64 = calls
+            .iter()
+            .filter(|call| call.2 && call.1 <= 16 * 1_048_576)
+            .map(|call| call.1 - call.0)
+            .sum();
         assert!(
-            calls[0].1 > block && calls[0].2,
-            "first read should fetch read-ahead through the cache, got {:?}",
-            calls[0]
+            read_ahead > block,
+            "first read should fetch read-ahead through the cache, got {calls:?}"
         );
         let far_block = far_offset / block * block;
-        assert_eq!(calls[1], (far_block, far_block + block, false));
+        assert_eq!(*calls.last().unwrap(), (far_block, far_block + block, false));
 
         vfs.release(fh).await.unwrap();
     });

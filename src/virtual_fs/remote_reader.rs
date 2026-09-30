@@ -28,9 +28,14 @@ use crate::xet::XetOps;
 /// Unit of caching and fetching.
 pub(crate) const BLOCK_SIZE: u64 = 256 * 1024;
 /// Read-ahead window of a stream when it first steps forward, in blocks: how
-/// far past its last read the stream keeps blocks requested. The window
-/// doubles each time the stream reads half of it.
+/// far past its last read the stream keeps blocks requested. Each time the
+/// stream reads half of it, the window grows fourfold (twofold past
+/// `MAX_WINDOW / 8`).
 const INITIAL_WINDOW: u64 = 8;
+/// Read-ahead window of a stream that starts at the beginning of the file,
+/// in blocks: such reads most often copy the whole file, and a file of a
+/// few dozen MiB would otherwise be read before the window has grown.
+const START_WINDOW: u64 = 256;
 /// Largest read-ahead window, in blocks. Requests top the window up as the
 /// stream reads and as its fetches complete, in runs of at least half the
 /// window (or `MAX_FETCH_BLOCKS`), so that fetching goes on while a read
@@ -40,6 +45,11 @@ const MAX_WINDOW: u64 = 2048;
 /// this size that download in parallel: one range streams at about the
 /// speed of a single connection.
 const MAX_FETCH_BLOCKS: u64 = 128;
+/// Smallest run of blocks one fetch downloads. A fetch delivers nothing
+/// until its whole range has arrived, so a run is at most as long as its
+/// distance to the reader (and at least this long): the first blocks a
+/// reader needs arrive after a short fetch, not after a 32 MiB one.
+const MIN_FETCH_BLOCKS: u64 = 4;
 /// Bytes in flight plus bytes fetched ahead that no read has touched yet,
 /// per reader. Read-ahead is trimmed to stay below it; a read always
 /// fetches the blocks it needs.
@@ -267,7 +277,7 @@ impl RemoteReader {
                     parts.push(None);
                 }
                 None => {
-                    push_block(&mut runs, block, false);
+                    push_block(&mut runs, block, false, first);
                     parts.push(None);
                 }
             }
@@ -304,9 +314,10 @@ impl RemoteReader {
         // With no budget left, the stream tries again at its next step or
         // when one of its fetches completes.
         state.streams[index].ahead_end = end;
+        let next = state.streams[index].last_block + 1;
         for block in start..end {
             if !state.blocks.contains_key(&block) {
-                push_block(runs, block, true);
+                push_block(runs, block, true, next);
             }
         }
     }
@@ -610,6 +621,9 @@ impl State {
                 if forward {
                     self.frontier_window = window;
                 }
+                // The first read of the whole file gets a larger window, but
+                // does not pass it on to the scan.
+                let window = if first == 0 { window.max(START_WINDOW) } else { window };
                 self.last_stream += 1;
                 self.streams.push(Stream {
                     id: self.last_stream,
@@ -633,7 +647,8 @@ impl State {
             stream.window = INITIAL_WINDOW;
             stream.grown_at = last;
         } else if last.saturating_sub(stream.grown_at) >= stream.window / 2 {
-            stream.window = (stream.window * 2).min(MAX_WINDOW);
+            let factor = if stream.window < MAX_WINDOW / 8 { 4 } else { 2 };
+            stream.window = (stream.window * factor).min(MAX_WINDOW);
             stream.grown_at = last;
         }
         let (start, end) = self.read_ahead_range(index, block_count)?;
@@ -660,11 +675,12 @@ impl State {
 }
 
 /// Add `block` to the fetch runs, extending the last run when contiguous
-/// and not full.
-fn push_block(runs: &mut Vec<(u64, u64, bool)>, block: u64, read_ahead: bool) {
+/// and shorter than its distance to `next`, the block the reader needs next
+/// (clamped to `[MIN_FETCH_BLOCKS, MAX_FETCH_BLOCKS]`).
+fn push_block(runs: &mut Vec<(u64, u64, bool)>, block: u64, read_ahead: bool, next: u64) {
     if let Some(run) = runs.last_mut()
         && run.1 == block
-        && run.1 - run.0 < MAX_FETCH_BLOCKS
+        && run.1 - run.0 < run.0.saturating_sub(next).clamp(MIN_FETCH_BLOCKS, MAX_FETCH_BLOCKS)
     {
         run.1 += 1;
         run.2 |= read_ahead;
@@ -1004,8 +1020,9 @@ mod tests {
         assert!(lone <= 2, "{lone} of {records} headers fetched alone");
     }
 
-    /// A sequential scan requests growing read-ahead fetches through the chunk
-    /// cache, and a far read fetches only its block, without it.
+    /// A sequential scan requests read-ahead through the chunk cache: short
+    /// fetches first, so that the first blocks arrive early, then runs of
+    /// the largest size, without gaps or overlaps.
     #[tokio::test]
     async fn sequential_scan_grows_read_ahead() {
         let xet = MockXet::new();
@@ -1014,26 +1031,24 @@ mod tests {
 
         let read_size = 128 * 1024u64;
         let mut offset = 0;
-        while offset < 200 * BLOCK_SIZE {
+        while offset < 600 * BLOCK_SIZE {
             let (data, _) = reader.read(offset, read_size as u32).await.unwrap();
             assert!(data[..] == content[offset as usize..(offset + read_size) as usize]);
             offset += read_size;
         }
-        let calls = stream_calls(&xet);
+        let mut calls = stream_calls(&xet);
         let sizes: Vec<u64> = calls.iter().map(|(start, end, _)| (end - start) / BLOCK_SIZE).collect();
-        assert_eq!(sizes[0], 1 + INITIAL_WINDOW, "sizes: {sizes:?}");
-        assert!(sizes[..4].windows(2).all(|pair| pair[1] > pair[0]), "sizes: {sizes:?}");
+        assert_eq!(sizes[0], MIN_FETCH_BLOCKS, "sizes: {sizes:?}");
         assert!(sizes.contains(&MAX_FETCH_BLOCKS), "sizes: {sizes:?}");
         assert!(
             calls.iter().all(|call| call.2),
             "read-ahead goes through the cache: {calls:?}"
         );
-
-        let far = 900 * BLOCK_SIZE + 17;
-        let (data, _) = reader.read(far, 4096).await.unwrap();
-        assert!(data[..] == content[far as usize..far as usize + 4096]);
-        let last = *stream_calls(&xet).last().unwrap();
-        assert_eq!(last, (900 * BLOCK_SIZE, 901 * BLOCK_SIZE, false));
+        calls.sort();
+        assert!(
+            calls.windows(2).all(|pair| pair[0].1 == pair[1].0),
+            "fetches overlap or leave gaps: {calls:?}"
+        );
     }
 
     /// A sequential scan reads ahead up to the end of the file: the last
