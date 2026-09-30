@@ -343,12 +343,17 @@ fn user_fixed_upload_concurrency() -> bool {
 fn xet_env_defaults(upload_cap: &str) -> Vec<(&'static str, &str)> {
     vec![
         ("HF_XET_CLIENT_AC_INITIAL_DOWNLOAD_CONCURRENCY", "16"),
+        // Let the adaptive controller scale far enough to saturate fast links
+        // under many concurrent readers (xet-core's default cap is 64).
+        ("HF_XET_CLIENT_AC_MAX_DOWNLOAD_CONCURRENCY", "124"),
         ("HF_XET_CLIENT_AC_MIN_BYTES_REQUIRED_FOR_ADJUSTMENT", "4194304"),
         ("HF_XET_RECONSTRUCTION_MIN_RECONSTRUCTION_FETCH_SIZE", "8388608"),
         ("HF_XET_RECONSTRUCTION_MIN_PREFETCH_BUFFER", "8388608"),
         ("HF_XET_RECONSTRUCTION_TARGET_BLOCK_COMPLETION_TIME", "30s"),
         ("HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_SIZE", "134217728"),
-        ("HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT", "268435456"),
+        // Downloads in flight across the mount. One fast remote reader alone
+        // keeps up to 256 MiB in flight (virtual_fs/remote_reader.rs).
+        ("HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT", "1073741824"),
         // Per-read inactivity timeout for CAS/CDN transfers (resets on every byte
         // received, so slow-but-progressing reads are fine). This governs the
         // DOWNLOAD/reconstruction path (term fetches and whole-file downloads);
