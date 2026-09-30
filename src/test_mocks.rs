@@ -387,7 +387,7 @@ impl FollowStreamOps for MockFollowStream {
 // ── MockXet ───────────────────────────────────────────────────────────
 
 pub struct MockXet {
-    files: Mutex<HashMap<String, Arc<Vec<u8>>>>,
+    files: Mutex<HashMap<String, Bytes>>,
     pub next_hash: AtomicU64,
     writer_create_fail: AtomicBool,
     upload_fail: AtomicBool,
@@ -456,7 +456,7 @@ impl MockXet {
         self.files
             .lock()
             .unwrap()
-            .insert(hash.to_string(), Arc::new(content.to_vec()));
+            .insert(hash.to_string(), Bytes::copy_from_slice(content));
     }
 
     pub fn fail_next_writer_create(&self) {
@@ -521,7 +521,7 @@ impl XetOps for MockXet {
             if let Some(parent) = dest.parent() {
                 std::fs::create_dir_all(parent).ok();
             }
-            std::fs::write(dest, content.as_slice()).map_err(Error::Io)?;
+            std::fs::write(dest, content).map_err(Error::Io)?;
         }
         Ok(())
     }
@@ -545,7 +545,7 @@ impl XetOps for MockXet {
             let content = std::fs::read(path).map_err(Error::Io)?;
             let hash = self.next_hash_string();
             let size = content.len() as u64;
-            self.files.lock().unwrap().insert(hash.clone(), Arc::new(content));
+            self.files.lock().unwrap().insert(hash.clone(), Bytes::from(content));
             results.push(XetFileInfo::new(hash, size));
         }
         Ok(results)
@@ -579,7 +579,7 @@ impl XetOps for MockXet {
         if prev_empty > 0 {
             self.range_empty_count.fetch_sub(1, Ordering::SeqCst);
             return Ok(Box::new(MockDownloadStream {
-                data: Arc::new(Vec::new()),
+                data: Bytes::new(),
                 offset: 0,
                 end: 0,
                 chunk_size: 4096,
@@ -633,7 +633,7 @@ impl StreamingWriterOps for MockStreamingWriter {
 // ── MockDownloadStream ────────────────────────────────────────────────
 
 pub struct MockDownloadStream {
-    data: Arc<Vec<u8>>,
+    data: Bytes,
     offset: usize,
     /// Upper bound (exclusive) on data this stream will serve.
     end: usize,
@@ -652,7 +652,7 @@ impl DownloadStreamOps for MockDownloadStream {
             return Ok(None);
         }
         let chunk_end = (self.offset + self.chunk_size).min(self.end).min(self.data.len());
-        let chunk = Bytes::copy_from_slice(&self.data[self.offset..chunk_end]);
+        let chunk = self.data.slice(self.offset..chunk_end);
         self.offset = chunk_end;
         Ok(Some(chunk))
     }
@@ -660,7 +660,8 @@ impl DownloadStreamOps for MockDownloadStream {
 
 /// A stream whose `next()` never resolves, modelling a CAS/CDN connection that
 /// stalls without delivering data or erroring. Used to exercise the read-fetch
-/// timeout: without a bound, awaiting this parks the FUSE worker thread forever.
+/// timeout: without a bound, the fetch and the reads that wait for its blocks
+/// would hang forever.
 pub struct StallingDownloadStream;
 
 #[async_trait::async_trait]

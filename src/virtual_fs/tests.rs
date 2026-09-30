@@ -2556,7 +2556,7 @@ fn read_past_eof() {
     });
 }
 
-/// Range read (seek backward) falls back to a temporary stream.
+/// A read before the previous one (a backward seek) returns its own bytes.
 #[test]
 fn read_seek_backward() {
     let hub = MockHub::new();
@@ -2583,10 +2583,10 @@ fn read_seek_backward() {
     });
 }
 
-/// A seek window first filled from a mid-file buffer keeps that buffer's file
-/// offsets: a later read at offset 0 must not be served from it.
+/// Regression test for #243: after reads in the middle of the file, a read at
+/// offset 0 returns the start of the file, not bytes fetched for those reads.
 #[test]
-fn read_seek_window_filled_mid_file() {
+fn read_at_start_after_mid_file_reads() {
     let hub = MockHub::new();
     let content: Vec<u8> = (0..1_000_000u32).map(|i| (i % 251) as u8).collect();
     hub.add_file("model.bin", content.len() as u64, Some("model_hash"), None);
@@ -2598,11 +2598,9 @@ fn read_seek_window_filled_mid_file() {
         let attr = vfs.lookup(ROOT_INODE, "model.bin").await.unwrap();
         let fh = vfs.open(attr.ino, false, false, None).await.unwrap();
 
-        // First read far from 0: the stream starts there.
+        // A read far from 0, then a backward seek and the read after it.
         vfs.read(fh, 600_000, 4096).await.unwrap();
-        // Backward seek: a bounded range download fills the forward buffer.
         vfs.read(fh, 200_000, 8192).await.unwrap();
-        // The next read drains that buffer into the still empty seek window.
         vfs.read(fh, 208_192, 4096).await.unwrap();
 
         let (data, _) = vfs.read(fh, 0, 4096).await.unwrap();
@@ -2632,7 +2630,7 @@ fn read_range_retry_on_error() {
         let attr = vfs.lookup(ROOT_INODE, "data.bin").await.unwrap();
         let fh = vfs.open(attr.ino, false, false, None).await.unwrap();
 
-        // Read at non-zero offset to force range download (not streaming)
+        // The first fetch fails, and its retry returns the data.
         let (data, _) = vfs.read(fh, 64, 32).await.unwrap();
         assert_eq!(data[0], 64);
         assert_eq!(data.len(), 32);
@@ -2689,10 +2687,8 @@ fn read_range_all_retries_exhausted() {
 }
 
 /// A stalled CAS/CDN stream must not park the read forever: the read-fetch
-/// timeout fails it with EIO so the FUSE worker thread is freed. Without the
-/// timeout the worker would block indefinitely and, once every worker is
-/// blocked this way, the whole mount silently wedges (cold reads return
-/// nothing while `ls` still works). The outer `timeout` guard turns a
+/// timeout fails it with EIO. Without the timeout, the read and every later
+/// read of its blocks would wait forever. The outer `timeout` guard turns a
 /// regression (unbounded wait) into a deterministic test failure instead of a
 /// hung CI run.
 #[test]
@@ -2720,8 +2716,8 @@ fn read_stalled_stream_times_out_with_eio() {
         let attr = vfs.lookup(ROOT_INODE, "data.bin").await.unwrap();
         let fh = vfs.open(attr.ino, false, false, None).await.unwrap();
 
-        // Non-zero offset forces a range download. Bound the whole read so a
-        // regression fails the test deterministically rather than hanging.
+        // Bound the whole read so a regression fails the test
+        // deterministically rather than hanging.
         let result = tokio::time::timeout(Duration::from_secs(10), vfs.read(fh, 64, 32)).await;
         let read_result = result.expect("read() did not return — fetch was not bounded by the timeout");
         assert_eq!(read_result.unwrap_err(), libc::EIO);

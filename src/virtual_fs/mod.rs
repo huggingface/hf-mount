@@ -136,10 +136,10 @@ pub struct VfsConfig {
     /// grace period. Must be < terminationGracePeriodSeconds, otherwise a slow
     /// Hub/CAS backend wedges the FUSE connection and strands the pod.
     pub flush_shutdown_timeout: Duration,
-    /// Upper bound on a single remote chunk fetch during a read. A stalled
-    /// fetch otherwise parks the FUSE worker thread that issued the `read()`
-    /// indefinitely; once all worker threads are parked the mount silently
-    /// wedges. `Duration::ZERO` disables the bound (legacy behaviour).
+    /// Longest wait of a remote fetch for its next chunk of data. A stalled
+    /// fetch is retried, then the reads that wait for it fail with EIO
+    /// instead of hanging. `Duration::ZERO` disables the bound (legacy
+    /// behaviour).
     pub read_fetch_timeout: Duration,
     /// 0 disables the LRU evictor.
     pub inode_soft_limit: usize,

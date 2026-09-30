@@ -4,7 +4,6 @@ use std::os::fd::OwnedFd;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::task::{Context, Poll, Waker};
 use std::time::{Duration, SystemTime};
 
 use fuser::{
@@ -12,6 +11,7 @@ use fuser::{
     OpenFlags, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite,
     Request, TimeOrNow,
 };
+use futures::FutureExt;
 use tracing::{error, info, warn};
 
 use crate::daemon::DaemonGuard;
@@ -284,9 +284,9 @@ impl Filesystem for FuseAdapter {
         // worker thread: page faults of a memory-mapped file would queue
         // behind it even when their own data is at hand.
         let _runtime = self.runtime.enter();
-        match read.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
-            Poll::Ready(result) => send(reply, result),
-            Poll::Pending => {
+        match read.as_mut().now_or_never() {
+            Some(result) => send(reply, result),
+            None => {
                 self.runtime.spawn(async move { send(reply, read.await) });
             }
         }
