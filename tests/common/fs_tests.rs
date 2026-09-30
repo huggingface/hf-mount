@@ -680,7 +680,7 @@ pub fn run_simple_write_tests(mp: &str, remote_file: &str) -> TestResult {
         assert!(std::fs::metadata(&path).is_err(), "file should be gone after unlink");
     }
 
-    // 13. Read an empty file (size=0, no xet hash — served via lazy prefetch, not staging)
+    // 13. Read an empty file (size=0, no xet hash — served by the lazy remote reader, not staging)
     eprintln!("  [simple-write] read empty file");
     {
         let path = format!("{}/empty.txt", mp);
