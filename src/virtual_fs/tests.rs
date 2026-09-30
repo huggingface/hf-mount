@@ -4384,8 +4384,13 @@ fn stream_calls_record_read_ahead_and_seek_ranges() {
         assert_eq!(chunk2.len(), 4096);
         assert_eq!(chunk2[0], (far_offset as usize % 251) as u8);
 
+        // Fetch tasks run on several threads and record their calls in any
+        // order: find each call by its range.
         let calls = xet.stream_calls.lock().unwrap().clone();
-        assert_eq!(calls[0].0, 0, "first call should start at offset 0");
+        assert!(
+            calls.iter().any(|call| call.0 == 0),
+            "a fetch should start at offset 0, got {calls:?}"
+        );
         let read_ahead: u64 = calls
             .iter()
             .filter(|call| call.2 && call.1 <= 16 * 1_048_576)
@@ -4396,7 +4401,8 @@ fn stream_calls_record_read_ahead_and_seek_ranges() {
             "first read should fetch read-ahead through the cache, got {calls:?}"
         );
         let far_block = far_offset / block * block;
-        assert_eq!(*calls.last().unwrap(), (far_block, far_block + block, false));
+        let far_calls: Vec<_> = calls.iter().filter(|call| call.1 > far_block).copied().collect();
+        assert_eq!(far_calls, vec![(far_block, far_block + block, false)]);
 
         vfs.release(fh).await.unwrap();
     });
