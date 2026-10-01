@@ -19,6 +19,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
+use futures::future::try_join_all;
 use tokio::sync::watch;
 use tokio::task::AbortHandle;
 use tracing::{debug, error, warn};
@@ -355,13 +356,20 @@ impl RemoteReader {
         let (mut parts, waiting) = self.plan(first, last);
         if let Some(mut waiting) = waiting {
             let started = std::time::Instant::now();
-            for (index, fill) in &mut waiting.waits {
-                let fill = match fill.wait_for(Option::is_some).await {
-                    Ok(fill) => fill.clone().expect("wait_for returns a filled value"),
+            // All at once: a block whose fetch gave up ends the read without
+            // waiting for the slower ones.
+            let fills = waiting.waits.iter_mut().map(|(index, fill)| async move {
+                match fill.wait_for(Option::is_some).await {
+                    Ok(fill) => fill
+                        .clone()
+                        .expect("wait_for returns a filled value")
+                        .map(|data| (*index, data)),
                     // The fetch task ended without an outcome (runtime shutdown).
                     Err(_) => Err(libc::EIO),
-                };
-                parts[*index] = Some(fill?);
+                }
+            });
+            for (index, data) in try_join_all(fills).await? {
+                parts[index] = Some(data);
             }
             debug!(
                 "reader: read at {} of {} waited {:?}",
@@ -435,7 +443,8 @@ impl RemoteReader {
             self.extend_read_ahead(state, index, start, end, &mut runs);
             stream = Some(state.streams[index].id);
         }
-        for (block, fill) in self.start_fetches(state, runs, stream, Some(last)) {
+        let (receivers, fetches) = self.prepare_fetches(state, runs, stream, Some(last));
+        for (block, fill) in receivers {
             waits.push(((block - first) as usize, fill));
         }
         // The share shrinks as other readers start: give fetched read-ahead
@@ -456,6 +465,8 @@ impl RemoteReader {
                 waits,
             })
         };
+        drop(guard);
+        self.spawn_fetches(fetches);
         (parts, waiting)
     }
 
@@ -484,20 +495,20 @@ impl RemoteReader {
         }
     }
 
-    /// Mark the blocks of `runs` pending and start their fetches. The blocks
-    /// up to `demanded_until` are the ones the calling read needs: returns
-    /// their receivers.
-    fn start_fetches(
+    /// Mark the blocks of `runs` pending and build their fetches, for
+    /// `spawn_fetches` once the state is unlocked. The blocks up to
+    /// `demanded_until` are the ones the calling read needs: returns their
+    /// receivers along with the fetches.
+    #[allow(clippy::type_complexity)]
+    fn prepare_fetches(
         self: &Arc<Self>,
         state: &mut State,
         runs: Vec<(u64, u64, bool)>,
         stream: Option<u64>,
         demanded_until: Option<u64>,
-    ) -> Vec<(u64, watch::Receiver<Fill>)> {
+    ) -> (Vec<(u64, watch::Receiver<Fill>)>, Vec<FetchRun>) {
         let mut receivers = Vec::new();
-        if runs.is_empty() {
-            return receivers;
-        }
+        let mut fetches = Vec::with_capacity(runs.len());
         for (start, end, read_ahead) in runs {
             let mut senders = VecDeque::with_capacity((end - start) as usize);
             for block in start..end {
@@ -524,17 +535,30 @@ impl RemoteReader {
                 self.file_info.hash(),
                 read_ahead
             );
-            let run = FetchRun {
+            fetches.push(FetchRun {
                 reader: Arc::downgrade(self),
                 next: start,
                 senders,
                 stream: stream.filter(|_| read_ahead),
-            };
-            let task = tokio::spawn(fetch_run(run));
-            state.fetches.push(task.abort_handle());
+            });
         }
-        state.fetches.retain(|task| !task.is_finished());
-        receivers
+        (receivers, fetches)
+    }
+
+    /// Start the fetch tasks prepared under the lock. Not with the state
+    /// locked: a runtime that shuts down drops a spawned future at once, and
+    /// `FetchRun::drop` locks the state to fail its blocks.
+    fn spawn_fetches(&self, fetches: Vec<FetchRun>) {
+        if fetches.is_empty() {
+            return;
+        }
+        let tasks: Vec<AbortHandle> = fetches
+            .into_iter()
+            .map(|run| tokio::spawn(fetch_run(run)).abort_handle())
+            .collect();
+        let mut guard = self.lock();
+        guard.fetches.retain(|task| !task.is_finished());
+        guard.fetches.extend(tasks);
     }
 
     /// A read-ahead fetch of stream `id` finished: top its window up again,
@@ -556,8 +580,10 @@ impl RemoteReader {
         if let Some((start, end)) = state.read_ahead_range(index, self.block_count()) {
             let mut runs = Vec::new();
             self.extend_read_ahead(state, index, start, end, &mut runs);
-            self.start_fetches(state, runs, Some(id), None);
+            let (_, fetches) = self.prepare_fetches(state, runs, Some(id), None);
             self.watch_idle(state);
+            drop(guard);
+            self.spawn_fetches(fetches);
         }
     }
 
@@ -1176,6 +1202,7 @@ async fn fetch_run(mut run: FetchRun) {
 mod tests {
     use super::*;
     use crate::test_mocks::MockXet;
+    use futures::FutureExt;
 
     fn pattern(len: usize) -> Vec<u8> {
         (0..len).map(|i| (i % 251) as u8).collect()
@@ -1811,6 +1838,53 @@ mod tests {
         assert!(state.blocks.is_empty(), "{} blocks left in flight", state.blocks.len());
         assert_eq!(state.ahead_bytes, 0);
         assert_eq!(state.pending_bytes, 0);
+    }
+
+    /// A read waiting for several fetches ends as soon as one of them gives
+    /// up, even while another one is still in flight.
+    #[tokio::test(start_paused = true)]
+    async fn failed_block_ends_the_read_without_waiting_for_the_others() {
+        let xet = MockXet::new();
+        let content = pattern(512 * BLOCK_SIZE as usize);
+        let reader = reader_with(&xet, &content, |reader| reader.fetch_timeout = Duration::ZERO);
+        // The first run of the read takes an hour; the second one fails.
+        xet.set_slow_offset(0, Duration::from_secs(3600));
+        xet.set_fail_offset(5 * BLOCK_SIZE);
+
+        let started = tokio::time::Instant::now();
+        let result = reader.read(0, 8 * BLOCK_SIZE as u32).await;
+        assert_eq!(result.unwrap_err(), libc::EIO);
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "waited {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// Fetches start once the state is unlocked: a runtime that shuts down
+    /// drops a spawned future at once, and dropping a fetch locks the state
+    /// to fail its blocks. Under the lock, that was a deadlock.
+    #[test]
+    fn fetches_spawned_on_a_closed_runtime_fail_without_deadlock() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let handle = runtime.handle().clone();
+        runtime.shutdown_background();
+        let xet = MockXet::new();
+        let content = pattern(8 * BLOCK_SIZE as usize);
+        let reader = reader_for(&xet, &content, false);
+
+        let (done, result) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _runtime = handle.enter();
+            let _ = done.send(reader.read(0, 4096).now_or_never());
+        });
+        let read = result
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the read deadlocked");
+        assert_eq!(read, Some(Err(libc::EIO)));
     }
 
     #[tokio::test]

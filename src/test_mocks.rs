@@ -406,6 +406,8 @@ pub struct MockXet {
     stream_delay: Mutex<Option<Duration>>,
     /// A stream whose range covers this offset waits this long instead.
     slow_offset: Mutex<Option<(u64, Duration)>>,
+    /// A stream whose range covers this offset fails to open.
+    fail_offset: Mutex<Option<u64>>,
     /// Count of download_to_file calls (used to assert staging cache reuse).
     pub download_to_file_calls: AtomicU64,
     /// Test hook to pause `upload_files` mid-call so the test can drive
@@ -437,6 +439,7 @@ impl MockXet {
             stream_calls: Mutex::new(Vec::new()),
             stream_delay: Mutex::new(None),
             slow_offset: Mutex::new(None),
+            fail_offset: Mutex::new(None),
             download_to_file_calls: AtomicU64::new(0),
             upload_gate: Mutex::new(None),
             uploads_inflight: AtomicU32::new(0),
@@ -499,6 +502,11 @@ impl MockXet {
     /// their first chunk.
     pub fn set_slow_offset(&self, offset: u64, delay: Duration) {
         *self.slow_offset.lock().unwrap() = Some((offset, delay));
+    }
+
+    /// Make the streams whose range covers `offset` fail to open.
+    pub fn set_fail_offset(&self, offset: u64) {
+        *self.fail_offset.lock().unwrap() = Some(offset);
     }
 
     fn next_hash_string(&self) -> String {
@@ -577,6 +585,12 @@ impl XetOps for MockXet {
 
         if self.stall_stream.load(Ordering::SeqCst) {
             return Ok(Box::new(StallingDownloadStream));
+        }
+        if let Some(at) = *self.fail_offset.lock().unwrap()
+            && offset <= at
+            && at < end
+        {
+            return Err(Error::Xet("mock stream open failure at offset".into()));
         }
 
         let prev_fail = self.range_fail_count.load(Ordering::SeqCst);
