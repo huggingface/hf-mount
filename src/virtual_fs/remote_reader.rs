@@ -171,9 +171,13 @@ struct State {
     frontier_window: u64,
 }
 
-/// A contiguous run of blocks fetched by one background task.
+/// A contiguous run of blocks fetched by one background task. Dropped with
+/// blocks left to deliver (the fetch gave up, or its task ended early), it
+/// fails them: no block stays in flight with no fetch behind it.
 struct FetchRun {
-    first_block: u64,
+    reader: Weak<RemoteReader>,
+    /// Next block to deliver.
+    next: u64,
     /// Senders of the blocks not delivered yet: a delivered block's channel
     /// keeps its data alive until no one holds the channel.
     senders: VecDeque<watch::Sender<Fill>>,
@@ -181,6 +185,20 @@ struct FetchRun {
     /// Read-ahead runs go through the on-disk chunk cache; runs of blocks
     /// only reads need do not.
     stream: Option<u64>,
+}
+
+impl Drop for FetchRun {
+    fn drop(&mut self) {
+        if self.senders.is_empty() {
+            return;
+        }
+        if let Some(reader) = self.reader.upgrade() {
+            reader.fail(self.next..self.next + self.senders.len() as u64);
+        }
+        for sender in self.senders.drain(..) {
+            let _ = sender.send(Some(Err(libc::EIO)));
+        }
+    }
 }
 
 /// Read-ahead memory of a mount. Read-ahead is reserved before its fetches
@@ -420,6 +438,14 @@ impl RemoteReader {
         for (block, fill) in self.start_fetches(state, runs, stream, Some(last)) {
             waits.push(((block - first) as usize, fill));
         }
+        // The share shrinks as other readers start: give fetched read-ahead
+        // back down to it.
+        let limit = self.ahead_limit(state);
+        self.evict_unread(state, limit, true);
+        self.evict_behind(state);
+        self.watch_idle(state);
+        // Built last: dropped by a panic above, it would lock the state this
+        // call still holds.
         let waiting = if waits.is_empty() {
             None
         } else {
@@ -430,12 +456,6 @@ impl RemoteReader {
                 waits,
             })
         };
-        // The share shrinks as other readers start: give fetched read-ahead
-        // back down to it.
-        let limit = self.ahead_limit(state);
-        self.evict_unread(state, limit, true);
-        self.evict_behind(state);
-        self.watch_idle(state);
         (parts, waiting)
     }
 
@@ -505,11 +525,12 @@ impl RemoteReader {
                 read_ahead
             );
             let run = FetchRun {
-                first_block: start,
+                reader: Arc::downgrade(self),
+                next: start,
                 senders,
                 stream: stream.filter(|_| read_ahead),
             };
-            let task = tokio::spawn(fetch_run(Arc::downgrade(self), run));
+            let task = tokio::spawn(fetch_run(run));
             state.fetches.push(task.abort_handle());
         }
         state.fetches.retain(|task| !task.is_finished());
@@ -775,10 +796,12 @@ impl State {
     }
 
     /// A read that waited for `block` ended. The block joins the eviction
-    /// queue once no read waits for it.
+    /// queue once no read waits for it. The block may be another one by now
+    /// (its fetch gave up, or a forward-only read dropped it, and a later read
+    /// fetched it again): a count at 0 stays there.
     fn leave(&mut self, block: u64) {
         match self.blocks.get_mut(&block) {
-            Some(Block::Pending { waiters, .. }) => *waiters -= 1,
+            Some(Block::Pending { waiters, .. }) => *waiters = waiters.saturating_sub(1),
             Some(Block::Ready { waiters, data, .. }) if *waiters > 0 => {
                 *waiters -= 1;
                 let last = *waiters == 0;
@@ -1030,9 +1053,10 @@ async fn next_chunk(
 }
 
 /// Stream the byte range of `run` and deliver it block by block. A failed
-/// attempt resumes at the first block not yet delivered.
-async fn fetch_run(reader: Weak<RemoteReader>, mut run: FetchRun) {
-    let Some((xet, file_info, file_size, timeout)) = reader.upgrade().map(|reader| {
+/// attempt resumes at the first block not yet delivered; after the last
+/// attempt, dropping `run` fails the blocks left and wakes their readers.
+async fn fetch_run(mut run: FetchRun) {
+    let Some((xet, file_info, file_size, timeout)) = run.reader.upgrade().map(|reader| {
         (
             reader.xet.clone(),
             reader.file_info.clone(),
@@ -1042,13 +1066,12 @@ async fn fetch_run(reader: Weak<RemoteReader>, mut run: FetchRun) {
     }) else {
         return;
     };
-    let block_count = run.senders.len() as u64;
-    let end = ((run.first_block + block_count) * BLOCK_SIZE).min(file_size);
-    let mut next = run.first_block;
+    let first_block = run.next;
+    let end = ((first_block + run.senders.len() as u64) * BLOCK_SIZE).min(file_size);
     let started = std::time::Instant::now();
 
     for attempt in 1..=MAX_ATTEMPTS {
-        let start = next * BLOCK_SIZE;
+        let start = run.next * BLOCK_SIZE;
         match xet.download_stream_boxed(&file_info, start, end, run.stream.is_some()) {
             Err(err) => warn!(
                 "reader: stream open failed at {} of {}, attempt {}/{}: {}",
@@ -1059,9 +1082,9 @@ async fn fetch_run(reader: Weak<RemoteReader>, mut run: FetchRun) {
                 err
             ),
             Ok(mut stream) => {
-                let mut block = BytesMut::with_capacity(block_len(file_size, next) as usize);
+                let mut block = BytesMut::with_capacity(block_len(file_size, run.next) as usize);
                 loop {
-                    let at = next * BLOCK_SIZE + block.len() as u64;
+                    let at = run.next * BLOCK_SIZE + block.len() as u64;
                     let mut chunk = match next_chunk(stream.as_mut(), timeout).await {
                         Some(Ok(Some(chunk))) => chunk,
                         None => {
@@ -1101,36 +1124,36 @@ async fn fetch_run(reader: Weak<RemoteReader>, mut run: FetchRun) {
                     // Copy into block-sized buffers: a slice of a chunk would
                     // keep the whole chunk (up to a 64 MiB term) alive.
                     while !chunk.is_empty() {
-                        let len = block_len(file_size, next) as usize;
+                        let len = block_len(file_size, run.next) as usize;
                         let take = (len - block.len()).min(chunk.len());
                         block.extend_from_slice(&chunk.split_to(take));
                         if block.len() < len {
                             continue;
                         }
                         let data = std::mem::take(&mut block).freeze();
-                        let Some(owner) = reader.upgrade() else { return };
-                        owner.complete(next, data.clone());
+                        let Some(owner) = run.reader.upgrade() else { return };
+                        owner.complete(run.next, data.clone());
                         drop(owner);
                         if let Some(sender) = run.senders.pop_front() {
                             let _ = sender.send(Some(Ok(data)));
                         }
-                        next += 1;
+                        run.next += 1;
                         if run.senders.is_empty() {
                             debug!(
                                 "reader: fetched [{}, {}) of {} in {:?}",
-                                run.first_block * BLOCK_SIZE,
+                                first_block * BLOCK_SIZE,
                                 end,
                                 file_info.hash(),
                                 started.elapsed()
                             );
                             if let Some(id) = run.stream
-                                && let Some(owner) = reader.upgrade()
+                                && let Some(owner) = run.reader.upgrade()
                             {
                                 owner.refill(id);
                             }
                             return;
                         }
-                        block = BytesMut::with_capacity(block_len(file_size, next) as usize);
+                        block = BytesMut::with_capacity(block_len(file_size, run.next) as usize);
                     }
                 }
             }
@@ -1142,17 +1165,11 @@ async fn fetch_run(reader: Weak<RemoteReader>, mut run: FetchRun) {
 
     error!(
         "reader: giving up on [{}, {}) of {} after {} attempts",
-        next * BLOCK_SIZE,
+        run.next * BLOCK_SIZE,
         end,
         file_info.hash(),
         MAX_ATTEMPTS
     );
-    if let Some(reader) = reader.upgrade() {
-        reader.fail(next..run.first_block + block_count);
-    }
-    for sender in &run.senders {
-        let _ = sender.send(Some(Err(libc::EIO)));
-    }
 }
 
 #[cfg(test)]
@@ -1757,6 +1774,43 @@ mod tests {
         // The failed block is forgotten: the next read fetches it again.
         let (data, _) = reader.read(BLOCK_SIZE, 4096).await.unwrap();
         assert!(data[..] == content[BLOCK_SIZE as usize..BLOCK_SIZE as usize + 4096]);
+    }
+
+    /// A read that waited for a block its fetch gave up on may end after a
+    /// later read fetched the block again: it must not count itself out of
+    /// that new fetch.
+    #[test]
+    fn leaving_a_refetched_block_does_not_underflow() {
+        let mut state = State::default();
+        let (_sender, fill) = watch::channel(None);
+        state.blocks.insert(4, Block::Pending { fill, waiters: 0 });
+        state.leave(4);
+        assert!(matches!(state.blocks.get(&4), Some(Block::Pending { waiters: 0, .. })));
+    }
+
+    /// A fetch task that ends before delivering its blocks (aborted, or it
+    /// panicked) fails them: the reads waiting get EIO, and the blocks do not
+    /// stay in flight with no fetch behind them.
+    #[tokio::test]
+    async fn aborted_fetch_fails_its_blocks() {
+        let xet = MockXet::new();
+        let content = pattern(8 * BLOCK_SIZE as usize);
+        let reader = reader_with(&xet, &content, |reader| reader.fetch_timeout = Duration::ZERO);
+        xet.stall_stream_reads();
+
+        let stalled = {
+            let reader = reader.clone();
+            tokio::spawn(async move { reader.read(BLOCK_SIZE, 4096).await })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        for fetch in reader.lock().fetches.clone() {
+            fetch.abort();
+        }
+        assert_eq!(stalled.await.unwrap().unwrap_err(), libc::EIO);
+        let state = reader.lock();
+        assert!(state.blocks.is_empty(), "{} blocks left in flight", state.blocks.len());
+        assert_eq!(state.ahead_bytes, 0);
+        assert_eq!(state.pending_bytes, 0);
     }
 
     #[tokio::test]
