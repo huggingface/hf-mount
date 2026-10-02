@@ -693,8 +693,9 @@ pub async fn mount_nfs(
 // CAS+Hub, release frees the fetched blocks. A subsequent read on an
 // evicted file simply re-opens it (cold open, read-ahead restarts).
 //
-// The memory of fetched blocks is capped per handle and across handles
-// by the remote reader (virtual_fs/remote_reader.rs), not by the pool.
+// The remote reader (virtual_fs/remote_reader.rs) caps read-ahead per
+// handle and across handles. Each handle also keeps up to 8 MiB of blocks
+// already read, so the pool caps those at about capacity × 8 MiB.
 
 const HANDLE_POOL_CAPACITY: usize = 64;
 
