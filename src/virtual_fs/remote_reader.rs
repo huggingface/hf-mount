@@ -56,13 +56,13 @@ const MIN_FETCH_BLOCKS: u64 = 4;
 /// per reader. Read-ahead is trimmed to stay below it; a read always
 /// fetches the blocks it needs.
 const MAX_AHEAD_BYTES: u64 = 512 * 1_048_576;
-/// The same budget for all the readers of a mount, split between those that
-/// hold read-ahead or want some: many files read at once must not each hold
-/// a full window.
-pub(crate) const MAX_TOTAL_AHEAD_BYTES: u64 = 1024 * 1_048_576;
 /// Bytes of blocks already read that a reader keeps, for re-reads and for
 /// streams that meet at a block boundary. The page cache keeps the rest.
 const MAX_BEHIND_BYTES: u64 = 8 * 1_048_576;
+/// The same for all the readers open on a mount, which split it: many files
+/// open at once (memory-mapped dataset shards) must not each keep
+/// `MAX_BEHIND_BYTES`.
+const MAX_TOTAL_BEHIND_BYTES: u64 = 256 * 1_048_576;
 /// Sequential streams tracked per reader.
 const MAX_STREAMS: usize = 32;
 /// A new stream that starts at most this many blocks past the furthest
@@ -77,13 +77,14 @@ const FRONTIER_GAP: u64 = 64;
 const STALE_READS: u64 = 256;
 /// A reader that has not read for this long gives back the blocks it
 /// fetched ahead beyond its share of the mount budget, so that the readers
-/// still at work get theirs, and the blocks it already read.
+/// still at work get theirs.
 const IDLE_DROP: Duration = Duration::from_secs(10);
-/// A reader that has not read for this long gives back all its read-ahead,
-/// and its next read starts its streams afresh, with small windows: a file
-/// kept open after its reads must not keep a share of the mount budget, and
-/// a read after a long pause must not fetch a whole window again. Shorter
-/// pauses (a training step, a batch) keep what the next reads need.
+/// A reader that has not read for this long gives back all its read-ahead
+/// and the blocks it read, and its next read starts its streams with small
+/// windows again: a file kept open after its reads must not keep a share of
+/// the mount budget, and a read after a long pause must not fetch a whole
+/// window again. Shorter pauses (a training step, a batch) keep what the
+/// next reads need.
 const IDLE_RELEASE: Duration = Duration::from_secs(120);
 /// Attempts per fetch before its remaining blocks fail with EIO.
 const MAX_ATTEMPTS: u32 = 3;
@@ -238,6 +239,8 @@ pub(crate) struct ReadAheadBudget {
     /// Bytes the readers hold or have reserved.
     held: AtomicU64,
     limit: u64,
+    /// Readers open on the mount: they split `MAX_TOTAL_BEHIND_BYTES`.
+    open: AtomicU64,
 }
 
 impl ReadAheadBudget {
@@ -246,6 +249,7 @@ impl ReadAheadBudget {
             readers: AtomicU64::new(0),
             held: AtomicU64::new(0),
             limit,
+            open: AtomicU64::new(0),
         })
     }
 
@@ -346,6 +350,7 @@ impl RemoteReader {
         forward_only: bool,
         budget: Arc<ReadAheadBudget>,
     ) -> Arc<Self> {
+        budget.open.fetch_add(1, Ordering::Relaxed);
         Arc::new(Self {
             file_info: XetFileInfo::new(xet_hash, file_size),
             file_size,
@@ -778,12 +783,28 @@ impl RemoteReader {
         }
     }
 
-    /// Drop the blocks read first beyond the budget of blocks already read.
+    /// Bytes of blocks already read this reader may keep.
+    fn behind_limit(&self) -> u64 {
+        let open = self.budget.open.load(Ordering::Relaxed).max(1);
+        self.max_behind_bytes
+            .min((MAX_TOTAL_BEHIND_BYTES / open).max(BLOCK_SIZE))
+    }
+
+    /// Drop the blocks read first beyond the budget of blocks already read,
+    /// except the last block of each live stream: its next read most often
+    /// starts in it, and another stream reading meanwhile must not make it
+    /// fetch that block again.
     fn evict_behind(&self, state: &mut State) {
-        while state.behind_bytes > self.max_behind_bytes
+        let limit = self.behind_limit();
+        let mut kept = 0;
+        while state.behind_bytes > limit
+            && kept < state.behind.len()
             && let Some(block) = state.behind.pop_front()
         {
-            if let Some(Block::Ready { data, .. }) = state.blocks.remove(&block) {
+            if state.live_streams().any(|stream| stream.last_block == block) {
+                state.behind.push_back(block);
+                kept += 1;
+            } else if let Some(Block::Ready { data, .. }) = state.blocks.remove(&block) {
                 state.behind_bytes -= data.len() as u64;
             }
         }
@@ -851,7 +872,7 @@ impl RemoteReader {
     /// Start the task that drops the read-ahead once the reader stops
     /// reading, unless it runs already.
     fn watch_idle(self: &Arc<Self>, state: &mut State) {
-        if (state.ahead_bytes > 0 || state.starved) && !state.idle_watch {
+        if (state.ahead_bytes > 0 || state.behind_bytes > 0 || state.starved) && !state.idle_watch {
             state.idle_watch = true;
             let task = tokio::spawn(drop_read_ahead_when_idle(Arc::downgrade(self)));
             state.fetches.push(task.abort_handle());
@@ -869,6 +890,7 @@ impl Drop for RemoteReader {
         state.ahead_bytes = 0;
         state.starved = false;
         self.budget.report(state);
+        self.budget.open.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -912,6 +934,15 @@ impl State {
     /// Streams that read within the last `STALE_READS` reads.
     fn live_streams(&self) -> impl Iterator<Item = &Stream> {
         self.streams.iter().filter(|stream| stream.is_live(self.tick))
+    }
+
+    /// Drop the blocks already read.
+    fn drop_behind(&mut self) {
+        while let Some(block) = self.behind.pop_front() {
+            if let Some(Block::Ready { data, .. }) = self.blocks.remove(&block) {
+                self.behind_bytes -= data.len() as u64;
+            }
+        }
     }
 
     /// Put a fetched `block` of `len` bytes in the eviction queue.
@@ -1155,7 +1186,8 @@ fn assemble(parts: &[Option<Bytes>], skip: u64, len: usize) -> Bytes {
 }
 
 /// Once `reader` is idle, give back its read-ahead beyond its share of the
-/// mount budget, then all of it after `IDLE_RELEASE`; end when it holds none.
+/// mount budget, then all of it and the blocks it read after
+/// `IDLE_RELEASE`; end when it holds none.
 async fn drop_read_ahead_when_idle(reader: Weak<RemoteReader>) {
     loop {
         let wake_at = {
@@ -1171,17 +1203,17 @@ async fn drop_read_ahead_when_idle(reader: Weak<RemoteReader>) {
             } else {
                 state.starved = false;
                 let release_at = state.progress_at.map_or(now, |at| at + IDLE_RELEASE);
-                let keep = if now >= release_at {
-                    0
-                } else {
-                    reader.ahead_limit(state)
-                };
+                let release = now >= release_at;
+                if release {
+                    state.drop_behind();
+                }
+                let keep = if release { 0 } else { reader.ahead_limit(state) };
                 reader.evict_unread(state, keep, true);
-                if state.ahead_bytes == 0 {
+                if state.ahead_bytes == 0 && state.behind_bytes == 0 {
                     state.idle_watch = false;
                     return;
                 }
-                if state.fetched_ahead() < state.ahead_bytes {
+                if release || state.fetched_ahead() < state.ahead_bytes {
                     // Blocks still in flight: check them soon after they arrive.
                     now + IDLE_DROP / 10
                 } else {
@@ -1331,6 +1363,9 @@ mod tests {
     use super::*;
     use crate::test_mocks::MockXet;
     use futures::FutureExt;
+
+    /// The default read-ahead budget of a mount (`--read-ahead-mb`).
+    const MAX_TOTAL_AHEAD_BYTES: u64 = 1024 * 1_048_576;
 
     fn pattern(len: usize) -> Vec<u8> {
         (0..len).map(|i| (i % 251) as u8).collect()
@@ -1817,8 +1852,15 @@ mod tests {
 
         let (data, _) = long.await.unwrap().unwrap();
         assert!(data[..] == content[..6 * BLOCK_SIZE as usize]);
+        // Beyond the budget, only the last blocks of the streams stay.
         let state = reader.lock();
-        assert!(state.behind_bytes <= BLOCK_SIZE, "behind {}", state.behind_bytes);
+        let last_blocks: Vec<u64> = state.streams.iter().map(|stream| stream.last_block).collect();
+        let others = state.behind.iter().filter(|block| !last_blocks.contains(block)).count() as u64;
+        assert!(
+            others * BLOCK_SIZE <= BLOCK_SIZE,
+            "behind {:?}, last blocks {last_blocks:?}",
+            state.behind
+        );
     }
 
     /// A reader counts toward the split while it holds read-ahead, and
@@ -2053,6 +2095,76 @@ mod tests {
         }
         assert_eq!(ahead(&reader), 0);
         assert_eq!(budget.readers.load(Ordering::Relaxed), 0);
+    }
+
+    /// Readers open on one mount split the memory for blocks already read:
+    /// many open files (memory-mapped dataset shards) do not each keep
+    /// `MAX_BEHIND_BYTES`.
+    #[tokio::test]
+    async fn open_readers_split_the_blocks_already_read() {
+        let xet = MockXet::new();
+        let content = pattern(64 * BLOCK_SIZE as usize);
+        xet.add_file("hash", &content);
+        let budget = ReadAheadBudget::new(MAX_TOTAL_AHEAD_BYTES);
+        let readers: Vec<_> = (0..64)
+            .map(|_| {
+                RemoteReader::new(
+                    "hash".into(),
+                    content.len() as u64,
+                    xet.clone(),
+                    Duration::from_secs(5),
+                    false,
+                    budget.clone(),
+                )
+            })
+            .collect();
+
+        for block in 0..64 {
+            readers[0].read(block * BLOCK_SIZE, BLOCK_SIZE as u32).await.unwrap();
+        }
+        let behind = readers[0].lock().behind_bytes;
+        // One more block: the last block of the stream stays.
+        assert!(
+            behind <= MAX_TOTAL_BEHIND_BYTES / 64 + BLOCK_SIZE,
+            "{} blocks already read kept",
+            behind / BLOCK_SIZE
+        );
+    }
+
+    /// An idle reader gives back the blocks it read along with its
+    /// read-ahead, after `IDLE_RELEASE`: the page cache holds them.
+    #[tokio::test(start_paused = true)]
+    async fn idle_reader_releases_the_blocks_it_read() {
+        let xet = MockXet::new();
+        let content = pattern(64 * BLOCK_SIZE as usize);
+        let reader = reader_for(&xet, &content, false);
+
+        for block in 8..16 {
+            reader.read(block * BLOCK_SIZE, BLOCK_SIZE as u32).await.unwrap();
+        }
+        assert!(reader.lock().behind_bytes > 0);
+        tokio::time::sleep(IDLE_RELEASE + IDLE_DROP).await;
+        let state = reader.lock();
+        assert_eq!(state.behind_bytes, 0);
+        assert!(state.blocks.is_empty(), "{} blocks left", state.blocks.len());
+    }
+
+    /// The last block of a live stream stays at hand while other streams
+    /// read: the next read of that stream most often starts in it.
+    #[tokio::test]
+    async fn last_block_of_a_live_stream_stays() {
+        let xet = MockXet::new();
+        let content = pattern(256 * BLOCK_SIZE as usize);
+        let reader = reader_with_limits(&xet, &content, MAX_AHEAD_BYTES, 4 * BLOCK_SIZE);
+
+        reader.read(100 * BLOCK_SIZE, (BLOCK_SIZE / 2) as u32).await.unwrap();
+        for block in 150..182 {
+            reader.read(block * BLOCK_SIZE, BLOCK_SIZE as u32).await.unwrap();
+        }
+        assert!(reader.lock().blocks.contains_key(&100), "block 100 evicted");
+        let offset = 100 * BLOCK_SIZE + BLOCK_SIZE / 2;
+        let (data, _) = reader.read(offset, (BLOCK_SIZE / 2) as u32).await.unwrap();
+        assert!(data[..] == content[offset as usize..(offset + BLOCK_SIZE / 2) as usize]);
     }
 
     /// An idle reader gives back its read-ahead beyond its share once

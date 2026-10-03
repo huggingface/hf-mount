@@ -21,7 +21,7 @@ mod remote_reader;
 mod staging;
 use crate::xet::{StagingDir, StreamingWriterOps, XetOps};
 use inode::{InodeEntry, InodeKind, InodeTable};
-use remote_reader::{MAX_TOTAL_AHEAD_BYTES, ReadAheadBudget, RemoteReader};
+use remote_reader::{ReadAheadBudget, RemoteReader};
 use staging::StagingCoordinator;
 
 // ── Constants ──────────────────────────────────────────────────────────
@@ -141,6 +141,8 @@ pub struct VfsConfig {
     /// instead of hanging. `Duration::ZERO` disables the bound (legacy
     /// behaviour).
     pub read_fetch_timeout: Duration,
+    /// Read-ahead memory shared by the remote readers of all open handles.
+    pub read_ahead_bytes: u64,
     /// 0 disables the LRU evictor.
     pub inode_soft_limit: usize,
     pub lru_sweep_interval: Duration,
@@ -366,7 +368,7 @@ impl VirtualFs {
             serve_lookup_from_cache: config.serve_lookup_from_cache,
             filter_os_files: config.filter_os_files,
             direct_io: config.direct_io,
-            read_ahead_budget: ReadAheadBudget::new(MAX_TOTAL_AHEAD_BYTES),
+            read_ahead_budget: ReadAheadBudget::new(config.read_ahead_bytes),
             file_cache,
         });
 
