@@ -795,10 +795,22 @@ impl RemoteReader {
             .min(state.in_flight_cap / BLOCK_SIZE / 2)
             .max(1);
         let (mut new_end, mut taken, mut cut) = (end, 0, false);
+        let (mut cell, mut taken_to_cell) = (start, 0);
         for &block in missing {
             let len = self.block_len(block);
+            if block.is_multiple_of(MAX_FETCH_BLOCKS) {
+                (cell, taken_to_cell) = (block, taken);
+            }
             if taken + len > reserved {
-                new_end = if block - start >= run { block } else { start };
+                // Back to the last cell boundary when that leaves a run
+                // worth a fetch: see `push_block`.
+                (new_end, taken) = if cell - start >= run {
+                    (cell, taken_to_cell)
+                } else if block - start >= run {
+                    (block, taken)
+                } else {
+                    (start, 0)
+                };
                 cut = true;
                 break;
             }
@@ -1253,12 +1265,17 @@ fn block_len(file_size: u64, block: u64) -> u64 {
     BLOCK_SIZE.min(file_size - block * BLOCK_SIZE)
 }
 
-/// Add `block` to the fetch runs, extending the last run when contiguous
-/// and shorter than its distance to `next`, the block the reader needs next
-/// (clamped to `[MIN_FETCH_BLOCKS, MAX_FETCH_BLOCKS]`).
+/// Add `block` to the fetch runs, extending the last run when contiguous,
+/// shorter than its distance to `next`, the block the reader needs next
+/// (clamped to `[MIN_FETCH_BLOCKS, MAX_FETCH_BLOCKS]`), and in the same cell
+/// of `MAX_FETCH_BLOCKS` blocks. Runs that stay within cells come back the
+/// same on every pass over a file, and so do their reconstruction queries:
+/// the chunk cache serves a range only from one item that holds all of it,
+/// and the plan cache only for the same range.
 fn push_block(runs: &mut Vec<(u64, u64, bool)>, block: u64, read_ahead: bool, next: u64) {
     if let Some(run) = runs.last_mut()
         && run.1 == block
+        && !block.is_multiple_of(MAX_FETCH_BLOCKS)
         && run.1 - run.0 < run.0.saturating_sub(next).clamp(MIN_FETCH_BLOCKS, MAX_FETCH_BLOCKS)
     {
         run.1 += 1;
@@ -1751,6 +1768,31 @@ mod tests {
             calls.windows(2).all(|pair| pair[0].1 == pair[1].0),
             "fetches overlap or leave gaps: {calls:?}"
         );
+    }
+
+    /// Fetch runs stay within cells of `MAX_FETCH_BLOCKS` blocks, also for a
+    /// scan that starts inside a cell, so that every pass over a file fetches
+    /// the same ranges: past the first cell, whole cells.
+    #[tokio::test]
+    async fn fetch_runs_stay_within_cells() {
+        let xet = MockXet::new();
+        let content = pattern(1024 * BLOCK_SIZE as usize);
+        let reader = reader_for(&xet, &content, false);
+
+        let read_size = 128 * 1024u64;
+        let mut offset = 37 * BLOCK_SIZE + 1000;
+        while offset < 700 * BLOCK_SIZE {
+            reader.read(offset, read_size as u32).await.unwrap();
+            offset += read_size;
+        }
+        let cell = MAX_FETCH_BLOCKS * BLOCK_SIZE;
+        let calls = stream_calls(&xet);
+        assert!(
+            calls.iter().all(|(start, end, _)| start / cell == (end - 1) / cell),
+            "a run crosses a cell boundary: {calls:?}"
+        );
+        let whole = calls.iter().filter(|(start, end, _)| end - start == cell).count();
+        assert!(whole >= 3, "{whole} whole cells fetched: {calls:?}");
     }
 
     /// A sequential scan reads ahead up to the end of the file: the last
