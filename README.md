@@ -227,6 +227,7 @@ The same `FUSE_NOTIFY_INVAL_INODE` writev can also wedge at **runtime** (not jus
 | `--poll-listing-concurrency` | `4` | Max concurrent tree-listing requests per poll round. Main knob to throttle load on the Hub `/api` endpoint; lower it in shared environments where many mounts poll in parallel. |
 | `--live-follow` | `true` | Subscribe to the Hub's bucket live-follow event stream (SSE): remote changes are applied to loaded directories as they happen, and the periodic poll fan-out is skipped while the stream is healthy. Falls back to interval polling automatically when the Hub doesn't serve the feed (older deployments, repo mounts). Works with `--poll-interval-secs 0` too (no fallback then). Disable with `--live-follow=false`. |
 | `--max-threads` | `16` | Maximum FUSE worker threads (Linux only) |
+| `--read-ahead-mb` | `1024` | Memory for read-ahead, shared by the files open on the mount (MiB). Files read at once split it, and one file holds at most 512 MiB of it. Lower it where the daemon has a tight memory limit, together with `HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT` (xet-core download buffers, 1 GiB by default). |
 | `--metadata-ttl-ms` | `10000` | How long file metadata is cached before re-checking (ms) |
 | `--metadata-ttl-minimal` | `false` | Re-check on every access (maximum freshness, lower throughput) |
 | `--negative-ttl-ms` | `1000` | How long a lookup miss (ENOENT) is remembered before re-probing the Hub. Caps HEAD traffic for missing paths; also the longest a remotely-added file stays hidden from a client that probed it before it existed. |
@@ -342,7 +343,7 @@ A lookup of a path that does not exist yet probes the Hub directly, so a file ad
 
 hf-mount sits between your application and the Hugging Face Hub. It presents a standard filesystem interface (FUSE or NFS) and translates file operations into Hub API calls and storage fetches.
 
-Reads go through an adaptive prefetch buffer that starts small and grows with sequential access. Writes are uploaded to HF storage and committed via the Hub API. A background poll loop keeps the local view in sync with remote changes.
+Reads fetch remote data in blocks, several ranges at a time, with a read-ahead window that grows for each sequential stream, so parallel readers of one file (such as memory-mapped model loaders) do not wait on each other. Writes are uploaded to HF storage and committed via the Hub API. A background poll loop keeps the local view in sync with remote changes.
 
 Built on [xet-core](https://github.com/huggingface/xet-core) for content-addressed storage and efficient file transfers, and [fuser](https://github.com/cberner/fuser) for the FUSE implementation.
 

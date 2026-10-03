@@ -136,6 +136,43 @@ async fn test_fuse_deep_cold_read() {
     }
 }
 
+/// Parallel page faults on one memory-mapped remote file (how transformers
+/// and torch load checkpoints) are served concurrently and correctly, even
+/// with few FUSE worker threads.
+#[tokio::test]
+async fn test_fuse_parallel_mmap_read() {
+    let mut content = vec![0u8; 48 << 20];
+    common::PseudoRandomBytes::new(0).fill(&mut content);
+    let guard = match common::setup_bucket_with_file("fuse-mmap-read", "model.bin", &content).await {
+        Some(g) => g,
+        None => return,
+    };
+
+    let mount_point = format!("/tmp/hf-mount-mmap-mnt-{}", std::process::id());
+    let cache_dir = format!("/tmp/hf-mount-mmap-cache-{}", std::process::id());
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let child = common::mount_bucket(
+            &guard.bucket_id,
+            &mount_point,
+            &cache_dir,
+            &["--read-only", "--max-threads", "4", "--no-disk-cache"],
+        );
+        let op = common::fs_tests::assert_parallel_mmap_read(&mount_point, "model.bin", &content, 16);
+        common::unmount(&mount_point, child, 30);
+        op
+    }));
+
+    std::fs::remove_dir_all(&mount_point).ok();
+    std::fs::remove_dir_all(&cache_dir).ok();
+
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => panic!("parallel mmap read test failed: {}", e),
+        Err(e) => std::panic::resume_unwind(e),
+    }
+}
+
 /// Test HEAD revalidation: remote file changes are detected via lookup() HEAD
 /// A directory uploaded remotely after the parent's listing was cached
 /// (poll disabled, so no background refresh) must still be discoverable
@@ -247,5 +284,108 @@ async fn test_fuse_revalidation() {
 
     if let Err(e) = result {
         panic!("FUSE revalidation test failed: {}", e);
+    }
+}
+
+/// Many cold sequential readers at once, more readers than FUSE worker
+/// threads, each file read in many fetches under the shared read-ahead
+/// budget. Regression test for #234: readers must not starve each other for
+/// download buffer, and no read may time out or fail.
+#[tokio::test]
+async fn test_fuse_parallel_cold_reads() {
+    const FILE_COUNT: usize = 24;
+    const CHUNK: usize = 1 << 20;
+    const FILE_SIZE: usize = 64 * CHUNK;
+
+    let guard = match common::setup_bucket("fuse-par-read").await {
+        Some(g) => g,
+        None => return,
+    };
+    let rel_paths = common::seed_parallel_read_files(&guard.hub, "fuse-pr", FILE_COUNT, FILE_SIZE).await;
+
+    let mount_point = format!("/tmp/hf-mount-pr-mnt-{}", std::process::id());
+    let cache_dir = format!("/tmp/hf-mount-pr-cache-{}", std::process::id());
+    let log_path = format!("/tmp/hf-mount-pr-log-{}.txt", std::process::id());
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let child = common::mount_bucket_logged(
+            &guard.bucket_id,
+            &mount_point,
+            &cache_dir,
+            // Few workers and a short fetch timeout so a wedge shows up as
+            // EIO within seconds instead of minutes.
+            &["--read-only", "--max-threads", "4", "--read-fetch-timeout-ms", "5000"],
+            &log_path,
+        );
+
+        let started = std::time::Instant::now();
+        let readers: Vec<_> = rel_paths
+            .iter()
+            .enumerate()
+            .map(|(i, rel)| {
+                let path = format!("{}/{}", mount_point, rel);
+                std::thread::spawn(move || -> Result<(), String> {
+                    use std::io::Read;
+                    let mut file = std::fs::File::open(&path).map_err(|e| format!("{path}: open: {e}"))?;
+                    let mut expected_gen = common::PseudoRandomBytes::new(i as u64);
+                    let mut got = vec![0u8; CHUNK];
+                    let mut expected = vec![0u8; CHUNK];
+                    for chunk in 0..FILE_SIZE / CHUNK {
+                        file.read_exact(&mut got)
+                            .map_err(|e| format!("{path}: read at {}: {e}", chunk * CHUNK))?;
+                        expected_gen.fill(&mut expected);
+                        if got != expected {
+                            return Err(format!("{path}: content mismatch at {}", chunk * CHUNK));
+                        }
+                    }
+                    if file.read(&mut got).map_err(|e| format!("{path}: read at eof: {e}"))? != 0 {
+                        return Err(format!("{path}: longer than {FILE_SIZE}"));
+                    }
+                    Ok(())
+                })
+            })
+            .collect();
+
+        let mut errors = Vec::new();
+        for reader in readers {
+            match reader.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => errors.push(e),
+                Err(_) => errors.push("reader thread panicked".to_string()),
+            }
+        }
+        eprintln!(
+            "{} readers x {} MiB done in {:?}",
+            FILE_COUNT,
+            FILE_SIZE / CHUNK,
+            started.elapsed()
+        );
+
+        common::unmount(&mount_point, child, 30);
+
+        // A single timeout is retried and would otherwise be invisible.
+        let log_text = std::fs::read_to_string(&log_path).unwrap_or_default();
+        let timeouts = log_text.matches("reader: no data for").count();
+        if !errors.is_empty() || timeouts > 0 {
+            let log_tail: Vec<&str> = log_text.lines().rev().take(20).collect();
+            return Err(format!(
+                "{} read errors, {} stream timeouts\nerrors: {:#?}\ndaemon log tail:\n{}",
+                errors.len(),
+                timeouts,
+                errors,
+                log_tail.into_iter().rev().collect::<Vec<_>>().join("\n"),
+            ));
+        }
+        Ok(())
+    }));
+
+    std::fs::remove_dir_all(&mount_point).ok();
+    std::fs::remove_dir_all(&cache_dir).ok();
+    std::fs::remove_file(&log_path).ok();
+
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => panic!("parallel cold read test failed: {}", e),
+        Err(e) => std::panic::resume_unwind(e),
     }
 }
