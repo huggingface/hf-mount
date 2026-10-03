@@ -86,8 +86,20 @@ const IDLE_DROP: Duration = Duration::from_secs(10);
 /// window again. Shorter pauses (a training step, a batch) keep what the
 /// next reads need.
 const IDLE_RELEASE: Duration = Duration::from_secs(120);
-/// Attempts per fetch before its remaining blocks fail with EIO.
+/// Attempts in a row that deliver nothing before the remaining blocks of a
+/// fetch fail with EIO. An attempt that delivers blocks resets the count.
 const MAX_ATTEMPTS: u32 = 3;
+/// Age of a read-ahead fetch in flight past which no read-ahead starts,
+/// when the fetch timeout is disabled (otherwise a quarter of it): a quarter
+/// of the default fetch timeout.
+const SLOW_FETCH: Duration = Duration::from_millis(7_500);
+/// Read-ahead bytes in flight a reader starts with. Each read-ahead fetch
+/// that arrives before it is slow adds its bytes to the cap, up to half the
+/// reader limit, and each one that arrives later or fails halves it, down to
+/// `MIN_IN_FLIGHT`: on a slow link, the bytes in flight stay about what the
+/// link downloads before a fetch is slow, well within the fetch timeout.
+const START_IN_FLIGHT: u64 = 64 * 1_048_576;
+const MIN_IN_FLIGHT: u64 = 8 * 1_048_576;
 
 /// A block fetch outcome: `None` while in flight, then the data or an errno.
 type Fill = Option<Result<Bytes, i32>>;
@@ -189,6 +201,11 @@ struct State {
     last_stream: u64,
     /// Last fetch id handed out.
     last_fetch: u64,
+    /// Read-ahead fetches in flight, by id: when each started, its blocks
+    /// not delivered yet, and its bytes.
+    in_flight: HashMap<u64, (tokio::time::Instant, u64, u64)>,
+    /// Most bytes in flight for read-ahead (see `START_IN_FLIGHT`).
+    in_flight_cap: u64,
     /// Furthest block read so far.
     frontier: Option<u64>,
     /// Read-ahead window, in blocks, given at once to a stream that starts
@@ -360,7 +377,10 @@ impl RemoteReader {
             max_ahead_bytes: MAX_AHEAD_BYTES,
             max_behind_bytes: MAX_BEHIND_BYTES,
             budget,
-            state: Mutex::new(State::default()),
+            state: Mutex::new(State {
+                in_flight_cap: START_IN_FLIGHT,
+                ..State::default()
+            }),
         })
     }
 
@@ -384,7 +404,28 @@ impl RemoteReader {
         let first = offset / BLOCK_SIZE;
         let last = (end - 1) / BLOCK_SIZE;
 
-        let (mut parts, waiting) = self.plan(first, last, offset - first * BLOCK_SIZE);
+        let skip = offset - first * BLOCK_SIZE;
+        let parts = match self.collect(first, last, skip).await {
+            Ok(parts) => parts,
+            // A fetch this read only joined gave up, maybe before the network
+            // came back: try once more, with fetches of its own.
+            Err((_, true)) => self.collect(first, last, skip).await.map_err(|(errno, _)| errno)?,
+            Err((errno, false)) => return Err(errno),
+        };
+        if self.forward_only {
+            self.drop_read(first, last, end);
+        }
+
+        let data = assemble(&parts, skip, (end - offset) as usize);
+        Ok((data, end == self.file_size))
+    }
+
+    /// The blocks `[first, last]` of a read that starts `skip` bytes into
+    /// block `first`, once all of them arrived. On failure, the errno, and
+    /// whether the fetch that failed was one the read joined rather than
+    /// started.
+    async fn collect(self: &Arc<Self>, first: u64, last: u64, skip: u64) -> Result<Vec<Option<Bytes>>, (i32, bool)> {
+        let (mut parts, waiting) = self.plan(first, last, skip);
         if let Some(mut waiting) = waiting {
             let started = std::time::Instant::now();
             // All at once, in the order they arrive: a block whose fetch gave
@@ -392,14 +433,16 @@ impl RemoteReader {
             let mut fills: FuturesUnordered<_> = waiting
                 .waits
                 .iter_mut()
-                .map(|(index, _, fill)| async move {
-                    match fill.wait_for(Option::is_some).await {
+                .map(|wait| async move {
+                    let joined = wait.joined;
+                    match wait.fill.wait_for(Option::is_some).await {
                         Ok(fill) => fill
                             .clone()
                             .expect("wait_for returns a filled value")
-                            .map(|data| (*index, data)),
+                            .map(|data| (wait.index, data))
+                            .map_err(|errno| (errno, joined)),
                         // The fetch task ended without an outcome (runtime shutdown).
-                        Err(_) => Err(libc::EIO),
+                        Err(_) => Err((libc::EIO, joined)),
                     }
                 })
                 .collect();
@@ -408,17 +451,12 @@ impl RemoteReader {
             }
             debug!(
                 "reader: read at {} of {} waited {:?}",
-                offset,
+                first * BLOCK_SIZE + skip,
                 self.file_info.hash(),
                 started.elapsed()
             );
         }
-        if self.forward_only {
-            self.drop_read(first, last, end);
-        }
-
-        let data = assemble(&parts, offset - first * BLOCK_SIZE, (end - offset) as usize);
-        Ok((data, end == self.file_size))
+        Ok(parts)
     }
 
     fn block_count(&self) -> u64 {
@@ -484,7 +522,12 @@ impl RemoteReader {
                 Some(Block::Pending { fill, waiters, fetch }) => {
                     let first_waiter = *waiters == 0;
                     *waiters += 1;
-                    waits.push((index, *fetch, fill.clone()));
+                    waits.push(Wait {
+                        index,
+                        fetch: *fetch,
+                        joined: true,
+                        fill: fill.clone(),
+                    });
                     if first_waiter {
                         state.pending_read_bytes += self.block_len(block);
                     }
@@ -510,7 +553,12 @@ impl RemoteReader {
         let receivers;
         (receivers, fetches) = self.prepare_fetches(state, runs, stream, Some(last));
         for (block, fetch, fill) in receivers {
-            waits.push(((block - first) as usize, fetch, fill));
+            waits.push(Wait {
+                index: (block - first) as usize,
+                fetch,
+                joined: false,
+                fill,
+            });
         }
         // The share shrinks as other readers start: give fetched read-ahead
         // back down to it.
@@ -577,6 +625,12 @@ impl RemoteReader {
         for (start, end, read_ahead) in runs {
             state.last_fetch += 1;
             let fetch = state.last_fetch;
+            if read_ahead {
+                let bytes = (end * BLOCK_SIZE).min(self.file_size) - start * BLOCK_SIZE;
+                state
+                    .in_flight
+                    .insert(fetch, (tokio::time::Instant::now(), end - start, bytes));
+            }
             let mut senders = VecDeque::with_capacity((end - start) as usize);
             for block in start..end {
                 let (sender, fill) = watch::channel(None);
@@ -665,6 +719,34 @@ impl RemoteReader {
         }
     }
 
+    /// A block of fetch `fetch` arrived (`ok`) or failed. A read-ahead fetch
+    /// leaves `in_flight` with its last block, and adjusts the cap of bytes
+    /// in flight by how long it took.
+    fn settle(&self, state: &mut State, fetch: u64, ok: bool) {
+        let Some((started, left, bytes)) = state.in_flight.get_mut(&fetch) else {
+            return;
+        };
+        *left -= 1;
+        if *left > 0 {
+            return;
+        }
+        let (in_time, bytes) = (ok && started.elapsed() <= self.max_fetch_age(), *bytes);
+        state.in_flight.remove(&fetch);
+        state.in_flight_cap = if in_time {
+            (state.in_flight_cap + bytes).min(self.max_ahead_bytes / 2)
+        } else {
+            (state.in_flight_cap / 2).max(MIN_IN_FLIGHT)
+        };
+    }
+
+    /// Age of a read-ahead fetch in flight past which no read-ahead starts.
+    fn max_fetch_age(&self) -> Duration {
+        match self.fetch_timeout {
+            Duration::ZERO => SLOW_FETCH,
+            timeout => timeout / 4,
+        }
+    }
+
     /// Read-ahead bytes this reader may hold.
     fn ahead_limit(&self, state: &State) -> u64 {
         self.max_ahead_bytes.min(self.budget.share(state.counted))
@@ -689,6 +771,16 @@ impl RemoteReader {
         let allowed = limit
             .saturating_sub(state.ahead_bytes)
             .min((limit / 2).saturating_sub(state.pending_bytes));
+        // A fetch slow to arrive means the link does not keep up: more in
+        // flight would only queue behind it and make every fetch wait past
+        // the fetch timeout. Wait for fetches to arrive instead, so that the
+        // bytes in flight stay about what the link downloads meanwhile.
+        let slow = self.max_fetch_age();
+        let allowed = if state.in_flight.values().any(|(at, _, _)| at.elapsed() > slow) {
+            0
+        } else {
+            allowed.min(state.in_flight_cap.saturating_sub(state.pending_bytes))
+        };
         self.budget.report(state);
         let reserved = self.budget.reserve(allowed);
         // Short of the mount budget, any run worth a fetch is better than
@@ -698,7 +790,10 @@ impl RemoteReader {
         } else {
             run
         };
-        let run = run.min(limit / BLOCK_SIZE / 4).max(1);
+        let run = run
+            .min(limit / BLOCK_SIZE / 4)
+            .min(state.in_flight_cap / BLOCK_SIZE / 2)
+            .max(1);
         let (mut new_end, mut taken, mut cut) = (end, 0, false);
         for &block in missing {
             let len = self.block_len(block);
@@ -846,6 +941,7 @@ impl RemoteReader {
             read_to: 0,
         };
         state.pending_bytes -= len;
+        self.settle(state, fetch, true);
         // Reads wait for it: no longer read-ahead, and not in the eviction
         // queue before the last of them ends (`Waiting` queues it then).
         if waiters > 0 {
@@ -858,8 +954,9 @@ impl RemoteReader {
     fn fail(&self, blocks: std::ops::Range<u64>) {
         let mut guard = self.lock();
         for block in blocks {
-            if let Some(&Block::Pending { waiters, .. }) = guard.blocks.get(&block) {
+            if let Some(&Block::Pending { waiters, fetch, .. }) = guard.blocks.get(&block) {
                 guard.blocks.remove(&block);
+                self.settle(&mut guard, fetch, false);
                 guard.ahead_bytes -= self.block_len(block);
                 guard.pending_bytes -= self.block_len(block);
                 if waiters > 0 {
@@ -901,8 +998,18 @@ struct Waiting<'a> {
     reader: &'a RemoteReader,
     /// First block of the read.
     first: u64,
-    /// Blocks to wait for, as (index from `first`, fetch id, fetch outcome).
-    waits: Vec<(usize, u64, watch::Receiver<Fill>)>,
+    waits: Vec<Wait>,
+}
+
+/// A block a read waits for.
+struct Wait {
+    /// Index of the block from the first block of the read.
+    index: usize,
+    /// The fetch of the block.
+    fetch: u64,
+    /// The read found the block in flight rather than starting its fetch.
+    joined: bool,
+    fill: watch::Receiver<Fill>,
 }
 
 impl Drop for Waiting<'_> {
@@ -911,9 +1018,9 @@ impl Drop for Waiting<'_> {
         let state = &mut *guard;
         state.waiting -= 1;
         state.progress_at = Some(tokio::time::Instant::now());
-        for &(index, fetch, _) in &self.waits {
-            let block = self.first + index as u64;
-            state.leave(block, fetch, self.reader.block_len(block));
+        for wait in &self.waits {
+            let block = self.first + wait.index as u64;
+            state.leave(block, wait.fetch, self.reader.block_len(block));
         }
         self.reader.evict_behind(state);
     }
@@ -1239,8 +1346,9 @@ async fn next_chunk(
 }
 
 /// Stream the byte range of `run` and deliver it block by block. A failed
-/// attempt resumes at the first block not yet delivered; after the last
-/// attempt, dropping `run` fails the blocks left and wakes their readers.
+/// attempt resumes at the first block not yet delivered; after
+/// `MAX_ATTEMPTS` in a row that deliver nothing, dropping `run` fails the
+/// blocks left and wakes their readers.
 async fn fetch_run(mut run: FetchRun) {
     let Some((xet, file_info, file_size, timeout)) = run.reader.upgrade().map(|reader| {
         (
@@ -1256,8 +1364,10 @@ async fn fetch_run(mut run: FetchRun) {
     let end = ((first_block + run.senders.len() as u64) * BLOCK_SIZE).min(file_size);
     let started = std::time::Instant::now();
 
-    for attempt in 1..=MAX_ATTEMPTS {
+    let mut attempt = 1;
+    loop {
         let start = run.next * BLOCK_SIZE;
+        let resumed_at = run.next;
         match xet.download_stream_boxed(&file_info, start, end, run.stream.is_some()) {
             Err(err) => warn!(
                 "reader: stream open failed at {} of {}, attempt {}/{}: {}",
@@ -1344,13 +1454,18 @@ async fn fetch_run(mut run: FetchRun) {
                 }
             }
         }
-        if attempt < MAX_ATTEMPTS {
-            tokio::time::sleep(Duration::from_millis(100 * attempt as u64)).await;
+        if run.next > resumed_at {
+            attempt = 1;
+        } else if attempt == MAX_ATTEMPTS {
+            break;
+        } else {
+            attempt += 1;
         }
+        tokio::time::sleep(Duration::from_millis(100 * u64::from(attempt.max(2) - 1))).await;
     }
 
     error!(
-        "reader: giving up on [{}, {}) of {} after {} attempts",
+        "reader: giving up on [{}, {}) of {} after {} attempts in a row",
         run.next * BLOCK_SIZE,
         end,
         file_info.hash(),
@@ -2304,6 +2419,65 @@ mod tests {
         // The failed block is forgotten: the next read fetches it again.
         let (data, _) = reader.read(BLOCK_SIZE, 4096).await.unwrap();
         assert!(data[..] == content[BLOCK_SIZE as usize..BLOCK_SIZE as usize + 4096]);
+    }
+
+    /// On a slow link, read-ahead waits for slow fetches instead of piling
+    /// more in flight behind them: every fetch gets its data within the
+    /// fetch timeout, and a long sequential read gets no error.
+    #[tokio::test(start_paused = true)]
+    async fn slow_link_reads_without_fetch_timeouts() {
+        let xet = MockXet::new();
+        let content = pattern(384 * 1_048_576);
+        let reader = reader_with(&xet, &content, |reader| reader.fetch_timeout = Duration::from_secs(30));
+        // 3 MB/s, in 8 MiB terms served in the order they were asked for.
+        xet.set_link(3_000_000, 8 * 1_048_576);
+
+        let chunk = 1_048_576u64;
+        for offset in (0..256 * chunk).step_by(chunk as usize) {
+            let (data, _) = reader.read(offset, chunk as u32).await.unwrap();
+            assert!(data[..] == content[offset as usize..(offset + chunk) as usize]);
+        }
+    }
+
+    /// Attempts that each deliver part of a fetch do not use up its
+    /// attempts: only attempts in a row that deliver nothing do.
+    #[tokio::test(start_paused = true)]
+    async fn attempts_that_deliver_blocks_do_not_count() {
+        let xet = MockXet::new();
+        let content = pattern(64 * BLOCK_SIZE as usize);
+        let reader = reader_for(&xet, &content, false);
+        // Every attempt delivers one block, then fails.
+        xet.fail_streams_after(BLOCK_SIZE as usize);
+
+        let offset = 8 * BLOCK_SIZE;
+        let size = (u64::from(MAX_ATTEMPTS) + 2) * BLOCK_SIZE;
+        let (data, _) = reader.read(offset, size as u32).await.unwrap();
+        assert!(data[..] == content[offset as usize..(offset + size) as usize]);
+    }
+
+    /// A read that joined a fetch that gave up tries once more with a fetch
+    /// of its own, as the network may be back by then. The read that started
+    /// the fetch fails.
+    #[tokio::test(start_paused = true)]
+    async fn read_that_joined_a_failed_fetch_tries_again() {
+        let xet = MockXet::new();
+        let content = pattern(64 * BLOCK_SIZE as usize);
+        let reader = reader_for(&xet, &content, false);
+        xet.fail_range_downloads(MAX_ATTEMPTS);
+
+        let offset = 8 * BLOCK_SIZE;
+        let starting = {
+            let reader = reader.clone();
+            tokio::spawn(async move { reader.read(offset, 4096).await })
+        };
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let joining = {
+            let reader = reader.clone();
+            tokio::spawn(async move { reader.read(offset, 4096).await })
+        };
+        assert_eq!(starting.await.unwrap().unwrap_err(), libc::EIO);
+        let (data, _) = joining.await.unwrap().unwrap();
+        assert!(data[..] == content[offset as usize..offset as usize + 4096]);
     }
 
     /// A read that waited for a block its fetch gave up on may end after a
