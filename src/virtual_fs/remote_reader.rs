@@ -89,9 +89,9 @@ const IDLE_RELEASE: Duration = Duration::from_secs(120);
 /// Attempts in a row that deliver nothing before the remaining blocks of a
 /// fetch fail with EIO. An attempt that delivers blocks resets the count.
 const MAX_ATTEMPTS: u32 = 3;
-/// Age of a read-ahead fetch in flight past which no read-ahead starts,
-/// when the fetch timeout is disabled (otherwise a quarter of it): a quarter
-/// of the default fetch timeout.
+/// Time a read-ahead fetch may take before it is slow, when the fetch
+/// timeout is disabled (otherwise a quarter of it): a quarter of the default
+/// fetch timeout.
 const SLOW_FETCH: Duration = Duration::from_millis(7_500);
 /// Read-ahead bytes in flight a reader starts with. Each read-ahead fetch
 /// that arrives before it is slow adds its bytes to the cap, up to half the
@@ -597,7 +597,7 @@ impl RemoteReader {
         // No fetch can start while the bytes in flight are at their bound:
         // skip collecting the range, up to a window of lookups per read.
         let limit = self.ahead_limit(state);
-        if state.pending_bytes >= (limit / 2).min(state.in_flight_cap) || self.slow_fetch_in_flight(state) {
+        if state.pending_bytes >= limit / 2 || state.read_ahead_in_flight() >= state.in_flight_cap {
             state.starved = false;
             return;
         }
@@ -746,13 +746,7 @@ impl RemoteReader {
         };
     }
 
-    /// Whether a read-ahead fetch in flight is older than `max_fetch_age`.
-    fn slow_fetch_in_flight(&self, state: &State) -> bool {
-        let slow = self.max_fetch_age();
-        state.in_flight.values().any(|(at, _, _)| at.elapsed() > slow)
-    }
-
-    /// Age of a read-ahead fetch in flight past which no read-ahead starts.
+    /// Time a read-ahead fetch may take before it is slow.
     fn max_fetch_age(&self) -> Duration {
         match self.fetch_timeout {
             Duration::ZERO => SLOW_FETCH,
@@ -784,15 +778,11 @@ impl RemoteReader {
         let allowed = limit
             .saturating_sub(state.ahead_bytes)
             .min((limit / 2).saturating_sub(state.pending_bytes));
-        // A fetch slow to arrive means the link does not keep up: more in
-        // flight would only queue behind it and make every fetch wait past
-        // the fetch timeout. Wait for fetches to arrive instead, so that the
-        // bytes in flight stay about what the link downloads meanwhile.
-        let allowed = if self.slow_fetch_in_flight(state) {
-            0
-        } else {
-            allowed.min(state.in_flight_cap.saturating_sub(state.pending_bytes))
-        };
+        // On a link that does not keep up, more in flight would only queue
+        // behind the fetches already asked for, past the fetch timeout: the
+        // cap keeps it to about what the link downloads before a fetch is
+        // slow.
+        let allowed = allowed.min(state.in_flight_cap.saturating_sub(state.read_ahead_in_flight()));
         self.budget.report(state);
         // No more than the range needs: the rest would keep the budget from
         // concurrent readers until the release below.
@@ -1058,6 +1048,13 @@ impl State {
     /// `IDLE_DROP`: the streams of the reader have most likely stopped.
     fn idle(&self) -> bool {
         self.waiting == 0 && self.progress_at.is_none_or(|at| at.elapsed() >= IDLE_DROP)
+    }
+
+    /// Bytes in flight that no read waits for yet. The cap of read-ahead in
+    /// flight leaves out blocks reads wait for: many concurrent reads (mmap
+    /// faults, NFS read RPCs) would otherwise use it up.
+    fn read_ahead_in_flight(&self) -> u64 {
+        self.pending_bytes - self.pending_read_bytes
     }
 
     /// Bytes of fetched blocks no read has touched.
@@ -2493,6 +2490,40 @@ mod tests {
         for offset in (0..256 * chunk).step_by(chunk as usize) {
             let (data, _) = reader.read(offset, chunk as u32).await.unwrap();
             assert!(data[..] == content[offset as usize..(offset + chunk) as usize]);
+        }
+    }
+
+    /// Blocks that reads wait for do not use up the cap of read-ahead in
+    /// flight: many concurrent reads (mmap faults, NFS read RPCs) leave room
+    /// for the read-ahead of a stream.
+    #[tokio::test(start_paused = true)]
+    async fn waited_blocks_leave_room_for_read_ahead() {
+        let xet = MockXet::new();
+        let content = pattern(1024 * BLOCK_SIZE as usize);
+        let reader = reader_for(&xet, &content, false);
+        reader.lock().in_flight_cap = MIN_IN_FLIGHT;
+        xet.set_stream_delay(Duration::from_secs(1));
+
+        // More blocks than the cap, each waited for by a read, none ahead.
+        let waiting: Vec<_> = (0..MIN_IN_FLIGHT / BLOCK_SIZE + 8)
+            .map(|read| {
+                let reader = reader.clone();
+                tokio::spawn(async move { reader.read((1000 - 3 * read) * BLOCK_SIZE, 4096).await })
+            })
+            .collect();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let scan = {
+            let reader = reader.clone();
+            tokio::spawn(async move { reader.read(0, BLOCK_SIZE as u32).await })
+        };
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(
+            stream_calls(&xet).iter().any(|call| call.2),
+            "no read-ahead while reads wait"
+        );
+        scan.await.unwrap().unwrap();
+        for read in waiting {
+            read.await.unwrap().unwrap();
         }
     }
 
