@@ -249,3 +249,31 @@ async fn test_fuse_revalidation() {
         panic!("FUSE revalidation test failed: {}", e);
     }
 }
+
+/// Regression test for #222: an open, never-closed file is published by the
+/// periodic flush.
+#[tokio::test]
+async fn test_fuse_periodic_flush_publishes_open_file() {
+    let guard = match common::setup_bucket("fuse-periodic-flush").await {
+        Some(g) => g,
+        None => return,
+    };
+
+    let mount_point = format!("/tmp/hf-mount-pf-mnt-{}", std::process::id());
+    let cache_dir = format!("/tmp/hf-mount-pf-cache-{}", std::process::id());
+
+    let child = common::mount_bucket(
+        &guard.bucket_id,
+        &mount_point,
+        &cache_dir,
+        &["--advanced-writes", "--flush-interval-ms", "1000"],
+    );
+    let result = common::fs_tests::run_periodic_flush_tests(&mount_point, &guard.hub).await;
+    common::unmount(&mount_point, child, 30);
+    std::fs::remove_dir_all(&mount_point).ok();
+    std::fs::remove_dir_all(&cache_dir).ok();
+
+    if let Err(e) = result {
+        panic!("periodic flush test failed: {e}");
+    }
+}

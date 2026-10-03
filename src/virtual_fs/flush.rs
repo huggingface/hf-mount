@@ -17,6 +17,9 @@ enum FlushSignal {
     Dirty(u64),
     /// Wake the loop to drain pending remote deletes (no dirty inode attached).
     WakeDeletes,
+    /// Close the batch being collected now (periodic flush), instead of
+    /// waiting for the debounce to expire.
+    Tick,
 }
 
 // ── FlushManager ──────────────────────────────────────────────────────
@@ -42,11 +45,32 @@ impl FlushManager {
         runtime: &tokio::runtime::Handle,
         debounce: Duration,
         max_batch_window: Duration,
+        interval: Duration,
     ) -> Self {
         let errors = Arc::new(Mutex::new(HashMap::new()));
         let pending_deletes = Arc::new(Mutex::new(Vec::new()));
 
         let (tx, rx) = mpsc::unbounded_channel::<FlushSignal>();
+        if !interval.is_zero() {
+            // Periodic flush of open dirty files (long-lived writers never
+            // release()). A weak sender so this task cannot keep the channel
+            // open past shutdown; it exits once the flush loop is gone.
+            let weak_tx = tx.downgrade();
+            let inodes = inodes.clone();
+            runtime.spawn(async move {
+                loop {
+                    tokio::time::sleep(interval).await;
+                    let Some(tx) = weak_tx.upgrade() else { return };
+                    let dirty = inodes.read().expect("inodes poisoned").dirty_inos();
+                    let signals = dirty.into_iter().map(FlushSignal::Dirty).chain([FlushSignal::Tick]);
+                    for signal in signals {
+                        if tx.send(signal).is_err() {
+                            return;
+                        }
+                    }
+                }
+            });
+        }
         let bg_errors = errors.clone();
         let bg_deletes = pending_deletes.clone();
         let bg_hub = hub_client.clone();
@@ -214,6 +238,7 @@ async fn flush_loop(
     loop {
         // Wait for the first signal
         let first = match rx.recv().await {
+            Some(FlushSignal::Tick) => continue, // nothing was dirty
             Some(sig) => sig,
             None => return, // channel closed, exit
         };
@@ -230,6 +255,7 @@ async fn flush_loop(
             }
             let timeout = debounce.min(remaining);
             match tokio::time::timeout(timeout, rx.recv()).await {
+                Ok(Some(FlushSignal::Tick)) => break, // periodic flush: batch closes now
                 Ok(Some(sig)) => signals.push(sig),
                 _ => break, // timeout (debounce expired) or channel closed
             }
@@ -243,7 +269,7 @@ async fn flush_loop(
             .into_iter()
             .filter_map(|sig| match sig {
                 FlushSignal::Dirty(ino) => Some(ino),
-                FlushSignal::WakeDeletes => None,
+                FlushSignal::WakeDeletes | FlushSignal::Tick => None,
             })
             .collect();
 
