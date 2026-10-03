@@ -3,8 +3,8 @@
 pub mod bench;
 pub mod fs_tests;
 
-use std::path::Path;
-use std::process::{Child, Command};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -262,25 +262,71 @@ pub async fn build_write_config(hub: &Arc<hf_mount::hub_api::HubApiClient>) -> A
     )
 }
 
-/// Upload a single file to CAS via an upload session.
-pub async fn upload_file(config: Arc<TranslatorConfig>, staged_path: &Path) -> XetFileInfo {
+/// Upload files to CAS in one upload session.
+pub async fn upload_files(config: Arc<TranslatorConfig>, staged_paths: &[PathBuf]) -> Vec<XetFileInfo> {
     let upload_session = FileUploadSession::new(config)
         .await
         .expect("FileUploadSession::new failed");
 
-    let files = vec![(staged_path.to_path_buf(), Sha256Policy::Skip)];
-    let mut results = upload_session.upload_files(files).await.expect("upload_files failed");
-
-    let file_info = results.pop().expect("upload returned no file info");
+    let files = staged_paths.iter().map(|path| (path.clone(), Sha256Policy::Skip));
+    let file_infos = upload_session.upload_files(files).await.expect("upload_files failed");
 
     upload_session.finalize().await.expect("finalize failed");
 
-    file_info
+    file_infos
+}
+
+/// Upload a single file to CAS via an upload session.
+pub async fn upload_file(config: Arc<TranslatorConfig>, staged_path: &Path) -> XetFileInfo {
+    upload_files(config, &[staged_path.to_path_buf()])
+        .await
+        .pop()
+        .expect("upload returned no file info")
 }
 
 /// Spawn hf-mount-fuse as a child process, wait until the mountpoint is live.
 /// `extra_args` are appended to the command (e.g. `&["--read-only"]`).
 pub fn mount_bucket(bucket_id: &str, mount_point: &str, cache_dir: &str, extra_args: &[&str]) -> Child {
+    spawn_mount_bucket(
+        bucket_id,
+        mount_point,
+        cache_dir,
+        extra_args,
+        Stdio::inherit(),
+        Stdio::inherit(),
+    )
+}
+
+/// Like `mount_bucket`, but with the daemon's output written to `log_path`
+/// so a test can assert on what it logged. Tracing goes to stdout, so both
+/// stdout and stderr are captured.
+pub fn mount_bucket_logged(
+    bucket_id: &str,
+    mount_point: &str,
+    cache_dir: &str,
+    extra_args: &[&str],
+    log_path: &str,
+) -> Child {
+    let log = std::fs::File::create(log_path).expect("create daemon log file");
+    let log_err = log.try_clone().expect("clone daemon log file");
+    spawn_mount_bucket(
+        bucket_id,
+        mount_point,
+        cache_dir,
+        extra_args,
+        log.into(),
+        log_err.into(),
+    )
+}
+
+fn spawn_mount_bucket(
+    bucket_id: &str,
+    mount_point: &str,
+    cache_dir: &str,
+    extra_args: &[&str],
+    stdout: Stdio,
+    stderr: Stdio,
+) -> Child {
     let token = std::env::var("HF_TOKEN").unwrap();
 
     let binary = std::env::current_exe()
@@ -314,6 +360,8 @@ pub fn mount_bucket(bucket_id: &str, mount_point: &str, cache_dir: &str, extra_a
         ])
         .args(extra_args)
         .args(["bucket", bucket_id, mount_point])
+        .stdout(stdout)
+        .stderr(stderr)
         .spawn()
         .expect("Failed to spawn hf-mount-fuse");
 
@@ -594,4 +642,69 @@ pub fn generate_pattern(size: usize) -> Vec<u8> {
 /// Verify content matches the deterministic pattern at a given offset.
 pub fn verify_pattern(data: &[u8], offset: usize) -> bool {
     data.iter().enumerate().all(|(i, &b)| b == ((offset + i) % 251) as u8)
+}
+
+/// Deterministic pseudo-random byte generator (xorshift64). Each seeded file
+/// has distinct content so nothing dedups across files, and readers can
+/// regenerate the expected bytes chunk by chunk instead of holding them.
+pub struct PseudoRandomBytes(u64);
+
+impl PseudoRandomBytes {
+    pub fn new(seed: u64) -> Self {
+        Self(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1)
+    }
+
+    pub fn fill(&mut self, buf: &mut [u8]) {
+        for chunk in buf.chunks_mut(8) {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            let bytes = x.to_le_bytes();
+            chunk.copy_from_slice(&bytes[..chunk.len()]);
+        }
+    }
+}
+
+/// Seed a bucket with `count` files of `size` bytes each under `par/`, all
+/// uploaded in one session. Returns the relative paths; file `i` regenerates
+/// from `PseudoRandomBytes::new(i)`.
+pub async fn seed_parallel_read_files(
+    hub: &Arc<hf_mount::hub_api::HubApiClient>,
+    tmp_dir_tag: &str,
+    count: usize,
+    size: usize,
+) -> Vec<String> {
+    let write_config = build_write_config(hub).await;
+    let tmp_dir = std::env::temp_dir().join(format!("hf-mount-{}-{}", tmp_dir_tag, std::process::id()));
+    std::fs::create_dir_all(&tmp_dir).ok();
+
+    let mut buf = vec![0u8; size];
+    let staged: Vec<_> = (0..count)
+        .map(|i| {
+            let path = tmp_dir.join(format!("f_{i:02}.bin"));
+            PseudoRandomBytes::new(i as u64).fill(&mut buf);
+            std::fs::write(&path, &buf).unwrap();
+            path
+        })
+        .collect();
+
+    let infos = upload_files(write_config, &staged).await;
+    assert_eq!(infos.len(), count);
+
+    let rel_paths: Vec<String> = (0..count).map(|i| format!("par/f_{i:02}.bin")).collect();
+    let ops: Vec<_> = rel_paths
+        .iter()
+        .zip(&infos)
+        .map(|(rel, info)| hf_mount::hub_api::BatchOp::AddFile {
+            path: rel.clone(),
+            xet_hash: info.hash().to_string(),
+            mtime: 0,
+            content_type: None,
+        })
+        .collect();
+    hub.batch_operations(&ops).await.expect("batch add failed");
+    std::fs::remove_dir_all(&tmp_dir).ok();
+    rel_paths
 }
