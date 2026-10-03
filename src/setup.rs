@@ -333,6 +333,16 @@ fn user_fixed_upload_concurrency() -> bool {
     std::env::var("HF_XET_FIXED_UPLOAD_CONCURRENCY").is_ok()
 }
 
+/// Whether the default for `key` must stay unset because the user pinned a
+/// fixed concurrency (`is_set` tells which variables are set). xet-runtime
+/// consults the HF_XET_FIXED_* aliases only when the canonical AC variables
+/// are absent: defaulting the canonical names would silently turn a fixed
+/// concurrency into an adaptive one.
+fn defers_to_fixed_concurrency(key: &str, is_set: impl Fn(&str) -> bool) -> bool {
+    (key.contains("UPLOAD_CONCURRENCY") && is_set("HF_XET_FIXED_UPLOAD_CONCURRENCY"))
+        || (key.contains("DOWNLOAD_CONCURRENCY") && is_set("HF_XET_FIXED_DOWNLOAD_CONCURRENCY"))
+}
+
 /// xet-core settings tuned for interactive FUSE reads (not batch downloads),
 /// applied as env defaults by `init_tracing`. xet-core ignores a value it
 /// cannot parse, so durations need a unit (`30s`, not `30`).
@@ -388,10 +398,7 @@ pub fn init_tracing(daemon: bool) {
 
     let upload_cap = XET_UPLOAD_CONCURRENCY_CAP.to_string();
     for (k, v) in xet_env_defaults(&upload_cap) {
-        // xet-runtime consults HF_XET_FIXED_UPLOAD_CONCURRENCY only when the
-        // canonical AC variables are absent — defaulting the canonical names
-        // would silently turn a user-fixed concurrency into an adaptive one.
-        if k.contains("UPLOAD_CONCURRENCY") && user_fixed_upload_concurrency() {
+        if defers_to_fixed_concurrency(k, |name| std::env::var(name).is_ok()) {
             continue;
         }
         if std::env::var(k).is_err() {
@@ -984,7 +991,10 @@ pub(crate) fn unmount_fuse(mount_point: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{XET_UPLOAD_CONCURRENCY_CAP, mountinfo_has_hf_mount, parse_mode, validate_revision, xet_env_defaults};
+    use super::{
+        XET_UPLOAD_CONCURRENCY_CAP, defers_to_fixed_concurrency, mountinfo_has_hf_mount, parse_mode, validate_revision,
+        xet_env_defaults,
+    };
     use std::path::Path;
     use xet_runtime::config::XetConfig;
 
@@ -1112,5 +1122,31 @@ mod tests {
             })
             .collect();
         assert!(rejected.is_empty(), "rejected by xet-core: {rejected:#?}");
+    }
+
+    /// A fixed download (or upload) concurrency set by the user keeps the
+    /// adaptive defaults of that direction unset, and only of that direction.
+    #[test]
+    fn fixed_concurrency_keeps_its_direction_defaults_unset() {
+        let upload_cap = XET_UPLOAD_CONCURRENCY_CAP.to_string();
+        for fixed in ["HF_XET_FIXED_DOWNLOAD_CONCURRENCY", "HF_XET_FIXED_UPLOAD_CONCURRENCY"] {
+            let direction = if fixed.contains("DOWNLOAD") {
+                "DOWNLOAD"
+            } else {
+                "UPLOAD"
+            };
+            for (key, _) in xet_env_defaults(&upload_cap) {
+                let deferred = defers_to_fixed_concurrency(key, |name| name == fixed);
+                assert_eq!(
+                    deferred,
+                    key.contains(&format!("{direction}_CONCURRENCY")),
+                    "{fixed} and {key}"
+                );
+            }
+        }
+        assert!(!defers_to_fixed_concurrency(
+            "HF_XET_CLIENT_AC_MAX_DOWNLOAD_CONCURRENCY",
+            |_| false
+        ));
     }
 }

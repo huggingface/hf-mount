@@ -413,6 +413,9 @@ impl RemoteReader {
     /// `first`, start fetches for missing blocks and for read-ahead, and
     /// return the data at hand plus the wait for the rest.
     fn plan(self: &Arc<Self>, first: u64, last: u64, skip: u64) -> (Vec<Option<Bytes>>, Option<Waiting<'_>>) {
+        // Declared before the lock, so that a panic releases the lock before
+        // the fetches drop: dropping one locks the state to fail its blocks.
+        let fetches;
         let mut guard = self.lock();
         let state = &mut *guard;
         state.tick += 1;
@@ -465,7 +468,8 @@ impl RemoteReader {
             self.extend_read_ahead(state, index, start, end, &mut runs);
             stream = Some(state.streams[index].id);
         }
-        let (receivers, fetches) = self.prepare_fetches(state, runs, stream, Some(last));
+        let receivers;
+        (receivers, fetches) = self.prepare_fetches(state, runs, stream, Some(last));
         for (block, fetch, fill) in receivers {
             waits.push(((block - first) as usize, fetch, fill));
         }
@@ -593,6 +597,8 @@ impl RemoteReader {
     /// Not once the reader is idle: that would fetch again what the idle
     /// task dropped.
     fn refill(self: &Arc<Self>, id: u64) {
+        // Before the lock, as in `plan`.
+        let fetches;
         let mut guard = self.lock();
         let state = &mut *guard;
         let Some(index) = state.streams.iter().position(|stream| stream.id == id) else {
@@ -605,7 +611,7 @@ impl RemoteReader {
         if let Some((start, end)) = state.read_ahead_range(index, self.block_count()) {
             let mut runs = Vec::new();
             self.extend_read_ahead(state, index, start, end, &mut runs);
-            let (_, fetches) = self.prepare_fetches(state, runs, Some(id), None);
+            (_, fetches) = self.prepare_fetches(state, runs, Some(id), None);
             self.watch_idle(state);
             drop(guard);
             self.spawn_fetches(fetches);
