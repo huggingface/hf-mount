@@ -1,0 +1,25 @@
+{
+  "build": {
+    "context": ".",
+    "dockerfile": "Dockerfile.dev"
+  },
+  "runArgs": [
+    "--cap-add=sys_admin",
+    "--device=/dev/fuse:/dev/fuse"
+  ],
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer"
+      ],
+      "settings": {
+        "editor.formatOnSave": true,
+        "[rust]": {
+          "editor.defaultFormatter": "rust-lang.rust-analyzer"
+        },
+        "rust-analyzer.cargo.features": "all",
+        "rust-analyzer.cargo-watch.enable": true
+      }
+    }
+  }
+}
