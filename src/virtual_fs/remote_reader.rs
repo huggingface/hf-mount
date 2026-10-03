@@ -782,6 +782,9 @@ impl RemoteReader {
             allowed.min(state.in_flight_cap.saturating_sub(state.pending_bytes))
         };
         self.budget.report(state);
+        // No more than the range needs: the rest would keep the budget from
+        // concurrent readers until the release below.
+        let allowed = allowed.min(wanted);
         let reserved = self.budget.reserve(allowed);
         // Short of the mount budget, any run worth a fetch is better than
         // reading block by block until others give theirs back.
