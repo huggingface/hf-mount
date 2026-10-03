@@ -66,16 +66,25 @@ const MAX_BEHIND_BYTES: u64 = 8 * 1_048_576;
 /// Sequential streams tracked per reader.
 const MAX_STREAMS: usize = 32;
 /// A new stream that starts at most this many blocks past the furthest
-/// block read continues a forward scan of the file.
-const FRONTIER_GAP: u64 = 256;
+/// block read continues a forward scan of the file, and its read-ahead
+/// fetches the gap too. Further reads skip data the reader may never read
+/// (the slices of a tensor-parallel rank, sparse sampling): they wait for a
+/// second read before reading ahead.
+const FRONTIER_GAP: u64 = 64;
 /// A stream that has not read for this many reads of its reader is taken
 /// as finished: its read-ahead may be evicted, and it no longer limits the
 /// read-ahead of the streams behind it.
 const STALE_READS: u64 = 256;
-/// A reader that has not read for this long drops the blocks it fetched
-/// ahead: a file kept open after its reads must not keep its share of the
-/// mount budget.
+/// A reader that has not read for this long gives back the blocks it
+/// fetched ahead beyond its share of the mount budget, so that the readers
+/// still at work get theirs, and the blocks it already read.
 const IDLE_DROP: Duration = Duration::from_secs(10);
+/// A reader that has not read for this long gives back all its read-ahead,
+/// and its next read starts its streams afresh, with small windows: a file
+/// kept open after its reads must not keep a share of the mount budget, and
+/// a read after a long pause must not fetch a whole window again. Shorter
+/// pauses (a training step, a batch) keep what the next reads need.
+const IDLE_RELEASE: Duration = Duration::from_secs(120);
 /// Attempts per fetch before its remaining blocks fail with EIO.
 const MAX_ATTEMPTS: u32 = 3;
 
@@ -148,6 +157,10 @@ struct State {
     ahead_bytes: u64,
     /// Bytes of pending blocks.
     pending_bytes: u64,
+    /// Bytes of pending blocks that reads wait for: in `ahead_bytes` until
+    /// they arrive, but not read-ahead, so they do not count the reader
+    /// among those that split the mount budget.
+    pending_read_bytes: u64,
     /// Bytes of fetched blocks a read has touched.
     behind_bytes: u64,
     /// Blocks in the order reads first touched them: eviction order of
@@ -197,6 +210,8 @@ struct FetchRun {
     /// Read-ahead runs go through the on-disk chunk cache; runs of blocks
     /// only reads need do not.
     stream: Option<u64>,
+    /// Reads planned when the run started (`State::tick`).
+    since: u64,
 }
 
 impl Drop for FetchRun {
@@ -267,7 +282,7 @@ impl ReadAheadBudget {
             self.held.fetch_sub(before - now, Ordering::Relaxed);
         }
         state.reported_ahead = now;
-        let counted = now > 0 || state.starved;
+        let counted = now > state.pending_read_bytes || state.starved;
         if counted != state.counted {
             if counted {
                 self.readers.fetch_add(1, Ordering::Relaxed);
@@ -418,8 +433,23 @@ impl RemoteReader {
         let fetches;
         let mut guard = self.lock();
         let state = &mut *guard;
+        if state.progress_at.is_some_and(|at| at.elapsed() >= IDLE_RELEASE) {
+            for stream in &mut state.streams {
+                stream.window = stream.window.min(INITIAL_WINDOW);
+                stream.grown_at = stream.last_block;
+            }
+            state.frontier_window = 0;
+        }
         state.tick += 1;
         let tick = state.tick;
+        // Now and then, give back the read-ahead of streams that stopped (a
+        // header read at the start of the file), and stop counting in the
+        // split until the budget cuts a fetch again: a reader that keeps
+        // reading elsewhere never goes idle.
+        if tick.is_multiple_of(STALE_READS) {
+            self.evict_stale(state);
+            state.starved = false;
+        }
 
         let mut parts = Vec::with_capacity((last - first + 1) as usize);
         let mut waits = Vec::new();
@@ -447,8 +477,12 @@ impl RemoteReader {
                     parts.push(Some(data));
                 }
                 Some(Block::Pending { fill, waiters, fetch }) => {
+                    let first_waiter = *waiters == 0;
                     *waiters += 1;
                     waits.push((index, *fetch, fill.clone()));
+                    if first_waiter {
+                        state.pending_read_bytes += self.block_len(block);
+                    }
                     parts.push(None);
                     progress = true;
                 }
@@ -555,6 +589,9 @@ impl RemoteReader {
                 );
                 state.ahead_bytes += self.block_len(block);
                 state.pending_bytes += self.block_len(block);
+                if demanded {
+                    state.pending_read_bytes += self.block_len(block);
+                }
                 senders.push_back(sender);
             }
             debug!(
@@ -569,6 +606,7 @@ impl RemoteReader {
                 next: start,
                 senders,
                 stream: stream.filter(|_| read_ahead),
+                since: state.tick,
             });
         }
         (receivers, fetches)
@@ -590,13 +628,14 @@ impl RemoteReader {
         guard.fetches.extend(tasks);
     }
 
-    /// A read-ahead fetch of stream `id` finished: top its window up again,
-    /// so that fetching goes on while its reads wait for a slower fetch.
-    /// Only for streams that have read sequentially for a while: a stream
-    /// made of one read (a record header) would keep fetching for nothing.
-    /// Not once the reader is idle: that would fetch again what the idle
-    /// task dropped.
-    fn refill(self: &Arc<Self>, id: u64) {
+    /// A read-ahead fetch of stream `id`, started when `since` reads were
+    /// planned, finished: top its window up again, so that fetching goes on
+    /// while its reads wait for a slower fetch. Only for streams that have
+    /// read sequentially for a while: a stream made of one read (a record
+    /// header) would keep fetching for nothing. Only while the reader reads:
+    /// a read waits, or the stream read since the fetch started. A stream
+    /// that stopped would fill its whole window for nothing.
+    fn refill(self: &Arc<Self>, id: u64, since: u64) {
         // Before the lock, as in `plan`.
         let fetches;
         let mut guard = self.lock();
@@ -605,7 +644,10 @@ impl RemoteReader {
             return;
         };
         let stream = &state.streams[index];
-        if !stream.is_live(state.tick) || stream.last_block - stream.first_block < INITIAL_WINDOW || state.idle() {
+        if !stream.is_live(state.tick)
+            || stream.last_block - stream.first_block < INITIAL_WINDOW
+            || (stream.last_used <= since && state.waiting == 0)
+        {
             return;
         }
         if let Some((start, end)) = state.read_ahead_range(index, self.block_count()) {
@@ -715,6 +757,27 @@ impl RemoteReader {
         }
     }
 
+    /// Drop the fetched blocks no read touched, no live stream heads to, and
+    /// fetched more than `STALE_READS` reads ago.
+    fn evict_stale(&self, state: &mut State) {
+        let live: Vec<&Stream> = state.live_streams().collect();
+        let stale: Vec<u64> = state
+            .blocks
+            .iter()
+            .filter_map(|(&block, slot)| match slot {
+                Block::Ready {
+                    read: false, last_used, ..
+                } if state.tick - last_used > STALE_READS && !live.iter().any(|stream| stream.heads_to(block)) => {
+                    Some(block)
+                }
+                _ => None,
+            })
+            .collect();
+        for block in stale {
+            state.drop_unread(block);
+        }
+    }
+
     /// Drop the blocks read first beyond the budget of blocks already read.
     fn evict_behind(&self, state: &mut State) {
         while state.behind_bytes > self.max_behind_bytes
@@ -766,6 +829,7 @@ impl RemoteReader {
         // queue before the last of them ends (`Waiting` queues it then).
         if waiters > 0 {
             state.ahead_bytes -= len;
+            state.pending_read_bytes -= len;
         }
     }
 
@@ -773,10 +837,13 @@ impl RemoteReader {
     fn fail(&self, blocks: std::ops::Range<u64>) {
         let mut guard = self.lock();
         for block in blocks {
-            if let Some(Block::Pending { .. }) = guard.blocks.get(&block) {
+            if let Some(&Block::Pending { waiters, .. }) = guard.blocks.get(&block) {
                 guard.blocks.remove(&block);
                 guard.ahead_bytes -= self.block_len(block);
                 guard.pending_bytes -= self.block_len(block);
+                if waiters > 0 {
+                    guard.pending_read_bytes -= self.block_len(block);
+                }
             }
         }
     }
@@ -823,7 +890,8 @@ impl Drop for Waiting<'_> {
         state.waiting -= 1;
         state.progress_at = Some(tokio::time::Instant::now());
         for &(index, fetch, _) in &self.waits {
-            state.leave(self.first + index as u64, fetch);
+            let block = self.first + index as u64;
+            state.leave(block, fetch, self.reader.block_len(block));
         }
         self.reader.evict_behind(state);
     }
@@ -858,13 +926,19 @@ impl State {
         self.queue_behind(block, len);
     }
 
-    /// A read that waited for `block` from fetch `fetch` ended. The block
-    /// joins the eviction queue once no read waits for it. A block fetched
-    /// again since (its fetch gave up, or a forward-only read dropped it)
-    /// counts the reads waiting for the new fetch only.
-    fn leave(&mut self, block: u64, fetch: u64) {
+    /// A read that waited for `block` (`len` bytes) from fetch `fetch` ended.
+    /// The block joins the eviction queue once no read waits for it, or, in
+    /// flight still, becomes read-ahead. A block fetched again since (its
+    /// fetch gave up, or a forward-only read dropped it) counts the reads
+    /// waiting for the new fetch only.
+    fn leave(&mut self, block: u64, fetch: u64, len: u64) {
         match self.blocks.get_mut(&block) {
-            Some(Block::Pending { waiters, fetch: id, .. }) if *id == fetch => *waiters -= 1,
+            Some(Block::Pending { waiters, fetch: id, .. }) if *id == fetch => {
+                *waiters -= 1;
+                if *waiters == 0 {
+                    self.pending_read_bytes -= len;
+                }
+            }
             Some(Block::Ready {
                 waiters,
                 data,
@@ -911,16 +985,17 @@ impl State {
         }
     }
 
-    /// First block of the nearest stream that started ahead of `stream` and
-    /// has moved since: read-ahead stops there, as that stream reads (or
-    /// has read) what follows. Parallel copies of one tensor split it in
-    /// adjacent ranges; without this, each range's read-ahead would fetch
-    /// the start of the next range again.
+    /// First block of the nearest stream that started ahead of `stream`, or
+    /// in its last block, and has moved since: read-ahead stops there, as
+    /// that stream reads (or has read) what follows. Parallel copies of one
+    /// tensor split it in adjacent ranges, which most often meet inside a
+    /// block; without this, each range's read-ahead would fetch the next
+    /// range again.
     fn next_stream_start(&self, stream: usize) -> u64 {
-        let position = self.streams[stream].last_block;
+        let (id, position) = (self.streams[stream].id, self.streams[stream].last_block);
         self.live_streams()
-            .filter(|other| other.first_block > position && other.last_block > other.first_block)
-            .map(|other| other.first_block)
+            .filter(|other| other.id != id && other.first_block >= position && other.last_block > other.first_block)
+            .map(|other| other.first_block.max(position + 1))
             .min()
             .unwrap_or(u64::MAX)
     }
@@ -1079,8 +1154,8 @@ fn assemble(parts: &[Option<Bytes>], skip: u64, len: usize) -> Bytes {
     out.freeze()
 }
 
-/// Drop the read-ahead of `reader` once it is idle, then end when it holds
-/// none.
+/// Once `reader` is idle, give back its read-ahead beyond its share of the
+/// mount budget, then all of it after `IDLE_RELEASE`; end when it holds none.
 async fn drop_read_ahead_when_idle(reader: Weak<RemoteReader>) {
     loop {
         let wake_at = {
@@ -1095,13 +1170,24 @@ async fn drop_read_ahead_when_idle(reader: Weak<RemoteReader>) {
                 }
             } else {
                 state.starved = false;
-                reader.evict_unread(state, 0, true);
+                let release_at = state.progress_at.map_or(now, |at| at + IDLE_RELEASE);
+                let keep = if now >= release_at {
+                    0
+                } else {
+                    reader.ahead_limit(state)
+                };
+                reader.evict_unread(state, keep, true);
                 if state.ahead_bytes == 0 {
                     state.idle_watch = false;
                     return;
                 }
-                // Blocks still in flight: drop them soon after they arrive.
-                now + IDLE_DROP / 10
+                if state.fetched_ahead() < state.ahead_bytes {
+                    // Blocks still in flight: check them soon after they arrive.
+                    now + IDLE_DROP / 10
+                } else {
+                    // Others may start reading and shrink the share.
+                    (now + IDLE_DROP).min(release_at)
+                }
             }
         };
         tokio::time::sleep_until(wake_at).await;
@@ -1217,7 +1303,7 @@ async fn fetch_run(mut run: FetchRun) {
                             if let Some(id) = run.stream
                                 && let Some(owner) = run.reader.upgrade()
                             {
-                                owner.refill(id);
+                                owner.refill(id, run.since);
                             }
                             return;
                         }
@@ -1387,6 +1473,32 @@ mod tests {
         );
     }
 
+    /// The same streams split inside blocks, as the threads copying a tensor
+    /// that follows a header of any length: the read-ahead of a stream stops
+    /// where the next stream started, in its last block too, instead of
+    /// fetching the next range again.
+    #[tokio::test]
+    async fn interleaved_streams_split_inside_blocks_fetch_each_byte_about_once() {
+        let xet = MockXet::new();
+        let (streams, header) = (8usize, 100 * 1024usize);
+        let stream_len = 24 * BLOCK_SIZE as usize;
+        let content = pattern(header + streams * stream_len);
+        let reader = reader_for(&xet, &content, false);
+
+        let read_size = 128 * 1024usize;
+        for step in 0..stream_len / read_size {
+            for stream in 0..streams {
+                let offset = header + stream * stream_len + step * read_size;
+                let (data, _) = reader.read(offset as u64, read_size as u32).await.unwrap();
+                assert!(data[..] == content[offset..offset + read_size]);
+            }
+        }
+
+        let fetched: u64 = stream_calls(&xet).iter().map(|(start, end, _)| end - start).sum();
+        let ratio = fetched as f64 / content.len() as f64;
+        assert!(ratio < 1.1, "fetched {ratio:.2}x the file");
+    }
+
     /// A loader copying tensors in file order, each with several threads,
     /// finds the next tensors already fetched: a stream that starts just
     /// past the furthest block read reads ahead at once.
@@ -1415,6 +1527,29 @@ mod tests {
         // would fetch its block alone.
         let lone = stream_calls(&xet).iter().filter(|call| !call.2).count();
         assert!(lone < tensors, "{lone} lone fetches for {} chunks", tensors * threads);
+    }
+
+    /// Small reads far apart at increasing offsets (the slices of a
+    /// tensor-parallel rank) fetch only what they read, not the gaps.
+    #[tokio::test]
+    async fn sparse_forward_reads_fetch_only_what_they_read() {
+        let xet = MockXet::new();
+        // 17 MiB apart.
+        let (reads, stride) = (8u64, 68 * BLOCK_SIZE);
+        let content = pattern((reads * stride) as usize);
+        let reader = reader_for(&xet, &content, false);
+
+        for read in 0..reads {
+            let offset = 7 * BLOCK_SIZE + read * stride;
+            let (data, _) = reader.read(offset, BLOCK_SIZE as u32).await.unwrap();
+            assert!(data[..] == content[offset as usize..(offset + BLOCK_SIZE) as usize]);
+        }
+        let fetched: u64 = stream_calls(&xet).iter().map(|(start, end, _)| end - start).sum();
+        assert!(
+            fetched <= 2 * reads * BLOCK_SIZE,
+            "fetched {} blocks for {reads} read",
+            fetched / BLOCK_SIZE
+        );
     }
 
     /// Small reads at increasing offsets (torch reading the record headers of
@@ -1656,7 +1791,7 @@ mod tests {
             assert_eq!(state.fetched_ahead(), BLOCK_SIZE);
             assert_eq!(state.waiting, 0);
         }
-        tokio::time::sleep(IDLE_DROP).await;
+        tokio::time::sleep(IDLE_RELEASE).await;
         assert_eq!(ahead(&reader), 0);
         assert!(reader.lock().blocks.is_empty());
     }
@@ -1704,20 +1839,20 @@ mod tests {
     /// A reader that stops reading drops the blocks it fetched ahead, and no
     /// longer counts toward the split of the mount budget.
     #[tokio::test(start_paused = true)]
-    async fn idle_reader_drops_its_read_ahead() {
+    async fn idle_reader_releases_its_read_ahead() {
         let xet = MockXet::new();
         let content = pattern(64 * BLOCK_SIZE as usize);
         let reader = reader_for(&xet, &content, false);
         let budget = reader.budget.clone();
 
         reader.read(0, 4096).await.unwrap();
-        tokio::time::sleep(IDLE_DROP / 2).await;
+        tokio::time::sleep(IDLE_RELEASE / 2).await;
         assert!(ahead(&reader) > 0);
         // A read of a new block restarts the delay.
         reader.read(BLOCK_SIZE, 4096).await.unwrap();
-        tokio::time::sleep(IDLE_DROP * 3 / 4).await;
+        tokio::time::sleep(IDLE_RELEASE * 3 / 4).await;
         assert!(ahead(&reader) > 0);
-        tokio::time::sleep(IDLE_DROP / 2).await;
+        tokio::time::sleep(IDLE_RELEASE / 2).await;
         assert_eq!(ahead(&reader), 0);
         assert_eq!(budget.readers.load(Ordering::Relaxed), 0);
 
@@ -1736,9 +1871,11 @@ mod tests {
         let reader = reader_for(&xet, &content, false);
 
         reader.read(0, 1).await.unwrap();
-        for _ in 0..4 {
+        let mut reread_for = Duration::ZERO;
+        while reread_for <= IDLE_RELEASE {
             tokio::time::sleep(IDLE_DROP / 2).await;
             reader.read(0, 1).await.unwrap();
+            reread_for += IDLE_DROP / 2;
         }
         assert_eq!(reader.lock().ahead_bytes, 0);
     }
@@ -1763,8 +1900,200 @@ mod tests {
 
         let (data, _) = slow.await.unwrap().unwrap();
         assert!(data[..] == content[far as usize..far as usize + 4096]);
-        tokio::time::sleep(IDLE_DROP * 3 / 2).await;
+        tokio::time::sleep(IDLE_RELEASE + IDLE_DROP).await;
         assert_eq!(ahead(&reader), 0);
+    }
+
+    /// A reader that reads in bursts, with pauses shorter than `IDLE_RELEASE`
+    /// (training steps), keeps its read-ahead through the pauses: no block is
+    /// fetched twice.
+    #[tokio::test(start_paused = true)]
+    async fn bursts_with_pauses_fetch_each_block_once() {
+        let xet = MockXet::new();
+        let content = pattern(1024 * BLOCK_SIZE as usize);
+        let reader = reader_for(&xet, &content, false);
+
+        let mut block = 0;
+        for _ in 0..6 {
+            for _ in 0..32 {
+                reader.read(block * BLOCK_SIZE, BLOCK_SIZE as u32).await.unwrap();
+                block += 1;
+            }
+            tokio::time::sleep(IDLE_DROP * 3).await;
+        }
+        let fetched: u64 = stream_calls(&xet).iter().map(|(start, end, _)| end - start).sum();
+        assert!(
+            fetched <= content.len() as u64,
+            "fetched {:.2}x the file",
+            fetched as f64 / content.len() as f64
+        );
+    }
+
+    /// After a pause longer than `IDLE_RELEASE`, a stream starts again with a
+    /// small window: a short read does not fetch a whole window again.
+    #[tokio::test(start_paused = true)]
+    async fn read_after_a_long_pause_reads_ahead_little() {
+        let xet = MockXet::new();
+        let content = pattern(2048 * BLOCK_SIZE as usize);
+        let reader = reader_for(&xet, &content, false);
+
+        for block in 0..300 {
+            reader.read(block * BLOCK_SIZE, BLOCK_SIZE as u32).await.unwrap();
+        }
+        tokio::time::sleep(IDLE_RELEASE + IDLE_DROP).await;
+        let before = stream_calls(&xet).len();
+        for block in 300..302 {
+            reader.read(block * BLOCK_SIZE, BLOCK_SIZE as u32).await.unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let fetched: u64 = stream_calls(&xet)[before..]
+            .iter()
+            .map(|(start, end, _)| end - start)
+            .sum();
+        assert!(
+            fetched <= 4 * INITIAL_WINDOW * BLOCK_SIZE,
+            "fetched {} blocks",
+            fetched / BLOCK_SIZE
+        );
+    }
+
+    /// A finished read-ahead fetch tops the window up only while the stream
+    /// reads: not once it stopped before the fetch started.
+    #[tokio::test]
+    async fn refill_stops_once_the_stream_stops_reading() {
+        let xet = MockXet::new();
+        let content = pattern(1024 * BLOCK_SIZE as usize);
+        let reader = reader_with_limits(&xet, &content, 64 * BLOCK_SIZE, MAX_BEHIND_BYTES);
+
+        for block in 0..40 {
+            reader.read(block * BLOCK_SIZE, BLOCK_SIZE as u32).await.unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let (id, tick) = {
+            let mut guard = reader.lock();
+            let state = &mut *guard;
+            // Room in the window again.
+            reader.evict_unread(state, 0, true);
+            (state.streams[0].id, state.tick)
+        };
+        let calls = stream_calls(&xet).len();
+        reader.refill(id, tick);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(stream_calls(&xet).len(), calls, "refilled a stream that stopped");
+        reader.refill(id, tick - 1);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(stream_calls(&xet).len() > calls, "no refill for a stream that read");
+    }
+
+    /// Readers whose only fetches are blocks their reads wait for do not
+    /// count in the split of the mount budget: a reader that holds
+    /// read-ahead keeps it while they wait.
+    #[tokio::test(start_paused = true)]
+    async fn demand_fetches_do_not_shrink_the_shares() {
+        let xet = MockXet::new();
+        let content = pattern(512 * BLOCK_SIZE as usize);
+        xet.add_file("hash", &content);
+        let budget = ReadAheadBudget::new(64 * BLOCK_SIZE);
+        let new_reader = || {
+            RemoteReader::new(
+                "hash".into(),
+                content.len() as u64,
+                xet.clone(),
+                Duration::from_secs(5),
+                false,
+                budget.clone(),
+            )
+        };
+        let streaming = new_reader();
+        for block in 0..16 {
+            streaming.read(block * BLOCK_SIZE, BLOCK_SIZE as u32).await.unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let held = ahead(&streaming);
+        assert!(held > 40 * BLOCK_SIZE, "{} blocks ahead", held / BLOCK_SIZE);
+
+        let far = 300 * BLOCK_SIZE;
+        xet.set_slow_offset(far, Duration::from_secs(1));
+        let waiting: Vec<_> = (0..3)
+            .map(|_| {
+                let reader = new_reader();
+                tokio::spawn(async move { reader.read(far, 4096).await })
+            })
+            .collect();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(budget.readers.load(Ordering::Relaxed), 1);
+        streaming.read(16 * BLOCK_SIZE, BLOCK_SIZE as u32).await.unwrap();
+        assert!(
+            ahead(&streaming) + BLOCK_SIZE >= held,
+            "{} of {} blocks ahead left",
+            ahead(&streaming) / BLOCK_SIZE,
+            held / BLOCK_SIZE
+        );
+        for read in waiting {
+            read.await.unwrap().unwrap();
+        }
+    }
+
+    /// A reader that keeps reading elsewhere gives back the read-ahead of a
+    /// stream that stopped (a header read at the start of the file), and no
+    /// longer counts in the split of the mount budget.
+    #[tokio::test]
+    async fn read_ahead_of_a_stopped_stream_is_given_back() {
+        let xet = MockXet::new();
+        let content = pattern(2048 * BLOCK_SIZE as usize);
+        let reader = reader_for(&xet, &content, false);
+        let budget = reader.budget.clone();
+
+        reader.read(0, 8).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(ahead(&reader) > 64 * BLOCK_SIZE);
+        // Reads far behind each other: none reads ahead.
+        for read in 0..2 * STALE_READS + 1 {
+            reader.read((2047 - 3 * read) * BLOCK_SIZE, 4096).await.unwrap();
+        }
+        assert_eq!(ahead(&reader), 0);
+        assert_eq!(budget.readers.load(Ordering::Relaxed), 0);
+    }
+
+    /// An idle reader gives back its read-ahead beyond its share once
+    /// another reader is at work, which then gets read-ahead in turn.
+    #[tokio::test(start_paused = true)]
+    async fn idle_reader_gives_back_read_ahead_beyond_its_share() {
+        let xet = MockXet::new();
+        let content = pattern(512 * BLOCK_SIZE as usize);
+        xet.add_file("hash", &content);
+        let budget = ReadAheadBudget::new(64 * BLOCK_SIZE);
+        let new_reader = || {
+            RemoteReader::new(
+                "hash".into(),
+                content.len() as u64,
+                xet.clone(),
+                Duration::from_secs(5),
+                false,
+                budget.clone(),
+            )
+        };
+        let (idle, busy) = (new_reader(), new_reader());
+
+        for block in 0..16 {
+            idle.read(block * BLOCK_SIZE, BLOCK_SIZE as u32).await.unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            ahead(&idle) > 40 * BLOCK_SIZE,
+            "{} blocks ahead",
+            ahead(&idle) / BLOCK_SIZE
+        );
+        for block in 0..(2 * IDLE_DROP.as_secs()) {
+            busy.read(block * BLOCK_SIZE, BLOCK_SIZE as u32).await.unwrap();
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        assert!(
+            ahead(&idle) <= 32 * BLOCK_SIZE,
+            "{} blocks ahead",
+            ahead(&idle) / BLOCK_SIZE
+        );
+        assert!(ahead(&busy) > 0);
     }
 
     /// When a stream stops reading (its read waits for a slow fetch), the
@@ -1880,7 +2209,7 @@ mod tests {
                 fetch: 2,
             },
         );
-        state.leave(4, 1);
+        state.leave(4, 1, BLOCK_SIZE);
         assert!(matches!(state.blocks.get(&4), Some(Block::Pending { waiters: 1, .. })));
 
         state.blocks.insert(
@@ -1894,7 +2223,7 @@ mod tests {
                 read_to: 0,
             },
         );
-        state.leave(4, 1);
+        state.leave(4, 1, 4);
         assert!(matches!(state.blocks.get(&4), Some(Block::Ready { waiters: 1, .. })));
         assert!(state.behind.is_empty());
     }
