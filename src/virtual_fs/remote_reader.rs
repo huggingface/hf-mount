@@ -594,6 +594,13 @@ impl RemoteReader {
         runs: &mut Vec<(u64, u64, bool)>,
     ) {
         let end = end.min(state.next_stream_start(index));
+        // No fetch can start while the bytes in flight are at their bound:
+        // skip collecting the range, up to a window of lookups per read.
+        let limit = self.ahead_limit(state);
+        if state.pending_bytes >= (limit / 2).min(state.in_flight_cap) || self.slow_fetch_in_flight(state) {
+            state.starved = false;
+            return;
+        }
         let run = state.streams[index].min_run();
         // The whole range counts as the stream's while room is made for it.
         state.streams[index].ahead_end = end;
@@ -739,6 +746,12 @@ impl RemoteReader {
         };
     }
 
+    /// Whether a read-ahead fetch in flight is older than `max_fetch_age`.
+    fn slow_fetch_in_flight(&self, state: &State) -> bool {
+        let slow = self.max_fetch_age();
+        state.in_flight.values().any(|(at, _, _)| at.elapsed() > slow)
+    }
+
     /// Age of a read-ahead fetch in flight past which no read-ahead starts.
     fn max_fetch_age(&self) -> Duration {
         match self.fetch_timeout {
@@ -775,8 +788,7 @@ impl RemoteReader {
         // flight would only queue behind it and make every fetch wait past
         // the fetch timeout. Wait for fetches to arrive instead, so that the
         // bytes in flight stay about what the link downloads meanwhile.
-        let slow = self.max_fetch_age();
-        let allowed = if state.in_flight.values().any(|(at, _, _)| at.elapsed() > slow) {
+        let allowed = if self.slow_fetch_in_flight(state) {
             0
         } else {
             allowed.min(state.in_flight_cap.saturating_sub(state.pending_bytes))
