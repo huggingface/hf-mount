@@ -34,7 +34,7 @@ jobs:
 
       # Pin nightly so rustfmt rules don't drift between CI and contributor machines.
       # Bump together with the nightly used in `make fmt` / contributor setup.
-      - uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f  # master
         with:
           toolchain: nightly-2026-04-22
           components: rustfmt
