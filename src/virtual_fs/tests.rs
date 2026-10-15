@@ -2507,9 +2507,9 @@ fn rename_source_enoent() {
     });
 }
 
-// ── read range / prefetch ───────────────────────────────────────────
+// ── read range / read-ahead ─────────────────────────────────────────
 
-/// Sequential reads from a xet file trigger streaming prefetch then range reads.
+/// Sequential reads from a xet file.
 #[test]
 fn read_sequential_xet_file() {
     let hub = MockHub::new();
@@ -2556,7 +2556,7 @@ fn read_past_eof() {
     });
 }
 
-/// Range read (seek backward) falls back to a temporary stream.
+/// A read before the previous one (a backward seek) returns its own bytes.
 #[test]
 fn read_seek_backward() {
     let hub = MockHub::new();
@@ -2583,10 +2583,10 @@ fn read_seek_backward() {
     });
 }
 
-/// A seek window first filled from a mid-file buffer keeps that buffer's file
-/// offsets: a later read at offset 0 must not be served from it.
+/// Regression test for #243: after reads in the middle of the file, a read at
+/// offset 0 returns the start of the file, not bytes fetched for those reads.
 #[test]
-fn read_seek_window_filled_mid_file() {
+fn read_at_start_after_mid_file_reads() {
     let hub = MockHub::new();
     let content: Vec<u8> = (0..1_000_000u32).map(|i| (i % 251) as u8).collect();
     hub.add_file("model.bin", content.len() as u64, Some("model_hash"), None);
@@ -2598,11 +2598,9 @@ fn read_seek_window_filled_mid_file() {
         let attr = vfs.lookup(ROOT_INODE, "model.bin").await.unwrap();
         let fh = vfs.open(attr.ino, false, false, None).await.unwrap();
 
-        // First read far from 0: the stream starts there.
+        // A read far from 0, then a backward seek and the read after it.
         vfs.read(fh, 600_000, 4096).await.unwrap();
-        // Backward seek: a bounded range download fills the forward buffer.
         vfs.read(fh, 200_000, 8192).await.unwrap();
-        // The next read drains that buffer into the still empty seek window.
         vfs.read(fh, 208_192, 4096).await.unwrap();
 
         let (data, _) = vfs.read(fh, 0, 4096).await.unwrap();
@@ -2632,7 +2630,7 @@ fn read_range_retry_on_error() {
         let attr = vfs.lookup(ROOT_INODE, "data.bin").await.unwrap();
         let fh = vfs.open(attr.ino, false, false, None).await.unwrap();
 
-        // Read at non-zero offset to force range download (not streaming)
+        // The first fetch fails, and its retry returns the data.
         let (data, _) = vfs.read(fh, 64, 32).await.unwrap();
         assert_eq!(data[0], 64);
         assert_eq!(data.len(), 32);
@@ -2689,10 +2687,8 @@ fn read_range_all_retries_exhausted() {
 }
 
 /// A stalled CAS/CDN stream must not park the read forever: the read-fetch
-/// timeout fails it with EIO so the FUSE worker thread is freed. Without the
-/// timeout the worker would block indefinitely and, once every worker is
-/// blocked this way, the whole mount silently wedges (cold reads return
-/// nothing while `ls` still works). The outer `timeout` guard turns a
+/// timeout fails it with EIO. Without the timeout, the read and every later
+/// read of its blocks would wait forever. The outer `timeout` guard turns a
 /// regression (unbounded wait) into a deterministic test failure instead of a
 /// hung CI run.
 #[test]
@@ -2720,8 +2716,8 @@ fn read_stalled_stream_times_out_with_eio() {
         let attr = vfs.lookup(ROOT_INODE, "data.bin").await.unwrap();
         let fh = vfs.open(attr.ino, false, false, None).await.unwrap();
 
-        // Non-zero offset forces a range download. Bound the whole read so a
-        // regression fails the test deterministically rather than hanging.
+        // Bound the whole read so a regression fails the test
+        // deterministically rather than hanging.
         let result = tokio::time::timeout(Duration::from_secs(10), vfs.read(fh, 64, 32)).await;
         let read_result = result.expect("read() did not return — fetch was not bounded by the timeout");
         assert_eq!(read_result.unwrap_err(), libc::EIO);
@@ -4029,16 +4025,16 @@ fn rename_dir_with_nested_children() {
 
 // ── short-read protection ────────────────────────────────────────────
 
-/// Reads at a prefetch buffer boundary must NOT return a short read (fewer
+/// Reads at a fetch boundary must NOT return a short read (fewer
 /// bytes than the kernel requested) unless the read reaches real EOF.
 /// The Linux FUSE kernel module shrinks i_size on short reads
 /// (fuse_read_update_size), which truncates the file from the app's view.
 #[test]
 fn read_no_short_read_at_buffer_boundary() {
     let hub = MockHub::new();
-    // File larger than one prefetch window (8 MiB). We use 10 MiB so the
-    // first window fills ~8 MiB and the second read at the boundary must
-    // fetch more rather than returning a short read.
+    // File larger than the first read-ahead windows, so that reads cross
+    // fetch boundaries and must wait for more data rather than returning a
+    // short read.
     let file_size: usize = 10 * 1024 * 1024;
     let content: Vec<u8> = (0..file_size).map(|i| (i % 251) as u8).collect();
     hub.add_file("big.bin", file_size as u64, Some("big_hash"), None);
@@ -4051,8 +4047,8 @@ fn read_no_short_read_at_buffer_boundary() {
         let fh = vfs.open(attr.ino, false, false, None).await.unwrap();
 
         // Simulate sequential reads of 128 KiB (typical FUSE read size).
-        // This will exhaust the first 8 MiB prefetch window. The read that
-        // crosses the boundary must return a full 128 KiB, not a short read.
+        // They cross several fetch boundaries; a read that crosses one must
+        // still return a full 128 KiB, not a short read.
         let chunk_size: u32 = 128 * 1024;
         let mut offset: u64 = 0;
         while offset < file_size as u64 {
@@ -4356,19 +4352,16 @@ fn staging_gc_evicts_least_recently_touched_first() {
     });
 }
 
-/// Sequential reads should pass `end=None` (unbounded stream), while seek reads
-/// should pass `end=Some(offset+size)` (bounded range). Validates that the mock
-/// correctly records and respects the `end` parameter.
+/// The first read at offset 0 fetches its block plus read-ahead through the
+/// chunk cache; a far read fetches only the block it covers, without it.
 #[test]
-fn stream_calls_record_bounded_end_for_seek_reads() {
-    // File must be larger than INITIAL_WINDOW (8 MiB) + FORWARD_SKIP (16 MiB) so a
-    // far seek triggers RangeDownload instead of a forward skip restart.
-    const FILE_SIZE: u64 = 30 * 1_048_576; // 30 MiB
+fn stream_calls_record_read_ahead_and_seek_ranges() {
+    const FILE_SIZE: u64 = 80 * 1_048_576; // 80 MiB
+    let block = super::remote_reader::BLOCK_SIZE;
 
     let hub = MockHub::new();
     hub.add_file("file.bin", FILE_SIZE, Some("hash_xyz"), None);
     let xet = MockXet::new();
-    // Use a small repeated pattern — only allocate enough to verify content.
     let data: Vec<u8> = (0..FILE_SIZE as usize).map(|i| (i % 251) as u8).collect();
     xet.add_file("hash_xyz", &data);
 
@@ -4377,29 +4370,35 @@ fn stream_calls_record_bounded_end_for_seek_reads() {
     rt.block_on(async {
         let attr = vfs.lookup(ROOT_INODE, "file.bin").await.unwrap();
         let fh = vfs.open(attr.ino, false, false, None).await.unwrap();
-        tokio::task::yield_now().await;
 
-        // Sequential read at offset 0 — should use unbounded stream (end=None).
         let (chunk, _) = vfs.read(fh, 0, 4096).await.unwrap();
         assert_eq!(chunk.len(), 4096);
 
-        // Far seek read (past INITIAL_WINDOW + FORWARD_SKIP) — should use bounded range.
-        let far_offset = 25 * 1_048_576u64; // 25 MiB
+        // Beyond the forward-scan gap: a random read, not the next tensor.
+        let far_offset = 70 * 1_048_576u64 + 100;
         let (chunk2, _) = vfs.read(fh, far_offset, 4096).await.unwrap();
         assert_eq!(chunk2.len(), 4096);
         assert_eq!(chunk2[0], (far_offset as usize % 251) as u8);
 
+        // Fetch tasks run on several threads and record their calls in any
+        // order: find each call by its range.
         let calls = xet.stream_calls.lock().unwrap().clone();
-        // First call: sequential (end=None).
-        assert_eq!(calls[0].0, 0, "first call should start at offset 0");
-        assert_eq!(calls[0].1, None, "sequential read should have end=None");
-        // Second call: seek (end=Some).
-        assert_eq!(calls[1].0, far_offset, "seek call should start at far_offset");
         assert!(
-            calls[1].1.is_some(),
-            "seek read should have end=Some (bounded range), got {:?}",
-            calls[1].1
+            calls.iter().any(|call| call.0 == 0),
+            "a fetch should start at offset 0, got {calls:?}"
         );
+        let read_ahead: u64 = calls
+            .iter()
+            .filter(|call| call.2 && call.1 <= 16 * 1_048_576)
+            .map(|call| call.1 - call.0)
+            .sum();
+        assert!(
+            read_ahead > block,
+            "first read should fetch read-ahead through the cache, got {calls:?}"
+        );
+        let far_block = far_offset / block * block;
+        let far_calls: Vec<_> = calls.iter().filter(|call| call.1 > far_block).copied().collect();
+        assert_eq!(far_calls, vec![(far_block, far_block + block, false)]);
 
         vfs.release(fh).await.unwrap();
     });

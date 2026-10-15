@@ -14,6 +14,66 @@ pub fn assert_point_read(mount_point: &str, rel_path: &str, expected: &[u8]) -> 
     Ok(())
 }
 
+/// Memory-map a file through the mount and copy it out with `threads`
+/// threads at once, each scanning its own contiguous range: the page-fault
+/// pattern of parallel model loaders (several tensors at a time, each copied
+/// by several threads). All the faults land on one open handle.
+pub fn assert_parallel_mmap_read(mount_point: &str, rel_path: &str, expected: &[u8], threads: usize) -> TestResult {
+    use std::os::fd::AsRawFd;
+
+    let full = format!("{}/{}", mount_point, rel_path);
+    let file = std::fs::File::open(&full).map_err(|e| format!("open {full}: {e}"))?;
+    let len = expected.len();
+    // SAFETY: a private read-only mapping of an open file, unmapped below
+    // after every thread reading it has joined.
+    let addr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            len,
+            libc::PROT_READ,
+            libc::MAP_PRIVATE,
+            file.as_raw_fd(),
+            0,
+        )
+    };
+    if addr == libc::MAP_FAILED {
+        return Err(format!("mmap {full}: {}", std::io::Error::last_os_error()).into());
+    }
+    // SAFETY: the mapping is `len` bytes long and stays mapped until munmap.
+    let map = unsafe { std::slice::from_raw_parts(addr as *const u8, len) };
+
+    let range = len.div_ceil(threads);
+    let outcome = std::thread::scope(|scope| {
+        let readers: Vec<_> = (0..threads)
+            .map(|index| {
+                scope.spawn(move || -> Result<(), String> {
+                    let start = (index * range).min(len);
+                    let end = (start + range).min(len);
+                    let mut copy = vec![0u8; 1 << 20];
+                    let mut offset = start;
+                    while offset < end {
+                        let n = (end - offset).min(copy.len());
+                        copy[..n].copy_from_slice(&map[offset..offset + n]);
+                        if copy[..n] != expected[offset..offset + n] {
+                            return Err(format!("content mismatch in [{offset}, {})", offset + n));
+                        }
+                        offset += n;
+                    }
+                    Ok(())
+                })
+            })
+            .collect();
+        readers
+            .into_iter()
+            .map(|reader| reader.join().unwrap_or_else(|_| Err("reader thread panicked".into())))
+            .collect::<Result<Vec<_>, _>>()
+    });
+    // SAFETY: `addr` and `len` come from the mmap above; no reader is left.
+    unsafe { libc::munmap(addr, len) };
+    outcome.map_err(|e| format!("{full}: {e}"))?;
+    Ok(())
+}
+
 /// Cold-read a deep path and then `readdir` an intermediate directory to
 /// make sure the HEAD → list_tree fallback populates directory listings
 /// on demand.
@@ -620,7 +680,7 @@ pub fn run_simple_write_tests(mp: &str, remote_file: &str) -> TestResult {
         assert!(std::fs::metadata(&path).is_err(), "file should be gone after unlink");
     }
 
-    // 13. Read an empty file (size=0, no xet hash — served via lazy prefetch, not staging)
+    // 13. Read an empty file (size=0, no xet hash — served by the lazy remote reader, not staging)
     eprintln!("  [simple-write] read empty file");
     {
         let path = format!("{}/empty.txt", mp);

@@ -11,12 +11,13 @@ use fuser::{
     OpenFlags, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite,
     Request, TimeOrNow,
 };
+use futures::FutureExt;
 use tracing::{error, info, warn};
 
 use crate::daemon::DaemonGuard;
 use crate::setup::{FS_NAME, MountSetup, unmount_fuse};
 use crate::virtual_fs::inode::InodeKind;
-use crate::virtual_fs::{InvalKind, VirtualFs, VirtualFsAttr};
+use crate::virtual_fs::{InvalKind, VirtualFs, VirtualFsAttr, VirtualFsResult};
 
 /// Always 0: we never recycle inode numbers, so generation is unnecessary.
 const GENERATION: Generation = Generation(0);
@@ -133,7 +134,7 @@ impl Filesystem for FuseAdapter {
         // Kernel default (12) is too low for network-backed I/O.
         let _ = config.set_max_background(64);
         // Readahead benefits local/cached files; remote lazy files use DIRECT_IO
-        // and rely on our userspace PrefetchState instead.
+        // and rely on our userspace RemoteReader instead.
         let _ = config.set_max_readahead(16 * 1_048_576); // 16 MiB
         let _ = config.set_max_write(16 * 1_048_576); // 16 MiB — fewer round-trips for large sequential writes
 
@@ -272,9 +273,22 @@ impl Filesystem for FuseAdapter {
         _lock_owner: Option<fuser::LockOwner>,
         reply: ReplyData,
     ) {
-        match self.runtime.block_on(self.virtual_fs.read(fh.0, offset, size)) {
+        let virtual_fs = self.virtual_fs.clone();
+        let mut read = Box::pin(async move { virtual_fs.read(fh.0, offset, size).await });
+        let send = |reply: ReplyData, result: VirtualFsResult<(bytes::Bytes, bool)>| match result {
             Ok((data, _eof)) => reply.data(&data),
             Err(e) => reply.error(Errno::from_i32(e)),
+        };
+        // Serve data already fetched inline. A read that waits for the
+        // network finishes in a task instead, so that it does not hold a
+        // worker thread: page faults of a memory-mapped file would queue
+        // behind it even when their own data is at hand.
+        let _runtime = self.runtime.enter();
+        match read.as_mut().now_or_never() {
+            Some(result) => send(reply, result),
+            None => {
+                self.runtime.spawn(async move { send(reply, read.await) });
+            }
         }
     }
 
