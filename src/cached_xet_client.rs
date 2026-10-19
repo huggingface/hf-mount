@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use xet_client::ClientError;
 use xet_client::cas_client::adaptive_concurrency::ConnectionPermit;
-use xet_client::cas_client::{Client, ProgressCallback, URLProvider};
+use xet_client::cas_client::{Client, ProgressCallback, ShardUploadProgressCallback, URLProvider};
 use xet_client::cas_types::{
     BatchQueryReconstructionResponse, FileChunkHashesResponse, FileRange, HexMerkleHash, QueryReconstructionResponseV2,
     XorbReconstructionTerm,
@@ -333,8 +333,15 @@ impl Client for CachedXetClient {
         self.inner.acquire_upload_permit().await
     }
 
-    async fn upload_shard(&self, shard_data: Bytes, upload_permit: ConnectionPermit) -> Result<bool> {
-        self.inner.upload_shard(shard_data, upload_permit).await
+    async fn upload_shard(
+        &self,
+        shard_data: Bytes,
+        upload_permit: ConnectionPermit,
+        progress_callback: Option<ShardUploadProgressCallback>,
+    ) -> Result<()> {
+        self.inner
+            .upload_shard(shard_data, upload_permit, progress_callback)
+            .await
     }
 
     async fn upload_xorb(
@@ -483,7 +490,12 @@ mod tests {
             unimplemented!("not needed in these tests")
         }
 
-        async fn upload_shard(&self, _shard_data: Bytes, _upload_permit: ConnectionPermit) -> Result<bool> {
+        async fn upload_shard(
+            &self,
+            _shard_data: Bytes,
+            _upload_permit: ConnectionPermit,
+            _progress_callback: Option<ShardUploadProgressCallback>,
+        ) -> Result<()> {
             unimplemented!("not needed in these tests")
         }
 
