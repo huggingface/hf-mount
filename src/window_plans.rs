@@ -14,18 +14,16 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
-use serde::Deserialize;
+use reqwest::StatusCode;
 use xet_client::ClientError;
 use xet_client::cas_client::Client;
 use xet_client::cas_types::{
-    ChunkRange, FileRange, HexMerkleHash, HttpRange, QueryReconstructionResponseV2, XorbMultiRangeFetch,
-    XorbRangeDescriptor, XorbReconstructionTerm,
+    ChunkLayoutResponse, ChunkRange, FileRange, HexMerkleHash, HttpRange, QueryReconstructionResponseV2,
+    XorbMultiRangeFetch, XorbRangeDescriptor, XorbReconstructionTerm,
 };
 use xet_core_structures::merklehash::MerkleHash;
-
-use crate::hub_api::{CasTokenInfo, HubTokenRefresher};
 
 pub const WINDOW: u64 = 1 << 30;
 /// Signed URLs live 60 minutes; a window is replaced before.
@@ -48,125 +46,53 @@ pub enum WindowPlansMode {
     Check,
 }
 
-/// The chunks of one term of a window, as `/v2/chunk-layout` lists them.
-#[derive(Debug, Deserialize)]
-pub struct TermChunkLayout {
-    pub hash: HexMerkleHash,
-    pub range: ChunkRange,
-    pub uncompressed: Vec<u32>,
-    pub serialized: Option<Vec<u32>>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct ChunkLayout {
-    pub offset_into_first_range: u64,
-    pub terms: Vec<TermChunkLayout>,
-}
-
-#[derive(Debug)]
-pub enum LayoutError {
-    /// CAS does not serve chunk layouts.
-    NotFound,
-    Failed(String),
-}
-
-/// Asks CAS for the plan of a window.
+/// What a window is built from: its plan and its chunk layout, both from CAS.
 #[async_trait::async_trait]
-pub trait PlanSource: Send + Sync {
+pub trait WindowSource: Send + Sync {
     async fn plan(
         &self,
         file_id: &MerkleHash,
         range: FileRange,
     ) -> Result<Option<QueryReconstructionResponseV2>, ClientError>;
+
+    async fn chunk_layout(
+        &self,
+        file_id: &MerkleHash,
+        range: FileRange,
+    ) -> Result<Option<ChunkLayoutResponse>, LayoutError>;
 }
 
-/// Window plans from the CAS client itself, under the mount's plan cache.
-pub struct ClientPlans(pub Arc<dyn Client>);
+#[derive(Debug)]
+pub enum LayoutError {
+    /// CAS does not serve chunk layouts.
+    NotServed,
+    Client(ClientError),
+}
 
 #[async_trait::async_trait]
-impl PlanSource for ClientPlans {
+impl WindowSource for Arc<dyn Client> {
     async fn plan(
         &self,
         file_id: &MerkleHash,
         range: FileRange,
     ) -> Result<Option<QueryReconstructionResponseV2>, ClientError> {
-        self.0.get_reconstruction(file_id, Some(range)).await
-    }
-}
-
-#[async_trait::async_trait]
-pub trait LayoutSource: Send + Sync {
-    async fn chunk_layout(&self, file_id: &MerkleHash, range: FileRange) -> Result<ChunkLayout, LayoutError>;
-}
-
-/// `/v2/chunk-layout` on the CAS endpoint of the mount's storage token.
-pub struct CasLayoutSource {
-    http: reqwest::Client,
-    refresher: Arc<HubTokenRefresher>,
-    token: tokio::sync::Mutex<Option<CasTokenInfo>>,
-}
-
-impl CasLayoutSource {
-    pub fn new(refresher: Arc<HubTokenRefresher>) -> Self {
-        Self {
-            http: reqwest::Client::builder()
-                .user_agent(concat!("hf-mount/", env!("CARGO_PKG_VERSION")))
-                .timeout(Duration::from_secs(30))
-                .build()
-                .expect("reqwest client"),
-            refresher,
-            token: tokio::sync::Mutex::new(None),
-        }
+        self.get_reconstruction(file_id, Some(range)).await
     }
 
-    async fn token(&self, refresh: bool) -> Result<(String, String), LayoutError> {
-        let mut token = self.token.lock().await;
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        if refresh || token.as_ref().is_none_or(|token| token.exp <= now + 60) {
-            let fresh = self
-                .refresher
-                .fetch_initial()
-                .await
-                .map_err(|err| LayoutError::Failed(format!("storage token: {err}")))?;
-            *token = Some(fresh);
-        }
-        let token = token.as_ref().expect("token set above");
-        Ok((token.cas_url.clone(), token.access_token.clone()))
-    }
-}
-
-#[async_trait::async_trait]
-impl LayoutSource for CasLayoutSource {
-    async fn chunk_layout(&self, file_id: &MerkleHash, range: FileRange) -> Result<ChunkLayout, LayoutError> {
-        let mut refresh = false;
-        loop {
-            let (endpoint, token) = self.token(refresh).await?;
-            let response = self
-                .http
-                .get(format!("{endpoint}/v2/chunk-layout/{}", file_id.hex()))
-                .bearer_auth(token)
-                .header(
-                    reqwest::header::RANGE,
-                    format!("bytes={}-{}", range.start, range.end - 1),
-                )
-                .send()
-                .await
-                .map_err(|err| LayoutError::Failed(err.to_string()))?;
-            match response.status() {
-                reqwest::StatusCode::UNAUTHORIZED if !refresh => refresh = true,
-                reqwest::StatusCode::NOT_FOUND => return Err(LayoutError::NotFound),
-                status if !status.is_success() => return Err(LayoutError::Failed(format!("status {status}"))),
-                _ => {
-                    return response
-                        .json()
-                        .await
-                        .map_err(|err| LayoutError::Failed(err.to_string()));
+    async fn chunk_layout(
+        &self,
+        file_id: &MerkleHash,
+        range: FileRange,
+    ) -> Result<Option<ChunkLayoutResponse>, LayoutError> {
+        self.get_chunk_layout(file_id, range, true)
+            .await
+            .map_err(|err| match err {
+                // CAS answers 404 when it does not serve chunk layouts.
+                ClientError::ReqwestError(ref inner, _) if inner.status() == Some(StatusCode::NOT_FOUND) => {
+                    LayoutError::NotServed
                 }
-            }
-        }
+                err => LayoutError::Client(err),
+            })
     }
 }
 
@@ -177,7 +103,7 @@ type BySignedRange = HashMap<usize, Vec<(u32, u32)>>;
 pub struct Window {
     start: u64,
     plan: QueryReconstructionResponseV2,
-    layout: ChunkLayout,
+    layout: ChunkLayoutResponse,
     serialized: HashMap<(HexMerkleHash, u32), u32>,
     /// The terms run to the end of the window, so the file goes on past it.
     reaches_end: bool,
@@ -185,7 +111,7 @@ pub struct Window {
 }
 
 impl Window {
-    fn new(start: u64, plan: QueryReconstructionResponseV2, layout: ChunkLayout) -> Result<Self, &'static str> {
+    fn new(start: u64, plan: QueryReconstructionResponseV2, layout: ChunkLayoutResponse) -> Result<Self, &'static str> {
         if plan
             .xorbs
             .values()
@@ -434,8 +360,7 @@ struct Slot {
 }
 
 pub struct WindowPlans {
-    plans: Arc<dyn PlanSource>,
-    layouts: Arc<dyn LayoutSource>,
+    source: Arc<dyn WindowSource>,
     mode: WindowPlansMode,
     /// Set when CAS does not serve chunk layouts: every plan is asked from CAS.
     disabled: AtomicBool,
@@ -449,10 +374,9 @@ pub struct Derived {
 }
 
 impl WindowPlans {
-    pub fn new(plans: Arc<dyn PlanSource>, layouts: Arc<dyn LayoutSource>, mode: WindowPlansMode) -> Arc<Self> {
+    pub fn new(source: Arc<dyn WindowSource>, mode: WindowPlansMode) -> Arc<Self> {
         Arc::new(Self {
-            plans,
-            layouts,
+            source,
             mode,
             disabled: AtomicBool::new(false),
             slots: Mutex::new(HashMap::new()),
@@ -547,11 +471,11 @@ impl WindowPlans {
     async fn fetch_window(&self, file_id: &MerkleHash, start: u64) -> SlotState {
         let range = FileRange::new(start, start + WINDOW);
         let (plan, layout) = tokio::join!(
-            self.plans.plan(file_id, range),
-            self.layouts.chunk_layout(file_id, range)
+            self.source.plan(file_id, range),
+            self.source.chunk_layout(file_id, range)
         );
         match (plan, layout) {
-            (Ok(Some(plan)), Ok(layout)) => match Window::new(start, plan, layout) {
+            (Ok(Some(plan)), Ok(Some(layout))) => match Window::new(start, plan, layout) {
                 Ok(window) => {
                     tracing::debug!("window plans: {:.8} window at {} ready", file_id, start);
                     return SlotState::Ready(Arc::new(window));
@@ -559,8 +483,8 @@ impl WindowPlans {
                 Err(reason) => tracing::warn!("window plans: {:.8} window at {}: {}", file_id, start, reason),
             },
             // Past the end of the file.
-            (Ok(None), _) => {}
-            (Ok(Some(_)), Err(LayoutError::NotFound)) => {
+            (Ok(None), _) | (_, Ok(None)) => {}
+            (Ok(Some(_)), Err(LayoutError::NotServed)) => {
                 if !self.disabled.swap(true, Ordering::Relaxed) {
                     tracing::info!("window plans: CAS does not serve chunk layouts, plans stay exact");
                 }
@@ -696,7 +620,7 @@ mod tests {
             })
         }
 
-        fn layout(&self, range: FileRange) -> ChunkLayout {
+        fn layout(&self, range: FileRange) -> ChunkLayoutResponse {
             let plan = self.plan(range).unwrap();
             let terms = plan
                 .terms
@@ -704,7 +628,7 @@ mod tests {
                 .map(|term| {
                     let xorb = self.xorbs.iter().find(|x| x.hash == term.hash).unwrap();
                     let chunks = term.range.start as usize..term.range.end as usize;
-                    TermChunkLayout {
+                    xet_client::cas_types::TermChunkLayout {
                         hash: term.hash,
                         range: term.range,
                         uncompressed: xorb.uncompressed[chunks.clone()].to_vec(),
@@ -712,7 +636,7 @@ mod tests {
                     }
                 })
                 .collect();
-            ChunkLayout {
+            ChunkLayoutResponse {
                 offset_into_first_range: plan.offset_into_first_range,
                 terms,
             }
@@ -790,37 +714,45 @@ mod tests {
         assert!(Window::new(0, plan, file.layout(range)).is_err());
     }
 
-    struct FileLayouts {
+    struct FileSource {
         file: File,
-        calls: AtomicUsize,
-        not_found: bool,
+        plans: AtomicUsize,
+        layouts: AtomicUsize,
+        not_served: bool,
     }
 
-    #[async_trait::async_trait]
-    impl LayoutSource for FileLayouts {
-        async fn chunk_layout(&self, _: &MerkleHash, range: FileRange) -> Result<ChunkLayout, LayoutError> {
-            self.calls.fetch_add(1, Ordering::Relaxed);
-            if self.not_found {
-                return Err(LayoutError::NotFound);
-            }
-            Ok(self.file.layout(range))
+    impl FileSource {
+        fn new(not_served: bool) -> Arc<Self> {
+            Arc::new(Self {
+                file: file(),
+                plans: AtomicUsize::new(0),
+                layouts: AtomicUsize::new(0),
+                not_served,
+            })
         }
     }
 
-    struct FilePlans {
-        file: File,
-        calls: AtomicUsize,
-    }
-
     #[async_trait::async_trait]
-    impl PlanSource for FilePlans {
+    impl WindowSource for FileSource {
         async fn plan(
             &self,
             _: &MerkleHash,
             range: FileRange,
         ) -> Result<Option<QueryReconstructionResponseV2>, ClientError> {
-            self.calls.fetch_add(1, Ordering::Relaxed);
+            self.plans.fetch_add(1, Ordering::Relaxed);
             Ok(self.file.plan(range))
+        }
+
+        async fn chunk_layout(
+            &self,
+            _: &MerkleHash,
+            range: FileRange,
+        ) -> Result<Option<ChunkLayoutResponse>, LayoutError> {
+            self.layouts.fetch_add(1, Ordering::Relaxed);
+            if self.not_served {
+                return Err(LayoutError::NotServed);
+            }
+            Ok(Some(self.file.layout(range)))
         }
     }
 
@@ -842,49 +774,33 @@ mod tests {
 
     #[tokio::test]
     async fn the_second_request_in_a_window_fetches_it() {
-        let layouts = Arc::new(FileLayouts {
-            file: file(),
-            calls: AtomicUsize::new(0),
-            not_found: false,
-        });
-        let inner = Arc::new(FilePlans {
-            file: file(),
-            calls: AtomicUsize::new(0),
-        });
-        let plans = WindowPlans::new(inner.clone(), layouts.clone(), WindowPlansMode::On);
+        let source = FileSource::new(false);
+        let plans = WindowPlans::new(source.clone(), WindowPlansMode::On);
         let file_id = MerkleHash::default();
         let range = FileRange::new(100, 20_000);
 
         assert!(plans.derive(&file_id, range).is_none());
         settle(&plans).await;
         assert_eq!(
-            layouts.calls.load(Ordering::Relaxed),
+            source.layouts.load(Ordering::Relaxed),
             0,
             "one request does not pull a window"
         );
 
         assert!(plans.derive(&file_id, range).is_none());
         settle(&plans).await;
-        assert_eq!(layouts.calls.load(Ordering::Relaxed), 1);
-        assert_eq!(inner.calls.load(Ordering::Relaxed), 1);
+        assert_eq!(source.layouts.load(Ordering::Relaxed), 1);
+        assert_eq!(source.plans.load(Ordering::Relaxed), 1);
 
         let derived = plans.derive(&file_id, range).expect("window ready");
         assert_same_plan(&derived.plan, &file().plan(range));
-        assert_eq!(inner.calls.load(Ordering::Relaxed), 1, "derived without asking CAS");
+        assert_eq!(source.plans.load(Ordering::Relaxed), 1, "derived without asking CAS");
     }
 
     #[tokio::test]
     async fn a_cas_without_chunk_layouts_turns_derivation_off() {
-        let layouts = Arc::new(FileLayouts {
-            file: file(),
-            calls: AtomicUsize::new(0),
-            not_found: true,
-        });
-        let inner = Arc::new(FilePlans {
-            file: file(),
-            calls: AtomicUsize::new(0),
-        });
-        let plans = WindowPlans::new(inner, layouts.clone(), WindowPlansMode::On);
+        let source = FileSource::new(true);
+        let plans = WindowPlans::new(source.clone(), WindowPlansMode::On);
         let file_id = MerkleHash::default();
         for _ in 0..2 {
             assert!(plans.derive(&file_id, FileRange::new(0, 100)).is_none());
@@ -899,6 +815,6 @@ mod tests {
             );
         }
         settle(&plans).await;
-        assert_eq!(layouts.calls.load(Ordering::Relaxed), 1);
+        assert_eq!(source.layouts.load(Ordering::Relaxed), 1);
     }
 }
