@@ -16,6 +16,7 @@ use crate::file_cache::FileCache;
 use crate::hub_api::{HubApiClient, HubTokenRefresher, SourceKind, parse_repo_id, split_path_prefix};
 use crate::overlay::OverlayBacking;
 use crate::virtual_fs::{VfsConfig, VirtualFs};
+use crate::window_plans::{CasLayoutSource, ClientPlans, WindowPlans, WindowPlansMode};
 use crate::xet::{StagingDir, XetSessions};
 
 /// Name hf-mount registers its FUSE mounts under (fuser `FSName`, i.e. the
@@ -243,6 +244,14 @@ pub struct MountOptions {
     /// buffers of xet-core).
     #[arg(long, default_value_t = 1024)]
     pub read_ahead_mb: u64,
+
+    /// Reconstruction plans from one CAS request per GiB of a file read, instead
+    /// of three per 32 MiB fetch: hf-mount asks for the plan and the chunk layout
+    /// of a 1 GiB window and derives the plans inside it. `check` derives them,
+    /// compares them with the plans CAS returns, logs any difference, and uses
+    /// the CAS plans. Plans stay exact when CAS does not serve chunk layouts.
+    #[arg(long, value_enum, default_value_t = WindowPlansMode::Off)]
+    pub window_plans: WindowPlansMode,
 
     /// Flush debounce delay in milliseconds. After the first dirty file is
     /// enqueued, the flush batch waits this long for more writes before firing.
@@ -582,7 +591,14 @@ pub fn build_with_runtime(
             false,
         ))
         .expect("Failed to create storage client");
-    let cached_client = CachedXetClient::new(raw_client);
+    let window_plans = (options.window_plans != WindowPlansMode::Off).then(|| {
+        WindowPlans::new(
+            Arc::new(ClientPlans(raw_client.clone())),
+            Arc::new(CasLayoutSource::new(refresher.clone())),
+            options.window_plans,
+        )
+    });
+    let cached_client = CachedXetClient::with_window_plans(raw_client, window_plans);
     let download_session = FileDownloadSession::from_client(&xet_ctx, cached_client.clone(), xorb_cache.clone());
     let upload_config = if remote_read_only { None } else { Some(cas_config) };
     let xet_sessions = XetSessions::new(xet_ctx, download_session, upload_config, cached_client, xorb_cache);
