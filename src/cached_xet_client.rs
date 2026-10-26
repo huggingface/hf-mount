@@ -14,6 +14,8 @@ use xet_core_structures::merklehash::MerkleHash;
 use xet_core_structures::metadata_shard::file_structs::MDBFileInfo;
 use xet_core_structures::xorb_object::SerializedXorbObject;
 
+use crate::window_plans::{WindowPlans, WindowPlansMode};
+
 type Result<T> = std::result::Result<T, ClientError>;
 
 /// Cache key: file hash + optional byte range (`None` = full-file plan).
@@ -60,6 +62,8 @@ pub struct CachedXetClient {
     /// key concurrently, only the first makes the CAS call; others wait and read from cache.
     inflight: Mutex<HashMap<ReconCacheKey, tokio::sync::broadcast::Sender<()>>>,
     ttl: Duration,
+    /// Range plans derived from window plans and chunk layouts.
+    windows: Option<Arc<WindowPlans>>,
 }
 
 impl CachedXetClient {
@@ -73,6 +77,17 @@ impl CachedXetClient {
             cache: Mutex::new(HashMap::new()),
             inflight: Mutex::new(HashMap::new()),
             ttl,
+            windows: None,
+        })
+    }
+
+    pub fn with_window_plans(inner: Arc<dyn Client>, windows: Option<Arc<WindowPlans>>) -> Arc<Self> {
+        Arc::new(Self {
+            inner,
+            cache: Mutex::new(HashMap::new()),
+            inflight: Mutex::new(HashMap::new()),
+            ttl: CACHE_TTL,
+            windows,
         })
     }
 }
@@ -142,9 +157,9 @@ fn derive_range_response(full: &QueryReconstructionResponseV2, range: FileRange)
     }
 }
 
-#[async_trait::async_trait]
-impl Client for CachedXetClient {
-    async fn get_reconstruction(
+impl CachedXetClient {
+    /// The plan CAS returns, from the cache when it holds it.
+    async fn exact_reconstruction(
         &self,
         file_id: &MerkleHash,
         bytes_range: Option<FileRange>,
@@ -288,6 +303,29 @@ impl Client for CachedXetClient {
                 }
             }
         } // loop
+    }
+}
+
+#[async_trait::async_trait]
+impl Client for CachedXetClient {
+    async fn get_reconstruction(
+        &self,
+        file_id: &MerkleHash,
+        bytes_range: Option<FileRange>,
+    ) -> Result<Option<QueryReconstructionResponseV2>> {
+        if let (Some(windows), Some(range)) = (&self.windows, bytes_range)
+            && let Some(derived) = windows.derive(file_id, range)
+        {
+            if windows.mode() != WindowPlansMode::Check {
+                return Ok(derived.plan);
+            }
+            let exact = self.exact_reconstruction(file_id, bytes_range).await;
+            if let Ok(exact) = &exact {
+                windows.check(file_id, range, &derived, exact);
+            }
+            return exact;
+        }
+        self.exact_reconstruction(file_id, bytes_range).await
     }
 
     async fn get_file_reconstruction_info(
