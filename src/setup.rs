@@ -16,7 +16,7 @@ use crate::file_cache::FileCache;
 use crate::hub_api::{HubApiClient, HubTokenRefresher, SourceKind, parse_repo_id, split_path_prefix};
 use crate::overlay::OverlayBacking;
 use crate::virtual_fs::{VfsConfig, VirtualFs};
-use crate::window_plans::{CasLayoutSource, ClientPlans, WindowPlans, WindowPlansMode};
+use crate::window_plans::{WindowPlans, WindowPlansMode};
 use crate::xet::{StagingDir, XetSessions};
 
 /// Name hf-mount registers its FUSE mounts under (fuser `FSName`, i.e. the
@@ -591,13 +591,8 @@ pub fn build_with_runtime(
             false,
         ))
         .expect("Failed to create storage client");
-    let window_plans = (options.window_plans != WindowPlansMode::Off).then(|| {
-        WindowPlans::new(
-            Arc::new(ClientPlans(raw_client.clone())),
-            Arc::new(CasLayoutSource::new(refresher.clone())),
-            options.window_plans,
-        )
-    });
+    let window_plans = (options.window_plans != WindowPlansMode::Off)
+        .then(|| WindowPlans::new(Arc::new(raw_client.clone()), options.window_plans));
     let cached_client = CachedXetClient::with_window_plans(raw_client, window_plans);
     let download_session = FileDownloadSession::from_client(&xet_ctx, cached_client.clone(), xorb_cache.clone());
     let upload_config = if remote_read_only { None } else { Some(cas_config) };
