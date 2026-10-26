@@ -962,22 +962,25 @@ impl HubApiClient {
             Err(err) => return Err(err),
         };
 
+        let redirected = resp.status().is_redirection();
         let headers = resp.headers();
         let xet_hash = headers
             .get("x-xet-hash")
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
-        // Prefer x-linked-size (LFS pointer's true blob size). For non-LFS files
-        // the resolve endpoint serves the file directly, so content-length is the
-        // real size.
+        // On a redirect (LFS/Xet files to the CDN, plain files of public repos
+        // to /api/resolve-cache), content-length and etag describe the redirect
+        // body, not the file: only the x-linked-* headers apply. Without
+        // x-linked-size the size stays unknown and callers fall back to the
+        // tree listing. A 200 (private or gated repos) serves the file itself.
         let size = headers
             .get("x-linked-size")
-            .or_else(|| headers.get("content-length"))
+            .or_else(|| headers.get("content-length").filter(|_| !redirected))
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.parse::<u64>().ok());
         let etag = headers
             .get("x-linked-etag")
-            .or_else(|| headers.get("etag"))
+            .or_else(|| headers.get("etag").filter(|_| !redirected))
             .and_then(|v| v.to_str().ok())
             .map(|s| s.trim_matches('"').to_string());
         let last_modified = headers
@@ -1858,6 +1861,60 @@ mod tests {
         let result = send_with_retry(|| client.get(&url), "test", false).await;
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), Error::Hub { status: Some(302), .. }));
+    }
+
+    // ── head_file tests ───────────────────────────────────────────────
+
+    /// HEAD `file.txt` against a server that answers once with `status` and `headers`.
+    async fn head_file_with_response(status: &str, headers: &str) -> HeadFileInfo {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let response = format!("HTTP/1.1 {status}\r\n{headers}connection: close\r\n\r\n");
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let _ = stream.read(&mut buf).await;
+            stream.write_all(response.as_bytes()).await.ok();
+            stream.shutdown().await.ok();
+        });
+
+        let mut client = make_test_client("", None);
+        client.endpoint = format!("http://{addr}");
+        client.head_file("file.txt").await.unwrap().unwrap()
+    }
+
+    #[tokio::test]
+    async fn head_file_redirect_ignores_content_length_and_etag() {
+        // Plain file in a public repo: the 307 to /api/resolve-cache carries
+        // the redirect body's content-length (246), not the file's (665).
+        let info = head_file_with_response(
+            "307 Temporary Redirect",
+            "content-length: 246\r\netag: \"redirect\"\r\nlocation: /api/resolve-cache/file.txt\r\n",
+        )
+        .await;
+        assert_eq!(info.size, None);
+        assert_eq!(info.etag, None);
+    }
+
+    #[tokio::test]
+    async fn head_file_redirect_uses_linked_headers() {
+        let info = head_file_with_response(
+            "307 Temporary Redirect",
+            "content-length: 246\r\nx-linked-size: 665\r\nx-linked-etag: \"10c6\"\r\nlocation: /api/resolve-cache/file.txt\r\n",
+        )
+        .await;
+        assert_eq!(info.size, Some(665));
+        assert_eq!(info.etag.as_deref(), Some("10c6"));
+    }
+
+    #[tokio::test]
+    async fn head_file_direct_response_uses_content_length() {
+        // Private or gated repo: the plain file is served directly with a 200.
+        let info = head_file_with_response("200 OK", "content-length: 665\r\netag: \"10c6\"\r\n").await;
+        assert_eq!(info.size, Some(665));
+        assert_eq!(info.etag.as_deref(), Some("10c6"));
     }
 
     // ── probe_repo tests ──────────────────────────────────────────────
