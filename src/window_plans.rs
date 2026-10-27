@@ -8,8 +8,10 @@
 //! sub-range of the window's signed ranges, located with the serialized sizes.
 //! That is the plan CAS would return for the range, with the window's URLs.
 //!
-//! A window is asked for in the background, on the second request that falls in
-//! it, so a lone random read never pulls a whole window and no read waits for one.
+//! A window is asked for in the background, so no read waits for one: at once for
+//! a read from the start of the file, on the second request that falls in it
+//! otherwise, so a lone random read never pulls a whole window. The next window
+//! is asked as soon as a plan is derived from the current one.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -32,8 +34,6 @@ const WINDOW_TTL: Duration = Duration::from_secs(50 * 60);
 const RETRY_AFTER: Duration = Duration::from_secs(60);
 /// Windows kept, by last use. A window of a 1 GiB fragmented range weighs a few hundred KB.
 const MAX_WINDOWS: usize = 128;
-/// A derived range that ends past this point of its window asks for the next window.
-const PREFETCH_FROM: u64 = WINDOW / 4 * 3;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
 pub enum WindowPlansMode {
@@ -396,9 +396,12 @@ impl WindowPlans {
         if range.end <= range.start || range.end > start + WINDOW {
             return None;
         }
-        let window = self.window(*file_id, start, false)?;
+        // A read from the start of the file is most likely a whole-file read.
+        let window = self.window(*file_id, start, range.start == 0)?;
         let plan = window.derive(range)?;
-        if range.end > start + PREFETCH_FROM && window.reaches_end {
+        // A window takes a second or two to arrive: a sequential reader is through
+        // most of it by the time the next one is asked at its end.
+        if window.reaches_end {
             self.window(*file_id, start + WINDOW, true);
         }
         Some(Derived { plan, window })
@@ -795,6 +798,20 @@ mod tests {
         let derived = plans.derive(&file_id, range).expect("window ready");
         assert_same_plan(&derived.plan, &file().plan(range));
         assert_eq!(source.plans.load(Ordering::Relaxed), 1, "derived without asking CAS");
+    }
+
+    #[tokio::test]
+    async fn a_read_from_the_start_fetches_the_window_at_once() {
+        let source = FileSource::new(false);
+        let plans = WindowPlans::new(source.clone(), WindowPlansMode::On);
+        let file_id = MerkleHash::default();
+
+        assert!(plans.derive(&file_id, FileRange::new(0, 8_000)).is_none());
+        settle(&plans).await;
+        assert_eq!(source.layouts.load(Ordering::Relaxed), 1);
+        let range = FileRange::new(8_000, 20_000);
+        let derived = plans.derive(&file_id, range).expect("window ready");
+        assert_same_plan(&derived.plan, &file().plan(range));
     }
 
     #[tokio::test]
