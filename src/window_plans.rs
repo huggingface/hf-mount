@@ -8,10 +8,12 @@
 //! sub-range of the window's signed ranges, located with the serialized sizes.
 //! That is the plan CAS would return for the range, with the window's URLs.
 //!
-//! A window is asked for in the background, so no read waits for one: at once for
-//! a read from the start of the file, on the second request that falls in it
-//! otherwise, so a lone random read never pulls a whole window. The next window
-//! is asked as soon as a plan is derived from the current one.
+//! A window is asked for in the background, so no read waits for one. A reader that
+//! starts at the beginning of the file, or that comes from the previous window, reads
+//! on: its window is asked at once, with the next `AHEAD` ones, so that they arrive
+//! before the read-ahead reaches them. Elsewhere a window is asked on the second
+//! request that falls in it, so a lone random read never pulls one. Files smaller
+//! than `MIN_FILE` keep exact plans: they are read before a window arrives.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -27,7 +29,16 @@ use xet_client::cas_types::{
 };
 use xet_core_structures::merklehash::MerkleHash;
 
-pub const WINDOW: u64 = 1 << 30;
+/// A window takes about 0.3 s plus 1 s per GiB to arrive from CAS: a smaller one arrives
+/// sooner, so fewer plans are asked from CAS before it does, for a few more windows per GiB.
+pub const WINDOW: u64 = 256 << 20;
+/// Windows asked ahead of the one a reader reads on into, 1 GiB in all. At 1 GB/s a reader
+/// goes through a window in a quarter of a second, less than one takes to arrive.
+const AHEAD: u64 = 4;
+/// Files smaller than this keep exact plans: they are read before a window arrives.
+const MIN_FILE: u64 = 256 << 20;
+/// File sizes kept for the windows, the files read through the mount most recently.
+const MAX_SIZES: usize = 4096;
 /// Signed URLs live 60 minutes; a window is replaced before.
 const WINDOW_TTL: Duration = Duration::from_secs(50 * 60);
 /// A window that could not be fetched is asked again after this delay.
@@ -105,8 +116,6 @@ pub struct Window {
     plan: QueryReconstructionResponseV2,
     layout: ChunkLayoutResponse,
     serialized: HashMap<(HexMerkleHash, u32), u32>,
-    /// The terms run to the end of the window, so the file goes on past it.
-    reaches_end: bool,
     fetched_at: Instant,
 }
 
@@ -140,14 +149,11 @@ impl Window {
                 serialized.insert((term.hash, chunk), *size);
             }
         }
-        let covered: u64 = plan.terms.iter().map(|term| term.unpacked_length as u64).sum();
-        let reaches_end = covered.saturating_sub(plan.offset_into_first_range) >= WINDOW;
         Ok(Self {
             start,
             plan,
             layout,
             serialized,
-            reaches_end,
             fetched_at: Instant::now(),
         })
     }
@@ -365,6 +371,8 @@ pub struct WindowPlans {
     /// Set when CAS does not serve chunk layouts: every plan is asked from CAS.
     disabled: AtomicBool,
     slots: Mutex<HashMap<(MerkleHash, u64), Slot>>,
+    /// The size of the files read through the mount. Windows need it to stop at the end of a file.
+    sizes: Mutex<HashMap<MerkleHash, u64>>,
 }
 
 /// A derived plan and the window it comes from.
@@ -380,6 +388,7 @@ impl WindowPlans {
             mode,
             disabled: AtomicBool::new(false),
             slots: Mutex::new(HashMap::new()),
+            sizes: Mutex::new(HashMap::new()),
         })
     }
 
@@ -387,24 +396,44 @@ impl WindowPlans {
         self.mode
     }
 
+    /// Record the size of a file read through the mount.
+    pub fn note_size(&self, file_id: &MerkleHash, size: u64) {
+        let mut sizes = self.sizes.lock().expect("sizes poisoned");
+        if sizes.len() >= MAX_SIZES && !sizes.contains_key(file_id) {
+            sizes.clear();
+        }
+        sizes.insert(*file_id, size);
+    }
+
     /// The plan of `range` from its window, or `None` when the caller must ask CAS.
     pub fn derive(self: &Arc<Self>, file_id: &MerkleHash, range: FileRange) -> Option<Derived> {
         if self.disabled.load(Ordering::Relaxed) {
             return None;
         }
+        let size = self.sizes.lock().expect("sizes poisoned").get(file_id).copied()?;
         let start = range.start / WINDOW * WINDOW;
-        if range.end <= range.start || range.end > start + WINDOW {
+        if size < MIN_FILE || range.end <= range.start || range.end > start + WINDOW {
             return None;
         }
-        // A read from the start of the file is most likely a whole-file read.
-        let window = self.window(*file_id, start, range.start == 0)?;
-        let plan = window.derive(range)?;
-        // A window takes a second or two to arrive: a sequential reader is through
-        // most of it by the time the next one is asked at its end.
-        if window.reaches_end {
-            self.window(*file_id, start + WINDOW, true);
+        let reads_on = range.start == 0 || (start >= WINDOW && self.asked(file_id, start - WINDOW));
+        let window = self.window(*file_id, start, reads_on);
+        if self.asked(file_id, start) {
+            for next in (1..=AHEAD).map(|i| start + i * WINDOW).take_while(|next| *next < size) {
+                self.window(*file_id, next, true);
+            }
         }
+        let window = window?;
+        let plan = window.derive(range)?;
         Some(Derived { plan, window })
+    }
+
+    /// Whether the window at `start` was asked: in flight, ready or failed.
+    fn asked(&self, file_id: &MerkleHash, start: u64) -> bool {
+        self.slots
+            .lock()
+            .expect("window slots poisoned")
+            .get(&(*file_id, start))
+            .is_some_and(|slot| !matches!(slot.state, SlotState::Seen))
     }
 
     /// Whether `derived` matches `exact`; logs the difference when it does not.
@@ -755,7 +784,7 @@ mod tests {
             if self.not_served {
                 return Err(LayoutError::NotServed);
             }
-            Ok(Some(self.file.layout(range)))
+            Ok(self.file.plan(range).map(|_| self.file.layout(range)))
         }
     }
 
@@ -780,6 +809,7 @@ mod tests {
         let source = FileSource::new(false);
         let plans = WindowPlans::new(source.clone(), WindowPlansMode::On);
         let file_id = MerkleHash::default();
+        plans.note_size(&file_id, MIN_FILE);
         let range = FileRange::new(100, 20_000);
 
         assert!(plans.derive(&file_id, range).is_none());
@@ -805,6 +835,7 @@ mod tests {
         let source = FileSource::new(false);
         let plans = WindowPlans::new(source.clone(), WindowPlansMode::On);
         let file_id = MerkleHash::default();
+        plans.note_size(&file_id, MIN_FILE);
 
         assert!(plans.derive(&file_id, FileRange::new(0, 8_000)).is_none());
         settle(&plans).await;
@@ -815,21 +846,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_reader_that_reads_on_asks_the_windows_ahead() {
+        let source = FileSource::new(false);
+        let plans = WindowPlans::new(source.clone(), WindowPlansMode::On);
+        let file_id = MerkleHash::default();
+        plans.note_size(&file_id, (AHEAD + 2) * WINDOW);
+
+        // From the start of the file: the first window and the `AHEAD` next ones.
+        assert!(plans.derive(&file_id, FileRange::new(0, 8_000)).is_none());
+        settle(&plans).await;
+        assert_eq!(source.layouts.load(Ordering::Relaxed), 1 + AHEAD as usize);
+
+        // Into the window after the last one asked: at once, on its first request.
+        let next = (AHEAD + 1) * WINDOW;
+        assert!(plans.derive(&file_id, FileRange::new(next + 100, next + 200)).is_none());
+        settle(&plans).await;
+        assert_eq!(source.layouts.load(Ordering::Relaxed), 2 + AHEAD as usize);
+    }
+
+    #[tokio::test]
+    async fn small_files_and_files_of_unknown_size_keep_exact_plans() {
+        let source = FileSource::new(false);
+        let plans = WindowPlans::new(source.clone(), WindowPlansMode::On);
+        let unknown = MerkleHash::default();
+        let small = compute_data_hash(b"small");
+        plans.note_size(&small, MIN_FILE - 1);
+        for file_id in [unknown, small] {
+            for _ in 0..3 {
+                assert!(plans.derive(&file_id, FileRange::new(0, 8_000)).is_none());
+                settle(&plans).await;
+            }
+        }
+        assert_eq!(source.layouts.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
     async fn a_cas_without_chunk_layouts_turns_derivation_off() {
         let source = FileSource::new(true);
         let plans = WindowPlans::new(source.clone(), WindowPlansMode::On);
         let file_id = MerkleHash::default();
+        plans.note_size(&file_id, MIN_FILE);
         for _ in 0..2 {
             assert!(plans.derive(&file_id, FileRange::new(0, 100)).is_none());
             settle(&plans).await;
         }
         assert!(plans.disabled.load(Ordering::Relaxed));
+        let other = compute_data_hash(b"other");
+        plans.note_size(&other, MIN_FILE);
         for _ in 0..3 {
-            assert!(
-                plans
-                    .derive(&compute_data_hash(b"other"), FileRange::new(0, 100))
-                    .is_none()
-            );
+            assert!(plans.derive(&other, FileRange::new(0, 100)).is_none());
         }
         settle(&plans).await;
         assert_eq!(source.layouts.load(Ordering::Relaxed), 1);
