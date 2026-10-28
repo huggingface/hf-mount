@@ -5,14 +5,16 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use xet_client::ClientError;
 use xet_client::cas_client::adaptive_concurrency::ConnectionPermit;
-use xet_client::cas_client::{Client, ProgressCallback, URLProvider};
+use xet_client::cas_client::{Client, ProgressCallback, ShardUploadProgressCallback, URLProvider};
 use xet_client::cas_types::{
-    BatchQueryReconstructionResponse, FileChunkHashesResponse, FileRange, HexMerkleHash, QueryReconstructionResponseV2,
-    XorbReconstructionTerm,
+    BatchQueryReconstructionResponse, ChunkLayoutResponse, FileChunkHashesResponse, FileRange, HexMerkleHash,
+    QueryReconstructionResponseV2, XorbReconstructionTerm,
 };
 use xet_core_structures::merklehash::MerkleHash;
 use xet_core_structures::metadata_shard::file_structs::MDBFileInfo;
 use xet_core_structures::xorb_object::SerializedXorbObject;
+
+use crate::window_plans::{WindowPlans, WindowPlansMode};
 
 type Result<T> = std::result::Result<T, ClientError>;
 
@@ -60,6 +62,8 @@ pub struct CachedXetClient {
     /// key concurrently, only the first makes the CAS call; others wait and read from cache.
     inflight: Mutex<HashMap<ReconCacheKey, tokio::sync::broadcast::Sender<()>>>,
     ttl: Duration,
+    /// Range plans derived from window plans and chunk layouts.
+    windows: Option<Arc<WindowPlans>>,
 }
 
 impl CachedXetClient {
@@ -73,6 +77,17 @@ impl CachedXetClient {
             cache: Mutex::new(HashMap::new()),
             inflight: Mutex::new(HashMap::new()),
             ttl,
+            windows: None,
+        })
+    }
+
+    pub fn with_window_plans(inner: Arc<dyn Client>, windows: Option<Arc<WindowPlans>>) -> Arc<Self> {
+        Arc::new(Self {
+            inner,
+            cache: Mutex::new(HashMap::new()),
+            inflight: Mutex::new(HashMap::new()),
+            ttl: CACHE_TTL,
+            windows,
         })
     }
 }
@@ -142,9 +157,9 @@ fn derive_range_response(full: &QueryReconstructionResponseV2, range: FileRange)
     }
 }
 
-#[async_trait::async_trait]
-impl Client for CachedXetClient {
-    async fn get_reconstruction(
+impl CachedXetClient {
+    /// The plan CAS returns, from the cache when it holds it.
+    async fn exact_reconstruction(
         &self,
         file_id: &MerkleHash,
         bytes_range: Option<FileRange>,
@@ -289,6 +304,29 @@ impl Client for CachedXetClient {
             }
         } // loop
     }
+}
+
+#[async_trait::async_trait]
+impl Client for CachedXetClient {
+    async fn get_reconstruction(
+        &self,
+        file_id: &MerkleHash,
+        bytes_range: Option<FileRange>,
+    ) -> Result<Option<QueryReconstructionResponseV2>> {
+        if let (Some(windows), Some(range)) = (&self.windows, bytes_range)
+            && let Some(derived) = windows.derive(file_id, range)
+        {
+            if windows.mode() != WindowPlansMode::Check {
+                return Ok(derived.plan);
+            }
+            let exact = self.exact_reconstruction(file_id, bytes_range).await;
+            if let Ok(exact) = &exact {
+                windows.check(file_id, range, &derived, exact);
+            }
+            return exact;
+        }
+        self.exact_reconstruction(file_id, bytes_range).await
+    }
 
     async fn get_file_reconstruction_info(
         &self,
@@ -333,8 +371,24 @@ impl Client for CachedXetClient {
         self.inner.acquire_upload_permit().await
     }
 
-    async fn upload_shard(&self, shard_data: Bytes, upload_permit: ConnectionPermit) -> Result<bool> {
-        self.inner.upload_shard(shard_data, upload_permit).await
+    async fn upload_shard(
+        &self,
+        shard_data: Bytes,
+        upload_permit: ConnectionPermit,
+        progress_callback: Option<ShardUploadProgressCallback>,
+    ) -> Result<Option<MerkleHash>> {
+        self.inner
+            .upload_shard(shard_data, upload_permit, progress_callback)
+            .await
+    }
+
+    async fn get_chunk_layout(
+        &self,
+        file_id: &MerkleHash,
+        bytes_range: FileRange,
+        serialized: bool,
+    ) -> Result<Option<ChunkLayoutResponse>> {
+        self.inner.get_chunk_layout(file_id, bytes_range, serialized).await
     }
 
     async fn upload_xorb(
@@ -483,7 +537,21 @@ mod tests {
             unimplemented!("not needed in these tests")
         }
 
-        async fn upload_shard(&self, _shard_data: Bytes, _upload_permit: ConnectionPermit) -> Result<bool> {
+        async fn get_chunk_layout(
+            &self,
+            _file_id: &MerkleHash,
+            _bytes_range: FileRange,
+            _serialized: bool,
+        ) -> Result<Option<ChunkLayoutResponse>> {
+            unimplemented!("not needed in these tests")
+        }
+
+        async fn upload_shard(
+            &self,
+            _shard_data: Bytes,
+            _upload_permit: ConnectionPermit,
+            _progress_callback: Option<ShardUploadProgressCallback>,
+        ) -> Result<Option<MerkleHash>> {
             unimplemented!("not needed in these tests")
         }
 
