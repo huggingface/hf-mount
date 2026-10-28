@@ -62,13 +62,7 @@ fn main() {
                 .filter(|p| p.exists())
                 .unwrap_or_else(|| PathBuf::from(backend));
 
-            // Extract mount point from args (last positional arg, the one after bucket/repo + id).
-            let mount_point = args
-                .iter()
-                .rev()
-                .find(|a| !a.starts_with('-') && std::path::Path::new(a).is_absolute())
-                .or_else(|| args.last())
-                .map(PathBuf::from);
+            let mount_point = hf_mount::daemon::mount_point_from_args(&args);
 
             let mount_point = match mount_point {
                 Some(p) => p,
