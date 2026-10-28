@@ -593,10 +593,17 @@ pub fn build_with_runtime(
         .expect("Failed to create storage client");
     let window_plans = (options.window_plans != WindowPlansMode::Off)
         .then(|| WindowPlans::new(Arc::new(raw_client.clone()), options.window_plans));
-    let cached_client = CachedXetClient::with_window_plans(raw_client, window_plans);
+    let cached_client = CachedXetClient::with_window_plans(raw_client, window_plans.clone());
     let download_session = FileDownloadSession::from_client(&xet_ctx, cached_client.clone(), xorb_cache.clone());
     let upload_config = if remote_read_only { None } else { Some(cas_config) };
-    let xet_sessions = XetSessions::new(xet_ctx, download_session, upload_config, cached_client, xorb_cache);
+    let xet_sessions = XetSessions::new(
+        xet_ctx,
+        download_session,
+        upload_config,
+        cached_client,
+        xorb_cache,
+        window_plans,
+    );
 
     let advanced_writes = options.advanced_writes || options.overlay || (is_nfs && !read_only);
 
