@@ -13,6 +13,7 @@ use xet_data::processing::{FileDownloadSession, FileUploadSession, Sha256Policy,
 use xet_runtime::core::XetContext;
 
 use crate::error::{Error, Result};
+use crate::window_plans::WindowPlans;
 
 // ── Traits ───────────────────────────────────────────────────────────
 
@@ -63,6 +64,8 @@ pub struct XetSessions {
     cas_client: Arc<dyn Client>,
     /// Chunk cache attached to downloads that ask for it (read-ahead).
     chunk_cache: Option<Arc<dyn ChunkCache>>,
+    /// Window plans of `cas_client`, told the size of the files read.
+    windows: Option<Arc<WindowPlans>>,
 }
 
 impl XetSessions {
@@ -72,6 +75,7 @@ impl XetSessions {
         upload_config: Option<Arc<TranslatorConfig>>,
         cas_client: Arc<dyn Client>,
         chunk_cache: Option<Arc<dyn ChunkCache>>,
+        windows: Option<Arc<WindowPlans>>,
     ) -> Arc<Self> {
         Arc::new(Self {
             ctx,
@@ -79,6 +83,7 @@ impl XetSessions {
             upload_config,
             cas_client,
             chunk_cache,
+            windows,
         })
     }
 
@@ -95,6 +100,9 @@ impl XetSessions {
         let hash = file_info
             .merkle_hash()
             .map_err(|e| Error::Xet(format!("invalid hash: {e}")))?;
+        if let (Some(windows), Some(size)) = (self.windows.as_ref(), file_info.file_size()) {
+            windows.note_size(&hash, size);
+        }
         let mut reconstructor =
             FileReconstructor::new(&self.ctx, &self.cas_client, hash).with_byte_range(FileRange::new(offset, end));
         if cached && let Some(cache) = self.chunk_cache.as_ref() {
