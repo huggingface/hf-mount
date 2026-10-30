@@ -220,6 +220,10 @@ pub struct VirtualFs {
     shutdown_once: std::sync::Once,
     /// Background poll task handle, aborted in shutdown().
     poll_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// True while polling or the live-follow feed keeps directory listings in
+    /// sync. When false, a listing is only trusted for `metadata_ttl`: nothing
+    /// else would ever show a remotely added or removed entry.
+    remote_sync: Arc<AtomicBool>,
     /// Kernel cache invalidation callback. Set via `set_invalidator()` after mount.
     /// The poll loop calls this to actively invalidate stale inodes when remote changes
     /// are detected, allowing the kernel page cache to be used instead of DIRECT_IO.
@@ -308,6 +312,7 @@ impl VirtualFs {
         // Spawn the remote change task when either sync mechanism is on:
         // interval polling (interval > 0) or the live-follow feed.
         let invalidator: Invalidator = Arc::new(OnceLock::new());
+        let remote_sync = Arc::new(AtomicBool::new(config.poll_interval_secs > 0 || config.live_follow));
         let poll_handle = if config.poll_interval_secs > 0 || config.live_follow {
             let bg_hub = hub_client.clone();
             let bg_inodes = inodes.clone();
@@ -317,15 +322,22 @@ impl VirtualFs {
             // Clamp to >= 1 in case a caller (library use) constructs VfsConfig directly.
             let listing_concurrency = config.poll_listing_concurrency.max(1);
 
-            Some(runtime.spawn(Self::poll_remote_changes(
-                bg_hub,
-                bg_inodes,
-                bg_neg_cache,
-                bg_invalidator,
-                interval,
-                listing_concurrency,
-                config.live_follow,
-            )))
+            let bg_remote_sync = remote_sync.clone();
+            let live_follow = config.live_follow;
+            Some(runtime.spawn(async move {
+                Self::poll_remote_changes(
+                    bg_hub,
+                    bg_inodes,
+                    bg_neg_cache,
+                    bg_invalidator,
+                    interval,
+                    listing_concurrency,
+                    live_follow,
+                )
+                .await;
+                // Only returns when the live-follow feed is unusable and polling is disabled.
+                bg_remote_sync.store(false, Ordering::Relaxed);
+            }))
         } else {
             None
         };
@@ -355,6 +367,7 @@ impl VirtualFs {
             pending_commits: Mutex::new(HashMap::new()),
             flush_manager,
             poll_handle: Mutex::new(poll_handle),
+            remote_sync,
             invalidator,
             entry_invalidator,
             shutting_down: Arc::new(AtomicBool::new(false)),
@@ -895,7 +908,7 @@ impl VirtualFs {
             let inodes = self.inode_table.read().expect("inodes poisoned");
             match inodes.get(parent_ino) {
                 Some(e) if e.kind != InodeKind::Directory => return Err(libc::ENOTDIR),
-                Some(e) if e.children_loaded() => return Ok(false),
+                Some(e) if self.listing_is_fresh(e) => return Ok(false),
                 None => return Err(libc::ENOENT),
                 _ => {}
             }
@@ -910,7 +923,7 @@ impl VirtualFs {
             let inodes = self.inode_table.read().expect("inodes poisoned");
             match inodes.get(parent_ino) {
                 Some(e) if e.kind != InodeKind::Directory => return Err(libc::ENOTDIR),
-                Some(e) if e.children_loaded() => return Ok(false),
+                Some(e) if self.listing_is_fresh(e) => return Ok(false),
                 Some(e) => e.full_path.to_string(),
                 None => return Err(libc::ENOENT),
             }
@@ -930,7 +943,7 @@ impl VirtualFs {
 
         let mut inodes = self.inode_table.write().expect("inodes poisoned");
         match inodes.get(parent_ino) {
-            Some(e) if e.children_loaded() => return Ok(false),
+            Some(e) if self.listing_is_fresh(e) => return Ok(false),
             Some(e) if e.kind != InodeKind::Directory => return Err(libc::ENOTDIR),
             None => return Err(libc::ENOENT),
             _ => {}
@@ -1093,6 +1106,15 @@ impl VirtualFs {
     /// Check if any open file handle references the given inode.
     fn has_open_handles(&self, ino: u64) -> bool {
         self.inode_table.read().expect("inodes poisoned").has_open_handles(ino)
+    }
+
+    /// Whether the children listing of `entry` can be trusted without listing again.
+    fn listing_is_fresh(&self, entry: &InodeEntry) -> bool {
+        match entry.children_loaded_at {
+            None => false,
+            Some(_) if self.remote_sync.load(Ordering::Relaxed) => true,
+            Some(loaded_at) => loaded_at.elapsed() < self.metadata_ttl,
+        }
     }
 
     /// Get or create a per-directory lock for serializing ensure_children_loaded().
@@ -1432,7 +1454,7 @@ impl VirtualFs {
                 },
                 // Either a dirty file (local writes win until flushed) or any
                 // entry under a fully-listed parent we can trust as-is.
-                Some(entry) if entry.kind == InodeKind::File || parent_entry.children_loaded() => {
+                Some(entry) if entry.kind == InodeKind::File || self.listing_is_fresh(parent_entry) => {
                     FastResult::Hit(self.make_vfs_attr(entry))
                 }
                 // Cached non-file under an unloaded parent: we can't HEAD-probe
@@ -1441,7 +1463,7 @@ impl VirtualFs {
                 Some(_) => FastResult::NotLoaded,
                 // No cached entry but the parent listing is authoritative →
                 // the name really doesn't exist; populate the negative cache.
-                None if parent_entry.children_loaded() => {
+                None if self.listing_is_fresh(parent_entry) => {
                     let parent_path = &parent_entry.full_path;
                     let full_path = if parent_path.is_empty() {
                         name.to_string()
