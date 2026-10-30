@@ -312,8 +312,9 @@ impl VirtualFs {
         // Spawn the remote change task when either sync mechanism is on:
         // interval polling (interval > 0) or the live-follow feed.
         let invalidator: Invalidator = Arc::new(OnceLock::new());
-        let remote_sync = Arc::new(AtomicBool::new(config.poll_interval_secs > 0 || config.live_follow));
-        let poll_handle = if config.poll_interval_secs > 0 || config.live_follow {
+        let remote_sync_on = config.poll_interval_secs > 0 || config.live_follow;
+        let remote_sync = Arc::new(AtomicBool::new(remote_sync_on));
+        let poll_handle = if remote_sync_on {
             let bg_hub = hub_client.clone();
             let bg_inodes = inodes.clone();
             let bg_neg_cache = negative_cache.clone();
@@ -322,19 +323,18 @@ impl VirtualFs {
             // Clamp to >= 1 in case a caller (library use) constructs VfsConfig directly.
             let listing_concurrency = config.poll_listing_concurrency.max(1);
 
+            let poll = Self::poll_remote_changes(
+                bg_hub,
+                bg_inodes,
+                bg_neg_cache,
+                bg_invalidator,
+                interval,
+                listing_concurrency,
+                config.live_follow,
+            );
             let bg_remote_sync = remote_sync.clone();
-            let live_follow = config.live_follow;
             Some(runtime.spawn(async move {
-                Self::poll_remote_changes(
-                    bg_hub,
-                    bg_inodes,
-                    bg_neg_cache,
-                    bg_invalidator,
-                    interval,
-                    listing_concurrency,
-                    live_follow,
-                )
-                .await;
+                poll.await;
                 // Only returns when the live-follow feed is unusable and polling is disabled.
                 bg_remote_sync.store(false, Ordering::Relaxed);
             }))
@@ -1110,11 +1110,9 @@ impl VirtualFs {
 
     /// Whether the children listing of `entry` can be trusted without listing again.
     fn listing_is_fresh(&self, entry: &InodeEntry) -> bool {
-        match entry.children_loaded_at {
-            None => false,
-            Some(_) if self.remote_sync.load(Ordering::Relaxed) => true,
-            Some(loaded_at) => loaded_at.elapsed() < self.metadata_ttl,
-        }
+        entry.children_loaded_at.is_some_and(|loaded_at| {
+            self.remote_sync.load(Ordering::Relaxed) || loaded_at.elapsed() < self.metadata_ttl
+        })
     }
 
     /// Get or create a per-directory lock for serializing ensure_children_loaded().
@@ -1435,11 +1433,11 @@ impl VirtualFs {
                 return Err(libc::ENOTDIR);
             }
 
-            // Try in-memory first regardless of `children_loaded`: an inode
+            // Try in-memory first regardless of a fresh listing: an inode
             // inserted via the HEAD point-lookup path or still present after
             // a partial eviction can be served without a full re-list.
             //
-            // For directories we still require `children_loaded` to trust the
+            // For directories we still require a fresh listing to trust the
             // cached entry: without the parent listing, we can't tell whether
             // the dir was removed or replaced remotely (files revalidate
             // individually via HEAD, dirs don't).
@@ -1453,13 +1451,13 @@ impl VirtualFs {
                     current_etag: entry.etag.clone(),
                 },
                 // Either a dirty file (local writes win until flushed) or any
-                // entry under a fully-listed parent we can trust as-is.
+                // entry under a freshly listed parent we can trust as-is.
                 Some(entry) if entry.kind == InodeKind::File || self.listing_is_fresh(parent_entry) => {
                     FastResult::Hit(self.make_vfs_attr(entry))
                 }
-                // Cached non-file under an unloaded parent: we can't HEAD-probe
-                // a directory to check it still exists (resolve endpoint only
-                // serves files), so defer to the slow path which lists.
+                // Cached non-file under an unloaded or stale parent: we can't
+                // HEAD-probe a directory to check it still exists (resolve
+                // endpoint only serves files), so defer to the slow path which lists.
                 Some(_) => FastResult::NotLoaded,
                 // No cached entry but the parent listing is authoritative →
                 // the name really doesn't exist; populate the negative cache.

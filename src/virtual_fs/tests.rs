@@ -2243,6 +2243,7 @@ fn ensure_children_loaded_idempotent() {
     });
 }
 
+/// Build a VFS that trusts cached metadata and listings for `metadata_ttl`.
 fn vfs_with_metadata_ttl(
     hub: &std::sync::Arc<MockHub>,
     xet: &std::sync::Arc<MockXet>,
@@ -2298,8 +2299,8 @@ fn listing_refetched_after_metadata_ttl_without_remote_sync() {
         );
 
         tokio::time::sleep(Duration::from_millis(400)).await;
-        assert_eq!(dir_names(&vfs, main).await, ["en", "zh"]);
         assert_eq!(vfs.lookup(main, "de").await.unwrap_err(), libc::ENOENT);
+        assert_eq!(dir_names(&vfs, main).await, ["en", "zh"]);
     });
 }
 
