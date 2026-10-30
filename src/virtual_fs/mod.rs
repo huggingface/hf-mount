@@ -2432,8 +2432,8 @@ impl VirtualFs {
                 // (fuse_read_update_size), which makes subsequent reads return
                 // 0 bytes and truncates the file from the application's view.
 
-                let mut response = BytesMut::with_capacity(to_read);
                 let mut cursor = offset;
+                let mut cached_data = None;
 
                 // Fast path: forward buffer has enough data (common case, zero-copy).
                 if let Some(data) = prefetch_state.try_serve_forward(offset, size) {
@@ -2443,7 +2443,7 @@ impl VirtualFs {
                         return Ok((data, eof));
                     }
                     cursor += data.len() as u64;
-                    response.extend_from_slice(&data);
+                    cached_data = Some(data);
                 } else if let Some(data) = prefetch_state.try_serve_seek(offset, size) {
                     // Seek window: only reachable when forward buffer has no data
                     // at this offset (backward seek). Zero-copy on full hit.
@@ -2453,6 +2453,11 @@ impl VirtualFs {
                         return Ok((data, eof));
                     }
                     cursor += data.len() as u64;
+                    cached_data = Some(data);
+                }
+
+                let mut response = BytesMut::with_capacity(to_read);
+                if let Some(data) = cached_data {
                     response.extend_from_slice(&data);
                 }
 
