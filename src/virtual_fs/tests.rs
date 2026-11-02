@@ -3133,6 +3133,95 @@ fn follow_delete_removes_clean_file_keeps_dirty() {
     });
 }
 
+/// Deleting every file of a directory makes the directory vanish (a bucket
+/// has no directory objects), so its parent's listing must be dropped even
+/// though each file was removed in place. Regression: a doc-builder run
+/// deleted `transformers/main/de`, and the Hub doc pods kept listing `de`
+/// (ENOENT on `de/_toctree.yml`, a 500) until a pod restart.
+#[test]
+fn follow_delete_of_last_files_drops_parent_listing() {
+    let hub = MockHub::new();
+    hub.add_file("lib/main/de/_toctree.yml", 10, Some("h1"), None);
+    hub.add_file("lib/main/de/_app/x.js", 10, Some("h2"), None);
+    hub.add_file("lib/main/en/_toctree.yml", 10, Some("h3"), None);
+    hub.add_file("lib/_versions.yml", 10, Some("h4"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let lib = vfs.lookup(ROOT_INODE, "lib").await.unwrap();
+        let main = vfs.lookup(lib.ino, "main").await.unwrap();
+        vfs.readdir(main.ino).await.unwrap();
+        let de = vfs.lookup(main.ino, "de").await.unwrap();
+        vfs.readdir(de.ino).await.unwrap();
+
+        hub.remove_file("lib/main/de/_toctree.yml");
+        hub.remove_file("lib/main/de/_app/x.js");
+        VirtualFs::apply_follow_changes(
+            &[
+                follow_change("lib/main/de/_toctree.yml", FollowOp::Delete),
+                follow_change("lib/main/de/_app/x.js", FollowOp::Delete),
+            ],
+            &vfs.inode_table,
+            &vfs.negative_cache,
+            &vfs.invalidator,
+        );
+
+        assert!(
+            !vfs.inode_table.read().unwrap().is_children_loaded(main.ino),
+            "main's listing must be dropped: 'de' has no file left"
+        );
+        let names: Vec<String> = vfs
+            .readdir(main.ino)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert!(names.contains(&"en".to_string()));
+        assert!(
+            !names.contains(&"de".to_string()),
+            "vanished 'de' still listed: {names:?}"
+        );
+        let inodes = vfs.inode_table.read().unwrap();
+        assert!(
+            !inodes.is_children_loaded(lib.ino),
+            "'main' holds no file, so it may have vanished too: 'lib' re-lists"
+        );
+        assert!(
+            inodes.is_children_loaded(ROOT_INODE),
+            "'lib' still holds _versions.yml: the walk stops there"
+        );
+    });
+}
+
+/// A deletion that leaves a file in the directory keeps the parent listing:
+/// a hot directory is not re-listed on every deletion.
+#[test]
+fn follow_delete_keeps_parent_listing_when_dir_still_holds_a_file() {
+    let hub = MockHub::new();
+    hub.add_file("dir/a.txt", 10, Some("h1"), None);
+    hub.add_file("dir/b.txt", 10, Some("h2"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let dir = vfs.lookup(ROOT_INODE, "dir").await.unwrap();
+        vfs.readdir(dir.ino).await.unwrap();
+
+        VirtualFs::apply_follow_changes(
+            &[follow_change("dir/a.txt", FollowOp::Delete)],
+            &vfs.inode_table,
+            &vfs.negative_cache,
+            &vfs.invalidator,
+        );
+
+        let inodes = vfs.inode_table.read().unwrap();
+        assert!(inodes.is_children_loaded(dir.ino), "dir's listing stays consistent");
+        assert!(inodes.is_children_loaded(ROOT_INODE), "root keeps its listing");
+    });
+}
+
 /// Changes under directories that were never loaded are no-ops: their first
 /// listing will be fresh anyway, and loaded ancestors above them stay valid.
 #[test]

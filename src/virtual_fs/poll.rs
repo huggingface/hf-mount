@@ -9,7 +9,7 @@ use crate::error::Error;
 use crate::follow::{FollowChange, FollowEvent, FollowOp};
 use crate::hub_api::HubOps;
 
-use super::inode::{InodeKind, InodeTable};
+use super::inode::{InodeKind, InodeTable, ROOT_INODE};
 use super::{InvalKind, Invalidator};
 
 /// Exponential backoff shared by the remote-change loops: `base * 2^exp`,
@@ -93,6 +93,33 @@ fn remove_remote_file(inode_table: &mut InodeTable, ino: u64, inos_to_invalidate
         inode_table.remove(ino);
     }
     true
+}
+
+/// A bucket has no directory objects: a directory exists only while a file
+/// sits under it. After a remote deletion in `dir_ino`, walk up while the
+/// directory may have lost its last file (no file child left, or not listed
+/// at all) and drop the listing of each loaded parent, so the next re-list
+/// prunes the vanished directory. Stops at the first directory that still
+/// holds a file, or at a directory created by a local `mkdir`.
+fn invalidate_vanished_dir_parents(inode_table: &InodeTable, mut dir_ino: u64, dirs_to_invalidate: &mut HashSet<u64>) {
+    while dir_ino != ROOT_INODE {
+        let Some(entry) = inode_table.get(dir_ino) else { return };
+        if entry.created_locally {
+            return;
+        }
+        let holds_file = entry.children_loaded()
+            && entry
+                .children
+                .iter()
+                .any(|c| inode_table.get(c.ino).is_some_and(|e| e.kind == InodeKind::File));
+        if holds_file {
+            return;
+        }
+        if inode_table.is_children_loaded(entry.parent) {
+            dirs_to_invalidate.insert(entry.parent);
+        }
+        dir_ino = entry.parent;
+    }
 }
 
 /// Outcome of one `poll_round`.
@@ -502,6 +529,9 @@ impl super::VirtualFs {
                     if inode_table.is_children_loaded(dir_ino) {
                         dirs_to_invalidate.insert(dir_ino);
                     }
+                    if change.op == FollowOp::Delete {
+                        invalidate_vanished_dir_parents(&inode_table, dir_ino, &mut dirs_to_invalidate);
+                    }
                     continue;
                 };
                 if is_dirty {
@@ -509,8 +539,12 @@ impl super::VirtualFs {
                 }
                 match change.op {
                     FollowOp::Delete => {
+                        let parent_ino = inode_table.get(ino).map(|e| e.parent);
                         if remove_remote_file(&mut inode_table, ino, &mut inos_to_invalidate) {
                             applied.push(("deletion", &change.path));
+                            if let Some(parent_ino) = parent_ino {
+                                invalidate_vanished_dir_parents(&inode_table, parent_ino, &mut dirs_to_invalidate);
+                            }
                         }
                     }
                     FollowOp::Add | FollowOp::Update => {
