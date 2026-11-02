@@ -2243,6 +2243,87 @@ fn ensure_children_loaded_idempotent() {
     });
 }
 
+/// Build a VFS that trusts cached metadata and listings for `metadata_ttl`.
+fn vfs_with_metadata_ttl(
+    hub: &std::sync::Arc<MockHub>,
+    xet: &std::sync::Arc<MockXet>,
+    metadata_ttl: Duration,
+) -> (tokio::runtime::Runtime, std::sync::Arc<VirtualFs>) {
+    let rt = new_runtime();
+    let vfs = make_test_vfs(
+        hub.clone(),
+        xet.clone(),
+        TestOpts {
+            serve_lookup_from_cache: true,
+            metadata_ttl,
+            ..Default::default()
+        },
+        &rt,
+    );
+    (rt, vfs)
+}
+
+async fn dir_names(vfs: &VirtualFs, ino: u64) -> Vec<String> {
+    let mut names: Vec<String> = vfs
+        .readdir(ino)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|e| e.name)
+        .filter(|n| n != "." && n != "..")
+        .collect();
+    names.sort();
+    names
+}
+
+/// Without polling or live-follow, a directory listing expires after
+/// `metadata_ttl`: remotely removed and added subdirectories show up.
+#[test]
+fn listing_refetched_after_metadata_ttl_without_remote_sync() {
+    let hub = MockHub::new();
+    hub.add_file("main/de/_toctree.yml", 10, Some("h1"), None);
+    hub.add_file("main/en/_toctree.yml", 10, Some("h2"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_with_metadata_ttl(&hub, &xet, Duration::from_millis(300));
+
+    rt.block_on(async {
+        let main = vfs.lookup(ROOT_INODE, "main").await.unwrap().ino;
+        assert_eq!(dir_names(&vfs, main).await, ["de", "en"]);
+
+        hub.remove_file("main/de/_toctree.yml");
+        hub.add_file("main/zh/_toctree.yml", 10, Some("h3"), None);
+        assert_eq!(
+            dir_names(&vfs, main).await,
+            ["de", "en"],
+            "listing trusted within the TTL"
+        );
+
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(vfs.lookup(main, "de").await.unwrap_err(), libc::ENOENT);
+        assert_eq!(dir_names(&vfs, main).await, ["en", "zh"]);
+    });
+}
+
+/// With a remote sync mechanism running, listings are not refetched on access.
+#[test]
+fn listing_not_refetched_with_remote_sync() {
+    let hub = MockHub::new();
+    hub.add_file("main/en/_toctree.yml", 10, Some("h1"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_with_metadata_ttl(&hub, &xet, Duration::from_millis(50));
+    vfs.remote_sync.store(true, Ordering::Relaxed);
+
+    rt.block_on(async {
+        let main = vfs.lookup(ROOT_INODE, "main").await.unwrap().ino;
+        dir_names(&vfs, main).await;
+        let calls = hub.list_tree_call_count();
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        dir_names(&vfs, main).await;
+        assert_eq!(hub.list_tree_call_count(), calls);
+    });
+}
+
 // ── open_readonly dispatch ──────────────────────────────────────────
 
 /// Opening an empty file (size=0, no hash) read-only succeeds.
