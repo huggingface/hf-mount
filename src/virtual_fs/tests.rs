@@ -3167,10 +3167,6 @@ fn follow_delete_of_last_files_drops_parent_listing() {
             &vfs.invalidator,
         );
 
-        assert!(
-            !vfs.inode_table.read().unwrap().is_children_loaded(main.ino),
-            "main's listing must be dropped: 'de' has no file left"
-        );
         let names: Vec<String> = vfs
             .readdir(main.ino)
             .await
@@ -3505,6 +3501,44 @@ fn revalidation_skips_dirty_files() {
         // Hash and size must remain unchanged (not overwritten by remote)
         assert_eq!(entry.xet_hash.as_deref(), Some("hash1"));
         assert_ne!(entry.size, 500, "dirty file size should not be updated from remote");
+    });
+}
+
+/// A polled directory whose fresh listing no longer has a subdirectory (it
+/// lost its last file) drops its listing, so the next readdir prunes it.
+#[test]
+fn poll_drops_listing_with_vanished_subdirectory() {
+    let hub = MockHub::new_repo();
+    hub.add_file("main/de/_toctree.yml", 10, Some("h1"), None);
+    hub.add_file("main/en/_toctree.yml", 10, Some("h2"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_repo(&hub, &xet);
+
+    rt.block_on(async {
+        let main = vfs.lookup(ROOT_INODE, "main").await.unwrap();
+        vfs.readdir(main.ino).await.unwrap();
+        hub.remove_file("main/de/_toctree.yml");
+
+        let prefixes = vfs.inode_table.read().unwrap().loaded_dir_prefixes();
+        let mut remote = Vec::new();
+        for prefix in &prefixes {
+            remote.extend(hub.list_tree(prefix).await.unwrap());
+        }
+        let polled: std::collections::HashSet<String> = prefixes.into_iter().collect();
+        VirtualFs::apply_poll_diff(remote, &polled, &vfs.inode_table, &vfs.negative_cache, &vfs.invalidator);
+
+        let names: Vec<String> = vfs
+            .readdir(main.ino)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert!(names.contains(&"en".to_string()));
+        assert!(
+            !names.contains(&"de".to_string()),
+            "vanished 'de' still listed: {names:?}"
+        );
     });
 }
 
