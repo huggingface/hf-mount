@@ -3133,6 +3133,123 @@ fn follow_delete_removes_clean_file_keeps_dirty() {
     });
 }
 
+/// Deleting every file of a directory makes the directory vanish (a bucket
+/// has no directory objects), so its parent's listing must be dropped even
+/// though each file was removed in place. Regression: a doc-builder run
+/// deleted `transformers/main/de`, and the Hub doc pods kept listing `de`
+/// (ENOENT on `de/_toctree.yml`, a 500) until a pod restart.
+#[test]
+fn follow_delete_of_last_files_drops_parent_listing() {
+    let hub = MockHub::new();
+    hub.add_file("lib/main/de/_toctree.yml", 10, Some("h1"), None);
+    hub.add_file("lib/main/de/_app/x.js", 10, Some("h2"), None);
+    hub.add_file("lib/main/en/_toctree.yml", 10, Some("h3"), None);
+    hub.add_file("lib/_versions.yml", 10, Some("h4"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let lib = vfs.lookup(ROOT_INODE, "lib").await.unwrap();
+        let main = vfs.lookup(lib.ino, "main").await.unwrap();
+        vfs.readdir(main.ino).await.unwrap();
+        let de = vfs.lookup(main.ino, "de").await.unwrap();
+        vfs.readdir(de.ino).await.unwrap();
+
+        hub.remove_file("lib/main/de/_toctree.yml");
+        hub.remove_file("lib/main/de/_app/x.js");
+        VirtualFs::apply_follow_changes(
+            &[
+                follow_change("lib/main/de/_toctree.yml", FollowOp::Delete),
+                follow_change("lib/main/de/_app/x.js", FollowOp::Delete),
+            ],
+            &vfs.inode_table,
+            &vfs.negative_cache,
+            &vfs.invalidator,
+        );
+
+        let names: Vec<String> = vfs
+            .readdir(main.ino)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert!(names.contains(&"en".to_string()));
+        assert!(
+            !names.contains(&"de".to_string()),
+            "vanished 'de' still listed: {names:?}"
+        );
+        let inodes = vfs.inode_table.read().unwrap();
+        assert!(
+            !inodes.is_children_loaded(lib.ino),
+            "'main' holds no file, so it may have vanished too: 'lib' re-lists"
+        );
+        assert!(
+            inodes.is_children_loaded(ROOT_INODE),
+            "'lib' still holds _versions.yml: the walk stops there"
+        );
+    });
+}
+
+/// When a remote directory loses its last file, a directory created inside
+/// it by a local `mkdir` keeps it alive: the re-list of the grandparent must
+/// not prune the subtree.
+#[test]
+fn follow_delete_keeps_dir_holding_a_local_mkdir() {
+    let hub = MockHub::new();
+    hub.add_file("a/b/file.txt", 10, Some("h1"), None);
+    hub.add_file("a/c.txt", 10, Some("h2"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let a = vfs.lookup(ROOT_INODE, "a").await.unwrap();
+        let b = vfs.lookup(a.ino, "b").await.unwrap();
+        vfs.readdir(b.ino).await.unwrap();
+        let local = vfs.mkdir(b.ino, "local", 0o755, 1000, 1000).await.unwrap();
+
+        hub.remove_file("a/b/file.txt");
+        VirtualFs::apply_follow_changes(
+            &[follow_change("a/b/file.txt", FollowOp::Delete)],
+            &vfs.inode_table,
+            &vfs.negative_cache,
+            &vfs.invalidator,
+        );
+        assert!(!vfs.inode_table.read().unwrap().is_children_loaded(a.ino));
+
+        let names: Vec<String> = vfs.readdir(a.ino).await.unwrap().into_iter().map(|e| e.name).collect();
+        assert!(names.contains(&"b".to_string()), "'b' holds a local mkdir: {names:?}");
+        assert_eq!(vfs.lookup(b.ino, "local").await.unwrap().ino, local.ino);
+    });
+}
+
+/// A deletion that leaves a file in the directory keeps the parent listing:
+/// a hot directory is not re-listed on every deletion.
+#[test]
+fn follow_delete_keeps_parent_listing_when_dir_still_holds_a_file() {
+    let hub = MockHub::new();
+    hub.add_file("dir/a.txt", 10, Some("h1"), None);
+    hub.add_file("dir/b.txt", 10, Some("h2"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let dir = vfs.lookup(ROOT_INODE, "dir").await.unwrap();
+        vfs.readdir(dir.ino).await.unwrap();
+
+        VirtualFs::apply_follow_changes(
+            &[follow_change("dir/a.txt", FollowOp::Delete)],
+            &vfs.inode_table,
+            &vfs.negative_cache,
+            &vfs.invalidator,
+        );
+
+        let inodes = vfs.inode_table.read().unwrap();
+        assert!(inodes.is_children_loaded(dir.ino), "dir's listing stays consistent");
+        assert!(inodes.is_children_loaded(ROOT_INODE), "root keeps its listing");
+    });
+}
+
 /// Changes under directories that were never loaded are no-ops: their first
 /// listing will be fresh anyway, and loaded ancestors above them stay valid.
 #[test]
@@ -3416,6 +3533,44 @@ fn revalidation_skips_dirty_files() {
         // Hash and size must remain unchanged (not overwritten by remote)
         assert_eq!(entry.xet_hash.as_deref(), Some("hash1"));
         assert_ne!(entry.size, 500, "dirty file size should not be updated from remote");
+    });
+}
+
+/// A polled directory whose fresh listing no longer has a subdirectory (it
+/// lost its last file) drops its listing, so the next readdir prunes it.
+#[test]
+fn poll_drops_listing_with_vanished_subdirectory() {
+    let hub = MockHub::new_repo();
+    hub.add_file("main/de/_toctree.yml", 10, Some("h1"), None);
+    hub.add_file("main/en/_toctree.yml", 10, Some("h2"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_repo(&hub, &xet);
+
+    rt.block_on(async {
+        let main = vfs.lookup(ROOT_INODE, "main").await.unwrap();
+        vfs.readdir(main.ino).await.unwrap();
+        hub.remove_file("main/de/_toctree.yml");
+
+        let prefixes = vfs.inode_table.read().unwrap().loaded_dir_prefixes();
+        let mut remote = Vec::new();
+        for prefix in &prefixes {
+            remote.extend(hub.list_tree(prefix).await.unwrap());
+        }
+        let polled: std::collections::HashSet<String> = prefixes.into_iter().collect();
+        VirtualFs::apply_poll_diff(remote, &polled, &vfs.inode_table, &vfs.negative_cache, &vfs.invalidator);
+
+        let names: Vec<String> = vfs
+            .readdir(main.ino)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert!(names.contains(&"en".to_string()));
+        assert!(
+            !names.contains(&"de".to_string()),
+            "vanished 'de' still listed: {names:?}"
+        );
     });
 }
 
