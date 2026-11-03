@@ -117,12 +117,7 @@ fn invalidate_vanished_dir_parents(
         if entry.created_locally {
             return;
         }
-        let holds_file = entry.children_loaded()
-            && entry
-                .children
-                .iter()
-                .any(|c| inode_table.get(c.ino).is_some_and(|e| e.kind == InodeKind::File));
-        if holds_file {
+        if entry.children_loaded() && entry.has_non_dir_child() {
             return;
         }
         if inode_table.is_children_loaded(entry.parent) {

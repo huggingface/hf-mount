@@ -1044,7 +1044,7 @@ impl VirtualFs {
                 .map(|c| c.ino)
                 .collect();
             for ino in stale {
-                if !inodes.has_dirty_or_open_descendants(ino) {
+                if !inodes.has_dirty_or_open_descendants(ino) && !inodes.has_locally_created_descendants(ino) {
                     inodes.remove(ino);
                 }
             }

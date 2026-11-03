@@ -190,6 +190,13 @@ impl InodeEntry {
         self.child_index.shrink_to_fit();
     }
 
+    /// True when a directory has a child that is not a directory. A directory's
+    /// `nlink` is 2 plus its number of subdirectories, so no child lookup is
+    /// needed. A drifted-high `nlink` only answers `false` too often.
+    pub fn has_non_dir_child(&self) -> bool {
+        self.children.len() > self.nlink.saturating_sub(2) as usize
+    }
+
     /// Returns true if the children listing has been populated. Only
     /// meaningful for directories.
     pub fn children_loaded(&self) -> bool {
@@ -752,6 +759,26 @@ impl InodeTable {
                 for child in &entry.children {
                     stack.push(child.ino);
                 }
+            }
+        }
+        false
+    }
+
+    /// True if a strict descendant of `ino` is a directory created by a local
+    /// `mkdir`. The Hub never lists such a directory, so pruning its remote
+    /// ancestor as stale would drop it.
+    pub fn has_locally_created_descendants(&self, ino: u64) -> bool {
+        let mut stack: Vec<u64> = self
+            .inodes
+            .get(&ino)
+            .map(|e| e.children.iter().map(|c| c.ino).collect())
+            .unwrap_or_default();
+        while let Some(current) = stack.pop() {
+            if let Some(entry) = self.inodes.get(&current) {
+                if entry.created_locally {
+                    return true;
+                }
+                stack.extend(entry.children.iter().map(|c| c.ino));
             }
         }
         false

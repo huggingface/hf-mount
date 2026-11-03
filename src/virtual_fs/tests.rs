@@ -3191,6 +3191,38 @@ fn follow_delete_of_last_files_drops_parent_listing() {
     });
 }
 
+/// When a remote directory loses its last file, a directory created inside
+/// it by a local `mkdir` keeps it alive: the re-list of the grandparent must
+/// not prune the subtree.
+#[test]
+fn follow_delete_keeps_dir_holding_a_local_mkdir() {
+    let hub = MockHub::new();
+    hub.add_file("a/b/file.txt", 10, Some("h1"), None);
+    hub.add_file("a/c.txt", 10, Some("h2"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let a = vfs.lookup(ROOT_INODE, "a").await.unwrap();
+        let b = vfs.lookup(a.ino, "b").await.unwrap();
+        vfs.readdir(b.ino).await.unwrap();
+        let local = vfs.mkdir(b.ino, "local", 0o755, 1000, 1000).await.unwrap();
+
+        hub.remove_file("a/b/file.txt");
+        VirtualFs::apply_follow_changes(
+            &[follow_change("a/b/file.txt", FollowOp::Delete)],
+            &vfs.inode_table,
+            &vfs.negative_cache,
+            &vfs.invalidator,
+        );
+        assert!(!vfs.inode_table.read().unwrap().is_children_loaded(a.ino));
+
+        let names: Vec<String> = vfs.readdir(a.ino).await.unwrap().into_iter().map(|e| e.name).collect();
+        assert!(names.contains(&"b".to_string()), "'b' holds a local mkdir: {names:?}");
+        assert_eq!(vfs.lookup(b.ino, "local").await.unwrap().ino, local.ino);
+    });
+}
+
 /// A deletion that leaves a file in the directory keeps the parent listing:
 /// a hot directory is not re-listed on every deletion.
 #[test]
