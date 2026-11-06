@@ -387,7 +387,7 @@ impl FollowStreamOps for MockFollowStream {
 // ── MockXet ───────────────────────────────────────────────────────────
 
 pub struct MockXet {
-    files: Mutex<HashMap<String, Vec<u8>>>,
+    files: Mutex<HashMap<String, Bytes>>,
     pub next_hash: AtomicU64,
     writer_create_fail: AtomicBool,
     upload_fail: AtomicBool,
@@ -400,8 +400,21 @@ pub struct MockXet {
     /// When true, opened streams hang on `next()` (simulates a stalled CAS/CDN
     /// connection) so the read-fetch timeout path can be exercised.
     stall_stream: AtomicBool,
-    /// Log of (offset, end) pairs passed to download_stream_boxed.
-    pub stream_calls: Mutex<Vec<(u64, Option<u64>)>>,
+    /// Log of (offset, end, cached) passed to download_stream_boxed.
+    pub stream_calls: Mutex<Vec<(u64, u64, bool)>>,
+    /// Delay before an opened stream yields its first chunk (CAS latency).
+    stream_delay: Mutex<Option<Duration>>,
+    /// A stream whose range covers this offset waits this long instead.
+    slow_offset: Mutex<Option<(u64, Duration)>>,
+    /// A stream whose range covers this offset fails to open.
+    fail_offset: Mutex<Option<u64>>,
+    /// Every opened stream fails after delivering this many bytes.
+    stream_fail_after: Mutex<Option<usize>>,
+    /// A link of this many bytes per second, delivering chunks of the given
+    /// size (whole xet terms), and when it has downloaded all the chunks of
+    /// the streams opened so far.
+    link: Mutex<Option<(u64, usize)>>,
+    link_free_at: Mutex<Option<tokio::time::Instant>>,
     /// Count of download_to_file calls (used to assert staging cache reuse).
     pub download_to_file_calls: AtomicU64,
     /// Test hook to pause `upload_files` mid-call so the test can drive
@@ -431,6 +444,12 @@ impl MockXet {
             range_empty_count: AtomicU32::new(0),
             stall_stream: AtomicBool::new(false),
             stream_calls: Mutex::new(Vec::new()),
+            stream_delay: Mutex::new(None),
+            slow_offset: Mutex::new(None),
+            fail_offset: Mutex::new(None),
+            stream_fail_after: Mutex::new(None),
+            link: Mutex::new(None),
+            link_free_at: Mutex::new(None),
             download_to_file_calls: AtomicU64::new(0),
             upload_gate: Mutex::new(None),
             uploads_inflight: AtomicU32::new(0),
@@ -450,7 +469,10 @@ impl MockXet {
     }
 
     pub fn add_file(&self, hash: &str, content: &[u8]) {
-        self.files.lock().unwrap().insert(hash.to_string(), content.to_vec());
+        self.files
+            .lock()
+            .unwrap()
+            .insert(hash.to_string(), Bytes::copy_from_slice(content));
     }
 
     pub fn fail_next_writer_create(&self) {
@@ -479,6 +501,36 @@ impl MockXet {
     /// connection that neither delivers data nor errors.
     pub fn stall_stream_reads(&self) {
         self.stall_stream.store(true, Ordering::SeqCst);
+    }
+
+    /// Make every opened stream wait `delay` before its first chunk.
+    pub fn set_stream_delay(&self, delay: Duration) {
+        *self.stream_delay.lock().unwrap() = Some(delay);
+    }
+
+    /// Make the streams whose range covers `offset` wait `delay` before
+    /// their first chunk.
+    pub fn set_slow_offset(&self, offset: u64, delay: Duration) {
+        *self.slow_offset.lock().unwrap() = Some((offset, delay));
+    }
+
+    /// Make the streams whose range covers `offset` fail to open.
+    pub fn set_fail_offset(&self, offset: u64) {
+        *self.fail_offset.lock().unwrap() = Some(offset);
+    }
+
+    /// Make every opened stream fail after delivering `bytes`.
+    pub fn fail_streams_after(&self, bytes: usize) {
+        *self.stream_fail_after.lock().unwrap() = Some(bytes);
+    }
+
+    /// Serve streams over a link of `rate` bytes per second, in chunks of
+    /// `chunk` bytes, as xet does: a stream asks for all its chunks (terms)
+    /// when it opens, the link downloads the chunks of all streams in the
+    /// order they were asked for, and a chunk is delivered once downloaded.
+    /// A stream dropped early leaves its chunks downloading.
+    pub fn set_link(&self, rate: u64, chunk: usize) {
+        *self.link.lock().unwrap() = Some((rate, chunk));
     }
 
     fn next_hash_string(&self) -> String {
@@ -534,7 +586,7 @@ impl XetOps for MockXet {
             let content = std::fs::read(path).map_err(Error::Io)?;
             let hash = self.next_hash_string();
             let size = content.len() as u64;
-            self.files.lock().unwrap().insert(hash.clone(), content);
+            self.files.lock().unwrap().insert(hash.clone(), Bytes::from(content));
             results.push(XetFileInfo::new(hash, size));
         }
         Ok(results)
@@ -550,12 +602,19 @@ impl XetOps for MockXet {
         &self,
         file_info: &XetFileInfo,
         offset: u64,
-        end: Option<u64>,
+        end: u64,
+        cached: bool,
     ) -> Result<Box<dyn DownloadStreamOps>> {
-        self.stream_calls.lock().unwrap().push((offset, end));
+        self.stream_calls.lock().unwrap().push((offset, end, cached));
 
         if self.stall_stream.load(Ordering::SeqCst) {
             return Ok(Box::new(StallingDownloadStream));
+        }
+        if let Some(at) = *self.fail_offset.lock().unwrap()
+            && offset <= at
+            && at < end
+        {
+            return Err(Error::Xet("mock stream open failure at offset".into()));
         }
 
         let prev_fail = self.range_fail_count.load(Ordering::SeqCst);
@@ -567,20 +626,42 @@ impl XetOps for MockXet {
         if prev_empty > 0 {
             self.range_empty_count.fetch_sub(1, Ordering::SeqCst);
             return Ok(Box::new(MockDownloadStream {
-                data: Vec::new(),
+                data: Bytes::new(),
                 offset: 0,
                 end: 0,
                 chunk_size: 4096,
+                delay: None,
+                fail_after: None,
+                arrivals: VecDeque::new(),
             }));
         }
         let files = self.files.lock().unwrap();
         let content = files.get(file_info.hash()).cloned().unwrap_or_default();
-        let bounded_end = end.map(|e| e as usize).unwrap_or(content.len());
+        let link = *self.link.lock().unwrap();
+        let mut arrivals = VecDeque::new();
+        if let Some((rate, chunk)) = link {
+            let mut free_at = self.link_free_at.lock().unwrap();
+            let mut at = free_at.map_or(tokio::time::Instant::now(), |free| {
+                free.max(tokio::time::Instant::now())
+            });
+            for start in (offset..end.min(content.len() as u64)).step_by(chunk) {
+                let len = (end.min(content.len() as u64) - start).min(chunk as u64);
+                at += Duration::from_secs_f64(len as f64 / rate as f64);
+                arrivals.push_back(at);
+            }
+            *free_at = Some(at);
+        }
         Ok(Box::new(MockDownloadStream {
             data: content,
             offset: offset as usize,
-            end: bounded_end,
-            chunk_size: 4096,
+            end: end as usize,
+            chunk_size: link.map_or(4096, |(_, chunk)| chunk),
+            delay: match *self.slow_offset.lock().unwrap() {
+                Some((at, delay)) if offset <= at && at < end => Some(delay),
+                _ => *self.stream_delay.lock().unwrap(),
+            },
+            fail_after: *self.stream_fail_after.lock().unwrap(),
+            arrivals,
         }))
     }
 }
@@ -620,21 +701,40 @@ impl StreamingWriterOps for MockStreamingWriter {
 // ── MockDownloadStream ────────────────────────────────────────────────
 
 pub struct MockDownloadStream {
-    data: Vec<u8>,
+    data: Bytes,
     offset: usize,
     /// Upper bound (exclusive) on data this stream will serve.
     end: usize,
     chunk_size: usize,
+    /// Wait before the first chunk.
+    delay: Option<Duration>,
+    /// Bytes left to deliver before the stream fails.
+    fail_after: Option<usize>,
+    /// When the link delivers each chunk left, over a mock link.
+    arrivals: VecDeque<tokio::time::Instant>,
 }
 
 #[async_trait::async_trait]
 impl DownloadStreamOps for MockDownloadStream {
     async fn next(&mut self) -> Result<Option<Bytes>> {
+        if let Some(delay) = self.delay.take() {
+            tokio::time::sleep(delay).await;
+        }
         if self.offset >= self.end.min(self.data.len()) {
             return Ok(None);
         }
-        let chunk_end = (self.offset + self.chunk_size).min(self.end).min(self.data.len());
-        let chunk = Bytes::copy_from_slice(&self.data[self.offset..chunk_end]);
+        if self.fail_after == Some(0) {
+            return Err(Error::Xet("mock stream failure mid-stream".into()));
+        }
+        let mut chunk_end = (self.offset + self.chunk_size).min(self.end).min(self.data.len());
+        if let Some(left) = self.fail_after {
+            chunk_end = chunk_end.min(self.offset + left);
+            self.fail_after = Some(left - (chunk_end - self.offset));
+        }
+        if let Some(at) = self.arrivals.pop_front() {
+            tokio::time::sleep_until(at).await;
+        }
+        let chunk = self.data.slice(self.offset..chunk_end);
         self.offset = chunk_end;
         Ok(Some(chunk))
     }
@@ -642,7 +742,8 @@ impl DownloadStreamOps for MockDownloadStream {
 
 /// A stream whose `next()` never resolves, modelling a CAS/CDN connection that
 /// stalls without delivering data or erroring. Used to exercise the read-fetch
-/// timeout: without a bound, awaiting this parks the FUSE worker thread forever.
+/// timeout: without a bound, the fetch and the reads that wait for its blocks
+/// would hang forever.
 pub struct StallingDownloadStream;
 
 #[async_trait::async_trait]
@@ -770,6 +871,7 @@ pub fn make_test_vfs(
             flush_max_batch_window: Duration::from_secs(1),
             flush_shutdown_timeout: Duration::from_secs(5),
             read_fetch_timeout: opts.read_fetch_timeout,
+            read_ahead_bytes: 1 << 30,
             inode_soft_limit: opts.inode_soft_limit,
             lru_sweep_interval: Duration::from_millis(50),
         },
@@ -819,6 +921,7 @@ pub fn make_overlay_test_vfs_with_root(
             flush_max_batch_window: Duration::from_secs(1),
             flush_shutdown_timeout: Duration::from_secs(5),
             read_fetch_timeout: Duration::from_secs(30),
+            read_ahead_bytes: 1 << 30,
             inode_soft_limit: 0,
             lru_sweep_interval: Duration::from_secs(5),
         },
