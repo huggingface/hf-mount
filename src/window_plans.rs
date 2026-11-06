@@ -44,6 +44,7 @@ const WINDOW_TTL: Duration = Duration::from_secs(50 * 60);
 /// A window that could not be fetched is asked again after this delay.
 const RETRY_AFTER: Duration = Duration::from_secs(60);
 /// Windows kept, by last use. A window of a 1 GiB fragmented range weighs a few hundred KB.
+/// A window in flight is not dropped, so this also bounds the window fetches in flight.
 const MAX_WINDOWS: usize = 128;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
@@ -472,9 +473,15 @@ impl WindowPlans {
                     }
                 }
                 None => {
-                    if slots.len() >= MAX_WINDOWS
-                        && let Some(oldest) = slots.iter().min_by_key(|(_, slot)| slot.used_at).map(|(key, _)| *key)
-                    {
+                    if slots.len() >= MAX_WINDOWS {
+                        // A window in flight keeps its slot until its fetch ends: without it,
+                        // the next request would fetch the window again while the first
+                        // fetch goes on, and nothing would bound the fetches in flight.
+                        let oldest = slots
+                            .iter()
+                            .filter(|(_, slot)| !matches!(slot.state, SlotState::Fetching))
+                            .min_by_key(|(_, slot)| slot.used_at)
+                            .map(|(key, _)| *key)?;
                         slots.remove(&oldest);
                     }
                     let state = if ask { SlotState::Fetching } else { SlotState::Seen };
@@ -802,6 +809,60 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         panic!("window fetch did not finish");
+    }
+
+    /// A CAS whose chunk layouts never arrive.
+    struct StalledSource {
+        layouts: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl WindowSource for StalledSource {
+        async fn plan(
+            &self,
+            _: &MerkleHash,
+            _: FileRange,
+        ) -> Result<Option<QueryReconstructionResponseV2>, ClientError> {
+            Ok(None)
+        }
+
+        async fn chunk_layout(&self, _: &MerkleHash, _: FileRange) -> Result<Option<ChunkLayoutResponse>, LayoutError> {
+            self.layouts.fetch_add(1, Ordering::Relaxed);
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn windows_in_flight_keep_their_slots() {
+        let source = Arc::new(StalledSource {
+            layouts: AtomicUsize::new(0),
+        });
+        let plans = WindowPlans::new(source.clone(), WindowPlansMode::On);
+        let file_id = MerkleHash::default();
+        let windows = MAX_WINDOWS as u64 + 10;
+        plans.note_size(&file_id, windows * WINDOW);
+
+        // Read through more windows than are kept, twice, while no window arrives.
+        for _ in 0..2 {
+            for start in (0..windows).map(|index| index * WINDOW) {
+                for _ in 0..2 {
+                    assert!(
+                        plans
+                            .derive(&file_id, FileRange::new(start + 100, start + 200))
+                            .is_none()
+                    );
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            source.layouts.load(Ordering::Relaxed),
+            MAX_WINDOWS,
+            "at most MAX_WINDOWS fetches, none of them twice"
+        );
+        let slots = plans.slots.lock().unwrap();
+        assert_eq!(slots.len(), MAX_WINDOWS);
+        assert!(slots.values().all(|slot| matches!(slot.state, SlotState::Fetching)));
     }
 
     #[tokio::test]
