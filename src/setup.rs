@@ -231,7 +231,8 @@ pub struct MountOptions {
     /// Maximum time (ms) a remote fetch may wait for its next chunk of data.
     /// A fetch that stalls longer (e.g. on a hung CDN connection) is cancelled
     /// and retried, and after its last attempt the reads that wait for its
-    /// data fail with EIO instead of hanging forever.
+    /// data fail with EIO instead of hanging forever. While other fetches of
+    /// the mount receive data, a fetch waits in line up to four times longer.
     /// 0 disables the timeout (legacy unbounded behaviour).
     #[arg(long, default_value_t = 30_000)]
     pub read_fetch_timeout_ms: u64,
