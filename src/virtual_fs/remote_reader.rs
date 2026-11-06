@@ -89,6 +89,13 @@ const IDLE_RELEASE: Duration = Duration::from_secs(120);
 /// Attempts in a row that deliver nothing before the remaining blocks of a
 /// fetch fail with EIO. An attempt that delivers blocks resets the count.
 const MAX_ATTEMPTS: u32 = 3;
+/// Fetch timeouts a fetch may wait for its next chunk while the link keeps
+/// delivering chunks of the other fetches of the mount. The link serves
+/// fetches in the order they were asked for, so the first read of a cold
+/// reader can wait behind the read-ahead of the others (several files read
+/// at once on a slow link): it waits in line rather than stalls, though not
+/// forever.
+const MAX_QUEUED_TIMEOUTS: u32 = 4;
 /// Time a read-ahead fetch may take before it is slow, when the fetch
 /// timeout is disabled (otherwise a quarter of it): a quarter of the default
 /// fetch timeout.
@@ -258,6 +265,10 @@ pub(crate) struct ReadAheadBudget {
     limit: u64,
     /// Readers open on the mount: they split `MAX_TOTAL_BEHIND_BYTES`.
     open: AtomicU64,
+    /// When a fetch of the mount last received a chunk, in nanoseconds from
+    /// `created`: see `MAX_QUEUED_TIMEOUTS`.
+    received: AtomicU64,
+    created: tokio::time::Instant,
 }
 
 impl ReadAheadBudget {
@@ -267,7 +278,21 @@ impl ReadAheadBudget {
             held: AtomicU64::new(0),
             limit,
             open: AtomicU64::new(0),
+            received: AtomicU64::new(0),
+            created: tokio::time::Instant::now(),
         })
+    }
+
+    /// A fetch of the mount received a chunk.
+    fn note_received(&self) {
+        self.received
+            .fetch_max(self.created.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    /// Whether a fetch of the mount received a chunk within `period`.
+    fn received_within(&self, period: Duration) -> bool {
+        let received = Duration::from_nanos(self.received.load(Ordering::Relaxed));
+        self.created.elapsed().saturating_sub(received) < period
     }
 
     /// Read-ahead bytes one reader may hold. `counted` tells whether the
@@ -1363,14 +1388,25 @@ async fn drop_read_ahead_when_idle(reader: Weak<RemoteReader>) {
 }
 
 /// The next chunk of `stream`, or `None` when none came within `timeout`
-/// (`Duration::ZERO` waits forever).
+/// (`Duration::ZERO` waits forever). While other fetches of the mount receive
+/// chunks, the fetch waits in line, up to `MAX_QUEUED_TIMEOUTS` timeouts.
 async fn next_chunk(
     stream: &mut dyn DownloadStreamOps,
     timeout: Duration,
+    budget: &ReadAheadBudget,
 ) -> Option<crate::error::Result<Option<Bytes>>> {
-    match timeout {
-        Duration::ZERO => Some(stream.next().await),
-        timeout => tokio::time::timeout(timeout, stream.next()).await.ok(),
+    if timeout == Duration::ZERO {
+        return Some(stream.next().await);
+    }
+    let waited_from = tokio::time::Instant::now();
+    let mut next = stream.next();
+    loop {
+        if let Ok(chunk) = tokio::time::timeout(timeout, &mut next).await {
+            return Some(chunk);
+        }
+        if !budget.received_within(timeout) || waited_from.elapsed() >= timeout * MAX_QUEUED_TIMEOUTS {
+            return None;
+        }
     }
 }
 
@@ -1379,12 +1415,13 @@ async fn next_chunk(
 /// `MAX_ATTEMPTS` in a row that deliver nothing, dropping `run` fails the
 /// blocks left and wakes their readers.
 async fn fetch_run(mut run: FetchRun) {
-    let Some((xet, file_info, file_size, timeout)) = run.reader.upgrade().map(|reader| {
+    let Some((xet, file_info, file_size, timeout, budget)) = run.reader.upgrade().map(|reader| {
         (
             reader.xet.clone(),
             reader.file_info.clone(),
             reader.file_size,
             reader.fetch_timeout,
+            reader.budget.clone(),
         )
     }) else {
         return;
@@ -1410,8 +1447,11 @@ async fn fetch_run(mut run: FetchRun) {
                 let mut block = BytesMut::with_capacity(block_len(file_size, run.next) as usize);
                 loop {
                     let at = run.next * BLOCK_SIZE + block.len() as u64;
-                    let mut chunk = match next_chunk(stream.as_mut(), timeout).await {
-                        Some(Ok(Some(chunk))) => chunk,
+                    let mut chunk = match next_chunk(stream.as_mut(), timeout, &budget).await {
+                        Some(Ok(Some(chunk))) => {
+                            budget.note_received();
+                            chunk
+                        }
                         None => {
                             error!(
                                 "reader: no data for {:?} at {} of {}, attempt {}/{}",
@@ -1505,7 +1545,7 @@ async fn fetch_run(mut run: FetchRun) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_mocks::MockXet;
+    use crate::test_mocks::{MockXet, StallingDownloadStream};
     use futures::FutureExt;
 
     /// The default read-ahead budget of a mount (`--read-ahead-mb`).
@@ -2491,6 +2531,83 @@ mod tests {
             let (data, _) = reader.read(offset, chunk as u32).await.unwrap();
             assert!(data[..] == content[offset as usize..(offset + chunk) as usize]);
         }
+    }
+
+    /// Cold readers of several files on one slow link get no fetch timeout
+    /// either. The link serves terms in the order they were asked for, so
+    /// the first read of a file waits behind the read-ahead the other readers
+    /// have in flight.
+    #[tokio::test(start_paused = true)]
+    async fn slow_link_reads_of_several_files_without_fetch_timeouts() {
+        for (files, rate, file_bytes) in [(3, 3_000_000, 128 * 1_048_576), (16, 12_000_000, 64 * 1_048_576)] {
+            let xet = MockXet::new();
+            xet.set_link(rate, 8 * 1_048_576);
+            let budget = ReadAheadBudget::new(MAX_TOTAL_AHEAD_BYTES);
+            let content = Arc::new(pattern(file_bytes));
+            let reads: Vec<_> = (0..files)
+                .map(|index| {
+                    let hash = format!("hash{index}");
+                    xet.add_file(&hash, &content);
+                    let reader = RemoteReader::new(
+                        hash,
+                        file_bytes as u64,
+                        xet.clone(),
+                        Duration::from_secs(30),
+                        false,
+                        budget.clone(),
+                    );
+                    let content = content.clone();
+                    tokio::spawn(async move {
+                        let chunk = 1_048_576;
+                        for offset in (0..file_bytes).step_by(chunk) {
+                            let (data, _) = reader
+                                .read(offset as u64, chunk as u32)
+                                .await
+                                .map_err(|errno| (offset, errno))?;
+                            assert!(data[..] == content[offset..offset + chunk]);
+                        }
+                        Ok::<_, (usize, i32)>(())
+                    })
+                })
+                .collect();
+            for (index, read) in reads.into_iter().enumerate() {
+                assert_eq!(read.await.unwrap(), Ok(()), "{files} files at {rate} B/s: file {index}");
+            }
+        }
+    }
+
+    /// A fetch that receives nothing waits in line while other fetches of the
+    /// mount receive chunks, up to `MAX_QUEUED_TIMEOUTS` timeouts, and one
+    /// timeout when the mount receives nothing either.
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_fetch_waits_in_line_but_not_forever() {
+        let budget = ReadAheadBudget::new(MAX_TOTAL_AHEAD_BYTES);
+        let timeout = Duration::from_secs(30);
+        let others = {
+            let budget = budget.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                    budget.note_received();
+                }
+            })
+        };
+        let started = tokio::time::Instant::now();
+        assert!(
+            next_chunk(&mut StallingDownloadStream, timeout, &budget)
+                .await
+                .is_none()
+        );
+        assert_eq!(started.elapsed(), timeout * MAX_QUEUED_TIMEOUTS);
+
+        others.abort();
+        let started = tokio::time::Instant::now();
+        assert!(
+            next_chunk(&mut StallingDownloadStream, timeout, &budget)
+                .await
+                .is_none()
+        );
+        assert_eq!(started.elapsed(), timeout);
     }
 
     /// Blocks that reads wait for do not use up the cap of read-ahead in
