@@ -338,7 +338,7 @@ impl Client for CachedXetClient {
         shard_data: Bytes,
         upload_permit: ConnectionPermit,
         progress_callback: Option<ShardUploadProgressCallback>,
-    ) -> Result<()> {
+    ) -> Result<Option<MerkleHash>> {
         self.inner
             .upload_shard(shard_data, upload_permit, progress_callback)
             .await
@@ -495,7 +495,7 @@ mod tests {
             _shard_data: Bytes,
             _upload_permit: ConnectionPermit,
             _progress_callback: Option<ShardUploadProgressCallback>,
-        ) -> Result<()> {
+        ) -> Result<Option<MerkleHash>> {
             unimplemented!("not needed in these tests")
         }
 
