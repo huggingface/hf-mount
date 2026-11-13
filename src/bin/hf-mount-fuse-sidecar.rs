@@ -326,7 +326,7 @@ fn discover_pending(tmp_dir: &Path) -> io::Result<Vec<PendingMount>> {
 /// Retries on ENOENT/ECONNREFUSED until the socket appears or timeout expires.
 ///
 /// Wire format (set by the CSI driver's Go SendMsg):
-///   - iov[0]: optional data payload (unused, we just need the fds)
+///   - `iov[0]`: optional data payload (unused, we just need the fds)
 ///   - cmsg:   single SCM_RIGHTS carrying N i32 fds (1 primary + N-1 cloned).
 ///     The CSI driver decides the count; here we accept any non-zero N up
 ///     to `MAX_FUSE_FDS`.
