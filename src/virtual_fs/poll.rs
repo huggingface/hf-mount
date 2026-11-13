@@ -80,7 +80,7 @@ fn remove_remote_file(
     inos_to_invalidate: &mut Vec<(u64, InvalKind)>,
 ) -> Option<u64> {
     let (parent_ino, name) = match inode_table.get(ino) {
-        Some(entry) if entry.is_dirty() || entry.renaming > 0 => return None,
+        Some(entry) if inode_table.is_held_locally(entry) => return None,
         Some(entry) => (entry.parent, entry.name.clone()),
         None => return None,
     };

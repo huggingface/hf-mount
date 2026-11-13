@@ -957,12 +957,12 @@ impl VirtualFs {
         let mut seen_names: std::collections::HashSet<String> = std::collections::HashSet::new();
         // Entries skipped for a rename in flight: the listing stays stale, so
         // the next lookup after the rename re-lists and sees them.
-        let mut skipped_rename_target = false;
+        let mut skipped_rename = false;
 
         for entry in entries {
             // A rename in flight committed this path: its local move inserts it.
-            if inodes.is_rename_target(&entry.path) {
-                skipped_rename_target = true;
+            if inodes.in_rename(&entry.path) {
+                skipped_rename = true;
                 continue;
             }
             // Convert absolute bucket path to path relative to current directory.
@@ -1052,9 +1052,9 @@ impl VirtualFs {
                     if in_listing {
                         return false;
                     }
-                    inodes.get(c.ino).is_some_and(|e| {
-                        !e.is_dirty() && !e.created_locally && e.renaming == 0 && !inodes.is_rename_target(&e.full_path)
-                    })
+                    inodes
+                        .get(c.ino)
+                        .is_some_and(|e| !inodes.is_held_locally(e) && !e.created_locally)
                 })
                 .map(|c| c.ino)
                 .collect();
@@ -1072,7 +1072,7 @@ impl VirtualFs {
             // directory we'd otherwise keep ~50% slack forever. Trim now,
             // since regrowth on rare child mutations is cheap.
             parent.children.shrink_to_fit();
-            if !skipped_rename_target {
+            if !skipped_rename {
                 parent.children_loaded_at = Some(Instant::now());
             }
             parent.children_from_remote = true;
@@ -3627,11 +3627,11 @@ impl VirtualFs {
 
         // Phase 1: validate, mark the entries, collect everything we need
         let info = self.rename_validate(parent, name, newparent, newname, no_replace)?;
-        // Held until the entries are moved locally: see `InodeEntry::renaming`.
+        // Held until the entries are moved locally: see `InodeTable::renames`.
         let _renaming = RenameMark {
             inode_table: &self.inode_table,
-            inos: info.marked_inos().collect(),
-            target: info.new_full_path.clone(),
+            old_path: info.old_path.clone(),
+            new_path: info.new_full_path.clone(),
         };
 
         // POSIX: rename(a, b) where a and b are hard links to the same inode is a no-op.
@@ -3709,7 +3709,7 @@ impl VirtualFs {
         }
     }
 
-    /// Phase 1: validate rename and mark its entries as being renamed, return all info needed for phases 2+3.
+    /// Phase 1: validate rename and register it as in flight, return all info needed for phases 2+3.
     fn rename_validate(
         &self,
         parent: u64,
@@ -3718,9 +3718,9 @@ impl VirtualFs {
         newname: &str,
         no_replace: bool,
     ) -> VirtualFsResult<RenameInfo> {
-        // A write lock, so that the entries are marked as being renamed
-        // (`InodeEntry::renaming`) in the same critical section as the
-        // validation: no remote deletion can drop one in between.
+        // A write lock, so that the rename is registered (`InodeTable::renames`)
+        // in the same critical section as the validation: no remote deletion
+        // can drop an entry in between.
         let mut inodes = self.inode_table.write().expect("inodes poisoned");
 
         let src = inodes.lookup_child(parent, name).ok_or(libc::ENOENT)?;
@@ -3758,9 +3758,7 @@ impl VirtualFs {
             }
         }
 
-        // For directories, collect all descendant clean files for remote rename,
-        // and every descendant to mark as being renamed.
-        let mut descendants = Vec::new();
+        // For directories, collect all descendant clean files for remote rename
         let descendant_files = if src.kind == InodeKind::Directory {
             let mut files = Vec::new();
             let mut stack = vec![src.inode];
@@ -3773,7 +3771,6 @@ impl VirtualFs {
             while let Some(dir_ino) = stack.pop() {
                 if let Some(entry) = inodes.get(dir_ino) {
                     for child_ref in &entry.children {
-                        descendants.push(child_ref.ino);
                         if let Some(child) = inodes.get(child_ref.ino) {
                             debug!(
                                 "rename_validate: child ino={} path={} dirty={} xet_hash={:?}",
@@ -3809,14 +3806,8 @@ impl VirtualFs {
             is_dirty: src.is_dirty(),
             new_full_path,
             descendant_files,
-            descendants,
         };
-        for ino in info.marked_inos() {
-            if let Some(entry) = inodes.get_mut(ino) {
-                entry.renaming += 1;
-            }
-        }
-        inodes.add_rename_target(&info.new_full_path);
+        inodes.add_rename(info.old_path.clone(), info.new_full_path.clone());
         Ok(info)
     }
 
@@ -4232,36 +4223,22 @@ struct RenameInfo {
     /// Descendant clean files to rename on the remote (dir renames only):
     /// old path and xet hash.
     descendant_files: Vec<(String, String)>,
-    /// Every entry under a renamed directory.
-    descendants: Vec<u64>,
 }
 
-impl RenameInfo {
-    /// The entries a rename moves: the renamed entry and every entry under a
-    /// renamed directory.
-    fn marked_inos(&self) -> impl Iterator<Item = u64> + '_ {
-        std::iter::once(self.ino).chain(self.descendants.iter().copied())
-    }
-}
-
-/// Unmarks the entries `rename_validate` marked as being renamed
-/// (`InodeEntry::renaming`), and the destination it registered
-/// (`InodeTable::is_rename_target`), when dropped.
+/// Unregisters the rename `rename_validate` registered (`InodeTable::renames`)
+/// when dropped, also on error.
 struct RenameMark<'a> {
     inode_table: &'a RwLock<InodeTable>,
-    inos: Vec<u64>,
-    target: String,
+    old_path: String,
+    new_path: String,
 }
 
 impl Drop for RenameMark<'_> {
     fn drop(&mut self) {
-        let mut inodes = self.inode_table.write().expect("inodes poisoned");
-        for ino in &self.inos {
-            if let Some(entry) = inodes.get_mut(*ino) {
-                entry.renaming = entry.renaming.saturating_sub(1);
-            }
-        }
-        inodes.remove_rename_target(&self.target);
+        self.inode_table
+            .write()
+            .expect("inodes poisoned")
+            .remove_rename(&self.old_path, &self.new_path);
     }
 }
 
