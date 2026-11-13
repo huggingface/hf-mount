@@ -7348,6 +7348,10 @@ fn listing_during_rename_does_not_take_the_destination() {
         hub.add_file("b.txt", 10, Some("ha"), None);
         vfs.inode_table.write().unwrap().invalidate_children(ROOT_INODE);
         vfs.readdir(ROOT_INODE).await.unwrap();
+        assert!(
+            !vfs.inode_table.read().unwrap().is_children_loaded(ROOT_INODE),
+            "a listing that skipped a rename destination must stay stale"
+        );
         barrier.wait().await;
         renaming.await.unwrap().unwrap();
 

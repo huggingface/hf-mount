@@ -955,10 +955,14 @@ impl VirtualFs {
         }
         let mut seen_dirs: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut seen_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // Entries skipped for a rename in flight: the listing stays stale, so
+        // the next lookup after the rename re-lists and sees them.
+        let mut skipped_rename_target = false;
 
         for entry in entries {
             // A rename in flight committed this path: its local move inserts it.
             if inodes.is_rename_target(&entry.path) {
+                skipped_rename_target = true;
                 continue;
             }
             // Convert absolute bucket path to path relative to current directory.
@@ -1068,7 +1072,9 @@ impl VirtualFs {
             // directory we'd otherwise keep ~50% slack forever. Trim now,
             // since regrowth on rare child mutations is cheap.
             parent.children.shrink_to_fit();
-            parent.children_loaded_at = Some(Instant::now());
+            if !skipped_rename_target {
+                parent.children_loaded_at = Some(Instant::now());
+            }
             parent.children_from_remote = true;
         }
         Ok(true)
