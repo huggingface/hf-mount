@@ -3,6 +3,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+/// How long a file remembers the hashes this mount committed for it: see
+/// `InodeEntry::recent_commits`. Live-follow reports arrive within seconds.
+const RECENT_COMMIT_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
 pub const ROOT_INODE: u64 = 1;
 
 /// Build a child's full path given the parent's full_path and child name.
@@ -139,6 +143,12 @@ pub struct InodeEntry {
     /// `ensure_children_loaded` would drop it as soon as a remote change
     /// invalidates the parent's listing.
     pub created_locally: bool,
+    /// Hashes this mount committed for the file, and when it last did.
+    /// Live-follow reports each commit after it returns, so when a file is
+    /// rewritten quickly the report of an earlier commit can arrive after a
+    /// later one: such a report must not roll the file back. `None` for files
+    /// this mount never committed or not within `RECENT_COMMIT_TTL`.
+    pub recent_commits: Option<Box<(Instant, Vec<String>)>>,
     pub children: Vec<DirChild>,
     /// Name → ino lookup for `lookup_child`. Kept in sync with `children`
     /// via the `add_child` / `remove_child_*` helpers so a directory with
@@ -220,9 +230,38 @@ impl InodeEntry {
         }
     }
 
+    /// Whether `hash` is a hash this mount committed for the file before
+    /// its current one, while the current one is this mount's last commit:
+    /// a remote report of it is then the late echo of that earlier commit.
+    /// Once another client changed the file, every report applies. A client
+    /// that writes the very content of an earlier commit of this mount within
+    /// `RECENT_COMMIT_TTL`, while the file still holds this mount's last
+    /// commit, looks the same and is ignored: hashes do not tell them apart.
+    pub fn is_earlier_own_commit(&self, hash: &str) -> bool {
+        let Some((at, hashes)) = self.recent_commits.as_deref() else {
+            return false;
+        };
+        let current = self.xet_hash.as_deref();
+        at.elapsed() < RECENT_COMMIT_TTL
+            && current != Some(hash)
+            && hashes.last().map(String::as_str) == current
+            && hashes.iter().any(|own| own == hash)
+    }
+
     /// Apply a successful commit: update hash, size, timestamps, and
     /// conditionally clear dirty + pending_deletes if the generation matches.
     pub fn apply_commit(&mut self, hash: &str, size: u64, dirty_generation: u64) {
+        // Recorded even when a newer write superseded this one: the commit
+        // reached the Hub, so its report may still arrive. The list restarts
+        // after a quiet `RECENT_COMMIT_TTL`, which bounds it.
+        let recent = self
+            .recent_commits
+            .get_or_insert_with(|| Box::new((Instant::now(), Vec::new())));
+        if recent.0.elapsed() >= RECENT_COMMIT_TTL {
+            recent.1.clear();
+        }
+        recent.0 = Instant::now();
+        recent.1.push(hash.to_string());
         if self.clear_dirty_if(dirty_generation) {
             // Only update metadata when the generation matches. A concurrent
             // writer may have advanced the generation with newer content;
@@ -257,6 +296,12 @@ pub struct InodeTable {
     /// is on (`soft_limit > 0`) or via `enable_touch_tracking()` (staging GC
     /// needs an LRU order over staging files even with the evictor disabled).
     touch_enabled: AtomicBool,
+    /// Renames in flight, as (old path, new path). A rename commits on the
+    /// Hub before it moves the entries locally: remote reports that arrive in
+    /// between (live-follow, poll, HEAD, a re-list) see the Hub's new state
+    /// while the table holds the old one, so they must leave both paths
+    /// alone until the local move (`is_held_locally`, `in_rename`).
+    renames: Vec<(String, String)>,
 }
 
 impl Default for InodeTable {
@@ -276,6 +321,7 @@ impl InodeTable {
             next_inode: AtomicU64::new(2),
             touch_counter: AtomicU64::new(0),
             touch_enabled: AtomicBool::new(track_touches),
+            renames: Vec::new(),
         };
 
         // Create root inode
@@ -302,6 +348,7 @@ impl InodeTable {
             children_loaded_at: None,
             children_from_remote: false,
             created_locally: false,
+            recent_commits: None,
             children: Vec::new(),
             child_index: HashMap::new(),
             pending_deletes: Vec::new(),
@@ -492,7 +539,7 @@ impl InodeTable {
         let should_evict = self.inodes.get(&ino).is_some_and(|e| {
             e.kind == InodeKind::File
                 && e.eviction.nlookup.load(Ordering::Relaxed) == 0
-                && !e.is_dirty()
+                && !self.is_held_locally(e)
                 && e.pending_deletes.is_empty()
                 && e.nlink > 0
         });
@@ -528,7 +575,7 @@ impl InodeTable {
                 e.kind == InodeKind::File
                     && e.eviction.nlookup.load(Ordering::Relaxed) == 0
                     && e.eviction.open_handles.load(Ordering::Relaxed) == 0
-                    && !e.is_dirty()
+                    && !self.is_held_locally(e)
                     && e.pending_deletes.is_empty()
                     && e.nlink > 0
             });
@@ -645,6 +692,7 @@ impl InodeTable {
             children_loaded_at: None,
             children_from_remote: false,
             created_locally: false,
+            recent_commits: None,
             children: Vec::new(),
             child_index: HashMap::new(),
             pending_deletes: Vec::new(),
@@ -717,10 +765,10 @@ impl InodeTable {
         new_size: u64,
         new_mtime: SystemTime,
     ) -> bool {
+        if !self.accepts_remote(ino, new_hash.as_deref()) {
+            return false;
+        }
         if let Some(entry) = self.inodes.get_mut(&ino) {
-            if entry.is_dirty() {
-                return false;
-            }
             entry.xet_hash = new_hash;
             entry.etag = new_etag;
             entry.size = new_size;
@@ -733,6 +781,35 @@ impl InodeTable {
         } else {
             false
         }
+    }
+
+    pub fn add_rename(&mut self, old_path: String, new_path: String) {
+        self.renames.push((old_path, new_path));
+    }
+
+    pub fn remove_rename(&mut self, old_path: &str, new_path: &str) {
+        if let Some(pos) = self.renames.iter().position(|(o, n)| o == old_path && n == new_path) {
+            self.renames.swap_remove(pos);
+        }
+    }
+
+    /// Whether `path` is, or is under, the old or new path of a rename in flight.
+    pub fn in_rename(&self, path: &str) -> bool {
+        let covers = |p: &str| path == p || crate::hub_api::strict_descendant_rel(path, p).is_some();
+        self.renames.iter().any(|(old, new)| covers(old) || covers(new))
+    }
+
+    /// Whether remote state must leave `entry` alone: it holds local writes
+    /// not flushed yet, or a rename in flight moves it.
+    pub fn is_held_locally(&self, entry: &InodeEntry) -> bool {
+        entry.is_dirty() || self.in_rename(&entry.full_path)
+    }
+
+    /// Whether a remote report of `ino` with `hash` may change it.
+    fn accepts_remote(&self, ino: u64, hash: Option<&str>) -> bool {
+        self.inodes.get(&ino).is_some_and(|entry| {
+            !self.is_held_locally(entry) && !hash.is_some_and(|hash| entry.is_earlier_own_commit(hash))
+        })
     }
 
     /// Reset children_loaded to false so the next readdir/lookup re-fetches.
@@ -753,7 +830,7 @@ impl InodeTable {
         let mut stack = vec![ino];
         while let Some(current) = stack.pop() {
             if let Some(entry) = self.inodes.get(&current) {
-                if entry.is_dirty() || entry.eviction.open_handles.load(Ordering::Relaxed) > 0 {
+                if self.is_held_locally(entry) || entry.eviction.open_handles.load(Ordering::Relaxed) > 0 {
                     return true;
                 }
                 for child in &entry.children {
@@ -845,12 +922,12 @@ impl InodeTable {
         size: Option<u64>,
         mtime: Option<SystemTime>,
     ) -> bool {
+        if !self.accepts_remote(ino, hash.as_deref()) {
+            return false;
+        }
         let Some(entry) = self.inodes.get_mut(&ino) else {
             return false;
         };
-        if entry.is_dirty() {
-            return false;
-        }
         if let Some(hash) = hash {
             entry.xet_hash = Some(hash);
         }
@@ -1151,6 +1228,63 @@ mod tests {
         assert_eq!(entry.size, 200);
         assert!(entry.pending_deletes.is_empty());
         assert!(entry.mtime > UNIX_EPOCH);
+    }
+
+    /// A commit superseded by a newer write still reached the Hub, so its
+    /// late report must not roll the file back once the newer one commits.
+    #[test]
+    fn superseded_commit_report_is_still_ignored() {
+        let mut table = InodeTable::new(false);
+        let ino = table.insert(
+            ROOT_INODE,
+            "f".to_string(),
+            "f".to_string(),
+            InodeKind::File,
+            1,
+            UNIX_EPOCH,
+            None,
+            0o644,
+            0,
+            0,
+        );
+        let entry = table.get_mut(ino).unwrap();
+        entry.set_dirty();
+        let first = entry.dirty_generation;
+        entry.set_dirty(); // a newer write lands while the first commit runs
+        entry.apply_commit("h1", 1, first);
+        let second = entry.dirty_generation;
+        entry.apply_commit("h2", 1, second);
+        assert!(entry.is_earlier_own_commit("h1"));
+        assert!(!table.merge_remote_file(ino, Some("h1".to_string()), Some(1), None));
+        assert_eq!(table.get(ino).unwrap().xet_hash.as_deref(), Some("h2"));
+    }
+
+    /// Once another client changed the file, a report of an earlier hash of
+    /// this mount is that client's change (a revert), and applies.
+    #[test]
+    fn revert_by_another_client_applies() {
+        let mut table = InodeTable::new(false);
+        let ino = table.insert(
+            ROOT_INODE,
+            "f".to_string(),
+            "f".to_string(),
+            InodeKind::File,
+            1,
+            UNIX_EPOCH,
+            None,
+            0o644,
+            0,
+            0,
+        );
+        for hash in ["h1", "h2"] {
+            let entry = table.get_mut(ino).unwrap();
+            entry.set_dirty();
+            let generation = entry.dirty_generation;
+            entry.apply_commit(hash, 1, generation);
+        }
+        assert!(table.merge_remote_file(ino, Some("other".to_string()), Some(5), None));
+        assert!(table.merge_remote_file(ino, Some("h1".to_string()), Some(1), None));
+        assert_eq!(table.get(ino).unwrap().xet_hash.as_deref(), Some("h1"));
     }
 
     #[test]
