@@ -21,8 +21,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     xfslibs-dev \
     && rm -rf /tmp/* /var/lib/apt/lists/*
 
-# Rust dev tooling required by the lint/format gate.
-RUN rustup component add rustfmt clippy
+# Rust dev tooling required by the lint/format gate. The nightly rustfmt is
+# the one the CI format check pins (`NIGHTLY` in the Makefile).
+RUN rustup component add rustfmt clippy \
+    && rustup toolchain install nightly-2026-04-22 --profile minimal --component rustfmt
 
 # Allow non-root FUSE mounts (needed for `cargo test --features fuse` dev runs).
 RUN echo 'user_allow_other' >> /etc/fuse.conf

@@ -1,27 +1,33 @@
-# Targets
-.PHONY: all build check clean doc fmt release test
+# Same commands as the CI lint and unit-test jobs (.github/workflows/ci.yml).
+.PHONY: all build check clean doc fmt lint release test
 
-BUILD_TOOL := cargo
+# rustfmt toolchain of the CI format check: bump both together.
+NIGHTLY := nightly-2026-04-22
+FEATURES := fuse,nfs
 
-all: clean fmt build
+all: fmt build
 
 build:
-	@$(BUILD_TOOL) build
+	cargo build --features $(FEATURES)
 
 check:
-	@$(BUILD_TOOL) check
+	cargo check --features $(FEATURES)
 
 clean:
-	@$(BUILD_TOOL) clean
+	cargo clean
 
 doc:
-	@$(BUILD_TOOL) doc --no-deps
+	cargo doc --no-deps --features $(FEATURES)
 
 fmt:
-	@$(BUILD_TOOL) fmt
+	cargo +$(NIGHTLY) fmt
 
-release: clean
-	@$(BUILD_TOOL) build --release
+lint:
+	cargo +$(NIGHTLY) fmt --check
+	cargo clippy --features $(FEATURES) -- -D warnings
+
+release:
+	cargo build --release --features $(FEATURES)
 
 test:
-	@$(BUILD_TOOL) test
+	cargo test --lib --features $(FEATURES)

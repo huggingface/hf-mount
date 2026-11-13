@@ -17,8 +17,7 @@
         "[rust]": {
           "editor.defaultFormatter": "rust-lang.rust-analyzer"
         },
-        "rust-analyzer.cargo.features": "all",
-        "rust-analyzer.cargo-watch.enable": true
+        "rust-analyzer.cargo.features": "all"
       }
     }
   }
