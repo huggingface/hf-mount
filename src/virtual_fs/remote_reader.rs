@@ -269,6 +269,10 @@ pub(crate) struct ReadAheadBudget {
     /// `created`: see `MAX_QUEUED_TIMEOUTS`.
     received: AtomicU64,
     created: tokio::time::Instant,
+    /// Bytes the fetches of the mount received, and bytes their open streams
+    /// still wait for: see `InLine`.
+    received_bytes: AtomicU64,
+    in_flight: AtomicU64,
 }
 
 impl ReadAheadBudget {
@@ -280,13 +284,16 @@ impl ReadAheadBudget {
             open: AtomicU64::new(0),
             received: AtomicU64::new(0),
             created: tokio::time::Instant::now(),
+            received_bytes: AtomicU64::new(0),
+            in_flight: AtomicU64::new(0),
         })
     }
 
-    /// A fetch of the mount received a chunk.
-    fn note_received(&self) {
+    /// A fetch of the mount received a chunk of `len` bytes.
+    fn note_received(&self, len: u64) {
         self.received
             .fetch_max(self.created.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        self.received_bytes.fetch_add(len, Ordering::Relaxed);
     }
 
     /// Whether a fetch of the mount received a chunk within `period`.
@@ -1390,13 +1397,63 @@ async fn drop_read_ahead_when_idle(reader: Weak<RemoteReader>) {
     }
 }
 
+/// The place of an open stream in the line of the mount's link. The link
+/// serves streams in the order they were opened, so a stream's data comes
+/// after the bytes the other streams of the mount still waited for when it
+/// opened (`ahead`).
+struct InLine<'a> {
+    budget: &'a ReadAheadBudget,
+    /// Bytes of the stream not received yet.
+    left: u64,
+    ahead: u64,
+    /// `received_bytes` of the mount when the stream opened.
+    opened_at: u64,
+    /// Bytes the stream received.
+    received: u64,
+}
+
+impl<'a> InLine<'a> {
+    fn open(budget: &'a ReadAheadBudget, len: u64) -> Self {
+        let opened_at = budget.received_bytes.load(Ordering::Relaxed);
+        let ahead = budget.in_flight.fetch_add(len, Ordering::Relaxed);
+        Self {
+            budget,
+            left: len,
+            ahead,
+            opened_at,
+            received: 0,
+        }
+    }
+
+    fn received(&mut self, len: u64) {
+        let len = len.min(self.left);
+        self.left -= len;
+        self.received += len;
+        self.budget.in_flight.fetch_sub(len, Ordering::Relaxed);
+        self.budget.note_received(len);
+    }
+
+    /// Whether the mount is still receiving what was in line before the stream.
+    fn behind_others(&self) -> bool {
+        let received = self.budget.received_bytes.load(Ordering::Relaxed);
+        received.saturating_sub(self.opened_at + self.received) < self.ahead
+    }
+}
+
+impl Drop for InLine<'_> {
+    fn drop(&mut self) {
+        self.budget.in_flight.fetch_sub(self.left, Ordering::Relaxed);
+    }
+}
+
 /// The next chunk of `stream`, or `None` when none came within `timeout`
 /// (`Duration::ZERO` waits forever). While other fetches of the mount receive
-/// chunks, the fetch waits in line, up to `MAX_QUEUED_TIMEOUTS` timeouts.
+/// chunks, the fetch waits in line: as long as the mount still receives what
+/// was in line before the stream, and at least `MAX_QUEUED_TIMEOUTS` timeouts.
 async fn next_chunk(
     stream: &mut dyn DownloadStreamOps,
     timeout: Duration,
-    budget: &ReadAheadBudget,
+    line: &mut InLine<'_>,
 ) -> Option<crate::error::Result<Option<Bytes>>> {
     if timeout == Duration::ZERO {
         return Some(stream.next().await);
@@ -1405,9 +1462,14 @@ async fn next_chunk(
     let mut next = stream.next();
     loop {
         if let Ok(chunk) = tokio::time::timeout(timeout, &mut next).await {
+            if let Ok(Some(chunk)) = &chunk {
+                line.received(chunk.len() as u64);
+            }
             return Some(chunk);
         }
-        if !budget.received_within(timeout) || waited_from.elapsed() >= timeout * MAX_QUEUED_TIMEOUTS {
+        if !line.budget.received_within(timeout)
+            || (waited_from.elapsed() >= timeout * MAX_QUEUED_TIMEOUTS && !line.behind_others())
+        {
             return None;
         }
     }
@@ -1447,14 +1509,12 @@ async fn fetch_run(mut run: FetchRun) {
                 err
             ),
             Ok(mut stream) => {
+                let mut line = InLine::open(&budget, end - start);
                 let mut block = BytesMut::with_capacity(block_len(file_size, run.next) as usize);
                 loop {
                     let at = run.next * BLOCK_SIZE + block.len() as u64;
-                    let mut chunk = match next_chunk(stream.as_mut(), timeout, &budget).await {
-                        Some(Ok(Some(chunk))) => {
-                            budget.note_received();
-                            chunk
-                        }
+                    let mut chunk = match next_chunk(stream.as_mut(), timeout, &mut line).await {
+                        Some(Ok(Some(chunk))) => chunk,
                         None => {
                             error!(
                                 "reader: no data for {:?} at {} of {}, attempt {}/{}",
@@ -2578,7 +2638,13 @@ mod tests {
     /// have in flight.
     #[tokio::test(start_paused = true)]
     async fn slow_link_reads_of_several_files_without_fetch_timeouts() {
-        for (files, rate, file_bytes) in [(3, 3_000_000, 128 * 1_048_576), (16, 12_000_000, 64 * 1_048_576)] {
+        for (files, rate, file_bytes) in [
+            (3, 3_000_000, 128 * 1_048_576),
+            (16, 12_000_000, 64 * 1_048_576),
+            (8, 3_000_000, 256 * 1_048_576),
+            (24, 5_000_000, 64 * 1_048_576),
+            (3, 1_000_000, 128 * 1_048_576),
+        ] {
             let xet = MockXet::new();
             xet.set_link(rate, 8 * 1_048_576);
             let budget = ReadAheadBudget::new(MAX_TOTAL_AHEAD_BYTES);
@@ -2627,13 +2693,13 @@ mod tests {
             tokio::spawn(async move {
                 loop {
                     tokio::time::sleep(Duration::from_secs(10)).await;
-                    budget.note_received();
+                    budget.note_received(1);
                 }
             })
         };
         let started = tokio::time::Instant::now();
         assert!(
-            next_chunk(&mut StallingDownloadStream, timeout, &budget)
+            next_chunk(&mut StallingDownloadStream, timeout, &mut InLine::open(&budget, 1))
                 .await
                 .is_none()
         );
@@ -2642,11 +2708,49 @@ mod tests {
         others.abort();
         let started = tokio::time::Instant::now();
         assert!(
-            next_chunk(&mut StallingDownloadStream, timeout, &budget)
+            next_chunk(&mut StallingDownloadStream, timeout, &mut InLine::open(&budget, 1))
                 .await
                 .is_none()
         );
         assert_eq!(started.elapsed(), timeout);
+    }
+
+    /// A fetch behind more bytes than the link carries in `MAX_QUEUED_TIMEOUTS`
+    /// timeouts waits on while the mount receives them, then gives up.
+    #[tokio::test(start_paused = true)]
+    async fn a_fetch_waits_for_the_bytes_in_line_before_it() {
+        let budget = ReadAheadBudget::new(MAX_TOTAL_AHEAD_BYTES);
+        let timeout = Duration::from_secs(30);
+        // 600 MB in line ahead (the streams of other readers), received at
+        // 1 MB/s: 600 s, five times the MAX_QUEUED_TIMEOUTS allowance.
+        budget.in_flight.fetch_add(600_000_000, Ordering::Relaxed);
+        let others = {
+            let budget = budget.clone();
+            tokio::spawn(async move {
+                for _ in 0..600 {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    budget.in_flight.fetch_sub(1_000_000, Ordering::Relaxed);
+                    budget.note_received(1_000_000);
+                }
+                // The link goes on with streams that opened later.
+                loop {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    budget.note_received(1_000_000);
+                }
+            })
+        };
+        let started = tokio::time::Instant::now();
+        assert!(
+            next_chunk(&mut StallingDownloadStream, timeout, &mut InLine::open(&budget, 1))
+                .await
+                .is_none()
+        );
+        let waited = started.elapsed();
+        assert!(
+            waited >= Duration::from_secs(600) && waited <= Duration::from_secs(600) + timeout,
+            "waited {waited:?}"
+        );
+        others.abort();
     }
 
     /// Blocks that reads wait for do not use up the cap of read-ahead in
