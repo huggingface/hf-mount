@@ -1048,7 +1048,9 @@ impl VirtualFs {
                     if in_listing {
                         return false;
                     }
-                    inodes.get(c.ino).is_some_and(|e| !e.is_dirty() && !e.created_locally)
+                    inodes.get(c.ino).is_some_and(|e| {
+                        !e.is_dirty() && !e.created_locally && e.renaming == 0 && !inodes.is_rename_target(&e.full_path)
+                    })
                 })
                 .map(|c| c.ino)
                 .collect();
@@ -3750,7 +3752,9 @@ impl VirtualFs {
             }
         }
 
-        // For directories, collect all descendant clean files for remote rename
+        // For directories, collect all descendant clean files for remote rename,
+        // and every descendant to mark as being renamed.
+        let mut descendants = Vec::new();
         let descendant_files = if src.kind == InodeKind::Directory {
             let mut files = Vec::new();
             let mut stack = vec![src.inode];
@@ -3763,6 +3767,7 @@ impl VirtualFs {
             while let Some(dir_ino) = stack.pop() {
                 if let Some(entry) = inodes.get(dir_ino) {
                     for child_ref in &entry.children {
+                        descendants.push(child_ref.ino);
                         if let Some(child) = inodes.get(child_ref.ino) {
                             debug!(
                                 "rename_validate: child ino={} path={} dirty={} xet_hash={:?}",
@@ -3776,7 +3781,6 @@ impl VirtualFs {
                                     files.push((
                                         child.full_path.to_string(),
                                         child.xet_hash.clone().expect("checked is_some above"),
-                                        child_ref.ino,
                                     ));
                                 }
                                 InodeKind::Directory => stack.push(child_ref.ino),
@@ -3799,6 +3803,7 @@ impl VirtualFs {
             is_dirty: src.is_dirty(),
             new_full_path,
             descendant_files,
+            descendants,
         };
         for ino in info.marked_inos() {
             if let Some(entry) = inodes.get_mut(ino) {
@@ -3837,7 +3842,7 @@ impl VirtualFs {
             // Hub batch API requires all adds before all deletes
             let mut ops = Vec::with_capacity(info.descendant_files.len() * 2);
             let mut deletes = Vec::with_capacity(info.descendant_files.len());
-            for (child_old_path, child_hash, _) in &info.descendant_files {
+            for (child_old_path, child_hash) in &info.descendant_files {
                 let suffix = child_old_path.strip_prefix(&info.old_path).unwrap_or(child_old_path);
                 let child_new_path = format!("{}{}", info.new_full_path, suffix);
                 ops.push(BatchOp::AddFile {
@@ -4219,15 +4224,17 @@ struct RenameInfo {
     is_dirty: bool,
     new_full_path: String,
     /// Descendant clean files to rename on the remote (dir renames only):
-    /// old path, xet hash, inode.
-    descendant_files: Vec<(String, String, u64)>,
+    /// old path and xet hash.
+    descendant_files: Vec<(String, String)>,
+    /// Every entry under a renamed directory.
+    descendants: Vec<u64>,
 }
 
 impl RenameInfo {
-    /// The entries a rename moves: the renamed entry and the clean files
-    /// under a renamed directory.
+    /// The entries a rename moves: the renamed entry and every entry under a
+    /// renamed directory.
     fn marked_inos(&self) -> impl Iterator<Item = u64> + '_ {
-        std::iter::once(self.ino).chain(self.descendant_files.iter().map(|(_, _, ino)| *ino))
+        std::iter::once(self.ino).chain(self.descendants.iter().copied())
     }
 }
 

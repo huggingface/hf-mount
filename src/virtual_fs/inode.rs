@@ -540,6 +540,7 @@ impl InodeTable {
             e.kind == InodeKind::File
                 && e.eviction.nlookup.load(Ordering::Relaxed) == 0
                 && !e.is_dirty()
+                && e.renaming == 0
                 && e.pending_deletes.is_empty()
                 && e.nlink > 0
         });
@@ -576,6 +577,7 @@ impl InodeTable {
                     && e.eviction.nlookup.load(Ordering::Relaxed) == 0
                     && e.eviction.open_handles.load(Ordering::Relaxed) == 0
                     && !e.is_dirty()
+                    && e.renaming == 0
                     && e.pending_deletes.is_empty()
                     && e.nlink > 0
             });
@@ -768,6 +770,7 @@ impl InodeTable {
     ) -> bool {
         if let Some(entry) = self.inodes.get_mut(&ino) {
             if entry.is_dirty()
+                || entry.renaming > 0
                 || new_hash
                     .as_deref()
                     .is_some_and(|hash| entry.is_earlier_own_commit(hash))
@@ -925,7 +928,7 @@ impl InodeTable {
         let Some(entry) = self.inodes.get_mut(&ino) else {
             return false;
         };
-        if entry.is_dirty() {
+        if entry.is_dirty() || entry.renaming > 0 {
             return false;
         }
         if hash.as_deref().is_some_and(|hash| entry.is_earlier_own_commit(hash)) {
