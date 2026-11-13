@@ -7224,3 +7224,103 @@ fn install_commit_hook_on_terminal_channel_does_not_wedge_pending_commits() {
         vfs.release(fh).await.unwrap();
     });
 }
+
+/// A rename commits on the Hub (add the new paths, delete the old ones)
+/// before it moves the entries locally. Live-follow can report the deletion
+/// of an old path in between: it must not drop the entry the rename is about
+/// to move, or the renamed directory loses its file (ENOENT on read).
+#[test]
+fn remote_delete_during_rename_keeps_the_moved_entries() {
+    let hub = MockHub::new();
+    hub.add_dir("src");
+    hub.add_file("src/a.txt", 10, Some("ha"), None);
+    hub.add_file("solo.txt", 10, Some("hs"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let src = vfs.lookup(ROOT_INODE, "src").await.unwrap();
+        vfs.lookup(src.ino, "a.txt").await.unwrap();
+        vfs.lookup(ROOT_INODE, "solo.txt").await.unwrap();
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        hub.set_batch_barrier(barrier.clone());
+        for (old, new, old_file, new_file) in [
+            ("src", "dst", "src/a.txt", "dst/a.txt"),
+            ("solo.txt", "moved.txt", "solo.txt", "moved.txt"),
+        ] {
+            let renaming = {
+                let vfs = vfs.clone();
+                let (old, new) = (old.to_string(), new.to_string());
+                tokio::spawn(async move { vfs.rename(ROOT_INODE, &old, ROOT_INODE, &new, false).await })
+            };
+            // Let the rename reach the Hub batch call, then deliver the
+            // feed's deletion of the old path before the call returns.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            VirtualFs::apply_follow_changes(
+                &[follow_change(old_file, FollowOp::Delete)],
+                &vfs.inode_table,
+                &vfs.negative_cache,
+                &vfs.invalidator,
+            );
+            barrier.wait().await;
+            renaming.await.unwrap().unwrap();
+
+            let inodes = vfs.inode_table.read().unwrap();
+            assert!(inodes.get_by_path(new_file).is_some(), "{new_file} lost by the rename");
+            assert!(inodes.get_by_path(old_file).is_none());
+        }
+    });
+}
+
+/// Live-follow reports each commit of a file after the commit returns. When a
+/// file is rewritten quickly, the report of an earlier commit can arrive after
+/// a later one: it must not roll the file back to the earlier content.
+#[test]
+fn follow_echo_of_an_earlier_own_commit_is_ignored() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let (attr, fh) = vfs
+            .create(ROOT_INODE, "counter.txt", 0o644, 1000, 1000, Some(42))
+            .await
+            .unwrap();
+        let ino = attr.ino;
+        let mut hashes = Vec::new();
+        for (round, content) in [b"1", b"2", b"3"].into_iter().enumerate() {
+            let fh = if round == 0 {
+                fh
+            } else {
+                vfs.open(ino, true, true, Some(42)).await.unwrap()
+            };
+            write_blocking(&vfs, ino, fh, 0, content).await.unwrap();
+            vfs.flush(ino, fh, Some(42)).await.unwrap();
+            vfs.release(fh).await.unwrap();
+            hashes.push(
+                vfs.inode_table
+                    .read()
+                    .unwrap()
+                    .get(ino)
+                    .unwrap()
+                    .xet_hash
+                    .clone()
+                    .unwrap(),
+            );
+        }
+        assert_ne!(hashes[0], hashes[2]);
+        let mut stale = follow_change("counter.txt", FollowOp::Update);
+        stale.xet_hash = Some(hashes[0].clone());
+        stale.size = Some(1);
+        VirtualFs::apply_follow_changes(&[stale], &vfs.inode_table, &vfs.negative_cache, &vfs.invalidator);
+
+        let inodes = vfs.inode_table.read().unwrap();
+        let entry = inodes.get_by_path("counter.txt").unwrap();
+        assert_eq!(
+            entry.xet_hash.as_deref(),
+            Some(hashes[2].as_str()),
+            "rolled back to an earlier commit"
+        );
+    });
+}

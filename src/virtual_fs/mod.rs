@@ -3628,6 +3628,14 @@ impl VirtualFs {
             }
         }
 
+        // Held until the entries are moved locally: see `InodeEntry::renaming`.
+        let _renaming = RenameMark::new(
+            &self.inode_table,
+            std::iter::once(info.ino)
+                .chain(info.descendant_files.iter().map(|(_, _, ino)| *ino))
+                .collect(),
+        );
+
         // Phase 2: sync to remote (add + delete ops). Skipped in overlay mode
         // since writes never propagate beyond the local backing.
         let remote_mutated = if self.overlay() {
@@ -3763,6 +3771,7 @@ impl VirtualFs {
                                     files.push((
                                         child.full_path.to_string(),
                                         child.xet_hash.clone().expect("checked is_some above"),
+                                        child_ref.ino,
                                     ));
                                 }
                                 InodeKind::Directory => stack.push(child_ref.ino),
@@ -3816,7 +3825,7 @@ impl VirtualFs {
             // Hub batch API requires all adds before all deletes
             let mut ops = Vec::with_capacity(info.descendant_files.len() * 2);
             let mut deletes = Vec::with_capacity(info.descendant_files.len());
-            for (child_old_path, child_hash) in &info.descendant_files {
+            for (child_old_path, child_hash, _) in &info.descendant_files {
                 let suffix = child_old_path.strip_prefix(&info.old_path).unwrap_or(child_old_path);
                 let child_new_path = format!("{}{}", info.new_full_path, suffix);
                 ops.push(BatchOp::AddFile {
@@ -4197,8 +4206,38 @@ struct RenameInfo {
     xet_hash: Option<String>,
     is_dirty: bool,
     new_full_path: String,
-    /// Descendant clean files to rename on the remote (dir renames only).
-    descendant_files: Vec<(String, String)>,
+    /// Descendant clean files to rename on the remote (dir renames only):
+    /// old path, xet hash, inode.
+    descendant_files: Vec<(String, String, u64)>,
+}
+
+/// Marks entries as being renamed (`InodeEntry::renaming`) until dropped.
+struct RenameMark<'a> {
+    inode_table: &'a RwLock<InodeTable>,
+    inos: Vec<u64>,
+}
+
+impl<'a> RenameMark<'a> {
+    fn new(inode_table: &'a RwLock<InodeTable>, inos: Vec<u64>) -> Self {
+        let mut inodes = inode_table.write().expect("inodes poisoned");
+        for ino in &inos {
+            if let Some(entry) = inodes.get_mut(*ino) {
+                entry.renaming += 1;
+            }
+        }
+        Self { inode_table, inos }
+    }
+}
+
+impl Drop for RenameMark<'_> {
+    fn drop(&mut self) {
+        let mut inodes = self.inode_table.write().expect("inodes poisoned");
+        for ino in &self.inos {
+            if let Some(entry) = inodes.get_mut(*ino) {
+                entry.renaming = entry.renaming.saturating_sub(1);
+            }
+        }
+    }
 }
 
 // ── Internal types ─────────────────────────────────────────────────────

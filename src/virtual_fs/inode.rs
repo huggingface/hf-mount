@@ -3,6 +3,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+/// How long a file remembers the hashes this mount committed for it: see
+/// `InodeEntry::recent_commits`. Live-follow reports arrive within seconds.
+const RECENT_COMMIT_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+const MAX_RECENT_COMMITS: usize = 8;
+
 pub const ROOT_INODE: u64 = 1;
 
 /// Build a child's full path given the parent's full_path and child name.
@@ -139,6 +144,16 @@ pub struct InodeEntry {
     /// `ensure_children_loaded` would drop it as soon as a remote change
     /// invalidates the parent's listing.
     pub created_locally: bool,
+    /// Renames in flight that move this entry. A rename commits on the Hub
+    /// before it moves the entry locally, so the remote deletion of the old
+    /// path (the echo of that commit, through live-follow or a poll) must not
+    /// drop the entry in between.
+    pub renaming: u32,
+    /// Hashes this mount committed for the file in the last
+    /// `RECENT_COMMIT_TTL`. Live-follow reports each commit after it returns,
+    /// so when a file is rewritten quickly the report of an earlier commit can
+    /// arrive after a later one: such a report must not roll the file back.
+    pub recent_commits: Vec<(String, Instant)>,
     pub children: Vec<DirChild>,
     /// Name → ino lookup for `lookup_child`. Kept in sync with `children`
     /// via the `add_child` / `remove_child_*` helpers so a directory with
@@ -222,12 +237,27 @@ impl InodeEntry {
 
     /// Apply a successful commit: update hash, size, timestamps, and
     /// conditionally clear dirty + pending_deletes if the generation matches.
+    /// Whether `hash` is a hash this mount committed for the file before
+    /// its current one: a remote report of it is stale.
+    pub fn is_earlier_own_commit(&self, hash: &str) -> bool {
+        self.xet_hash.as_deref() != Some(hash)
+            && self
+                .recent_commits
+                .iter()
+                .any(|(own, at)| own == hash && at.elapsed() < RECENT_COMMIT_TTL)
+    }
+
     pub fn apply_commit(&mut self, hash: &str, size: u64, dirty_generation: u64) {
         if self.clear_dirty_if(dirty_generation) {
             // Only update metadata when the generation matches. A concurrent
             // writer may have advanced the generation with newer content;
             // overwriting size/hash here would clobber the in-progress data.
             self.xet_hash = Some(hash.to_string());
+            self.recent_commits.retain(|(_, at)| at.elapsed() < RECENT_COMMIT_TTL);
+            if self.recent_commits.len() >= MAX_RECENT_COMMITS {
+                self.recent_commits.remove(0);
+            }
+            self.recent_commits.push((hash.to_string(), Instant::now()));
             // The on-disk staging file is the just-uploaded content — valid
             // cache for the next write-open.
             self.staging_is_current = true;
@@ -302,6 +332,8 @@ impl InodeTable {
             children_loaded_at: None,
             children_from_remote: false,
             created_locally: false,
+            renaming: 0,
+            recent_commits: Vec::new(),
             children: Vec::new(),
             child_index: HashMap::new(),
             pending_deletes: Vec::new(),
@@ -645,6 +677,8 @@ impl InodeTable {
             children_loaded_at: None,
             children_from_remote: false,
             created_locally: false,
+            renaming: 0,
+            recent_commits: Vec::new(),
             children: Vec::new(),
             child_index: HashMap::new(),
             pending_deletes: Vec::new(),
@@ -718,7 +752,11 @@ impl InodeTable {
         new_mtime: SystemTime,
     ) -> bool {
         if let Some(entry) = self.inodes.get_mut(&ino) {
-            if entry.is_dirty() {
+            if entry.is_dirty()
+                || new_hash
+                    .as_deref()
+                    .is_some_and(|hash| entry.is_earlier_own_commit(hash))
+            {
                 return false;
             }
             entry.xet_hash = new_hash;
@@ -753,7 +791,7 @@ impl InodeTable {
         let mut stack = vec![ino];
         while let Some(current) = stack.pop() {
             if let Some(entry) = self.inodes.get(&current) {
-                if entry.is_dirty() || entry.eviction.open_handles.load(Ordering::Relaxed) > 0 {
+                if entry.is_dirty() || entry.renaming > 0 || entry.eviction.open_handles.load(Ordering::Relaxed) > 0 {
                     return true;
                 }
                 for child in &entry.children {
@@ -849,6 +887,9 @@ impl InodeTable {
             return false;
         };
         if entry.is_dirty() {
+            return false;
+        }
+        if hash.as_deref().is_some_and(|hash| entry.is_earlier_own_commit(hash)) {
             return false;
         }
         if let Some(hash) = hash {

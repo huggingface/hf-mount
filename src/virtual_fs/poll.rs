@@ -72,14 +72,15 @@ fn queue_file_invalidation(inode_table: &InodeTable, ino: u64, inos_to_invalidat
 
 /// Drop a remotely deleted file from the inode table and queue the parent
 /// directory + inode invalidations. Returns the parent directory, or `None`
-/// when the inode is gone or dirty (local writes take precedence until flushed).
+/// when the inode is gone, dirty (local writes take precedence until flushed)
+/// or being renamed (the deletion is the rename's own commit).
 fn remove_remote_file(
     inode_table: &mut InodeTable,
     ino: u64,
     inos_to_invalidate: &mut Vec<(u64, InvalKind)>,
 ) -> Option<u64> {
     let (parent_ino, name) = match inode_table.get(ino) {
-        Some(entry) if entry.is_dirty() => return None,
+        Some(entry) if entry.is_dirty() || entry.renaming > 0 => return None,
         Some(entry) => (entry.parent, entry.name.clone()),
         None => return None,
     };
