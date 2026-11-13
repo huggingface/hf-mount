@@ -96,6 +96,10 @@ const MAX_ATTEMPTS: u32 = 3;
 /// at once on a slow link): it waits in line rather than stalls, though not
 /// forever.
 const MAX_QUEUED_TIMEOUTS: u32 = 4;
+/// Fetch timeouts a fetch waits in line at most, however many bytes it
+/// counts ahead of it: the count can include bytes of streams that gave up
+/// and that the link may not carry.
+const MAX_LINE_TIMEOUTS: u32 = 16;
 /// Time a read-ahead fetch may take before it is slow, when the fetch
 /// timeout is disabled (otherwise a quarter of it): a quarter of the default
 /// fetch timeout.
@@ -1468,7 +1472,8 @@ impl Drop for InLine<'_> {
 /// The next chunk of `stream`, or `None` when none came within `timeout`
 /// (`Duration::ZERO` waits forever). While other fetches of the mount receive
 /// chunks, the fetch waits in line: as long as the mount still receives what
-/// was in line before the stream, and at least `MAX_QUEUED_TIMEOUTS` timeouts.
+/// was in line before the stream, at least `MAX_QUEUED_TIMEOUTS` timeouts and
+/// at most `MAX_LINE_TIMEOUTS`.
 async fn next_chunk(
     stream: &mut dyn DownloadStreamOps,
     timeout: Duration,
@@ -1486,8 +1491,10 @@ async fn next_chunk(
             }
             return Some(chunk);
         }
+        let waited = waited_from.elapsed();
         if !line.budget.received_within(timeout)
-            || (waited_from.elapsed() >= timeout * MAX_QUEUED_TIMEOUTS && !line.behind_others())
+            || waited >= timeout * MAX_LINE_TIMEOUTS
+            || (waited >= timeout * MAX_QUEUED_TIMEOUTS && !line.behind_others())
         {
             return None;
         }
@@ -2751,19 +2758,49 @@ mod tests {
         assert_eq!(budget.line().in_flight, 0);
     }
 
+    /// Bytes counted ahead of a fetch that never come (a stream that gave up,
+    /// whose terms the link no longer carries) hold it in line for at most
+    /// `MAX_LINE_TIMEOUTS` timeouts while the mount receives other data.
+    #[tokio::test(start_paused = true)]
+    async fn a_fetch_waits_in_line_at_most_max_line_timeouts() {
+        let budget = ReadAheadBudget::new(MAX_TOTAL_AHEAD_BYTES);
+        let timeout = Duration::from_secs(30);
+        let mut waiting = {
+            let _gave_up = InLine::open(&budget, 10_000_000_000);
+            InLine::open(&budget, 1)
+        };
+        let others = {
+            let budget = budget.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    budget.note_received();
+                }
+            })
+        };
+        let started = tokio::time::Instant::now();
+        assert!(
+            next_chunk(&mut StallingDownloadStream, timeout, &mut waiting)
+                .await
+                .is_none()
+        );
+        assert_eq!(started.elapsed(), timeout * MAX_LINE_TIMEOUTS);
+        others.abort();
+    }
+
     /// A fetch behind more bytes than the link carries in `MAX_QUEUED_TIMEOUTS`
     /// timeouts waits on while the mount receives them, then gives up.
     #[tokio::test(start_paused = true)]
     async fn a_fetch_waits_for_the_bytes_in_line_before_it() {
         let budget = ReadAheadBudget::new(MAX_TOTAL_AHEAD_BYTES);
         let timeout = Duration::from_secs(30);
-        // 600 MB in line ahead (the streams of other readers), received at
-        // 1 MB/s: 600 s, five times the MAX_QUEUED_TIMEOUTS allowance.
-        budget.line().in_flight += 600_000_000;
+        // 300 MB in line ahead (the streams of other readers), received at
+        // 1 MB/s: 300 s, more than the MAX_QUEUED_TIMEOUTS allowance.
+        budget.line().in_flight += 300_000_000;
         let others = {
             let budget = budget.clone();
             tokio::spawn(async move {
-                for _ in 0..600 {
+                for _ in 0..300 {
                     tokio::time::sleep(Duration::from_secs(1)).await;
                     {
                         let mut line = budget.line();
@@ -2788,7 +2825,7 @@ mod tests {
         );
         let waited = started.elapsed();
         assert!(
-            waited >= Duration::from_secs(600) && waited <= Duration::from_secs(600) + timeout,
+            waited >= Duration::from_secs(300) && waited <= Duration::from_secs(300) + timeout,
             "waited {waited:?}"
         );
         others.abort();
