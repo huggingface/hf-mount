@@ -121,7 +121,13 @@ pub struct Window {
 }
 
 impl Window {
-    fn new(start: u64, plan: QueryReconstructionResponseV2, layout: ChunkLayoutResponse) -> Result<Self, &'static str> {
+    /// `fetched_at` is when the plan was asked: its signed URLs age from then.
+    fn new(
+        start: u64,
+        plan: QueryReconstructionResponseV2,
+        layout: ChunkLayoutResponse,
+        fetched_at: Instant,
+    ) -> Result<Self, &'static str> {
         if plan
             .xorbs
             .values()
@@ -155,7 +161,7 @@ impl Window {
             plan,
             layout,
             serialized,
-            fetched_at: Instant::now(),
+            fetched_at,
         })
     }
 
@@ -509,12 +515,13 @@ impl WindowPlans {
 
     async fn fetch_window(&self, file_id: &MerkleHash, start: u64) -> SlotState {
         let range = FileRange::new(start, start + WINDOW);
+        let asked_at = Instant::now();
         let (plan, layout) = tokio::join!(
             self.source.plan(file_id, range),
             self.source.chunk_layout(file_id, range)
         );
         match (plan, layout) {
-            (Ok(Some(plan)), Ok(Some(layout))) => match Window::new(start, plan, layout) {
+            (Ok(Some(plan)), Ok(Some(layout))) => match Window::new(start, plan, layout, asked_at) {
                 Ok(window) => {
                     tracing::debug!("window plans: {:.8} window at {} ready", file_id, start);
                     return SlotState::Ready(Arc::new(window));
@@ -683,7 +690,7 @@ mod tests {
 
         fn window(&self, start: u64) -> Window {
             let range = FileRange::new(start, start + WINDOW);
-            Window::new(start, self.plan(range).unwrap(), self.layout(range)).unwrap()
+            Window::new(start, self.plan(range).unwrap(), self.layout(range), Instant::now()).unwrap()
         }
     }
 
@@ -750,7 +757,7 @@ mod tests {
         for fetch in plan.xorbs.values_mut().flatten() {
             fetch.url.push_str("&X-Amz-Signature=abc");
         }
-        assert!(Window::new(0, plan, file.layout(range)).is_err());
+        assert!(Window::new(0, plan, file.layout(range), Instant::now()).is_err());
     }
 
     struct FileSource {
@@ -830,6 +837,39 @@ mod tests {
             self.layouts.fetch_add(1, Ordering::Relaxed);
             std::future::pending().await
         }
+    }
+
+    #[tokio::test]
+    async fn window_age_starts_when_its_plan_is_asked() {
+        /// Answers the plan at once and the chunk layout late.
+        struct SlowLayout(Arc<FileSource>);
+
+        #[async_trait::async_trait]
+        impl WindowSource for SlowLayout {
+            async fn plan(
+                &self,
+                file_id: &MerkleHash,
+                range: FileRange,
+            ) -> Result<Option<QueryReconstructionResponseV2>, ClientError> {
+                self.0.plan(file_id, range).await
+            }
+
+            async fn chunk_layout(
+                &self,
+                file_id: &MerkleHash,
+                range: FileRange,
+            ) -> Result<Option<ChunkLayoutResponse>, LayoutError> {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                self.0.chunk_layout(file_id, range).await
+            }
+        }
+
+        let plans = WindowPlans::new(Arc::new(SlowLayout(FileSource::new(false))), WindowPlansMode::On);
+        let SlotState::Ready(window) = plans.fetch_window(&MerkleHash::default(), 0).await else {
+            panic!("window not ready");
+        };
+        // The signed URLs of the plan age while the layout is on its way.
+        assert!(window.fetched_at.elapsed() >= Duration::from_millis(50));
     }
 
     #[tokio::test]
