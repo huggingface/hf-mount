@@ -11,6 +11,7 @@ pub mod nfs;
 pub mod overlay;
 pub mod setup;
 pub mod virtual_fs;
+pub mod window_plans;
 pub mod xet;
 
 #[cfg(test)]

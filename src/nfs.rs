@@ -43,9 +43,9 @@ impl NFSAdapter {
     }
 
     /// Get or open a pooled read handle with a shared pin. Cold-read races
-    /// converge on a single pooled handle so the per-handle prefetch buffer
-    /// absorbs concurrent NFS readahead RPCs instead of spawning duplicate
-    /// Xet streams.
+    /// converge on a single pooled handle so that concurrent NFS readahead
+    /// RPCs share one remote reader (its fetched and in-flight blocks)
+    /// instead of fetching the same data twice.
     async fn get_or_open_handle(&self, ino: u64) -> Result<u64, nfsstat3> {
         if let Some(handle) = self.acquire_shared(ino) {
             return Ok(handle);
@@ -164,10 +164,9 @@ impl NFSFileSystem for NFSAdapter {
     }
 
     async fn read(&self, id: fileid3, offset: u64, count: u32) -> Result<(Vec<u8>, bool), nfsstat3> {
-        // Share the pooled handle across concurrent readers — its prefetch
-        // buffer absorbs NFS readahead RPCs efficiently. The shared pin only
-        // blocks LRU eviction; concurrent reads still serialize on the
-        // per-handle prefetch mutex inside virtual_fs.
+        // Share the pooled handle across concurrent readers: its remote
+        // reader serves NFS readahead RPCs in parallel, from blocks already
+        // fetched or in flight. The shared pin only blocks LRU eviction.
         let file_handle = match self.acquire_shared(id) {
             Some(handle) => handle,
             None => self.get_or_open_handle(id).await?,
@@ -686,16 +685,17 @@ pub async fn mount_nfs(
 //
 // NFS v3 is stateless — there is no open/close. Every read arrives with
 // just a fileid. Our VFS, however, is stateful: open() allocates a file
-// handle that tracks prefetch buffers, staging files, etc.
+// handle that tracks fetched blocks, staging files, etc.
 //
 // The handle pool bridges the gap: it caches VFS file handles keyed by
 // inode, evicting the least-recently-used entry when full. Eviction
 // calls flush() then release() — flush commits dirty write data to
-// CAS+Hub, release frees the prefetch buffer. A subsequent read on an
-// evicted file simply re-opens it (cold open — prefetch restarts).
+// CAS+Hub, release frees the fetched blocks. A subsequent read on an
+// evicted file simply re-opens it (cold open, read-ahead restarts).
 //
-// Each open handle may hold a prefetch buffer (~8 MB worst case), so the
-// pool size caps memory usage at roughly capacity × 8 MB.
+// The remote reader (virtual_fs/remote_reader.rs) caps read-ahead per
+// handle and across handles. Each handle also keeps up to 8 MiB of blocks
+// already read, so the pool caps those at about capacity × 8 MiB.
 
 const HANDLE_POOL_CAPACITY: usize = 64;
 
