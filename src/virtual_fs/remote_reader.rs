@@ -1472,29 +1472,32 @@ impl Drop for InLine<'_> {
 /// The next chunk of `stream`, or `None` when none came within `timeout`
 /// (`Duration::ZERO` waits forever). While other fetches of the mount receive
 /// chunks, the fetch waits in line: as long as the mount still receives what
-/// was in line before the stream, at least `MAX_QUEUED_TIMEOUTS` timeouts and
-/// at most `MAX_LINE_TIMEOUTS`.
+/// was in line before the stream, at least `MAX_QUEUED_TIMEOUTS` timeouts,
+/// and at most `MAX_LINE_TIMEOUTS` since `stalled_since`, when the fetch last
+/// received a chunk: the attempts of a fetch that receive nothing share it.
 async fn next_chunk(
     stream: &mut dyn DownloadStreamOps,
     timeout: Duration,
     line: &mut InLine<'_>,
+    stalled_since: &mut Option<tokio::time::Instant>,
 ) -> Option<crate::error::Result<Option<Bytes>>> {
     if timeout == Duration::ZERO {
         return Some(stream.next().await);
     }
     let waited_from = tokio::time::Instant::now();
+    let stalled_from = *stalled_since.get_or_insert(waited_from);
     let mut next = stream.next();
     loop {
         if let Ok(chunk) = tokio::time::timeout(timeout, &mut next).await {
             if let Ok(Some(chunk)) = &chunk {
                 line.received(chunk.len() as u64);
+                *stalled_since = None;
             }
             return Some(chunk);
         }
-        let waited = waited_from.elapsed();
         if !line.budget.received_within(timeout)
-            || waited >= timeout * MAX_LINE_TIMEOUTS
-            || (waited >= timeout * MAX_QUEUED_TIMEOUTS && !line.behind_others())
+            || stalled_from.elapsed() >= timeout * MAX_LINE_TIMEOUTS
+            || (waited_from.elapsed() >= timeout * MAX_QUEUED_TIMEOUTS && !line.behind_others())
         {
             return None;
         }
@@ -1522,6 +1525,7 @@ async fn fetch_run(mut run: FetchRun) {
     let started = std::time::Instant::now();
 
     let mut attempt = 1;
+    let mut stalled_since = None;
     loop {
         let start = run.next * BLOCK_SIZE;
         let resumed_at = run.next;
@@ -1539,7 +1543,7 @@ async fn fetch_run(mut run: FetchRun) {
                 let mut block = BytesMut::with_capacity(block_len(file_size, run.next) as usize);
                 loop {
                     let at = run.next * BLOCK_SIZE + block.len() as u64;
-                    let mut chunk = match next_chunk(stream.as_mut(), timeout, &mut line).await {
+                    let mut chunk = match next_chunk(stream.as_mut(), timeout, &mut line, &mut stalled_since).await {
                         Some(Ok(Some(chunk))) => chunk,
                         None => {
                             error!(
@@ -2725,18 +2729,28 @@ mod tests {
         };
         let started = tokio::time::Instant::now();
         assert!(
-            next_chunk(&mut StallingDownloadStream, timeout, &mut InLine::open(&budget, 1))
-                .await
-                .is_none()
+            next_chunk(
+                &mut StallingDownloadStream,
+                timeout,
+                &mut InLine::open(&budget, 1),
+                &mut None
+            )
+            .await
+            .is_none()
         );
         assert_eq!(started.elapsed(), timeout * MAX_QUEUED_TIMEOUTS);
 
         others.abort();
         let started = tokio::time::Instant::now();
         assert!(
-            next_chunk(&mut StallingDownloadStream, timeout, &mut InLine::open(&budget, 1))
-                .await
-                .is_none()
+            next_chunk(
+                &mut StallingDownloadStream,
+                timeout,
+                &mut InLine::open(&budget, 1),
+                &mut None
+            )
+            .await
+            .is_none()
         );
         assert_eq!(started.elapsed(), timeout);
     }
@@ -2780,11 +2794,45 @@ mod tests {
         };
         let started = tokio::time::Instant::now();
         assert!(
-            next_chunk(&mut StallingDownloadStream, timeout, &mut waiting)
+            next_chunk(&mut StallingDownloadStream, timeout, &mut waiting, &mut None)
                 .await
                 .is_none()
         );
         assert_eq!(started.elapsed(), timeout * MAX_LINE_TIMEOUTS);
+        others.abort();
+    }
+
+    /// The attempts of a fetch that receive nothing share the
+    /// `MAX_LINE_TIMEOUTS` limit: a read in line behind other readers fails
+    /// after about that long, not that long for each attempt.
+    #[tokio::test(start_paused = true)]
+    async fn attempts_share_the_wait_in_line() {
+        let xet = MockXet::new();
+        let content = pattern(64 * BLOCK_SIZE as usize);
+        let reader = reader_for(&xet, &content, false);
+        let timeout = Duration::from_secs(5);
+        xet.stall_stream_reads();
+        // Other readers keep the line ahead and the mount receiving.
+        let _ahead = InLine::open(&reader.budget, 10_000_000_000);
+        let others = {
+            let budget = reader.budget.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    budget.note_received();
+                }
+            })
+        };
+        let started = tokio::time::Instant::now();
+        assert!(reader.read(0, 4096).await.is_err());
+        let waited = started.elapsed();
+        // The first attempt waits the whole limit, the others one timeout
+        // each (plus the backoff between attempts); then the read tries once
+        // more with a fetch of its own.
+        assert!(
+            waited <= 2 * (timeout * MAX_LINE_TIMEOUTS + timeout * MAX_ATTEMPTS),
+            "waited {waited:?}"
+        );
         others.abort();
     }
 
@@ -2819,9 +2867,14 @@ mod tests {
         };
         let started = tokio::time::Instant::now();
         assert!(
-            next_chunk(&mut StallingDownloadStream, timeout, &mut InLine::open(&budget, 1))
-                .await
-                .is_none()
+            next_chunk(
+                &mut StallingDownloadStream,
+                timeout,
+                &mut InLine::open(&budget, 1),
+                &mut None
+            )
+            .await
+            .is_none()
         );
         let waited = started.elapsed();
         assert!(
