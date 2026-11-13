@@ -62,23 +62,9 @@ fn main() {
                 .filter(|p| p.exists())
                 .unwrap_or_else(|| PathBuf::from(backend));
 
-            // Extract mount point from args (last positional arg, the one after bucket/repo + id).
-            let mount_point = args
-                .iter()
-                .rev()
-                .find(|a| !a.starts_with('-') && std::path::Path::new(a).is_absolute())
-                .or_else(|| args.last())
-                .map(PathBuf::from);
-
-            let mount_point = match mount_point {
-                Some(p) => p,
-                None => {
-                    eprintln!("Error: could not determine mount point from arguments");
-                    eprintln!(
-                        "Usage: hf-mount start [--fuse] [backend-options...] <subcommand> <source> <mount-point>"
-                    );
-                    std::process::exit(1);
-                }
+            let mount_point = match hf_mount::daemon::mount_point_from_args(&args) {
+                Ok(p) => p,
+                Err(err) => err.exit(),
             };
 
             // Extract source label from args (e.g. "bucket myuser/mybucket" or "repo gpt2").
