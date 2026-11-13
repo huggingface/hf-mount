@@ -62,17 +62,9 @@ fn main() {
                 .filter(|p| p.exists())
                 .unwrap_or_else(|| PathBuf::from(backend));
 
-            let mount_point = hf_mount::daemon::mount_point_from_args(&args);
-
-            let mount_point = match mount_point {
-                Some(p) => p,
-                None => {
-                    eprintln!("Error: could not determine mount point from arguments");
-                    eprintln!(
-                        "Usage: hf-mount start [--fuse] [backend-options...] <subcommand> <source> <mount-point>"
-                    );
-                    std::process::exit(1);
-                }
+            let mount_point = match hf_mount::daemon::mount_point_from_args(&args) {
+                Ok(p) => p,
+                Err(err) => err.exit(),
             };
 
             // Extract source label from args (e.g. "bucket myuser/mybucket" or "repo gpt2").

@@ -118,21 +118,13 @@ fn read_pid_file(pid_file: &Path) -> Option<PidFileContents> {
 ///
 /// Parses `args` with the backend CLI so that option values (e.g.
 /// `--cache-dir /var/cache/hf`, `--revision v1.0`) are never mistaken for the
-/// mount point. Falls back to the last positional argument when the arguments
-/// don't parse; the backend then reports the actual usage error.
-pub fn mount_point_from_args(args: &[String]) -> Option<PathBuf> {
+/// mount point. Arguments the backend would reject return its usage error.
+pub fn mount_point_from_args(args: &[String]) -> Result<PathBuf, clap::Error> {
     use clap::Parser;
 
-    if let Ok(parsed) =
-        crate::setup::Args::try_parse_from(std::iter::once("hf-mount").chain(args.iter().map(String::as_str)))
-    {
-        return Some(parsed.source.mount_point().to_path_buf());
-    }
-    args.iter()
-        .rev()
-        .find(|a| !a.starts_with('-') && Path::new(a).is_absolute())
-        .or_else(|| args.last())
-        .map(PathBuf::from)
+    let parsed =
+        crate::setup::Args::try_parse_from(std::iter::once("hf-mount start").chain(args.iter().map(String::as_str)))?;
+    Ok(parsed.source.mount_point().to_path_buf())
 }
 
 /// Guard held by the daemon child process. Signals readiness to the parent
@@ -520,26 +512,34 @@ mod tests {
     #[test]
     fn mount_point_from_args_absolute() {
         let a = args(&["--hf-token", "x", "bucket", "user/bucket", "/tmp/data"]);
-        assert_eq!(mount_point_from_args(&a), Some(PathBuf::from("/tmp/data")));
+        assert_eq!(mount_point_from_args(&a).unwrap(), PathBuf::from("/tmp/data"));
         let a = args(&["repo", "openai-community/gpt2", "/tmp/gpt2", "--revision", "v1.0"]);
-        assert_eq!(mount_point_from_args(&a), Some(PathBuf::from("/tmp/gpt2")));
+        assert_eq!(mount_point_from_args(&a).unwrap(), PathBuf::from("/tmp/gpt2"));
     }
 
     #[test]
     fn mount_point_from_args_relative() {
         let a = args(&["bucket", "user/bucket", "data"]);
-        assert_eq!(mount_point_from_args(&a), Some(PathBuf::from("data")));
+        assert_eq!(mount_point_from_args(&a).unwrap(), PathBuf::from("data"));
     }
 
     #[test]
     fn mount_point_from_args_ignores_absolute_option_value() {
         let a = args(&["--cache-dir", "/var/cache/hf", "bucket", "user/bucket", "data"]);
-        assert_eq!(mount_point_from_args(&a), Some(PathBuf::from("data")));
+        assert_eq!(mount_point_from_args(&a).unwrap(), PathBuf::from("data"));
+    }
+
+    #[test]
+    fn mount_point_from_args_rejects_what_the_backend_rejects() {
+        // The old guess took `/c` here, the value of `--cache-dir`.
+        let a = args(&["bucket", "user/bucket", "data", "--cache-dir", "/c", "--bogus-flag"]);
+        assert!(mount_point_from_args(&a).is_err());
+        assert!(mount_point_from_args(&[]).is_err());
     }
 
     #[test]
     fn mount_point_from_args_ignores_trailing_option_value() {
         let a = args(&["repo", "openai-community/gpt2", "gpt2", "--revision", "v1.0"]);
-        assert_eq!(mount_point_from_args(&a), Some(PathBuf::from("gpt2")));
+        assert_eq!(mount_point_from_args(&a).unwrap(), PathBuf::from("gpt2"));
     }
 }
