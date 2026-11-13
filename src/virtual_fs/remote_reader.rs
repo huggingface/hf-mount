@@ -1367,6 +1367,9 @@ async fn drop_read_ahead_when_idle(reader: Weak<RemoteReader>) {
                 let release = now >= release_at;
                 if release {
                     state.drop_behind();
+                } else {
+                    // Readers that opened since its last read shrank its share.
+                    reader.evict_behind(state);
                 }
                 let keep = if release { 0 } else { reader.ahead_limit(state) };
                 reader.evict_unread(state, keep, true);
@@ -2340,6 +2343,42 @@ mod tests {
         );
     }
 
+    /// A reader that read while it was alone, then stopped as other files
+    /// opened, gives back its blocks already read beyond its new share once
+    /// idle, not only after `IDLE_RELEASE`.
+    #[tokio::test(start_paused = true)]
+    async fn idle_reader_shrinks_its_blocks_already_read_to_its_share() {
+        let xet = MockXet::new();
+        let content = pattern(64 * BLOCK_SIZE as usize);
+        xet.add_file("hash", &content);
+        let budget = ReadAheadBudget::new(MAX_TOTAL_AHEAD_BYTES);
+        let new_reader = || {
+            RemoteReader::new(
+                "hash".into(),
+                content.len() as u64,
+                xet.clone(),
+                Duration::from_secs(5),
+                false,
+                budget.clone(),
+            )
+        };
+        let first = new_reader();
+        for block in 0..64 {
+            first.read(block * BLOCK_SIZE, BLOCK_SIZE as u32).await.unwrap();
+        }
+        assert!(first.lock().behind_bytes >= MAX_BEHIND_BYTES);
+
+        let _others: Vec<_> = (0..63).map(|_| new_reader()).collect();
+        tokio::time::sleep(IDLE_DROP * 2).await;
+        let behind = first.lock().behind_bytes;
+        // One more block: the last block of the stream stays.
+        assert!(
+            behind <= MAX_TOTAL_BEHIND_BYTES / 64 + BLOCK_SIZE,
+            "{} blocks already read kept",
+            behind / BLOCK_SIZE
+        );
+    }
+
     /// An idle reader gives back the blocks it read along with its
     /// read-ahead, after `IDLE_RELEASE`: the page cache holds them.
     #[tokio::test(start_paused = true)]
@@ -2656,6 +2695,32 @@ mod tests {
 
         let offset = 8 * BLOCK_SIZE;
         let size = (u64::from(MAX_ATTEMPTS) + 2) * BLOCK_SIZE;
+        let (data, _) = reader.read(offset, size as u32).await.unwrap();
+        assert!(data[..] == content[offset as usize..(offset + size) as usize]);
+    }
+
+    /// An attempt that fails inside a block leaves no partial bytes behind:
+    /// the next attempt fetches that block again from its start, so the
+    /// bytes a read returns are not shifted or repeated.
+    #[tokio::test(start_paused = true)]
+    async fn attempt_that_fails_inside_a_block_returns_exact_bytes() {
+        let xet = MockXet::new();
+        // Not periodic, so that a repeated or skipped prefix shows.
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let content: Vec<u8> = (0..64 * BLOCK_SIZE as usize)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                seed as u8
+            })
+            .collect();
+        let reader = reader_for(&xet, &content, false);
+        // Every attempt delivers one block and a third of the next, then fails.
+        xet.fail_streams_after((BLOCK_SIZE + BLOCK_SIZE / 3) as usize);
+
+        let offset = 8 * BLOCK_SIZE + 1000;
+        let size = 6 * BLOCK_SIZE;
         let (data, _) = reader.read(offset, size as u32).await.unwrap();
         assert!(data[..] == content[offset as usize..(offset + size) as usize]);
     }
