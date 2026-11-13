@@ -18,9 +18,10 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use reqwest::StatusCode;
+use tokio::time::Instant;
 use xet_client::ClientError;
 use xet_client::cas_client::Client;
 use xet_client::cas_types::{
@@ -46,6 +47,10 @@ const RETRY_AFTER: Duration = Duration::from_secs(60);
 /// Windows kept, by last use. A window of a 1 GiB fragmented range weighs a few hundred KB.
 /// A window in flight is not dropped, so this also bounds the window fetches in flight.
 const MAX_WINDOWS: usize = 128;
+/// A window used within this period is not dropped for another one: when the windows in use
+/// fill the cache, a request elsewhere keeps its exact plan instead of making a window that is
+/// needed again fetch once more.
+const KEEP_USED: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
 pub enum WindowPlansMode {
@@ -485,7 +490,11 @@ impl WindowPlans {
                         // fetch goes on, and nothing would bound the fetches in flight.
                         let oldest = slots
                             .iter()
-                            .filter(|(_, slot)| !matches!(slot.state, SlotState::Fetching))
+                            .filter(|(_, slot)| match slot.state {
+                                SlotState::Fetching => false,
+                                SlotState::Ready(_) => now.duration_since(slot.used_at) >= KEEP_USED,
+                                SlotState::Seen | SlotState::Failed(_) => true,
+                            })
                             .min_by_key(|(_, slot)| slot.used_at)
                             .map(|(key, _)| *key)?;
                         slots.remove(&oldest);
@@ -870,6 +879,77 @@ mod tests {
         };
         // The signed URLs of the plan age while the layout is on its way.
         assert!(window.fetched_at.elapsed() >= Duration::from_millis(50));
+    }
+
+    /// More large files read at once than the windows the cache keeps: a window in use is not
+    /// dropped for another one and fetched again, so windows never cost more CAS requests than
+    /// the exact plans they replace.
+    #[tokio::test(start_paused = true)]
+    async fn windows_in_use_are_not_dropped_for_others() {
+        /// Answers every window with the plan of the first window, after a delay.
+        struct SameWindow {
+            file: File,
+            fetches: AtomicUsize,
+        }
+
+        #[async_trait::async_trait]
+        impl WindowSource for SameWindow {
+            async fn plan(
+                &self,
+                _: &MerkleHash,
+                _: FileRange,
+            ) -> Result<Option<QueryReconstructionResponseV2>, ClientError> {
+                self.fetches.fetch_add(1, Ordering::Relaxed);
+                tokio::time::sleep(Duration::from_millis(550)).await;
+                Ok(self.file.plan(FileRange::new(0, WINDOW)))
+            }
+
+            async fn chunk_layout(
+                &self,
+                _: &MerkleHash,
+                _: FileRange,
+            ) -> Result<Option<ChunkLayoutResponse>, LayoutError> {
+                tokio::time::sleep(Duration::from_millis(550)).await;
+                Ok(Some(self.file.layout(FileRange::new(0, WINDOW))))
+            }
+        }
+
+        let source = Arc::new(SameWindow {
+            file: file(),
+            fetches: AtomicUsize::new(0),
+        });
+        let plans = WindowPlans::new(source.clone(), WindowPlansMode::On);
+        let windows_per_file = 16;
+        let files: Vec<MerkleHash> = (0..37u8).map(|index| compute_data_hash(&[index, 1])).collect();
+        for file_id in &files {
+            plans.note_size(file_id, windows_per_file * WINDOW);
+        }
+        // Each reader reads 32 MB/s and asks xet's three plans per 32 MiB fetch.
+        let (mut asked, mut derived) = (0, 0);
+        let mut offset = 0;
+        for len in [8u64 << 20, 16 << 20, 8 << 20].into_iter().cycle() {
+            if offset >= windows_per_file * WINDOW {
+                break;
+            }
+            for file_id in &files {
+                asked += 1;
+                derived += usize::from(plans.derive(file_id, FileRange::new(offset, offset + len)).is_some());
+                tokio::time::sleep(Duration::from_micros(333_000 / files.len() as u64)).await;
+            }
+            offset += len;
+        }
+        let fetches = source.fetches.load(Ordering::Relaxed);
+        // A window fetch is two requests: a plan and a chunk layout.
+        let requests = 2 * fetches + asked - derived;
+        assert!(
+            fetches <= files.len() * windows_per_file as usize,
+            "{fetches} window fetches for {} windows",
+            files.len() * windows_per_file as usize
+        );
+        assert!(
+            requests < asked / 2,
+            "{requests} CAS requests with windows, {asked} without"
+        );
     }
 
     #[tokio::test]
