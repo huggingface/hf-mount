@@ -645,6 +645,7 @@ impl super::VirtualFs {
         // Phase 1: Compute diff (no lock held)
         struct Update {
             ino: u64,
+            path: Arc<str>,
             hash: Option<String>,
             etag: Option<String>,
             size: u64,
@@ -678,6 +679,7 @@ impl super::VirtualFs {
                             .unwrap_or(SystemTime::now());
                         updates.push(Update {
                             ino: *ino,
+                            path: path.clone(),
                             hash: remote_hash.map(|s| s.to_string()),
                             etag: remote_oid.map(|s| s.to_string()),
                             size: remote_size,
@@ -693,7 +695,7 @@ impl super::VirtualFs {
                     let parent_prefix = path.rsplit_once('/').map_or("", |(p, _)| p);
                     if polled_prefixes.contains(parent_prefix) {
                         info!("Remote deletion detected: {}", path);
-                        deletions.push(*ino);
+                        deletions.push((*ino, path.clone()));
                     }
                 }
             }
@@ -705,15 +707,24 @@ impl super::VirtualFs {
         {
             let mut inode_table = inodes.write().expect("inodes poisoned");
 
+            // The diff was computed from a snapshot: an inode renamed since
+            // then sits at another path, which the listing says nothing about.
+            let at_path =
+                |table: &InodeTable, ino: u64, path: &str| table.get(ino).is_some_and(|e| &*e.full_path == path);
             for update in updates {
+                if !at_path(&inode_table, update.ino, &update.path) {
+                    continue;
+                }
                 inode_table.update_remote_file(update.ino, update.hash, update.etag, update.size, update.mtime);
                 queue_file_invalidation(&inode_table, update.ino, &mut inos_to_invalidate);
             }
 
             // Re-checked under the write lock by the helper: the inode may
             // have been removed or dirtied since the read-lock snapshot.
-            for ino in &deletions {
-                remove_remote_file(&mut inode_table, *ino, &mut inos_to_invalidate);
+            for (ino, path) in &deletions {
+                if at_path(&inode_table, *ino, path) {
+                    remove_remote_file(&mut inode_table, *ino, &mut inos_to_invalidate);
+                }
             }
 
             // Phase 3: New remote entries (files AND directories) -> invalidate parent dir.

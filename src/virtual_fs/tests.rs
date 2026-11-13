@@ -7324,3 +7324,34 @@ fn follow_echo_of_an_earlier_own_commit_is_ignored() {
         );
     });
 }
+
+/// A listing taken while a rename is between its Hub commit and its local
+/// move already holds the destination. It must not materialize it, or the
+/// local move finds the destination taken (EEXIST with RENAME_NOREPLACE).
+#[test]
+fn listing_during_rename_does_not_take_the_destination() {
+    let hub = MockHub::new();
+    hub.add_file("a.txt", 10, Some("ha"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        vfs.lookup(ROOT_INODE, "a.txt").await.unwrap();
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        hub.set_batch_barrier(barrier.clone());
+        let renaming = {
+            let vfs = vfs.clone();
+            tokio::spawn(async move { vfs.rename(ROOT_INODE, "a.txt", ROOT_INODE, "b.txt", true).await })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // The Hub holds the destination now; the root listing is re-read.
+        hub.add_file("b.txt", 10, Some("ha"), None);
+        vfs.inode_table.write().unwrap().invalidate_children(ROOT_INODE);
+        vfs.readdir(ROOT_INODE).await.unwrap();
+        barrier.wait().await;
+        renaming.await.unwrap().unwrap();
+
+        let inodes = vfs.inode_table.read().unwrap();
+        assert!(inodes.get_by_path("b.txt").is_some());
+    });
+}

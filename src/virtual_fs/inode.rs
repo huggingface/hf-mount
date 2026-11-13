@@ -238,26 +238,35 @@ impl InodeEntry {
     /// Apply a successful commit: update hash, size, timestamps, and
     /// conditionally clear dirty + pending_deletes if the generation matches.
     /// Whether `hash` is a hash this mount committed for the file before
-    /// its current one: a remote report of it is stale.
+    /// its current one, while the current one is this mount's last commit:
+    /// a remote report of it is then the late echo of that earlier commit.
+    /// Once another client changed the file, every report applies. A client
+    /// that writes the very content of an earlier commit of this mount within
+    /// `RECENT_COMMIT_TTL`, while the file still holds this mount's last
+    /// commit, looks the same and is ignored: hashes do not tell them apart.
     pub fn is_earlier_own_commit(&self, hash: &str) -> bool {
-        self.xet_hash.as_deref() != Some(hash)
-            && self
-                .recent_commits
+        let recent = |h: &str| {
+            self.recent_commits
                 .iter()
-                .any(|(own, at)| own == hash && at.elapsed() < RECENT_COMMIT_TTL)
+                .any(|(own, at)| own == h && at.elapsed() < RECENT_COMMIT_TTL)
+        };
+        let current = self.xet_hash.as_deref();
+        current != Some(hash) && self.recent_commits.last().map(|(own, _)| own.as_str()) == current && recent(hash)
     }
 
     pub fn apply_commit(&mut self, hash: &str, size: u64, dirty_generation: u64) {
+        // Recorded even when a newer write superseded this one: the commit
+        // reached the Hub, so its report may still arrive.
+        self.recent_commits.retain(|(_, at)| at.elapsed() < RECENT_COMMIT_TTL);
+        if self.recent_commits.len() >= MAX_RECENT_COMMITS {
+            self.recent_commits.remove(0);
+        }
+        self.recent_commits.push((hash.to_string(), Instant::now()));
         if self.clear_dirty_if(dirty_generation) {
             // Only update metadata when the generation matches. A concurrent
             // writer may have advanced the generation with newer content;
             // overwriting size/hash here would clobber the in-progress data.
             self.xet_hash = Some(hash.to_string());
-            self.recent_commits.retain(|(_, at)| at.elapsed() < RECENT_COMMIT_TTL);
-            if self.recent_commits.len() >= MAX_RECENT_COMMITS {
-                self.recent_commits.remove(0);
-            }
-            self.recent_commits.push((hash.to_string(), Instant::now()));
             // The on-disk staging file is the just-uploaded content — valid
             // cache for the next write-open.
             self.staging_is_current = true;
@@ -287,6 +296,11 @@ pub struct InodeTable {
     /// is on (`soft_limit > 0`) or via `enable_touch_tracking()` (staging GC
     /// needs an LRU order over staging files even with the evictor disabled).
     touch_enabled: AtomicBool,
+    /// Destination paths of renames in flight. A rename commits on the Hub
+    /// before it moves the entries locally, so a listing taken in between
+    /// already holds the destination: it must not materialize it, or the
+    /// local move finds the destination taken (EEXIST, ENOTEMPTY).
+    rename_targets: HashMap<String, u32>,
 }
 
 impl Default for InodeTable {
@@ -306,6 +320,7 @@ impl InodeTable {
             next_inode: AtomicU64::new(2),
             touch_counter: AtomicU64::new(0),
             touch_enabled: AtomicBool::new(track_touches),
+            rename_targets: HashMap::new(),
         };
 
         // Create root inode
@@ -774,6 +789,30 @@ impl InodeTable {
     }
 
     /// Reset children_loaded to false so the next readdir/lookup re-fetches.
+    pub fn add_rename_target(&mut self, path: &str) {
+        *self.rename_targets.entry(path.to_string()).or_default() += 1;
+    }
+
+    pub fn remove_rename_target(&mut self, path: &str) {
+        if let Some(count) = self.rename_targets.get_mut(path) {
+            *count -= 1;
+            if *count == 0 {
+                self.rename_targets.remove(path);
+            }
+        }
+    }
+
+    /// Whether `path` is, or is under, the destination of a rename in flight.
+    pub fn is_rename_target(&self, path: &str) -> bool {
+        !self.rename_targets.is_empty()
+            && self.rename_targets.keys().any(|target| {
+                path == target
+                    || path
+                        .strip_prefix(target.as_str())
+                        .is_some_and(|rest| rest.starts_with('/'))
+            })
+    }
+
     pub fn invalidate_children(&mut self, ino: u64) {
         if let Some(entry) = self.inodes.get_mut(&ino) {
             entry.children_loaded_at = None;
@@ -1192,6 +1231,63 @@ mod tests {
         assert_eq!(entry.size, 200);
         assert!(entry.pending_deletes.is_empty());
         assert!(entry.mtime > UNIX_EPOCH);
+    }
+
+    /// A commit superseded by a newer write still reached the Hub, so its
+    /// late report must not roll the file back once the newer one commits.
+    #[test]
+    fn superseded_commit_report_is_still_ignored() {
+        let mut table = InodeTable::new(false);
+        let ino = table.insert(
+            ROOT_INODE,
+            "f".to_string(),
+            "f".to_string(),
+            InodeKind::File,
+            1,
+            UNIX_EPOCH,
+            None,
+            0o644,
+            0,
+            0,
+        );
+        let entry = table.get_mut(ino).unwrap();
+        entry.set_dirty();
+        let first = entry.dirty_generation;
+        entry.set_dirty(); // a newer write lands while the first commit runs
+        entry.apply_commit("h1", 1, first);
+        let second = entry.dirty_generation;
+        entry.apply_commit("h2", 1, second);
+        assert!(entry.is_earlier_own_commit("h1"));
+        assert!(!table.merge_remote_file(ino, Some("h1".to_string()), Some(1), None));
+        assert_eq!(table.get(ino).unwrap().xet_hash.as_deref(), Some("h2"));
+    }
+
+    /// Once another client changed the file, a report of an earlier hash of
+    /// this mount is that client's change (a revert), and applies.
+    #[test]
+    fn revert_by_another_client_applies() {
+        let mut table = InodeTable::new(false);
+        let ino = table.insert(
+            ROOT_INODE,
+            "f".to_string(),
+            "f".to_string(),
+            InodeKind::File,
+            1,
+            UNIX_EPOCH,
+            None,
+            0o644,
+            0,
+            0,
+        );
+        for hash in ["h1", "h2"] {
+            let entry = table.get_mut(ino).unwrap();
+            entry.set_dirty();
+            let generation = entry.dirty_generation;
+            entry.apply_commit(hash, 1, generation);
+        }
+        assert!(table.merge_remote_file(ino, Some("other".to_string()), Some(5), None));
+        assert!(table.merge_remote_file(ino, Some("h1".to_string()), Some(1), None));
+        assert_eq!(table.get(ino).unwrap().xet_hash.as_deref(), Some("h1"));
     }
 
     #[test]

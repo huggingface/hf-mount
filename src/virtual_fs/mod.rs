@@ -957,6 +957,10 @@ impl VirtualFs {
         let mut seen_names: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         for entry in entries {
+            // A rename in flight committed this path: its local move inserts it.
+            if inodes.is_rename_target(&entry.path) {
+                continue;
+            }
             // Convert absolute bucket path to path relative to current directory.
             // e.g. prefix="models" → "models/bert/config.json" → "bert/config.json"
             let rel_path = if prefix.is_empty() {
@@ -3613,8 +3617,14 @@ impl VirtualFs {
             self.ensure_children_loaded(dst_ino).await?;
         }
 
-        // Phase 1: validate under read lock, collect everything we need
+        // Phase 1: validate, mark the entries, collect everything we need
         let info = self.rename_validate(parent, name, newparent, newname, no_replace)?;
+        // Held until the entries are moved locally: see `InodeEntry::renaming`.
+        let _renaming = RenameMark {
+            inode_table: &self.inode_table,
+            inos: info.marked_inos().collect(),
+            target: info.new_full_path.clone(),
+        };
 
         // POSIX: rename(a, b) where a and b are hard links to the same inode is a no-op.
         // Check before remote sync to avoid spurious backend mutations.
@@ -3627,14 +3637,6 @@ impl VirtualFs {
                 return Ok(());
             }
         }
-
-        // Held until the entries are moved locally: see `InodeEntry::renaming`.
-        let _renaming = RenameMark::new(
-            &self.inode_table,
-            std::iter::once(info.ino)
-                .chain(info.descendant_files.iter().map(|(_, _, ino)| *ino))
-                .collect(),
-        );
 
         // Phase 2: sync to remote (add + delete ops). Skipped in overlay mode
         // since writes never propagate beyond the local backing.
@@ -3699,7 +3701,7 @@ impl VirtualFs {
         }
     }
 
-    /// Phase 1: validate rename under inode read lock, return all info needed for phases 2+3.
+    /// Phase 1: validate rename and mark its entries as being renamed, return all info needed for phases 2+3.
     fn rename_validate(
         &self,
         parent: u64,
@@ -3708,7 +3710,10 @@ impl VirtualFs {
         newname: &str,
         no_replace: bool,
     ) -> VirtualFsResult<RenameInfo> {
-        let inodes = self.inode_table.read().expect("inodes poisoned");
+        // A write lock, so that the entries are marked as being renamed
+        // (`InodeEntry::renaming`) in the same critical section as the
+        // validation: no remote deletion can drop one in between.
+        let mut inodes = self.inode_table.write().expect("inodes poisoned");
 
         let src = inodes.lookup_child(parent, name).ok_or(libc::ENOENT)?;
 
@@ -3786,7 +3791,7 @@ impl VirtualFs {
             Vec::new()
         };
 
-        Ok(RenameInfo {
+        let info = RenameInfo {
             ino: src.inode,
             old_path: src.full_path.to_string(),
             kind: src.kind,
@@ -3794,7 +3799,14 @@ impl VirtualFs {
             is_dirty: src.is_dirty(),
             new_full_path,
             descendant_files,
-        })
+        };
+        for ino in info.marked_inos() {
+            if let Some(entry) = inodes.get_mut(ino) {
+                entry.renaming += 1;
+            }
+        }
+        inodes.add_rename_target(&info.new_full_path);
+        Ok(info)
     }
 
     /// Phase 2: send batch rename ops to the Hub (add new paths + delete old ones).
@@ -4211,22 +4223,21 @@ struct RenameInfo {
     descendant_files: Vec<(String, String, u64)>,
 }
 
-/// Marks entries as being renamed (`InodeEntry::renaming`) until dropped.
+impl RenameInfo {
+    /// The entries a rename moves: the renamed entry and the clean files
+    /// under a renamed directory.
+    fn marked_inos(&self) -> impl Iterator<Item = u64> + '_ {
+        std::iter::once(self.ino).chain(self.descendant_files.iter().map(|(_, _, ino)| *ino))
+    }
+}
+
+/// Unmarks the entries `rename_validate` marked as being renamed
+/// (`InodeEntry::renaming`), and the destination it registered
+/// (`InodeTable::is_rename_target`), when dropped.
 struct RenameMark<'a> {
     inode_table: &'a RwLock<InodeTable>,
     inos: Vec<u64>,
-}
-
-impl<'a> RenameMark<'a> {
-    fn new(inode_table: &'a RwLock<InodeTable>, inos: Vec<u64>) -> Self {
-        let mut inodes = inode_table.write().expect("inodes poisoned");
-        for ino in &inos {
-            if let Some(entry) = inodes.get_mut(*ino) {
-                entry.renaming += 1;
-            }
-        }
-        Self { inode_table, inos }
-    }
+    target: String,
 }
 
 impl Drop for RenameMark<'_> {
@@ -4237,6 +4248,7 @@ impl Drop for RenameMark<'_> {
                 entry.renaming = entry.renaming.saturating_sub(1);
             }
         }
+        inodes.remove_rename_target(&self.target);
     }
 }
 
