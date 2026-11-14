@@ -1,11 +1,13 @@
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Once, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
+use xet_data::processing::XetFileInfo;
 
+use crate::error::{Error, Result};
 use crate::hub_api::{BatchOp, HubOps};
 use crate::xet::XetOps;
 
@@ -36,13 +38,9 @@ const UPLOAD_MIN_RATE: u64 = 1024 * 1024;
 
 async fn upload_with_timeout(
     xet_sessions: &dyn XetOps,
-    staging_paths: &[&std::path::Path],
-) -> crate::error::Result<Vec<xet_data::processing::XetFileInfo>> {
-    let bytes: u64 = staging_paths
-        .iter()
-        .filter_map(|path| std::fs::metadata(path).ok())
-        .map(|metadata| metadata.len())
-        .sum();
+    staging_paths: &[&Path],
+    bytes: u64,
+) -> Result<Vec<XetFileInfo>> {
     let timeout = UPLOAD_TIMEOUT + Duration::from_secs(bytes / UPLOAD_MIN_RATE);
     let upload = xet_sessions.upload_files(staging_paths);
     tokio::pin!(upload);
@@ -57,7 +55,7 @@ async fn upload_with_timeout(
     );
     tokio::time::timeout(timeout - slow_after, upload)
         .await
-        .unwrap_or_else(|_| Err(crate::error::Error::Xet(format!("upload timed out after {timeout:?}"))))
+        .unwrap_or_else(|_| Err(Error::Xet(format!("upload timed out after {timeout:?}"))))
 }
 
 // ── FlushManager ──────────────────────────────────────────────────────
@@ -366,6 +364,7 @@ struct FlushItem {
     staging_path: PathBuf,
     pending_deletes: Vec<String>,
     dirty_generation: u64,
+    size: u64,
     /// Hash from the last successful commit, used to skip redundant Hub commits
     /// when the CAS upload produces the same hash (content unchanged).
     prev_xet_hash: Option<String>,
@@ -432,6 +431,7 @@ async fn flush_batch(
                     staging_path,
                     pending_deletes: entry.pending_deletes.clone(),
                     dirty_generation: entry.dirty_generation,
+                    size: entry.size,
                     prev_xet_hash: entry.xet_hash.clone(),
                 })
             })
@@ -453,8 +453,9 @@ async fn flush_batch(
     let mut upload_results = Vec::with_capacity(to_flush.len());
 
     for (chunk_idx, chunk) in to_flush.chunks(UPLOAD_CHUNK_SIZE).enumerate() {
-        let staging_paths: Vec<&std::path::Path> = chunk.iter().map(|item| item.staging_path.as_path()).collect();
-        match upload_with_timeout(xet_sessions, &staging_paths).await {
+        let staging_paths: Vec<&Path> = chunk.iter().map(|item| item.staging_path.as_path()).collect();
+        let bytes: u64 = chunk.iter().map(|item| item.size).sum();
+        match upload_with_timeout(xet_sessions, &staging_paths, bytes).await {
             Ok(results) => {
                 assert_eq!(
                     results.len(),

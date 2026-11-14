@@ -391,8 +391,6 @@ pub struct MockXet {
     pub next_hash: AtomicU64,
     writer_create_fail: AtomicBool,
     upload_fail: AtomicBool,
-    /// When true, `upload_files` never returns (a CAS request that hangs).
-    upload_hang: AtomicBool,
     download_fail: AtomicBool,
     writer_fail_after: AtomicU64,
     /// Number of range download calls that should fail before succeeding.
@@ -440,7 +438,6 @@ impl MockXet {
             next_hash: AtomicU64::new(1),
             writer_create_fail: AtomicBool::new(false),
             upload_fail: AtomicBool::new(false),
-            upload_hang: AtomicBool::new(false),
             download_fail: AtomicBool::new(false),
             writer_fail_after: AtomicU64::new(u64::MAX),
             range_fail_count: AtomicU32::new(0),
@@ -484,11 +481,6 @@ impl MockXet {
 
     pub fn fail_upload(&self) {
         self.upload_fail.store(true, Ordering::SeqCst);
-    }
-
-    /// Make the next `upload_files` call hang forever.
-    pub fn hang_next_upload(&self) {
-        self.upload_hang.store(true, Ordering::SeqCst);
     }
 
     pub fn fail_writer_after(&self, bytes: u64) {
@@ -585,9 +577,6 @@ impl XetOps for MockXet {
             gate.entered.notify_one();
             gate.release.notified().await;
             self.uploads_inflight.fetch_sub(1, Ordering::SeqCst);
-        }
-        if self.upload_hang.swap(false, Ordering::SeqCst) {
-            std::future::pending::<()>().await;
         }
         if self.upload_fail.swap(false, Ordering::SeqCst) {
             return Err(Error::Xet("mock upload failure".into()));

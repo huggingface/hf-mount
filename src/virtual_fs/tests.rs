@@ -1769,36 +1769,34 @@ fn flush_hung_upload_times_out() {
         let ino = vfs.lookup(ROOT_INODE, "file.txt").await.unwrap().ino;
         let fh = vfs.open(ino, true, true, Some(42)).await.unwrap();
         write_blocking(&vfs, ino, fh, 0, b"first").await.unwrap();
-        xet.hang_next_upload();
+        // Never released: the upload hangs.
+        let _gate = xet.install_upload_gate();
         vfs.release(fh).await.unwrap();
 
         let flush_manager = vfs.flush_manager.as_ref().unwrap();
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        let err = loop {
-            if let Some(err) = flush_manager.check_error(ino) {
-                break err;
-            }
-            assert!(std::time::Instant::now() < deadline, "hung upload never timed out");
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        };
-        assert!(err.contains("timed out"), "unexpected error: {err}");
+        let mut err = None;
+        assert!(
+            wait_until(|| {
+                err = flush_manager.check_error(ino);
+                err.is_some()
+            })
+            .await,
+            "hung upload never timed out"
+        );
+        assert!(err.unwrap().contains("timed out"));
 
         let fh = vfs.open(ino, true, false, Some(42)).await.unwrap();
         write_blocking(&vfs, ino, fh, 0, b"second").await.unwrap();
         vfs.release(fh).await.unwrap();
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while !hub
-            .take_batch_log()
-            .iter()
-            .flatten()
-            .any(|op| matches!(op, crate::hub_api::BatchOp::AddFile { path, .. } if path == "file.txt"))
-        {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "flush after the timeout never committed"
-            );
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
+        assert!(
+            wait_until(|| hub
+                .take_batch_log()
+                .iter()
+                .flatten()
+                .any(|op| matches!(op, BatchOp::AddFile { path, .. } if path == "file.txt")))
+            .await,
+            "flush after the timeout never committed"
+        );
     });
 
     vfs.shutdown();
