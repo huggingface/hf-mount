@@ -22,6 +22,44 @@ enum FlushSignal {
     Tick,
 }
 
+/// An upload batch still running after this logs an error: the mount is not
+/// persisting, and writers to these files wait on their staging locks.
+const UPLOAD_SLOW_AFTER: Duration = Duration::from_secs(60);
+/// Bound on one `upload_files` call: above xet-core's own retry budget
+/// (6 min), plus the batch size at `UPLOAD_MIN_RATE`, so a request that never
+/// answers cannot stall every later flush, and a large batch still has time.
+#[cfg(not(test))]
+const UPLOAD_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+#[cfg(test)]
+const UPLOAD_TIMEOUT: Duration = Duration::from_secs(2);
+const UPLOAD_MIN_RATE: u64 = 1024 * 1024;
+
+async fn upload_with_timeout(
+    xet_sessions: &dyn XetOps,
+    staging_paths: &[&std::path::Path],
+) -> crate::error::Result<Vec<xet_data::processing::XetFileInfo>> {
+    let bytes: u64 = staging_paths
+        .iter()
+        .filter_map(|path| std::fs::metadata(path).ok())
+        .map(|metadata| metadata.len())
+        .sum();
+    let timeout = UPLOAD_TIMEOUT + Duration::from_secs(bytes / UPLOAD_MIN_RATE);
+    let upload = xet_sessions.upload_files(staging_paths);
+    tokio::pin!(upload);
+    let slow_after = UPLOAD_SLOW_AFTER.min(timeout);
+    if let Ok(result) = tokio::time::timeout(slow_after, &mut upload).await {
+        return result;
+    }
+    error!(
+        "Batch upload of {} file(s) still running after {:?}, flushes are blocked",
+        staging_paths.len(),
+        slow_after
+    );
+    tokio::time::timeout(timeout - slow_after, upload)
+        .await
+        .unwrap_or_else(|_| Err(crate::error::Error::Xet(format!("upload timed out after {timeout:?}"))))
+}
+
 // ── FlushManager ──────────────────────────────────────────────────────
 
 pub(crate) struct FlushManager {
@@ -416,7 +454,7 @@ async fn flush_batch(
 
     for (chunk_idx, chunk) in to_flush.chunks(UPLOAD_CHUNK_SIZE).enumerate() {
         let staging_paths: Vec<&std::path::Path> = chunk.iter().map(|item| item.staging_path.as_path()).collect();
-        match xet_sessions.upload_files(&staging_paths).await {
+        match upload_with_timeout(xet_sessions, &staging_paths).await {
             Ok(results) => {
                 assert_eq!(
                     results.len(),
