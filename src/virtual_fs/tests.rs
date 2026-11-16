@@ -1756,6 +1756,52 @@ fn flush_manager_check_error_surfaces() {
     });
 }
 
+/// Regression test for #221: a hung upload times out, records an error, and
+/// does not block later flushes.
+#[test]
+fn flush_hung_upload_times_out() {
+    let hub = MockHub::new();
+    hub.add_file("file.txt", 100, Some("hash1"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_advanced(&hub, &xet);
+
+    rt.block_on(async {
+        let ino = vfs.lookup(ROOT_INODE, "file.txt").await.unwrap().ino;
+        let fh = vfs.open(ino, true, true, Some(42)).await.unwrap();
+        write_blocking(&vfs, ino, fh, 0, b"first").await.unwrap();
+        // Never released: the upload hangs.
+        let _gate = xet.install_upload_gate();
+        vfs.release(fh).await.unwrap();
+
+        let flush_manager = vfs.flush_manager.as_ref().unwrap();
+        let mut err = None;
+        assert!(
+            wait_until(|| {
+                err = flush_manager.check_error(ino);
+                err.is_some()
+            })
+            .await,
+            "hung upload never timed out"
+        );
+        assert!(err.unwrap().contains("timed out"));
+
+        let fh = vfs.open(ino, true, false, Some(42)).await.unwrap();
+        write_blocking(&vfs, ino, fh, 0, b"second").await.unwrap();
+        vfs.release(fh).await.unwrap();
+        assert!(
+            wait_until(|| hub
+                .take_batch_log()
+                .iter()
+                .flatten()
+                .any(|op| matches!(op, BatchOp::AddFile { path, .. } if path == "file.txt")))
+            .await,
+            "flush after the timeout never committed"
+        );
+    });
+
+    vfs.shutdown();
+}
+
 /// Concurrent shutdown calls must not deadlock. Reproduces the scenario where
 /// destroy() and the signal handler both call shutdown() simultaneously.
 #[test]
