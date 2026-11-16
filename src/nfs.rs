@@ -524,9 +524,24 @@ pub async fn mount_nfs(
         });
     }));
 
-    let mut listener = NFSTcpListener::bind("127.0.0.1:0", adapter).await?;
+    // The Windows NFS client keeps the file handles of a server for about a
+    // minute after an unmount, and nfsserve's handles expire with the server
+    // process, so a remount at the same address fails with "The handle is
+    // invalid". A loopback address of its own per server start avoids it.
+    #[cfg(windows)]
+    let host = {
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_nanos() as u32)
+            ^ std::process::id().rotate_left(16);
+        let [_, b, c, d] = seed.to_be_bytes();
+        format!("127.{b}.{c}.{}", d.max(2))
+    };
+    #[cfg(not(windows))]
+    let host = "127.0.0.1".to_string();
+    let mut listener = NFSTcpListener::bind(&format!("{host}:0"), adapter).await?;
     let port = listener.get_listen_port();
-    info!("NFS server listening on 127.0.0.1:{}", port);
+    info!("NFS server listening on {host}:{port}");
 
     // Register mount/unmount listener: nfsserve sends `false` on UMNT.
     let (mount_tx, mut mount_rx) = tokio::sync::mpsc::channel::<bool>(1);
@@ -627,13 +642,16 @@ pub async fn mount_nfs(
     // `portmap_listener` on 127.0.0.1:111 to map NFS/MOUNT v3 to the actual
     // server port. Requires Administrator (port 111 is privileged).
     #[cfg(windows)]
-    let portmapper_handle = nfsserve::portmap_listener::spawn("127.0.0.1:111".parse().unwrap(), port)
-        .await
-        .map_err(|e| {
-            std::io::Error::other(format!(
-                "failed to bind portmapper on 127.0.0.1:111: {e} (Administrator required, or another portmap is running)"
-            ))
-        })?;
+    let portmapper_handle = nfsserve::portmap_listener::spawn(
+        format!("{host}:111").parse().expect("loopback address"),
+        port,
+    )
+    .await
+    .map_err(|e| {
+        std::io::Error::other(format!(
+            "failed to bind portmapper on {host}:111: {e} (Administrator required, or another portmap is running)"
+        ))
+    })?;
     #[cfg(windows)]
     let skip_auto_mount = std::env::var_os("HF_MOUNT_SKIP_AUTO_MOUNT").is_some();
     #[cfg(not(windows))]
@@ -645,7 +663,7 @@ pub async fn mount_nfs(
         if read_only {
             opts.push_str(",ro");
         }
-        let share = "\\\\127.0.0.1\\!";
+        let share = format!("\\\\{host}\\!");
         let cmd = format!("mount.exe -o {opts} {share} {mount_point_str}");
         if skip_auto_mount {
             info!(
@@ -655,7 +673,7 @@ pub async fn mount_nfs(
         } else {
             info!("Running: {cmd}");
             let output = tokio::process::Command::new("mount")
-                .args(["-o", &opts, share, mount_point_str])
+                .args(["-o", &opts, &share, mount_point_str])
                 .output()
                 .await?;
             if !output.status.success() {

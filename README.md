@@ -70,11 +70,11 @@ Install-WindowsFeature -Name NFS-Client
 Enable-WindowsOptionalFeature -Online -FeatureName ServicesForNFS-ClientOnly,ClientForNFS-Infrastructure -All
 ```
 
-`hf-mount-nfs.exe` must run as Administrator (it binds the privileged portmapper port 111). To make admin-mounted drives visible to non-admin Explorer / apps, set `EnableLinkedConnections` and reboot ([MS doc](https://learn.microsoft.com/en-US/troubleshoot/windows-client/networking/mapped-drives-not-available-from-elevated-command)):
+`hf-mount-nfs.exe` must run as Administrator: it binds the privileged portmapper port 111, which the Windows NFS client always queries. Each mount listens on a loopback address of its own (`\\127.x.y.z\!`), because the Windows client keeps the file handles of a server for about a minute after an unmount.
 
-```cmd
-reg add HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System /v EnableLinkedConnections /t REG_DWORD /d 1 /f
-```
+The Windows client mounts anonymously, so files show with mode `0666` and directories with `0777` by default (`--file-mode` / `--dir-mode` to change). With the Unix defaults, Windows refuses to overwrite existing files.
+
+A drive mounted from an elevated shell is only visible to elevated processes, so Explorer and non-admin apps do not see it. On Windows 11, a user reported that this works: start the server from the elevated shell with `HF_MOUNT_SKIP_AUTO_MOUNT=1` (it then logs the `mount.exe` command and skips it), and run that `mount.exe` command from a non-elevated shell.
 
 ### Build from source
 

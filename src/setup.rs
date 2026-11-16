@@ -59,6 +59,15 @@ pub enum Source {
 /// into a query string and smuggle the trailing text on. An allowlist refuses
 /// anything unanticipated; branches, tags, slashed branches and SHAs all pass.
 /// Parse an octal permission string such as `0755`, `755` or `0o777`.
+#[cfg(unix)]
+const DEFAULT_DIR_MODE: &str = "0755";
+#[cfg(unix)]
+const DEFAULT_FILE_MODE: &str = "0644";
+#[cfg(not(unix))]
+const DEFAULT_DIR_MODE: &str = "0777";
+#[cfg(not(unix))]
+const DEFAULT_FILE_MODE: &str = "0666";
+
 fn parse_mode(s: &str) -> Result<u16, String> {
     let digits = s.strip_prefix("0o").unwrap_or(s);
     let mode = u16::from_str_radix(digits, 8).map_err(|_| format!("{s:?} is not an octal permission mode"))?;
@@ -137,12 +146,15 @@ pub struct MountOptions {
 
     /// Permission bits (octal) reported for directories listed from the remote.
     /// Entries created through the mount keep the mode they were created with.
-    #[arg(long, default_value = "0755", value_parser = parse_mode)]
+    /// Windows default: 0777 (the Windows NFS client mounts anonymously, so
+    /// it never owns the files).
+    #[arg(long, default_value = DEFAULT_DIR_MODE, value_parser = parse_mode)]
     pub dir_mode: u16,
 
     /// Permission bits (octal) reported for files listed from the remote.
     /// Entries created through the mount keep the mode they were created with.
-    #[arg(long, default_value = "0644", value_parser = parse_mode)]
+    /// Windows default: 0666.
+    #[arg(long, default_value = DEFAULT_FILE_MODE, value_parser = parse_mode)]
     pub file_mode: u16,
 
     /// Mount in read-only mode (no writes allowed)
