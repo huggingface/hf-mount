@@ -24,10 +24,11 @@ pub struct NFSAdapter {
     read_only: bool,
     /// Server start time in ms, stamped in every file handle.
     generation: u64,
+    /// Put the file's path in its handles, so a handle of an earlier server
+    /// still resolves. Only the Windows client reuses handles across a
+    /// remount; elsewhere each mount is a new server on a new port.
+    path_handles: bool,
 }
-
-/// Bytes of a file handle before the path: generation, then inode number.
-const FH_HEADER_LEN: usize = 16;
 
 impl NFSAdapter {
     pub fn new(virtual_fs: Arc<VirtualFs>, read_only: bool) -> Self {
@@ -38,16 +39,8 @@ impl NFSAdapter {
             generation: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map_or(1, |elapsed| elapsed.as_millis() as u64),
+            path_handles: cfg!(windows),
         }
-    }
-
-    /// Find the inode now at `path`, loading the directories on the way.
-    async fn resolve_path(&self, path: &str) -> Option<fileid3> {
-        let mut ino = self.root_dir();
-        for name in path.split('/').filter(|name| !name.is_empty()) {
-            ino = self.virtual_fs.lookup(ino, name).await.ok()?.ino;
-        }
-        Some(ino)
     }
 
     /// Evict a handle: flush dirty data, then release.
@@ -156,17 +149,18 @@ impl NFSFileSystem for NFSAdapter {
         1
     }
 
-    /// A handle is the generation, the inode number and, when it fits in
-    /// the 64-byte NFSv3 limit, the file's path. Inode numbers change when
-    /// the server restarts, and NFS clients keep handles across a remount
-    /// (the Windows client for about a minute), so a handle of an earlier
-    /// server is resolved again by its path instead of failing as stale.
+    /// A handle is the generation, the inode number and, with `path_handles`
+    /// and when it fits in the 64-byte NFSv3 limit, the file's path. Inode
+    /// numbers change when the server restarts, so a handle of an earlier
+    /// server is resolved again by its path (a new file at that path takes
+    /// it over), and is stale when the path did not fit or is gone.
     fn id_to_fh(&self, id: fileid3) -> nfs_fh3 {
         let mut data = Vec::with_capacity(nfsserve::nfs::NFS3_FHSIZE as usize);
         data.extend_from_slice(&self.generation.to_le_bytes());
         data.extend_from_slice(&id.to_le_bytes());
-        if let Ok(path) = self.virtual_fs.full_path(id)
-            && FH_HEADER_LEN + path.len() <= nfsserve::nfs::NFS3_FHSIZE as usize
+        if self.path_handles
+            && let Some(path) = self.virtual_fs.full_path(id)
+            && data.len() + path.len() <= nfsserve::nfs::NFS3_FHSIZE as usize
         {
             data.extend_from_slice(path.as_bytes());
         }
@@ -174,27 +168,23 @@ impl NFSFileSystem for NFSAdapter {
     }
 
     fn fh_to_id(&self, fh: &nfs_fh3) -> Result<fileid3, nfsstat3> {
-        if fh.data.len() < FH_HEADER_LEN {
-            return Err(nfsstat3::NFS3ERR_BADHANDLE);
-        }
-        let (header, path) = fh.data.split_at(FH_HEADER_LEN);
-        let generation = u64::from_le_bytes(header[..8].try_into().expect("8 bytes"));
-        let id = u64::from_le_bytes(header[8..].try_into().expect("8 bytes"));
-        if generation == self.generation {
-            return Ok(id);
-        }
-        if id == self.root_dir() {
-            return Ok(id);
-        }
-        let Ok(path) = std::str::from_utf8(path) else {
+        let Some((generation, rest)) = fh.data.split_first_chunk() else {
             return Err(nfsstat3::NFS3ERR_BADHANDLE);
         };
+        let Some((id, path)) = rest.split_first_chunk() else {
+            return Err(nfsstat3::NFS3ERR_BADHANDLE);
+        };
+        let (generation, id) = (u64::from_le_bytes(*generation), u64::from_le_bytes(*id));
+        if generation == self.generation || id == self.root_dir() {
+            return Ok(id);
+        }
+        // An empty path is a handle whose path did not fit, not the root.
         if path.is_empty() {
             return Err(nfsstat3::NFS3ERR_STALE);
         }
         // fh_to_id is synchronous; resolving may list directories on the Hub.
         let runtime = tokio::runtime::Handle::current();
-        tokio::task::block_in_place(|| runtime.block_on(self.resolve_path(path))).ok_or(nfsstat3::NFS3ERR_STALE)
+        tokio::task::block_in_place(|| runtime.block_on(self.path_to_id(path))).map_err(|_| nfsstat3::NFS3ERR_STALE)
     }
 
     fn capabilities(&self) -> VFSCapabilities {
@@ -1151,7 +1141,9 @@ mod tests {
         hub.add_file("dir/b.txt", 1, Some("hash_b"), None);
         let new_adapter = || {
             let vfs = make_test_vfs(hub.clone(), MockXet::new(), TestOpts::default(), &rt);
-            NFSAdapter::new(vfs, true)
+            let mut adapter = NFSAdapter::new(vfs, true);
+            adapter.path_handles = true;
+            adapter
         };
         let first = new_adapter();
         // The second server lists more files, so "dir/b.txt" gets another inode.
@@ -1159,7 +1151,6 @@ mod tests {
         hub.add_file("aaa/c.txt", 1, Some("hash_c"), None);
         let mut second = new_adapter();
         second.generation = first.generation + 1;
-        let second = Arc::new(second);
 
         rt.block_on(async {
             let dir = first.lookup(1, &nfsstring(b"dir".to_vec())).await.unwrap();
@@ -1168,15 +1159,9 @@ mod tests {
 
             let aaa = second.lookup(1, &nfsstring(b"aaa".to_vec())).await.unwrap();
             second.lookup(aaa, &nfsstring(b"c.txt".to_vec())).await.unwrap();
-            let resolved = tokio::task::spawn_blocking({
-                let second = second.clone();
-                move || second.fh_to_id(&old_handle)
-            });
-            let resolved = resolved.await.unwrap().expect("old handle resolves");
-            let dir = second.lookup(1, &nfsstring(b"dir".to_vec())).await.unwrap();
-            let expected = second.lookup(dir, &nfsstring(b"b.txt".to_vec())).await.unwrap();
-            assert_ne!(file, expected, "inode numbers differ between servers");
-            assert_eq!(resolved, expected);
+            let resolved = second.fh_to_id(&old_handle).expect("old handle resolves");
+            assert_ne!(file, resolved, "inode numbers differ between servers");
+            assert_eq!(second.virtual_fs.full_path(resolved).as_deref(), Some("dir/b.txt"));
         });
     }
 
