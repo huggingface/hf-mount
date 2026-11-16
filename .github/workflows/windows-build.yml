@@ -1,0 +1,44 @@
+name: Windows Build
+
+on:
+  pull_request:
+    paths:
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/windows-build.yml"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build hf-mount-nfs.exe
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-build
+
+      - name: Build hf-mount-nfs
+        # No vendored-openssl: native-tls uses Schannel on Windows, no OpenSSL dependency.
+        run: cargo build --release --target x86_64-pc-windows-msvc --no-default-features --features nfs --bin hf-mount-nfs
+
+      - name: Stage artifacts
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp target/x86_64-pc-windows-msvc/release/hf-mount-nfs.exe dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hf-mount-windows-x86_64
+          path: dist/
+          if-no-files-found: error

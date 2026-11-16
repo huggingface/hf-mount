@@ -1,7 +1,9 @@
 use std::path::Path;
 use std::time::SystemTime;
 
-use cap_std::fs::{Dir, DirBuilder, DirBuilderExt, OpenOptions, Permissions, PermissionsExt};
+use cap_std::fs::{Dir, DirBuilder, OpenOptions};
+#[cfg(unix)]
+use cap_std::fs::{DirBuilderExt, Permissions, PermissionsExt};
 
 #[derive(Debug, Clone)]
 pub struct OverlayDirEntry {
@@ -75,8 +77,12 @@ impl OverlayBacking {
 
     pub fn create_dir(&self, full_path: &str, mode: u16) -> std::io::Result<()> {
         let rel = validate_rel_path(full_path)?;
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut builder = DirBuilder::new();
+        #[cfg(unix)]
         builder.mode(mode as u32);
+        #[cfg(not(unix))]
+        let _ = mode;
         self.dir.create_dir_with(rel, &builder)
     }
 
@@ -96,7 +102,13 @@ impl OverlayBacking {
                 "overlay chmod rejects symlinks",
             ));
         }
-        self.dir.set_permissions(target, Permissions::from_mode(mode as u32))
+        #[cfg(unix)]
+        return self.dir.set_permissions(target, Permissions::from_mode(mode as u32));
+        #[cfg(not(unix))]
+        {
+            let _ = mode;
+            Ok(())
+        }
     }
 
     pub fn remove_file(&self, full_path: &str) -> std::io::Result<()> {
@@ -148,8 +160,11 @@ impl OverlayBacking {
                 is_symlink: false,
                 size: meta.len(),
                 mtime: meta.modified().map(|t| t.into_std()).unwrap_or(SystemTime::UNIX_EPOCH),
+                #[cfg(unix)]
                 #[allow(clippy::unnecessary_cast)]
                 mode: (meta.permissions().mode() & 0o777) as u16,
+                #[cfg(not(unix))]
+                mode: if meta.permissions().readonly() { 0o555 } else { 0o755 },
             });
         }
         Ok(out)

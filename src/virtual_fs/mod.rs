@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
@@ -23,6 +22,38 @@ use crate::xet::{StagingDir, StreamingWriterOps, XetOps};
 use inode::{InodeEntry, InodeKind, InodeTable};
 use remote_reader::{ReadAheadBudget, RemoteReader};
 use staging::StagingCoordinator;
+
+// ── Cross-platform positional I/O ──────────────────────────────────────
+
+/// Read at a fixed offset without moving the file's seek cursor. Thread-safe
+/// (atomic offset). Maps to pread(2) on Unix, ReadFile-with-OVERLAPPED on Windows.
+fn read_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        file.read_at(buf, offset)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileExt;
+        file.seek_read(buf, offset)
+    }
+}
+
+/// Write at a fixed offset without moving the file's seek cursor. Thread-safe.
+/// Maps to pwrite(2) on Unix, WriteFile-with-OVERLAPPED on Windows.
+fn write_at(file: &File, buf: &[u8], offset: u64) -> std::io::Result<usize> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        file.write_at(buf, offset)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileExt;
+        file.seek_write(buf, offset)
+    }
+}
 
 // ── Constants ──────────────────────────────────────────────────────────
 
@@ -2279,24 +2310,14 @@ impl VirtualFs {
 
         match read_target {
             ReadTarget::LocalFd(file) => {
-                let file_descriptor = file.as_raw_fd();
                 let mut buf = BytesMut::zeroed(size as usize);
-                // SAFETY: fd is valid (Arc<File> keeps it alive), buf is correctly sized.
-                // pread is thread-safe (atomic offset, no shared seek cursor).
-                let n = unsafe {
-                    libc::pread(
-                        file_descriptor,
-                        buf.as_mut_ptr() as *mut libc::c_void,
-                        size as usize,
-                        offset as i64,
-                    )
-                };
-                if n < 0 {
-                    Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO))
-                } else {
-                    buf.truncate(n as usize);
-                    let eof = (n as u32) < size;
-                    Ok((buf.freeze(), eof))
+                match read_at(&file, &mut buf, offset) {
+                    Ok(n) => {
+                        buf.truncate(n);
+                        let eof = (n as u32) < size;
+                        Ok((buf.freeze(), eof))
+                    }
+                    Err(e) => Err(e.raw_os_error().unwrap_or(libc::EIO)),
                 }
             }
             ReadTarget::Remote(reader) => reader.read(offset, size).await,
@@ -2345,20 +2366,8 @@ impl VirtualFs {
         };
 
         match target {
-            WriteTarget::Local { file, ino: handle_ino } => {
-                let file_descriptor = file.as_raw_fd();
-                let n = unsafe {
-                    libc::pwrite(
-                        file_descriptor,
-                        data.as_ptr() as *const libc::c_void,
-                        data.len(),
-                        offset as i64,
-                    )
-                };
-
-                if n < 0 {
-                    Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO))
-                } else {
+            WriteTarget::Local { file, ino: handle_ino } => match write_at(&file, data, offset) {
+                Ok(n) => {
                     let written = n as u32;
                     let new_end = offset + written as u64;
                     let mut inodes = self.inode_table.write().expect("inodes poisoned");
@@ -2374,7 +2383,8 @@ impl VirtualFs {
                     inodes.touch(handle_ino);
                     Ok(written)
                 }
-            }
+                Err(e) => Err(e.raw_os_error().unwrap_or(libc::EIO)),
+            },
             WriteTarget::Streaming {
                 ino: handle_ino,
                 channel,

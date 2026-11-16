@@ -60,22 +60,38 @@ The NFS backend has no system dependencies. For FUSE:
 
 **macOS**: install [macFUSE](https://osxfuse.github.io/) (`brew install macfuse`, requires reboot on first install)
 
+**Windows**: NFS backend only (FUSE is Unix-only). Enable the "Client for NFS" feature:
+
+```powershell
+# Windows Server
+Install-WindowsFeature -Name NFS-Client
+
+# Windows 10 / 11
+Enable-WindowsOptionalFeature -Online -FeatureName ServicesForNFS-ClientOnly,ClientForNFS-Infrastructure -All
+```
+
+`hf-mount-nfs.exe` must run as Administrator (it binds the privileged portmapper port 111). To make admin-mounted drives visible to non-admin Explorer / apps, set `EnableLinkedConnections` and reboot ([MS doc](https://learn.microsoft.com/en-US/troubleshoot/windows-client/networking/mapped-drives-not-available-from-elevated-command)):
+
+```cmd
+reg add HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System /v EnableLinkedConnections /t REG_DWORD /d 1 /f
+```
+
 ### Build from source
 
 Requires Rust 1.89+.
 
 ```bash
-# NFS only (no system deps, works everywhere)
+# NFS only (no system deps, works everywhere including Windows)
 cargo build --release --features nfs
 
-# FUSE (requires macFUSE on macOS, fuse3 on Linux)
+# FUSE (requires macFUSE on macOS, fuse3 on Linux; not available on Windows)
 cargo build --release --features fuse
 
 # All backends
 cargo build --release --features fuse,nfs
 ```
 
-Binaries: `target/release/hf-mount`, `target/release/hf-mount-nfs`, `target/release/hf-mount-fuse`
+Binaries: `target/release/hf-mount`, `target/release/hf-mount-nfs`, `target/release/hf-mount-fuse`. On Windows only `hf-mount-nfs.exe` is produced.
 
 ## Best for / Not for
 

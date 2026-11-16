@@ -1,5 +1,6 @@
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
@@ -627,6 +628,7 @@ pub fn build_with_runtime(
     // mount itself, crash-looping the restarted container until someone
     // cleans the corpse up. Detach it so a fresh session can mount over a
     // clean path. Must run before the overlay pre-mount fd is opened.
+    #[cfg(unix)]
     detach_dead_mount(&mount_point);
 
     // Overlay: open a pre-mount fd to the mount point directory. The fd is
@@ -653,13 +655,13 @@ pub fn build_with_runtime(
         None
     };
 
-    let uid = options.uid.unwrap_or_else(|| unsafe { libc::getuid() });
-    let gid = options.gid.unwrap_or_else(|| unsafe { libc::getgid() });
+    let uid = options.uid.unwrap_or_else(default_uid);
+    let gid = options.gid.unwrap_or_else(default_gid);
 
-    // Ignore EEXIST: the directory may already exist from a previous (possibly
-    // stale) mount. FUSE/NFS will fail at mount time if it's actually busy.
+    // Ignore AlreadyExists: the directory may already exist from a previous
+    // (possibly stale) mount. FUSE/NFS will fail at mount time if it's actually busy.
     if let Err(e) = std::fs::create_dir_all(&mount_point)
-        && e.raw_os_error() != Some(libc::EEXIST)
+        && e.kind() != std::io::ErrorKind::AlreadyExists
     {
         panic!("Failed to create mount point {:?}: {e}", mount_point);
     }
@@ -793,19 +795,23 @@ pub fn setup(is_nfs: bool) -> MountSetup {
 
 /// Try to raise the soft file descriptor limit to avoid "Too many open files"
 /// errors during large batch operations. Most FUSE/NFS filesystems do this.
+/// No-op on Windows (handle limits are per-process and effectively unbounded).
 pub fn raise_fd_limit() {
-    const TARGET_NOFILE: u64 = 65536;
-    let mut rlim = libc::rlimit {
-        rlim_cur: 0,
-        rlim_max: 0,
-    };
-    // SAFETY: rlim is a plain C struct, getrlimit/setrlimit are standard POSIX.
-    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) } != 0 || rlim.rlim_cur >= TARGET_NOFILE {
-        return;
-    }
-    rlim.rlim_cur = TARGET_NOFILE.min(rlim.rlim_max);
-    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &rlim) } != 0 {
-        eprintln!("warning: failed to raise file descriptor limit to {TARGET_NOFILE}");
+    #[cfg(unix)]
+    {
+        const TARGET_NOFILE: u64 = 65536;
+        let mut rlim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: rlim is a plain C struct, getrlimit/setrlimit are standard POSIX.
+        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) } != 0 || rlim.rlim_cur >= TARGET_NOFILE {
+            return;
+        }
+        rlim.rlim_cur = TARGET_NOFILE.min(rlim.rlim_max);
+        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &rlim) } != 0 {
+            eprintln!("warning: failed to raise file descriptor limit to {TARGET_NOFILE}");
+        }
     }
 }
 
@@ -814,6 +820,7 @@ pub fn raise_fd_limit() {
 /// ENOTCONN or EIO (the "corrupted mount" errnos k8s mount-utils also keys
 /// on). Detaching is safe for consumers: bind mounts made from this path
 /// reference the superblock directly and keep working.
+#[cfg(unix)]
 fn detach_dead_mount(path: &Path) {
     let Err(e) = std::fs::metadata(path) else { return };
     if !matches!(e.raw_os_error(), Some(libc::ENOTCONN) | Some(libc::EIO)) {
@@ -874,7 +881,7 @@ fn resolve_mount_path(path: &Path) -> Option<PathBuf> {
 
 /// No mount table to consult off Linux: fail closed (the dead-mount recovery
 /// is a Kubernetes concern; macOS is a development platform).
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(unix, not(target_os = "linux")))]
 fn hf_mount_mounted_at(_path: &Path) -> bool {
     false
 }
@@ -968,6 +975,28 @@ where
     }
 }
 
+#[cfg(unix)]
+fn default_uid() -> u32 {
+    // SAFETY: getuid is a thread-safe POSIX call with no preconditions.
+    unsafe { libc::getuid() }
+}
+
+#[cfg(unix)]
+fn default_gid() -> u32 {
+    // SAFETY: getgid is a thread-safe POSIX call with no preconditions.
+    unsafe { libc::getgid() }
+}
+
+#[cfg(not(unix))]
+fn default_uid() -> u32 {
+    0
+}
+
+#[cfg(not(unix))]
+fn default_gid() -> u32 {
+    0
+}
+
 fn build_cas_config(
     ctx: &XetContext,
     runtime: &tokio::runtime::Handle,
@@ -991,6 +1020,7 @@ fn build_cas_config(
 
 /// Trigger FUSE unmount. Returns `true` on success. Uses libc as primary
 /// method (no external process dependency), then falls back to fusermount/umount.
+#[cfg(unix)]
 pub(crate) fn unmount_fuse(mount_point: &Path) -> bool {
     use std::ffi::CString;
 

@@ -18,6 +18,7 @@ pub fn assert_point_read(mount_point: &str, rel_path: &str, expected: &[u8]) -> 
 /// threads at once, each scanning its own contiguous range: the page-fault
 /// pattern of parallel model loaders (several tensors at a time, each copied
 /// by several threads). All the faults land on one open handle.
+#[cfg(unix)]
 pub fn assert_parallel_mmap_read(mount_point: &str, rel_path: &str, expected: &[u8], threads: usize) -> TestResult {
     use std::os::fd::AsRawFd;
 
@@ -354,8 +355,10 @@ pub fn run_write_tests(mp: &str, remote_file: &str, remote_content: &str) -> Tes
     }
 
     // 12. Flush idempotency: dup fd then close both
-    eprintln!("  [write] flush idempotency (dup fd)");
+    // libc::dup is Unix-only; Windows has no equivalent FD duplication semantics.
+    #[cfg(unix)]
     {
+        eprintln!("  [write] flush idempotency (dup fd)");
         use std::io::{Seek, SeekFrom, Write};
         use std::os::unix::io::AsRawFd;
         let path = format!("{}/duptest.txt", mp);
@@ -689,8 +692,10 @@ pub fn run_simple_write_tests(mp: &str, remote_file: &str) -> TestResult {
     }
 
     // 14. Flush idempotency: dup fd then close both (FUSE calls flush per fd)
-    eprintln!("  [simple-write] flush idempotency (dup fd)");
+    // libc::dup is Unix-only; skip on Windows.
+    #[cfg(unix)]
     {
+        eprintln!("  [simple-write] flush idempotency (dup fd)");
         use std::io::Write;
         use std::os::unix::io::AsRawFd;
         let path = format!("{}/duptest.txt", mp);
