@@ -1044,6 +1044,16 @@ fn vfs_attr_to_nfs(attr: &VirtualFsAttr) -> fattr3 {
     };
     fattr3 {
         ftype,
+        // The Windows NFS client mounts anonymously and never owns a file,
+        // so it only writes where "other" may: report write bits for all.
+        #[cfg(windows)]
+        mode: attr.perm as u32
+            | if attr.kind == InodeKind::Directory {
+                0o777
+            } else {
+                0o666
+            },
+        #[cfg(not(windows))]
         mode: attr.perm as u32,
         nlink: attr.nlink,
         uid: attr.uid,
