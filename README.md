@@ -60,22 +60,38 @@ The NFS backend has no system dependencies. For FUSE:
 
 **macOS**: install [macFUSE](https://osxfuse.github.io/) (`brew install macfuse`, requires reboot on first install)
 
+**Windows**: NFS backend only (FUSE is Unix-only). Enable the "Client for NFS" feature:
+
+```powershell
+# Windows Server
+Install-WindowsFeature -Name NFS-Client
+
+# Windows 10 / 11
+Enable-WindowsOptionalFeature -Online -FeatureName ServicesForNFS-ClientOnly,ClientForNFS-Infrastructure -All
+```
+
+`hf-mount-nfs.exe` must run as Administrator: it binds the privileged portmapper port 111, which the Windows NFS client always queries. Each mount listens on a loopback address of its own (`\\127.x.y.z\!`), because the Windows client keeps the file handles of a server for about a minute after an unmount.
+
+The Windows client mounts anonymously, so files are owned by its anonymous id (`4294967294`, the Client for NFS default) unless `--uid`/`--gid` say otherwise.
+
+A drive mounted from an elevated shell is only visible to elevated processes, so Explorer and non-admin apps do not see it. On Windows 11, a user reported that this works: start the server from the elevated shell with `HF_MOUNT_SKIP_AUTO_MOUNT=1` (it then logs the `mount.exe` command and skips it), and run that `mount.exe` command from a non-elevated shell.
+
 ### Build from source
 
 Requires Rust 1.89+.
 
 ```bash
-# NFS only (no system deps, works everywhere)
+# NFS only (no system deps, works everywhere including Windows)
 cargo build --release --features nfs
 
-# FUSE (requires macFUSE on macOS, fuse3 on Linux)
+# FUSE (requires macFUSE on macOS, fuse3 on Linux; not available on Windows)
 cargo build --release --features fuse
 
 # All backends
 cargo build --release --features fuse,nfs
 ```
 
-Binaries: `target/release/hf-mount`, `target/release/hf-mount-nfs`, `target/release/hf-mount-fuse`
+Binaries: `target/release/hf-mount`, `target/release/hf-mount-nfs`, `target/release/hf-mount-fuse`. On Windows only `hf-mount-nfs.exe` is produced.
 
 ## Best for / Not for
 
