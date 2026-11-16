@@ -434,6 +434,8 @@ pub fn run_write_tests(mp: &str, remote_file: &str, remote_content: &str) -> Tes
 
     // 17. Rename dir over empty dir (replace)
     eprintln!("  [write] rename dir over empty dir");
+    // Windows MoveFileEx never replaces an existing directory.
+    #[cfg(not(windows))]
     {
         let d1 = format!("{}/ren_src2", mp);
         let d2 = format!("{}/ren_dst2", mp);
