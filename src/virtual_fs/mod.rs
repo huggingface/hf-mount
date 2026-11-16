@@ -25,8 +25,8 @@ use staging::StagingCoordinator;
 
 // ── Cross-platform positional I/O ──────────────────────────────────────
 
-/// Read at a fixed offset without moving the file's seek cursor. Thread-safe
-/// (atomic offset). Maps to pread(2) on Unix, ReadFile-with-OVERLAPPED on Windows.
+/// Positional read: pread(2) on Unix. On Windows it also moves the seek
+/// cursor, which nothing here relies on (all staging I/O is positional).
 fn read_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
     #[cfg(unix)]
     {
@@ -40,8 +40,7 @@ fn read_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
     }
 }
 
-/// Write at a fixed offset without moving the file's seek cursor. Thread-safe.
-/// Maps to pwrite(2) on Unix, WriteFile-with-OVERLAPPED on Windows.
+/// Positional write: pwrite(2) on Unix; see `read_at` for Windows.
 fn write_at(file: &File, buf: &[u8], offset: u64) -> std::io::Result<usize> {
     #[cfg(unix)]
     {

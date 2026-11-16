@@ -655,8 +655,9 @@ pub fn build_with_runtime(
         None
     };
 
-    let uid = options.uid.unwrap_or_else(default_uid);
-    let gid = options.gid.unwrap_or_else(default_gid);
+    let (default_uid, default_gid) = default_owner();
+    let uid = options.uid.unwrap_or(default_uid);
+    let gid = options.gid.unwrap_or(default_gid);
 
     // Ignore AlreadyExists: the directory may already exist from a previous
     // (possibly stale) mount. FUSE/NFS will fail at mount time if it's actually busy.
@@ -975,26 +976,18 @@ where
     }
 }
 
+/// The owner reported for files when `--uid`/`--gid` are not set.
 #[cfg(unix)]
-fn default_uid() -> u32 {
-    // SAFETY: getuid is a thread-safe POSIX call with no preconditions.
-    unsafe { libc::getuid() }
+fn default_owner() -> (u32, u32) {
+    // SAFETY: getuid and getgid are thread-safe POSIX calls with no preconditions.
+    unsafe { (libc::getuid(), libc::getgid()) }
 }
 
-#[cfg(unix)]
-fn default_gid() -> u32 {
-    // SAFETY: getgid is a thread-safe POSIX call with no preconditions.
-    unsafe { libc::getgid() }
-}
-
+/// The anonymous id the Windows NFS client mounts with (its default -2), so
+/// files are owned by the client that writes them.
 #[cfg(not(unix))]
-fn default_uid() -> u32 {
-    0
-}
-
-#[cfg(not(unix))]
-fn default_gid() -> u32 {
-    0
+fn default_owner() -> (u32, u32) {
+    (u32::MAX - 1, u32::MAX - 1)
 }
 
 fn build_cas_config(

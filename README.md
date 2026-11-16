@@ -72,7 +72,7 @@ Enable-WindowsOptionalFeature -Online -FeatureName ServicesForNFS-ClientOnly,Cli
 
 `hf-mount-nfs.exe` must run as Administrator: it binds the privileged portmapper port 111, which the Windows NFS client always queries. Each mount listens on a loopback address of its own (`\\127.x.y.z\!`), because the Windows client keeps the file handles of a server for about a minute after an unmount.
 
-The Windows client mounts anonymously and never owns the files, so `hf-mount-nfs.exe` reports every file and directory as writable by all users.
+The Windows client mounts anonymously, so files are owned by its anonymous id (`4294967294`, the Client for NFS default) unless `--uid`/`--gid` say otherwise.
 
 A drive mounted from an elevated shell is only visible to elevated processes, so Explorer and non-admin apps do not see it. On Windows 11, a user reported that this works: start the server from the elevated shell with `HF_MOUNT_SKIP_AUTO_MOUNT=1` (it then logs the `mount.exe` command and skips it), and run that `mount.exe` command from a non-elevated shell.
 

@@ -652,10 +652,7 @@ pub async fn mount_nfs(
             "failed to bind portmapper on {host}:111: {e} (Administrator required, or another portmap is running)"
         ))
     })?;
-    #[cfg(windows)]
-    let skip_auto_mount = std::env::var_os("HF_MOUNT_SKIP_AUTO_MOUNT").is_some();
-    #[cfg(not(windows))]
-    let skip_auto_mount = false;
+    let skip_auto_mount = cfg!(windows) && std::env::var_os("HF_MOUNT_SKIP_AUTO_MOUNT").is_some();
     #[cfg(windows)]
     {
         let _ = actimeo; // mount.exe has no actimeo equivalent.
@@ -1044,16 +1041,6 @@ fn vfs_attr_to_nfs(attr: &VirtualFsAttr) -> fattr3 {
     };
     fattr3 {
         ftype,
-        // The Windows NFS client mounts anonymously and never owns a file,
-        // so it only writes where "other" may: report write bits for all.
-        #[cfg(windows)]
-        mode: attr.perm as u32
-            | if attr.kind == InodeKind::Directory {
-                0o777
-            } else {
-                0o666
-            },
-        #[cfg(not(windows))]
         mode: attr.perm as u32,
         nlink: attr.nlink,
         uid: attr.uid,

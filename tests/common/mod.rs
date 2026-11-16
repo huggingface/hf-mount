@@ -329,13 +329,7 @@ fn spawn_mount_bucket(
 ) -> Child {
     let token = std::env::var("HF_TOKEN").unwrap();
 
-    let binary = std::env::current_exe()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("hf-mount-fuse");
+    let binary = bin_path("hf-mount-fuse");
 
     eprintln!("Mounting with binary: {:?}", binary);
 
@@ -377,13 +371,7 @@ fn spawn_mount_bucket(
 pub fn mount_repo(repo_id: &str, mount_point: &str, cache_dir: &str, extra_args: &[&str]) -> Child {
     let token = std::env::var("HF_TOKEN").ok();
 
-    let binary = std::env::current_exe()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("hf-mount-fuse");
+    let binary = bin_path("hf-mount-fuse");
 
     eprintln!("Mounting repo with binary: {:?}", binary);
 
@@ -422,30 +410,18 @@ pub fn mount_repo(repo_id: &str, mount_point: &str, cache_dir: &str, extra_args:
 /// Unix: `/tmp/hf-mount-nfs-{slug}-{pid}`. Windows: `Z:` (drive letters are
 /// process-global so this requires --test-threads=1, which we already enforce).
 pub fn nfs_mount_point(slug: &str) -> String {
-    #[cfg(unix)]
-    {
-        format!("/tmp/hf-mount-nfs-{}-{}", slug, std::process::id())
-    }
-    #[cfg(windows)]
-    {
-        let _ = slug;
+    if cfg!(windows) {
         "Z:".to_string()
+    } else {
+        format!("/tmp/hf-mount-nfs-{}-{}", slug, std::process::id())
     }
 }
 
-fn nfs_binary_path() -> std::path::PathBuf {
-    let dir = std::env::current_exe()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .to_path_buf();
-    if cfg!(windows) {
-        dir.join("hf-mount-nfs.exe")
-    } else {
-        dir.join("hf-mount-nfs")
-    }
+/// Path of a binary of this crate, next to the test binary's `deps/` dir.
+fn bin_path(name: &str) -> std::path::PathBuf {
+    let exe = std::env::current_exe().unwrap();
+    let dir = exe.parent().unwrap().parent().unwrap();
+    dir.join(format!("{name}{}", std::env::consts::EXE_SUFFIX))
 }
 
 pub fn mount_bucket_nfs(bucket_id: &str, mount_point: &str, cache_dir: &str, extra_args: &[&str]) -> Child {
@@ -459,7 +435,7 @@ pub fn mount_repo_nfs(repo_id: &str, mount_point: &str, cache_dir: &str, extra_a
 
 fn mount_nfs(source_kind: &str, source_id: &str, mount_point: &str, cache_dir: &str, extra_args: &[&str]) -> Child {
     let token = std::env::var("HF_TOKEN").ok();
-    let binary = nfs_binary_path();
+    let binary = bin_path("hf-mount-nfs");
 
     eprintln!("Mounting NFS with binary: {:?}", binary);
 
@@ -523,10 +499,12 @@ pub fn unmount_nfs(mount_point: &str, child: Child, graceful_secs: u64) {
 
 #[cfg(not(target_os = "macos"))]
 pub fn unmount_nfs(mount_point: &str, child: Child, graceful_secs: u64) {
-    #[cfg(unix)]
-    unmount_with(mount_point, child, graceful_secs, &["sudo", "umount"]);
-    #[cfg(windows)]
-    unmount_with(mount_point, child, graceful_secs, &["umount.exe", "-f"]);
+    let command: &[&str] = if cfg!(windows) {
+        &["umount.exe", "-f"]
+    } else {
+        &["sudo", "umount"]
+    };
+    unmount_with(mount_point, child, graceful_secs, command);
 }
 
 fn wait_for_mount(mount_point: &str) -> bool {
