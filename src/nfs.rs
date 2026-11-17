@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use nfsserve::nfs::{
-    fattr3, fileid3, filename3, ftype3, nfspath3, nfsstat3, nfsstring, nfstime3, sattr3, set_atime, set_gid3,
+    fattr3, fileid3, filename3, ftype3, nfs_fh3, nfspath3, nfsstat3, nfsstring, nfstime3, sattr3, set_atime, set_gid3,
     set_mode3, set_mtime, set_size3, set_uid3, specdata3,
 };
 use nfsserve::tcp::{NFSTcp, NFSTcpListener};
@@ -22,6 +22,12 @@ pub struct NFSAdapter {
     virtual_fs: Arc<VirtualFs>,
     handle_pool: Arc<Mutex<HandlePool>>,
     read_only: bool,
+    /// Server start time in ms, stamped in every file handle.
+    generation: u64,
+    /// Put the file's path in its handles, so a handle of an earlier server
+    /// still resolves. Only the Windows client reuses handles across a
+    /// remount; elsewhere each mount is a new server on a new port.
+    path_handles: bool,
 }
 
 impl NFSAdapter {
@@ -30,6 +36,10 @@ impl NFSAdapter {
             virtual_fs,
             handle_pool: Arc::new(Mutex::new(HandlePool::new())),
             read_only,
+            generation: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(1, |elapsed| elapsed.as_millis() as u64),
+            path_handles: cfg!(windows),
         }
     }
 
@@ -137,6 +147,44 @@ impl NFSAdapter {
 impl NFSFileSystem for NFSAdapter {
     fn root_dir(&self) -> fileid3 {
         1
+    }
+
+    /// A handle is the generation, the inode number and, with `path_handles`
+    /// and when it fits in the 64-byte NFSv3 limit, the file's path. Inode
+    /// numbers change when the server restarts, so a handle of an earlier
+    /// server is resolved again by its path (a new file at that path takes
+    /// it over), and is stale when the path did not fit or is gone.
+    fn id_to_fh(&self, id: fileid3) -> nfs_fh3 {
+        let mut data = Vec::with_capacity(nfsserve::nfs::NFS3_FHSIZE as usize);
+        data.extend_from_slice(&self.generation.to_le_bytes());
+        data.extend_from_slice(&id.to_le_bytes());
+        if self.path_handles
+            && let Some(path) = self.virtual_fs.full_path(id)
+            && data.len() + path.len() <= nfsserve::nfs::NFS3_FHSIZE as usize
+        {
+            data.extend_from_slice(path.as_bytes());
+        }
+        nfs_fh3 { data }
+    }
+
+    fn fh_to_id(&self, fh: &nfs_fh3) -> Result<fileid3, nfsstat3> {
+        let Some((generation, rest)) = fh.data.split_first_chunk() else {
+            return Err(nfsstat3::NFS3ERR_BADHANDLE);
+        };
+        let Some((id, path)) = rest.split_first_chunk() else {
+            return Err(nfsstat3::NFS3ERR_BADHANDLE);
+        };
+        let (generation, id) = (u64::from_le_bytes(*generation), u64::from_le_bytes(*id));
+        if generation == self.generation || id == self.root_dir() {
+            return Ok(id);
+        }
+        // An empty path is a handle whose path did not fit, not the root.
+        if path.is_empty() {
+            return Err(nfsstat3::NFS3ERR_STALE);
+        }
+        // fh_to_id is synchronous; resolving may list directories on the Hub.
+        let runtime = tokio::runtime::Handle::current();
+        tokio::task::block_in_place(|| runtime.block_on(self.path_to_id(path))).map_err(|_| nfsstat3::NFS3ERR_STALE)
     }
 
     fn capabilities(&self) -> VFSCapabilities {
@@ -524,17 +572,22 @@ pub async fn mount_nfs(
         });
     }));
 
-    // The Windows NFS client keeps the file handles of a server for about a
-    // minute after an unmount, and nfsserve's handles expire with the server
-    // process, so a remount at the same address fails with "The handle is
-    // invalid". A loopback address of its own per server start avoids it.
+    // Windows mount.exe always asks the portmapper on port 111, so each
+    // mount needs a loopback address of its own. Derive it from the mount
+    // point so a remount reaches the same address: the Windows client keeps
+    // trying the servers it knew, and a new address per start leaves it
+    // retrying dead ones, which blocks every later mount.
     #[cfg(windows)]
     let host = {
-        let seed = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |elapsed| elapsed.as_nanos() as u32)
-            ^ std::process::id().rotate_left(16);
-        let [_, b, c, d] = seed.to_be_bytes();
+        // FNV-1a: stable across Rust versions, unlike DefaultHasher.
+        let hash = mount_point
+            .to_string_lossy()
+            .to_ascii_lowercase()
+            .bytes()
+            .fold(0x811c_9dc5_u32, |hash, byte| {
+                (hash ^ u32::from(byte)).wrapping_mul(0x0100_0193)
+            });
+        let [b, c, d, _] = hash.to_le_bytes();
         format!("127.{b}.{c}.{}", d.max(2))
     };
     #[cfg(not(windows))]
@@ -1075,6 +1128,43 @@ mod tests {
     /// `virtual_fs.write()` which returned EBADF, and `errno_to_nfs` mapped
     /// that to STALE — at which point macOS NFS silently discards the write.
     ///
+    /// A handle from an earlier server (other inode numbers, other
+    /// generation) still names the same file, through the path it carries.
+    #[test]
+    fn handle_from_earlier_server_resolves_by_path() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let hub = MockHub::new();
+        hub.add_file("a.txt", 1, Some("hash_a"), None);
+        hub.add_file("dir/b.txt", 1, Some("hash_b"), None);
+        let new_adapter = || {
+            let vfs = make_test_vfs(hub.clone(), MockXet::new(), TestOpts::default(), &rt);
+            let mut adapter = NFSAdapter::new(vfs, true);
+            adapter.path_handles = true;
+            adapter
+        };
+        let first = new_adapter();
+        // The second server lists more files, so "dir/b.txt" gets another inode.
+        hub.add_dir("aaa");
+        hub.add_file("aaa/c.txt", 1, Some("hash_c"), None);
+        let mut second = new_adapter();
+        second.generation = first.generation + 1;
+
+        rt.block_on(async {
+            let dir = first.lookup(1, &nfsstring(b"dir".to_vec())).await.unwrap();
+            let file = first.lookup(dir, &nfsstring(b"b.txt".to_vec())).await.unwrap();
+            let old_handle = first.id_to_fh(file);
+
+            let aaa = second.lookup(1, &nfsstring(b"aaa".to_vec())).await.unwrap();
+            second.lookup(aaa, &nfsstring(b"c.txt".to_vec())).await.unwrap();
+            let resolved = second.fh_to_id(&old_handle).expect("old handle resolves");
+            assert_ne!(file, resolved, "inode numbers differ between servers");
+            assert_eq!(second.virtual_fs.full_path(resolved).as_deref(), Some("dir/b.txt"));
+        });
+    }
+
     /// The fix: on EBADF, evict the read-only handle and re-open writable,
     /// then retry. This test exercises that exact sequence.
     #[test]

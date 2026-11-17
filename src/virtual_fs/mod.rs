@@ -1838,6 +1838,12 @@ impl VirtualFs {
         Ok(())
     }
 
+    /// The path of `ino` relative to the mount root ("" for the root).
+    pub fn full_path(&self, ino: u64) -> Option<Arc<str>> {
+        let inodes = self.inode_table.read().expect("inodes poisoned");
+        inodes.get(ino).map(|entry| entry.full_path.clone())
+    }
+
     pub fn getattr(&self, ino: u64) -> VirtualFsResult<VirtualFsAttr> {
         debug!("getattr: ino={}", ino);
 

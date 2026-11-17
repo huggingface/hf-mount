@@ -70,7 +70,7 @@ Install-WindowsFeature -Name NFS-Client
 Enable-WindowsOptionalFeature -Online -FeatureName ServicesForNFS-ClientOnly,ClientForNFS-Infrastructure -All
 ```
 
-`hf-mount-nfs.exe` must run as Administrator: it binds the privileged portmapper port 111, which the Windows NFS client always queries. Each mount listens on a loopback address of its own (`\\127.x.y.z\!`), because the Windows client keeps the file handles of a server for about a minute after an unmount.
+`hf-mount-nfs.exe` must run as Administrator: it binds the privileged portmapper port 111, which the Windows NFS client always queries. Each mount point listens on a loopback address of its own (`\\127.x.y.z\!`), derived from the mount point, so a remount reaches the same server address.
 
 The Windows client mounts anonymously, so files are owned by its anonymous id (`4294967294`, the Client for NFS default) unless `--uid`/`--gid` say otherwise.
 
