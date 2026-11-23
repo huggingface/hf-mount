@@ -1463,12 +1463,21 @@ impl VirtualFs {
         writable: bool,
         staging_backed: bool,
     ) -> VirtualFsResult<u64> {
-        let file_handle = self.alloc_file_handle();
         {
             let inodes = self.inode_table.read().expect("inodes poisoned");
             inodes.bump_open_handles(ino);
-            inodes.touch(ino);
+            if writable {
+                inodes.bump_write_handles(ino);
+            }
         }
+        Ok(self.insert_counted_local_handle(ino, file, writable, staging_backed))
+    }
+
+    /// Register a local handle whose open/write counts the caller already
+    /// bumped.
+    fn insert_counted_local_handle(&self, ino: u64, file: Arc<File>, writable: bool, staging_backed: bool) -> u64 {
+        let file_handle = self.alloc_file_handle();
+        self.inode_table.read().expect("inodes poisoned").touch(ino);
         self.open_files.write().expect("open_files poisoned").insert(
             file_handle,
             OpenFile::Local {
@@ -1478,7 +1487,7 @@ impl VirtualFs {
                 staging_backed,
             },
         );
-        Ok(file_handle)
+        file_handle
     }
 
     /// Fire-and-forget background populate of the whole-file cache. Failures
@@ -2157,16 +2166,17 @@ impl VirtualFs {
         // the just-committed hash) between `open`'s snapshot and our lock
         // acquisition. Using stale values here was the previous source of
         // user-visible EIO on the drift check below.
-        let (is_dirty, staging_is_current, xet_hash, size) = {
+        let (dirty_generation, staging_is_current, xet_hash, size) = {
             let inodes = self.inode_table.read().expect("inodes poisoned");
             let entry = inodes.get(ino).ok_or(libc::ENOENT)?;
             (
-                entry.is_dirty(),
+                entry.dirty_generation,
                 entry.staging_is_current,
                 entry.xet_hash.clone().unwrap_or_default(),
                 entry.size,
             )
         };
+        let is_dirty = dirty_generation > 0;
         let xet_hash = xet_hash.as_str();
         let local_exists = self.local_backing_exists(ino, full_path).map_err(|e| {
             error!("Failed to check local backing file for ino={}: {}", ino, e);
@@ -2202,10 +2212,12 @@ impl VirtualFs {
             // reusable.
             if let Some(entry) = self.inode_table.write().expect("inodes poisoned").get_mut(ino) {
                 entry.staging_is_current = false;
-                // Drop any stale sparse_write — the staging file is about to
-                // be recreated. The new sparse_write (if any) is installed
-                // below against the just-prepared staging.
-                entry.sparse_write = None;
+                // Drop any stale sparse_write: the staging file is about to be
+                // recreated. The sparse path swaps it under io_lock instead,
+                // together with the hole punch.
+                if !want_sparse {
+                    entry.sparse_write = None;
+                }
             }
             // GC accounting only matters for non-overlay (overlay files live
             // in user dir, so file_size returns 0 here on miss).
@@ -2219,18 +2231,27 @@ impl VirtualFs {
                     .staging
                     .path(ino)
                     .expect("staging directory required for advanced writes");
-                // Hold io_lock(ino) across File::create + set_len: File::create
-                // is O_TRUNC and shrinks the shared on-disk inode to 0 BEFORE
-                // set_len extends it back to `size`. A concurrent reader on
-                // the prior staging file (its Arc<File> still alive from a
-                // previous open) whose pread lands in that window would read
-                // 0 bytes and deliver a phantom EOF to FUSE. io_lock
-                // serializes us against any read()/setattr/fill_sparse_holes
-                // critical section that touches the staging file. Both
-                // syscalls are sync, so the lock is never held across await.
+                // Hold io_lock(ino) across File::create + set_len and the
+                // sparse_write swap. A handle that survives from an earlier
+                // session still reads and writes this file: File::create is
+                // O_TRUNC, so a pread in the window would see a phantom EOF,
+                // a pread before the swap would take the fresh hole for data,
+                // and a write before the swap would go untracked. io_lock
+                // serializes us against read(), write(), setattr and
+                // fill_sparse_holes. A write that already landed since the
+                // snapshot makes the staging content ours to keep: retry the
+                // open, which then reuses the dirty staging. All calls are
+                // sync, so the lock is never held across await.
                 let io_lock = self.staging.io_lock(ino);
                 {
                     let _io_guard = io_lock.lock().expect("staging io_lock poisoned");
+                    {
+                        let inodes = self.inode_table.read().expect("inodes poisoned");
+                        let entry = inodes.get(ino).ok_or(libc::ENOENT)?;
+                        if entry.dirty_generation != dirty_generation || entry.xet_hash.as_deref() != Some(xet_hash) {
+                            return Err(libc::EAGAIN);
+                        }
+                    }
                     let file = std::fs::File::create(&staging_path).map_err(|e| {
                         error!("Failed to create sparse staging file: {}", e);
                         libc::EIO
@@ -2239,6 +2260,10 @@ impl VirtualFs {
                         error!("Failed to set sparse staging file length: {}", e);
                         libc::EIO
                     })?;
+                    // The fresh hole has empty coverage: reads fill it from CAS.
+                    if let Some(entry) = self.inode_table.write().expect("inodes poisoned").get_mut(ino) {
+                        entry.sparse_write = Some(Arc::new(inode::SparseWriteState::new(xet_hash.to_string(), size)));
+                    }
                 }
                 size
             } else if has_remote_xet {
@@ -2373,9 +2398,9 @@ impl VirtualFs {
                     .is_some_and(|sw| sw.original_hash == xet_hash);
                 if !existing_matches {
                     if !can_reuse_staging {
-                        // We just punched a fresh sparse hole above: staging is
-                        // empty, so empty coverage is correct — reads fill holes
-                        // from CAS lazily.
+                        // The last release of a surviving handle dropped the
+                        // state installed with the hole punch: staging is
+                        // still that fresh hole, so empty coverage is correct.
                         entry.sparse_write = Some(Arc::new(inode::SparseWriteState::new(xet_hash.to_string(), size)));
                     } else if live_staging_is_current && !live_is_dirty {
                         // Reused a CLEAN cache that mirrors the original in
@@ -2407,9 +2432,14 @@ impl VirtualFs {
                     }
                 }
             }
+            // Count the handle under the same lock: a poll between here and
+            // the handle registration would otherwise see no open handle and
+            // rotate the identity under the session just prepared.
+            inodes.bump_open_handles(ino);
+            inodes.bump_write_handles(ino);
         }
 
-        self.install_local_handle(ino, Arc::new(file), true, true)
+        Ok(self.insert_counted_local_handle(ino, Arc::new(file), true, true))
     }
 
     /// Simple streaming write: truncate existing file and set up a new streaming writer.
@@ -3193,6 +3223,7 @@ impl VirtualFs {
             | Some(OpenFile::Streaming { ino, .. }) => Some(*ino),
             _ => None,
         };
+        let released_writable = matches!(&removed, Some(OpenFile::Local { writable: true, .. }));
 
         let mut release_error: Option<i32> = None;
 
@@ -3286,7 +3317,13 @@ impl VirtualFs {
             // unlink of the dirty file passes its open-handles guard and the
             // source AddFile then resurrects the just-removed path on the
             // Hub.
-            self.inode_table.read().expect("inodes poisoned").drop_open_handles(ino);
+            {
+                let inodes = self.inode_table.read().expect("inodes poisoned");
+                inodes.drop_open_handles(ino);
+                if released_writable {
+                    inodes.drop_write_handles(ino);
+                }
+            }
 
             // Sparse state is session-scoped: when the last handle closes on
             // a clean inode, drop sparse_write so no stale-keyed state
@@ -3527,7 +3564,7 @@ impl VirtualFs {
 
         let now = SystemTime::now();
         // Re-check parent + EEXIST + insert under one write lock (TOCTOU guard)
-        let (ino, full_path, dirty_gen) = {
+        let (ino, full_path, dirty_gen, staging_guard) = {
             let mut inodes = self.inode_table.write().expect("inodes poisoned");
             let parent_entry = match inodes.get(parent) {
                 Some(e) if e.kind == InodeKind::Directory => e,
@@ -3559,7 +3596,17 @@ impl VirtualFs {
             };
             inodes.touch_parent(parent, now);
             inodes.touch(ino);
-            (ino, full_path, dirty_gen)
+            // The inode is dirty from here on, but its staging file does not
+            // exist yet. Hold the staging lock until it does, or a flush in
+            // between would take the file for lost. Taken before the table
+            // lock drops, so no flush can reach this inode first; the inode
+            // number is fresh, so the lock is free.
+            let staging_guard = if self.advanced_writes {
+                self.staging.lock(ino).try_lock_owned().ok()
+            } else {
+                None
+            };
+            (ino, full_path, dirty_gen, staging_guard)
         };
 
         self.negative_cache_remove(&full_path);
@@ -3579,6 +3626,7 @@ impl VirtualFs {
                     let file_handle = self.alloc_file_handle();
                     let inodes = self.inode_table.read().expect("inodes poisoned");
                     inodes.bump_open_handles(ino);
+                    inodes.bump_write_handles(ino);
                     self.open_files.write().expect("open_files poisoned").insert(
                         file_handle,
                         OpenFile::Local {
@@ -3599,6 +3647,7 @@ impl VirtualFs {
                         },
                     );
 
+                    drop(staging_guard);
                     let attr = self.make_vfs_attr(inodes.get(ino).ok_or(libc::ENOENT)?);
                     Ok((attr, file_handle))
                 }
@@ -4792,28 +4841,8 @@ impl VirtualFs {
                 let staging_recreated = !can_reuse;
                 if staging_recreated {
                     if want_sparse_install {
-                        // Sparse hole, no download. io_lock covers the
-                        // File::create + set_len window like the equivalent in
-                        // open_advanced_write: File::create is O_TRUNC and an
-                        // untrusted-but-present staging file may still have a
-                        // live Arc<File> reader somewhere; serializing against
-                        // read()/fill_sparse_holes makes the zero-window
-                        // unobservable. Both syscalls are sync — the lock is
-                        // never held across await.
-                        let staging_path = self
-                            .staging
-                            .path(ino)
-                            .expect("staging directory required for advanced writes");
-                        let io_lock = self.staging.io_lock(ino);
-                        let _io_guard = io_lock.lock().expect("staging io_lock poisoned");
-                        let file = std::fs::File::create(&staging_path).map_err(|e| {
-                            error!("Failed to create sparse staging file for setattr: {}", e);
-                            libc::EIO
-                        })?;
-                        file.set_len(new_size).map_err(|e| {
-                            error!("Failed to set sparse staging file length: {}", e);
-                            libc::EIO
-                        })?;
+                        // Sparse hole, no download: punched below, under the
+                        // same io_lock section that installs sparse_write.
                     } else if new_size > 0 {
                         let staging_path = self
                             .staging
@@ -4852,6 +4881,25 @@ impl VirtualFs {
                 // are sync, the `?` in the closure only short-circuits).
                 let io_lock = self.staging.io_lock(ino);
                 let _io_guard = io_lock.lock().expect("staging io_lock poisoned");
+                if want_sparse_install {
+                    // File::create is O_TRUNC and an untrusted-but-present
+                    // staging file may still have a live Arc<File> reader
+                    // somewhere. Punching the hole under the io_lock section
+                    // that also installs sparse_write keeps such a reader from
+                    // seeing a phantom EOF or taking the hole for data.
+                    let staging_path = self
+                        .staging
+                        .path(ino)
+                        .expect("staging directory required for advanced writes");
+                    let file = std::fs::File::create(&staging_path).map_err(|e| {
+                        error!("Failed to create sparse staging file for setattr: {}", e);
+                        libc::EIO
+                    })?;
+                    file.set_len(new_size).map_err(|e| {
+                        error!("Failed to set sparse staging file length: {}", e);
+                        libc::EIO
+                    })?;
+                }
                 let mut inodes = self.inode_table.write().expect("inodes poisoned");
                 // Current revision under the write lock. Poll can rotate
                 // xet_hash/size on a clean inode between the pre-lock snapshot

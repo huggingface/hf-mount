@@ -28,32 +28,28 @@ enum FlushSignal {
 /// An upload batch still running after this logs an error: the mount is not
 /// persisting, and writers to these files wait on their staging locks.
 const UPLOAD_SLOW_AFTER: Duration = Duration::from_secs(60);
-/// Bound on one `upload_files` call: above xet-core's own retry budget
-/// (6 min), plus the batch size at `UPLOAD_MIN_RATE`, so a request that never
-/// answers cannot stall every later flush, and a large batch still has time.
+/// Bound on one upload call (`upload_files` or `range_upload`): above
+/// xet-core's own retry budget (6 min), plus the upload size at
+/// `UPLOAD_MIN_RATE`, so a request that never answers cannot stall every later
+/// flush, and a large upload still has time.
 #[cfg(not(test))]
 const UPLOAD_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 #[cfg(test)]
 const UPLOAD_TIMEOUT: Duration = Duration::from_secs(2);
 const UPLOAD_MIN_RATE: u64 = 1024 * 1024;
 
-async fn upload_with_timeout(
-    xet_sessions: &dyn XetOps,
-    staging_paths: &[&Path],
+async fn upload_with_timeout<T>(
+    what: &str,
     bytes: u64,
-) -> Result<Vec<XetFileInfo>> {
+    upload: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
     let timeout = UPLOAD_TIMEOUT + Duration::from_secs(bytes / UPLOAD_MIN_RATE);
-    let upload = xet_sessions.upload_files(staging_paths);
     tokio::pin!(upload);
     let slow_after = UPLOAD_SLOW_AFTER.min(timeout);
     if let Ok(result) = tokio::time::timeout(slow_after, &mut upload).await {
         return result;
     }
-    error!(
-        "Batch upload of {} file(s) still running after {:?}, flushes are blocked",
-        staging_paths.len(),
-        slow_after
-    );
+    error!("{what} still running after {slow_after:?}, flushes are blocked");
     tokio::time::timeout(timeout - slow_after, upload)
         .await
         .unwrap_or_else(|_| Err(Error::Xet(format!("upload timed out after {timeout:?}"))))
@@ -604,7 +600,7 @@ async fn flush_batch(
 
     // Dirty inos whose staging file is gone (external tmp-cleaner, manual rm
     // of the staging dir). Resolved to a terminal state below.
-    let mut missing_staging: Vec<(u64, String)> = Vec::new();
+    let mut missing_staging: Vec<(u64, String, u64)> = Vec::new();
 
     // Snapshot dirty_generation so we only clear dirty if no concurrent writer advanced it.
     let to_flush: Vec<FlushItem> = {
@@ -629,7 +625,7 @@ async fn flush_batch(
                 }
                 let staging_path = staging_dir.path(ino);
                 if !staging_path.exists() {
-                    missing_staging.push((ino, entry.full_path.to_string()));
+                    missing_staging.push((ino, entry.full_path.to_string(), entry.dirty_generation));
                     return None;
                 }
                 Some(FlushItem {
@@ -658,22 +654,24 @@ async fn flush_batch(
     if !missing_staging.is_empty() {
         {
             let mut inode_table = inodes.write().expect("inodes poisoned");
-            for (ino, path) in &missing_staging {
+            for (ino, path, generation) in &missing_staging {
                 error!(
                     "flush: ino={} staging file missing for {} — dirty bytes are lost; \
                      reverting the inode to remote-backed",
                     ino, path
                 );
-                if let Some(entry) = inode_table.get_mut(*ino) {
-                    let generation = entry.dirty_generation;
-                    entry.clear_dirty_if(generation);
+                // A write since the check keeps the inode dirty: the next
+                // flush looks at the staging file again.
+                if let Some(entry) = inode_table.get_mut(*ino)
+                    && entry.clear_dirty_if(*generation)
+                {
                     entry.sparse_write = None;
                     entry.staging_is_current = false;
                 }
             }
         }
         let mut errs = flush_errors.lock().expect("flush_errors poisoned");
-        for (ino, path) in &missing_staging {
+        for (ino, path, _) in &missing_staging {
             errs.insert(*ino, format!("staging file missing for {path}; local changes lost"));
         }
     }
@@ -807,9 +805,14 @@ async fn flush_batch(
             // final group always lands exactly on item.file_size.
             let group_end = group.last().map(|&(_, end)| end).unwrap_or(0);
             let target_size = item.file_size.min(base_size.max(group_end));
-            match xet_sessions
-                .range_upload(&base_hash, base_size, target_size, snapshots)
-                .await
+            let bytes: u64 = snapshots.iter().map(|snapshot| snapshot.data.len() as u64).sum();
+            let what = format!("Sparse upload of {}", item.full_path);
+            match upload_with_timeout(
+                &what,
+                bytes,
+                xet_sessions.range_upload(&base_hash, base_size, target_size, snapshots),
+            )
+            .await
             {
                 Ok(info) => {
                     base_hash = info.hash().to_string();
@@ -850,7 +853,8 @@ async fn flush_batch(
     for chunk in regular_indices.chunks(UPLOAD_CHUNK_SIZE) {
         let staging_paths: Vec<&Path> = chunk.iter().map(|&i| to_flush[i].staging_path.as_path()).collect();
         let bytes: u64 = chunk.iter().map(|&i| to_flush[i].size).sum();
-        match upload_with_timeout(xet_sessions, &staging_paths, bytes).await {
+        let what = format!("Batch upload of {} file(s)", staging_paths.len());
+        match upload_with_timeout(&what, bytes, xet_sessions.upload_files(&staging_paths)).await {
             Ok(results) => {
                 assert_eq!(
                     results.len(),

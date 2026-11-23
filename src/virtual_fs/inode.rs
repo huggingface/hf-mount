@@ -59,6 +59,10 @@ pub struct EvictionState {
     /// with `open_handles > 0` — a racing read/write would silently lose
     /// data if the inode disappeared under it.
     pub open_handles: AtomicU32,
+    /// The writable staging handles among `open_handles`. Such a handle keeps
+    /// writing against the staging frame of the revision it opened, so a
+    /// remote rotation is refused while one is open.
+    pub write_handles: AtomicU32,
 }
 
 impl Clone for EvictionState {
@@ -68,6 +72,7 @@ impl Clone for EvictionState {
             last_touched: AtomicU64::new(self.last_touched.load(Ordering::Relaxed)),
             evict_pending: AtomicBool::new(self.evict_pending.load(Ordering::Relaxed)),
             open_handles: AtomicU32::new(self.open_handles.load(Ordering::Relaxed)),
+            write_handles: AtomicU32::new(self.write_handles.load(Ordering::Relaxed)),
         }
     }
 }
@@ -763,6 +768,19 @@ impl InodeTable {
         }
     }
 
+    /// Count a writable staging handle (on top of `bump_open_handles`).
+    pub(crate) fn bump_write_handles(&self, ino: u64) {
+        if let Some(entry) = self.inodes.get(&ino) {
+            entry.eviction.write_handles.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn drop_write_handles(&self, ino: u64) {
+        if let Some(entry) = self.inodes.get(&ino) {
+            entry.eviction.write_handles.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
     /// Is there at least one live FUSE file handle on this inode?
     pub(crate) fn has_open_handles(&self, ino: u64) -> bool {
         self.inodes
@@ -1125,25 +1143,6 @@ impl InodeTable {
             return false;
         }
         if let Some(entry) = self.inodes.get_mut(&ino) {
-            // Refuse to rotate identity under an open sparse session. A still-open write
-            // handle keeps writing against the previous hash/size frame:
-            // rotating here leaves entry.size/xet_hash describing the new
-            // revision while staging — and a retained sparse_write — describe
-            // the old one. The next flush then commits chimeric content: a
-            // remote shrink makes a fully-covered sparse staging pass the
-            // fast-path check and upload the old revision's bytes under the
-            // new size, and a remote grow yields phantom-EOF reads past the
-            // staging length. The entry is revalidated by the next poll/HEAD
-            // cycle once the last handle closes.
-            if entry.sparse_write.is_some() && entry.eviction.open_handles.load(Ordering::Relaxed) > 0 {
-                debug!(
-                    "update_remote_file: ino={} rotation refused ({} open handle(s) in a sparse session); \
-                     deferred until last close",
-                    ino,
-                    entry.eviction.open_handles.load(Ordering::Relaxed)
-                );
-                return false;
-            }
             entry.xet_hash = new_hash;
             entry.etag = new_etag;
             entry.size = new_size;
@@ -1153,8 +1152,8 @@ impl InodeTable {
             // its post-check and won't re-flag the cache.
             entry.staging_is_current = false;
             // Sparse-write state stays keyed to its `original_hash`, NOT
-            // the just-rotated `entry.xet_hash`. No handle is open here (see
-            // the guard above), so nothing reads or writes through the stale
+            // the just-rotated `entry.xet_hash`. No handle is open on it (see
+            // `holds_frame`), so nothing reads or writes through the stale
             // state; the next open observes the hash mismatch and rebuilds a
             // fresh sparse_write against the new revision.
             true
@@ -1188,8 +1187,31 @@ impl InodeTable {
     /// Whether a remote report of `ino` with `hash` may change it.
     fn accepts_remote(&self, ino: u64, hash: Option<&str>) -> bool {
         self.inodes.get(&ino).is_some_and(|entry| {
-            !self.is_held_locally(entry) && !hash.is_some_and(|hash| entry.is_earlier_own_commit(hash))
+            !self.is_held_locally(entry)
+                && !Self::holds_frame(entry)
+                && !hash.is_some_and(|hash| entry.is_earlier_own_commit(hash))
         })
+    }
+
+    /// An open write handle, or an open sparse session, works against the
+    /// staging frame of the revision it opened. Rotating identity under it
+    /// leaves entry.size/xet_hash describing the new revision while staging
+    /// (and a retained sparse_write) describe the old one: the next flush
+    /// commits the old revision's bytes under the new size, and a remote grow
+    /// yields phantom-EOF reads past the staging length. A read-only handle
+    /// on a plain inode reads remote state and takes the update. The entry is
+    /// revalidated by the next poll/HEAD cycle once the last handle closes.
+    fn holds_frame(entry: &InodeEntry) -> bool {
+        let open_handles = entry.eviction.open_handles.load(Ordering::Relaxed);
+        let write_handles = entry.eviction.write_handles.load(Ordering::Relaxed);
+        let held = write_handles > 0 || (entry.sparse_write.is_some() && open_handles > 0);
+        if held {
+            debug!(
+                "ino={} remote update deferred until last close ({} open handle(s), {} writable)",
+                entry.inode, open_handles, write_handles
+            );
+        }
+        held
     }
 
     /// Reset children_loaded to false so the next readdir/lookup re-fetches.

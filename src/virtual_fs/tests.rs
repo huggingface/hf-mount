@@ -1832,6 +1832,92 @@ fn flush_hung_upload_times_out() {
     vfs.shutdown();
 }
 
+/// A hung sparse `range_upload` times out like `upload_files`, records an
+/// error, and does not block later flushes of other files.
+#[test]
+fn sparse_flush_hung_range_upload_times_out() {
+    let hub = MockHub::new();
+    let original: Vec<u8> = (0u8..20).collect();
+    hub.add_file("file.bin", original.len() as u64, Some("h1"), None);
+    hub.add_file("other.txt", 5, Some("h2"), None);
+    let xet = MockXet::new();
+    xet.add_file("h1", &original);
+    xet.add_file("h2", b"other");
+    let (rt, vfs) = vfs_sparse(&hub, &xet);
+
+    rt.block_on(async {
+        let ino = vfs.lookup(ROOT_INODE, "file.bin").await.unwrap().ino;
+        let fh = vfs.open(ino, true, false, None).await.unwrap();
+        write_blocking(&vfs, ino, fh, 0, b"AB").await.unwrap();
+        // Never released: the range upload hangs.
+        let _gate = xet.install_range_upload_gate();
+        vfs.release(fh).await.unwrap();
+
+        let flush_manager = vfs.flush_manager.as_ref().unwrap();
+        let mut err = None;
+        assert!(
+            wait_until(|| {
+                err = flush_manager.check_error(ino);
+                err.is_some()
+            })
+            .await,
+            "hung range_upload never timed out"
+        );
+        assert!(err.unwrap().contains("timed out"));
+
+        let other = vfs.lookup(ROOT_INODE, "other.txt").await.unwrap().ino;
+        let fh = vfs.open(other, true, true, None).await.unwrap();
+        write_blocking(&vfs, other, fh, 0, b"later").await.unwrap();
+        vfs.release(fh).await.unwrap();
+        assert!(
+            wait_until(|| hub
+                .take_batch_log()
+                .iter()
+                .flatten()
+                .any(|op| matches!(op, BatchOp::AddFile { path, .. } if path == "other.txt")))
+            .await,
+            "flush after the range_upload timeout never committed"
+        );
+    });
+
+    vfs.shutdown();
+}
+
+/// create() holds the staging lock while the new staging file does not exist
+/// yet, and must release it so that the flush commits the new file.
+#[test]
+fn create_releases_staging_lock_and_commits() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_advanced(&hub, &xet);
+
+    rt.block_on(async {
+        let (attr, fh) = vfs
+            .create(ROOT_INODE, "new.txt", 0o644, 1000, 1000, None)
+            .await
+            .unwrap();
+        let ino = attr.ino;
+        // A staging lock taken right after create() returns is free: create()
+        // released it once the staging file existed.
+        let staging_lock = vfs.staging.lock(ino);
+        assert!(
+            staging_lock.try_lock().is_ok(),
+            "create() must release the staging lock"
+        );
+        vfs.release(fh).await.unwrap();
+        wait_for_clean(&vfs, ino).await;
+        assert!(vfs.flush_manager.as_ref().unwrap().check_error(ino).is_none());
+        assert!(
+            hub.take_batch_log()
+                .iter()
+                .flatten()
+                .any(|op| matches!(op, BatchOp::AddFile { path, .. } if path == "new.txt"))
+        );
+    });
+
+    vfs.shutdown();
+}
+
 /// Concurrent shutdown calls must not deadlock. Reproduces the scenario where
 /// destroy() and the signal handler both call shutdown() simultaneously.
 #[test]
@@ -8516,6 +8602,129 @@ fn poll_rotation_refused_while_write_handle_open() {
             !rotated,
             "update_remote_file must refuse to rotate while a handle is open"
         );
+
+        vfs.release(fh).await.unwrap();
+    });
+
+    vfs.shutdown();
+}
+
+/// A reopen that recreates the sparse staging while an earlier write handle
+/// is still open must not drop a write that lands through that handle in the
+/// meantime. The test holds io_lock so that the write queues on it before the
+/// reopen reaches the hole punch.
+#[test]
+fn sparse_reopen_recreate_keeps_racing_write() {
+    let hub = MockHub::new();
+    let original: Vec<u8> = (0u8..40).collect();
+    hub.add_file("file.bin", original.len() as u64, Some("h1"), None);
+    let xet = MockXet::new();
+    xet.add_file("h1", &original);
+    let (rt, vfs) = vfs_sparse(&hub, &xet);
+
+    rt.block_on(async {
+        let ino = vfs.lookup(ROOT_INODE, "file.bin").await.unwrap().ino;
+        let fh1 = vfs.open(ino, true, false, None).await.unwrap();
+        // A partial write committed by range_upload leaves the inode clean
+        // with a non-current staging file, so the next open recreates it.
+        write_blocking(&vfs, ino, fh1, 5, b"ZZZZ").await.unwrap();
+        vfs.fsync(ino, fh1, None).await.unwrap();
+        wait_for_clean(&vfs, ino).await;
+
+        // A blocking thread holds io_lock while the write, then the reopen,
+        // queue on it.
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (unlock_tx, unlock_rx) = std::sync::mpsc::channel::<()>();
+        let holder = {
+            let io_lock = vfs.staging.io_lock(ino);
+            std::thread::spawn(move || {
+                let _io_guard = io_lock.lock().unwrap();
+                locked_tx.send(()).unwrap();
+                unlock_rx.recv().unwrap();
+            })
+        };
+        locked_rx.recv().unwrap();
+        let writer = {
+            let vfs = vfs.clone();
+            tokio::task::spawn_blocking(move || vfs.write(ino, fh1, 0, b"X"))
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let reopen = {
+            let vfs = vfs.clone();
+            tokio::spawn(async move { vfs.open(ino, true, false, None).await })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!reopen.is_finished(), "the reopen must wait on io_lock");
+        unlock_tx.send(()).unwrap();
+        holder.join().unwrap();
+        writer.await.unwrap().unwrap();
+        let fh2 = reopen.await.unwrap().unwrap();
+
+        vfs.release(fh2).await.unwrap();
+        vfs.release(fh1).await.unwrap();
+        wait_for_clean(&vfs, ino).await;
+
+        let hash = vfs
+            .inode_table
+            .read()
+            .unwrap()
+            .get(ino)
+            .unwrap()
+            .xet_hash
+            .clone()
+            .unwrap();
+        let mut expected = original.clone();
+        expected[5..9].copy_from_slice(b"ZZZZ");
+        expected[0] = b'X';
+        assert_eq!(xet_content(&xet, &hash), Some(expected));
+    });
+
+    vfs.shutdown();
+}
+
+/// A clean inode with a write handle open must not take a remote rotation in
+/// non-sparse mode either: staging keeps the old revision, so the next flush
+/// would commit it under the rotated size.
+#[test]
+fn poll_rotation_refused_while_non_sparse_write_handle_open() {
+    let hub = MockHub::new();
+    let original: Vec<u8> = (0u8..40).collect();
+    hub.add_file("file.bin", original.len() as u64, Some("h1"), None);
+    let xet = MockXet::new();
+    xet.add_file("h1", &original);
+    let (rt, vfs) = vfs_advanced(&hub, &xet);
+
+    rt.block_on(async {
+        let ino = vfs.lookup(ROOT_INODE, "file.bin").await.unwrap().ino;
+        let fh = vfs.open(ino, true, false, None).await.unwrap();
+        write_blocking(&vfs, ino, fh, 5, b"ZZZZ").await.unwrap();
+        vfs.fsync(ino, fh, None).await.unwrap();
+        wait_for_clean(&vfs, ino).await;
+
+        let rotated = {
+            let mut inodes = vfs.inode_table.write().unwrap();
+            inodes.update_remote_file(ino, Some("h_remote2".to_string()), None, 10, SystemTime::now())
+        };
+        assert!(
+            !rotated,
+            "update_remote_file must refuse to rotate under a write handle"
+        );
+
+        write_blocking(&vfs, ino, fh, 0, b"X").await.unwrap();
+        vfs.fsync(ino, fh, None).await.unwrap();
+        wait_for_clean(&vfs, ino).await;
+
+        let (final_hash, final_size) = {
+            let inodes = vfs.inode_table.read().unwrap();
+            let entry = inodes.get(ino).unwrap();
+            (entry.xet_hash.clone().unwrap(), entry.size)
+        };
+        let committed = xet_content(&xet, &final_hash).expect("committed hash must exist in mock CAS");
+        let mut expected = original.clone();
+        expected[5..9].copy_from_slice(b"ZZZZ");
+        expected[0] = b'X';
+        assert_eq!(committed, expected);
+        assert_eq!(final_size, expected.len() as u64);
 
         vfs.release(fh).await.unwrap();
     });
