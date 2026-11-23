@@ -287,11 +287,26 @@ pub async fn upload_file(config: Arc<TranslatorConfig>, staged_path: &Path) -> X
 /// Spawn hf-mount-fuse as a child process, wait until the mountpoint is live.
 /// `extra_args` are appended to the command (e.g. `&["--read-only"]`).
 pub fn mount_bucket(bucket_id: &str, mount_point: &str, cache_dir: &str, extra_args: &[&str]) -> Child {
+    mount_bucket_with_env(bucket_id, mount_point, cache_dir, extra_args, &[])
+}
+
+/// Same as `mount_bucket` but also forwards `(key, value)` pairs as env vars
+/// to the spawned child. Use this instead of `std::env::set_var` from a test:
+/// `std::env::set_var` is unsafe and races with concurrent `cargo test`
+/// threads that may be reading the env or spawning their own children.
+pub fn mount_bucket_with_env(
+    bucket_id: &str,
+    mount_point: &str,
+    cache_dir: &str,
+    extra_args: &[&str],
+    extra_env: &[(&str, &str)],
+) -> Child {
     spawn_mount_bucket(
         bucket_id,
         mount_point,
         cache_dir,
         extra_args,
+        extra_env,
         Stdio::inherit(),
         Stdio::inherit(),
     )
@@ -314,6 +329,7 @@ pub fn mount_bucket_logged(
         mount_point,
         cache_dir,
         extra_args,
+        &[],
         log.into(),
         log_err.into(),
     )
@@ -324,6 +340,7 @@ fn spawn_mount_bucket(
     mount_point: &str,
     cache_dir: &str,
     extra_args: &[&str],
+    extra_env: &[(&str, &str)],
     stdout: Stdio,
     stderr: Stdio,
 ) -> Child {
@@ -337,11 +354,15 @@ fn spawn_mount_bucket(
     std::fs::create_dir_all(cache_dir).ok();
 
     let ep = endpoint();
-    let child = Command::new(binary)
-        .env(
-            "RUST_LOG",
-            std::env::var("RUST_LOG").unwrap_or_else(|_| "hf_mount=warn".to_string()),
-        )
+    let mut cmd = Command::new(binary);
+    cmd.env(
+        "RUST_LOG",
+        std::env::var("RUST_LOG").unwrap_or_else(|_| "hf_mount=warn".to_string()),
+    );
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    let child = cmd
         .args([
             "--hf-token",
             &token,
@@ -546,7 +567,7 @@ fn decode_proc_mount_path(path: &str) -> String {
     String::from_utf8_lossy(&decoded).into_owned()
 }
 
-fn is_mounted(mount_point: &str) -> bool {
+pub fn is_mounted(mount_point: &str) -> bool {
     #[cfg(target_os = "linux")]
     {
         let mount_point = std::fs::canonicalize(mount_point)

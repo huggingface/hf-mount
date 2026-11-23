@@ -715,8 +715,11 @@ impl super::VirtualFs {
                 if !at_path(&inode_table, update.ino, &update.path) {
                     continue;
                 }
-                inode_table.update_remote_file(update.ino, update.hash, update.etag, update.size, update.mtime);
-                queue_file_invalidation(&inode_table, update.ino, &mut inos_to_invalidate);
+                // A refusal (dirty inode, open handles) leaves the local view
+                // unchanged; a later cycle applies it once the inode quiesces.
+                if inode_table.update_remote_file(update.ino, update.hash, update.etag, update.size, update.mtime) {
+                    queue_file_invalidation(&inode_table, update.ino, &mut inos_to_invalidate);
+                }
             }
 
             // Re-checked under the write lock by the helper: the inode may

@@ -154,6 +154,16 @@ pub struct MountOptions {
     #[arg(long, default_value_t = false)]
     pub advanced_writes: bool,
 
+    /// Sparse writes: open-for-write punches a hole instead of downloading
+    /// the original CAS content, and flush composes the new file via
+    /// `range_upload` (CAS prefix/suffix + re-chunked dirty windows). Reads
+    /// outside the dirty regions fetch from CAS on demand and populate the
+    /// local staging file as a cache, so each byte is fetched at most once
+    /// per mount lifetime. Saves bandwidth on small-edit workloads against
+    /// large CAS-backed files. Implies `--advanced-writes`. Experimental.
+    #[arg(long, default_value_t = false)]
+    pub sparse_writes: bool,
+
     /// Interval in seconds for polling remote changes (0 to disable).
     #[arg(long, default_value_t = 30)]
     pub poll_interval_secs: u64,
@@ -620,7 +630,13 @@ pub fn build_with_runtime(
         window_plans,
     );
 
-    let advanced_writes = options.advanced_writes || options.overlay || (is_nfs && !read_only);
+    // --sparse-writes implies --advanced-writes: the sparse path lives on
+    // top of the staging substrate that advanced writes provides. Forcing
+    // the implication here is what makes the implication real — without
+    // this, VfsConfig would silently downgrade sparse_writes to false and
+    // the user would see the legacy write path behind their back.
+    let advanced_writes = options.advanced_writes || options.sparse_writes || options.overlay || (is_nfs && !read_only);
+    let sparse_writes = options.sparse_writes;
 
     // A previous FUSE daemon may have died (OOM kill, crash) leaving a dead
     // mount at the mount point: every stat() on it returns ENOTCONN, which
@@ -697,13 +713,17 @@ pub fn build_with_runtime(
         access_mode,
         backend_name,
     );
+    if sparse_writes {
+        warn!("--sparse-writes is experimental; report issues at https://github.com/huggingface/hf-mount/issues");
+    }
     info!(
-        "Config: advanced_writes={} overlay={} remote_read_only={} direct_io={} poll_interval={}s \
+        "Config: advanced_writes={} sparse_writes={} overlay={} remote_read_only={} direct_io={} poll_interval={}s \
          poll_listing_concurrency={} live_follow={} metadata_ttl={}ms negative_ttl={}ms \
          cache_dir={:?} cache_size={} no_disk_cache={} cache_mode={:?} max_staging_size={} max_threads={} \
          flush_debounce={}ms flush_max_batch={}ms read_fetch_timeout={}ms read_ahead={}MiB uid={} gid={} \
          dir_mode={:04o} file_mode={:04o} filter_os_files={}",
         advanced_writes,
+        sparse_writes,
         options.overlay,
         remote_read_only,
         options.direct_io,
@@ -741,6 +761,16 @@ pub fn build_with_runtime(
         VfsConfig {
             read_only,
             advanced_writes,
+            sparse_writes,
+            // Sparse-write fallback threshold. Files smaller than this bypass
+            // the sparse path and use the standard download-then-upload route.
+            // Default 256 MiB (bench-derived crossover for typical cloud
+            // networks); override via HF_MOUNT_SPARSE_MIN_BYTES.
+            sparse_min_size_bytes: std::env::var("HF_MOUNT_SPARSE_MIN_BYTES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(256 * 1024 * 1024),
+            sparse_flush_budget_bytes: crate::virtual_fs::flush::SPARSE_SNAPSHOT_BUDGET_BYTES,
             uid,
             gid,
             dir_mode: options.dir_mode,
