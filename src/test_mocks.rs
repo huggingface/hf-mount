@@ -100,6 +100,7 @@ impl MockHub {
             xet_hash: xet_hash.map(|s| s.to_string()),
             oid: oid.map(|s| s.to_string()),
             mtime: None,
+            mode: None,
         });
         if let Some(hash) = xet_hash {
             self.head_responses.lock().unwrap().insert(
@@ -109,6 +110,7 @@ impl MockHub {
                     etag: oid.map(|s| s.to_string()),
                     size: Some(size),
                     last_modified: None,
+                    mode: None,
                 }),
             );
         }
@@ -122,7 +124,18 @@ impl MockHub {
             xet_hash: None,
             oid: None,
             mtime: None,
+            mode: None,
         });
+    }
+
+    /// Set the stored POSIX mode of a file added with `add_file`.
+    pub fn set_mode(&self, path: &str, mode: Option<u32>) {
+        for entry in self.tree.lock().unwrap().iter_mut().filter(|e| e.path == path) {
+            entry.mode = mode;
+        }
+        if let Some(Some(head)) = self.head_responses.lock().unwrap().get_mut(path) {
+            head.mode = mode;
+        }
     }
 
     pub fn remove_file(&self, path: &str) {
@@ -267,6 +280,7 @@ impl HubOps for MockHub {
                         xet_hash: None,
                         oid: None,
                         mtime: None,
+                        mode: None,
                     });
                 }
             } else {
@@ -289,6 +303,7 @@ impl HubOps for MockHub {
                 etag: i.etag.clone(),
                 size: i.size,
                 last_modified: i.last_modified.clone(),
+                mode: i.mode,
             })),
             None => Ok(None),
         }

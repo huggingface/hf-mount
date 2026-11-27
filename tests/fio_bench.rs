@@ -210,7 +210,9 @@ async fn test_fio_compare() {
             path: filename.clone(),
             xet_hash,
             mtime: mtime_ms,
+            mtime_nanos: 0,
             content_type: None,
+            mode: None,
         });
     }
 

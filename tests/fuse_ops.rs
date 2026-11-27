@@ -219,7 +219,9 @@ async fn test_fuse_remote_dir_appears_after_listing() {
             path: "newdir/payload.txt".to_string(),
             xet_hash: info.hash().to_string(),
             mtime: 0,
+            mtime_nanos: 0,
             content_type: None,
+            mode: None,
         }])
         .await
         .expect("batch add failed");

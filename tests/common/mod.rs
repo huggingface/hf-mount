@@ -107,7 +107,9 @@ pub async fn setup_bucket_with_file(test_name: &str, filename: &str, content: &[
             path: filename.to_string(),
             xet_hash,
             mtime: mtime_ms,
+            mtime_nanos: 0,
             content_type: None,
+            mode: None,
         }])
         .await
         .expect("batch add failed");
@@ -139,7 +141,9 @@ pub async fn seed_big_dir_with_target(
             path: format!("big_dir/sib_{i:02}.txt"),
             xet_hash: info.hash().to_string(),
             mtime: 0,
+            mtime_nanos: 0,
             content_type: None,
+            mode: None,
         });
     }
     let target_path = tmp_dir.join("target.txt");
@@ -149,7 +153,9 @@ pub async fn seed_big_dir_with_target(
         path: "big_dir/target.txt".to_string(),
         xet_hash: info.hash().to_string(),
         mtime: 0,
+        mtime_nanos: 0,
         content_type: None,
+        mode: None,
     });
     hub.batch_operations(&ops).await.expect("batch add failed");
     std::fs::remove_dir_all(&tmp_dir).ok();
@@ -170,7 +176,9 @@ pub async fn seed_deep_tree(hub: &Arc<hf_mount::hub_api::HubApiClient>, tmp_dir_
         path: "a/b/c/d/payload.txt".to_string(),
         xet_hash: info.hash().to_string(),
         mtime: 0,
+        mtime_nanos: 0,
         content_type: None,
+        mode: None,
     }])
     .await
     .expect("batch add failed");
@@ -714,7 +722,9 @@ pub async fn seed_parallel_read_files(
             path: rel.clone(),
             xet_hash: info.hash().to_string(),
             mtime: 0,
+            mtime_nanos: 0,
             content_type: None,
+            mode: None,
         })
         .collect();
     hub.batch_operations(&ops).await.expect("batch add failed");

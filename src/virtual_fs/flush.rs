@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Once, RwLock};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime};
 
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
@@ -368,6 +368,11 @@ struct FlushItem {
     /// Hash from the last successful commit, used to skip redundant Hub commits
     /// when the CAS upload produces the same hash (content unchanged).
     prev_xet_hash: Option<String>,
+    /// Committed along with the content (last write or explicit setattr).
+    mtime: SystemTime,
+    mode: Option<u32>,
+    /// Mode/mtime changed since the last commit: commit even when unchanged.
+    meta_dirty: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -433,6 +438,9 @@ async fn flush_batch(
                     dirty_generation: entry.dirty_generation,
                     size: entry.size,
                     prev_xet_hash: entry.xet_hash.clone(),
+                    mtime: entry.mtime,
+                    mode: entry.stored_mode(),
+                    meta_dirty: entry.meta_dirty,
                 })
             })
             .collect()
@@ -488,18 +496,16 @@ async fn flush_batch(
         return;
     }
 
-    let mtime_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
-
     // Hub API requires all adds before all deletes.
     let mut ops = Vec::new();
     let mut delete_ops = Vec::new();
     let mut unchanged = vec![false; to_flush.len()];
 
     for (i, (item, file_info)) in to_flush.iter().zip(upload_results.iter()).enumerate() {
-        if item.pending_deletes.is_empty() && item.prev_xet_hash.as_deref() == Some(file_info.hash()) {
+        if item.pending_deletes.is_empty()
+            && !item.meta_dirty
+            && item.prev_xet_hash.as_deref() == Some(file_info.hash())
+        {
             debug!(
                 "flush_batch: unchanged ino={} path={} (hash {})",
                 item.ino,
@@ -516,12 +522,12 @@ async fn flush_batch(
             file_info.hash(),
             file_info.file_size().expect("upload returned XetFileInfo without size")
         );
-        ops.push(BatchOp::AddFile {
-            path: item.full_path.clone(),
-            xet_hash: file_info.hash().to_string(),
-            mtime: mtime_ms,
-            content_type: None,
-        });
+        ops.push(BatchOp::add_file(
+            item.full_path.clone(),
+            file_info.hash().to_string(),
+            item.mtime,
+            item.mode,
+        ));
         for old_path in &item.pending_deletes {
             delete_ops.push(BatchOp::DeleteFile { path: old_path.clone() });
         }

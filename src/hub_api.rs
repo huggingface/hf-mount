@@ -195,16 +195,71 @@ impl std::fmt::Display for SourceKind {
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum BatchOp {
+    /// Sets the file's whole state: `mtime` and `mode` are cleared on the Hub
+    /// when omitted.
     #[serde(rename_all = "camelCase")]
     AddFile {
         path: String,
         xet_hash: String,
+        /// Milliseconds since the epoch.
         mtime: u64,
+        /// Sub-millisecond part of `mtime` (0-999999).
+        mtime_nanos: u32,
         #[serde(skip_serializing_if = "Option::is_none")]
         content_type: Option<String>,
+        /// POSIX `st_mode` (permission bits, plus `S_IFREG`/`S_IFLNK`).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        mode: Option<u32>,
+    },
+    /// Changes only the given fields of an existing file (content untouched).
+    #[serde(rename_all = "camelCase")]
+    UpdateMetadata {
+        path: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        mtime: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        mtime_nanos: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        mode: Option<u32>,
     },
     #[serde(rename_all = "camelCase")]
     DeleteFile { path: String },
+}
+
+/// Split a timestamp into the batch API's `(mtime ms, mtimeNanos)` pair.
+fn batch_mtime(t: SystemTime) -> (u64, u32) {
+    let d = t.duration_since(UNIX_EPOCH).unwrap_or_default();
+    (d.as_millis() as u64, d.subsec_nanos() % 1_000_000)
+}
+
+impl BatchOp {
+    pub fn add_file(path: String, xet_hash: String, mtime: SystemTime, mode: Option<u32>) -> Self {
+        let (mtime, mtime_nanos) = batch_mtime(mtime);
+        Self::AddFile {
+            path,
+            xet_hash,
+            mtime,
+            mtime_nanos,
+            content_type: None,
+            mode,
+        }
+    }
+
+    pub fn update_metadata(path: String, mtime: Option<SystemTime>, mode: Option<u32>) -> Self {
+        let mtime = mtime.map(batch_mtime);
+        Self::UpdateMetadata {
+            path,
+            mtime: mtime.map(|(ms, _)| ms),
+            mtime_nanos: mtime.map(|(_, ns)| ns),
+            mode,
+        }
+    }
+
+    fn path_mut(&mut self) -> &mut String {
+        match self {
+            Self::AddFile { path, .. } | Self::UpdateMetadata { path, .. } | Self::DeleteFile { path } => path,
+        }
+    }
 }
 
 /// Unified tree entry exposed to the rest of the codebase.
@@ -220,6 +275,9 @@ pub struct TreeEntry {
     #[serde(default)]
     pub oid: Option<String>,
     pub mtime: Option<String>,
+    /// Stored POSIX `st_mode` (buckets only; absent when the file has none).
+    #[serde(default)]
+    pub mode: Option<u32>,
 }
 
 /// Raw tree entry from the repo `/tree` API (different shape from bucket tree).
@@ -261,6 +319,8 @@ pub struct HeadFileInfo {
     pub etag: Option<String>,
     pub size: Option<u64>,
     pub last_modified: Option<String>,
+    /// Stored POSIX `st_mode` (`X-File-Mode`, buckets only).
+    pub mode: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -912,6 +972,7 @@ impl HubApiClient {
                     xet_hash: raw.xet_hash,
                     oid: raw.oid,
                     mtime: raw.last_commit.and_then(|c| c.date),
+                    mode: None,
                 });
             }
 
@@ -987,12 +1048,17 @@ impl HubApiClient {
             .get("last-modified")
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
+        let mode = headers
+            .get("x-file-mode")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u32>().ok());
 
         Ok(Some(HeadFileInfo {
             xet_hash,
             etag,
             size,
             last_modified,
+            mode,
         }))
     }
 
@@ -1053,22 +1119,9 @@ impl HubApiClient {
             if self.path_prefix.is_empty() {
                 body.push_str(&serde_json::to_string(op)?);
             } else {
-                let prefixed = match op {
-                    BatchOp::AddFile {
-                        path,
-                        xet_hash,
-                        mtime,
-                        content_type,
-                    } => BatchOp::AddFile {
-                        path: self.prefixed_path(path),
-                        xet_hash: xet_hash.clone(),
-                        mtime: *mtime,
-                        content_type: content_type.clone(),
-                    },
-                    BatchOp::DeleteFile { path } => BatchOp::DeleteFile {
-                        path: self.prefixed_path(path),
-                    },
-                };
+                let mut prefixed = op.clone();
+                let path = prefixed.path_mut();
+                *path = self.prefixed_path(path);
                 body.push_str(&serde_json::to_string(&prefixed)?);
             }
             body.push('\n');
@@ -1301,7 +1354,9 @@ mod tests {
             path: "data/file.bin".to_string(),
             xet_hash: "abc123def456".to_string(),
             mtime: 1700000000000,
+            mtime_nanos: 0,
             content_type: Some("application/octet-stream".to_string()),
+            mode: None,
         };
 
         let json = serde_json::to_string(&op).unwrap();
@@ -1338,7 +1393,9 @@ mod tests {
             path: "readme.txt".to_string(),
             xet_hash: "hash999".to_string(),
             mtime: 1234567890000,
+            mtime_nanos: 0,
             content_type: None,
+            mode: None,
         };
 
         let json = serde_json::to_string(&op).unwrap();
@@ -1355,6 +1412,48 @@ mod tests {
         assert_eq!(parsed["path"], "readme.txt");
         assert_eq!(parsed["xetHash"], "hash999");
         assert_eq!(parsed["mtime"], 1234567890000u64);
+    }
+
+    #[test]
+    fn test_batch_op_add_file_mode_and_nanos() {
+        let mtime = UNIX_EPOCH + Duration::new(1_700_000_000, 123_456_789);
+        let op = BatchOp::add_file("bin/run".to_string(), "h".to_string(), mtime, Some(0o100755));
+        let parsed: serde_json::Value = serde_json::to_value(&op).unwrap();
+        assert_eq!(parsed["mtime"], 1_700_000_000_123u64);
+        assert_eq!(parsed["mtimeNanos"], 456_789);
+        assert_eq!(parsed["mode"], 0o100755);
+
+        let op = BatchOp::add_file("plain".to_string(), "h".to_string(), mtime, None);
+        let parsed: serde_json::Value = serde_json::to_value(&op).unwrap();
+        assert!(parsed.get("mode").is_none(), "no stored mode → omitted");
+    }
+
+    #[test]
+    fn test_batch_op_update_metadata_serialization() {
+        let op = BatchOp::update_metadata("a.sh".to_string(), None, Some(0o100700));
+        let parsed: serde_json::Value = serde_json::to_value(&op).unwrap();
+        assert_eq!(parsed["type"], "updateMetadata");
+        assert_eq!(parsed["path"], "a.sh");
+        assert_eq!(parsed["mode"], 0o100700);
+        assert!(parsed.get("mtime").is_none());
+        assert!(parsed.get("mtimeNanos").is_none());
+        assert!(parsed.get("xetHash").is_none());
+
+        let op = BatchOp::update_metadata("a.sh".to_string(), Some(UNIX_EPOCH + Duration::from_millis(5)), None);
+        let parsed: serde_json::Value = serde_json::to_value(&op).unwrap();
+        assert_eq!(parsed["mtime"], 5);
+        assert_eq!(parsed["mtimeNanos"], 0);
+        assert!(parsed.get("mode").is_none());
+    }
+
+    #[test]
+    fn test_tree_entry_mode_parsing() {
+        let entries: Vec<TreeEntry> = serde_json::from_str(
+            r#"[{"path":"a","type":"file","size":1,"mode":41471},{"path":"b","type":"file","size":1}]"#,
+        )
+        .unwrap();
+        assert_eq!(entries[0].mode, Some(0o120777));
+        assert_eq!(entries[1].mode, None);
     }
 
     #[test]
