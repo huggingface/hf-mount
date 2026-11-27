@@ -960,7 +960,9 @@ pub async fn run_revalidation_test(
         path: remote_file.to_string(),
         xet_hash,
         mtime: mtime_ms,
+        mtime_nanos: 0,
         content_type: None,
+        mode: None,
     }])
     .await?;
 

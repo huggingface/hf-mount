@@ -255,7 +255,7 @@ The same `FUSE_NOTIFY_INVAL_INODE` writev can also wedge at **runtime** (not jus
 | `--direct-io` | `false` | Bypass the kernel page cache (FOPEN_DIRECT_IO); every read goes through the FUSE handler. For benchmarking; not recommended in production (disables efficient mmap caching). |
 | `--no-filter-os-files` | `false` | Stop filtering OS junk files (.DS_Store, Thumbs.db, etc.) |
 | `--uid` / `--gid` | current user | Override UID/GID for mounted files |
-| `--dir-mode` / `--file-mode` | `0755` / `0644` | Octal permission bits reported for directories/files listed from the remote (which stores no POSIX metadata). Entries created through the mount keep their requested mode. Use `0777` / `0666` to let any local user write to a bucket mounted by another UID. |
+| `--dir-mode` / `--file-mode` | `0755` / `0644` | Octal permission bits reported for directories listed from the remote, and for files without a stored mode (bucket files keep the mode set by `chmod` or at creation). Entries created through the mount keep their requested mode. Use `0777` / `0666` to let any local user write to a bucket mounted by another UID. |
 | `--fuse-owner-only` | `false` | Restrict mount access to the mounting user only (FUSE only; by default all users can access, which requires `user_allow_other` in /etc/fuse.conf) |
 | `--token-file` | | Path to a token file (re-read on each request for credential rotation) |
 | `--inode-soft-limit` | `0` | Soft cap on the in-memory inode table (0 disables). See "Bounding inode memory" below. |
@@ -312,7 +312,7 @@ RUST_LOG=hf_mount=debug hf-mount-fuse repo gpt2 /mnt/gpt2
 - **Simple writes** (default) -- append-only, in-memory, synchronous upload on close
 - **Advanced writes** (`--advanced-writes`) -- staging files on disk, random writes + seek, async debounced flush
 - **Remote sync** -- a live-follow event stream (buckets) plus background polling keep the local view in sync with remote changes
-- **POSIX metadata** -- chmod, chown, timestamps, symlinks (in-memory only, lost on unmount)
+- **POSIX metadata** -- on buckets, file modes (chmod), mtimes and symlinks are stored on the Hub; ownership (chown), atime and directory modes/timestamps are in-memory only, lost on unmount
 - **Overlay mode** (`--overlay`) -- mount point doubles as a writable local layer; remote stays read-only
 
 ## Consistency model

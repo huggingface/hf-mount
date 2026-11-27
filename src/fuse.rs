@@ -428,7 +428,7 @@ impl Filesystem for FuseAdapter {
 
     /// Read the target of a symbolic link.
     fn readlink(&self, _req: &Request, ino: INodeNo, reply: ReplyData) {
-        match self.virtual_fs.readlink(ino.0) {
+        match self.runtime.block_on(self.virtual_fs.readlink(ino.0)) {
             Ok(target) => reply.data(target.as_bytes()),
             Err(e) => reply.error(Errno::from_i32(e)),
         }

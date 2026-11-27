@@ -49,6 +49,20 @@ pub struct FollowChange {
     /// back to `uploaded_at`.
     #[serde(default)]
     pub mtime: Option<String>,
+    /// Stored POSIX `st_mode`: `None` = unchanged (absent), `Some(None)` =
+    /// cleared by a re-upload (explicit `null`), `Some(Some(m))` = set.
+    #[serde(default, deserialize_with = "present")]
+    pub mode: Option<Option<u32>>,
+}
+
+/// Deserialize a field that is present (possibly `null`) into `Some(_)`, so
+/// `#[serde(default)]` can tell "absent" from "explicit null".
+fn present<'de, D, T>(deserializer: D) -> std::result::Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
 }
 
 /// A parsed event from the live-follow feed.
@@ -343,8 +357,9 @@ mod tests {
             event: "changes".into(),
             data: r#"{"cursor":"c3","changes":[
                 {"path":"a/b.txt","op":"add","size":42,"xetHash":"h1","uploadedAt":"2026-05-01T00:00:00Z"},
-                {"path":"a/c.txt","op":"update","uploadedAt":"2026-05-01T00:00:01Z","mtime":null,"mtimeNanos":null},
-                {"path":"old.txt","op":"delete"}
+                {"path":"a/c.txt","op":"update","uploadedAt":"2026-05-01T00:00:01Z","mtime":null,"mtimeNanos":null,"mode":null},
+                {"path":"old.txt","op":"delete"},
+                {"path":"a/run.sh","op":"update","mode":33261}
             ]}"#
             .into(),
         };
@@ -352,7 +367,7 @@ mod tests {
             panic!("expected Changes");
         };
         assert_eq!(cursor, "c3");
-        assert_eq!(changes.len(), 3);
+        assert_eq!(changes.len(), 4);
         assert_eq!(changes[0].op, FollowOp::Add);
         assert_eq!(changes[0].size, Some(42));
         assert_eq!(changes[0].xet_hash.as_deref(), Some("h1"));
@@ -360,7 +375,11 @@ mod tests {
         assert_eq!(changes[1].op, FollowOp::Update);
         assert_eq!(changes[1].size, None);
         assert_eq!(changes[1].mtime, None);
+        // `mode` distinguishes absent (unchanged) from null (cleared).
+        assert_eq!(changes[0].mode, None);
+        assert_eq!(changes[1].mode, Some(None));
         assert_eq!(changes[2].op, FollowOp::Delete);
+        assert_eq!(changes[3].mode, Some(Some(0o100755)));
     }
 
     #[test]

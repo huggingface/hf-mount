@@ -531,7 +531,7 @@ impl NFSFileSystem for NFSAdapter {
     }
 
     async fn readlink(&self, id: fileid3) -> Result<nfspath3, nfsstat3> {
-        let target = self.virtual_fs.readlink(id).map_err(errno_to_nfs)?;
+        let target = self.virtual_fs.readlink(id).await.map_err(errno_to_nfs)?;
         Ok(nfsstring(target.into_bytes()))
     }
 }

@@ -3,7 +3,7 @@ use std::fs::{File, OpenOptions};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime};
 
 use bytes::{Bytes, BytesMut};
 use tracing::{debug, error, info, warn};
@@ -510,6 +510,7 @@ impl VirtualFs {
                 e.size = entry.size;
                 e.mtime = entry.mtime;
                 e.mode = entry.mode;
+                e.mode_stored = true;
                 e.xet_hash = None;
                 if !e.is_dirty() {
                     e.set_dirty();
@@ -787,17 +788,15 @@ impl VirtualFs {
     // ── Helpers ─────────────────────────────────────────────────────────
 
     fn make_vfs_attr(&self, entry: &InodeEntry) -> VirtualFsAttr {
-        let perm = if self.read_only {
-            match entry.kind {
-                InodeKind::File => 0o444,
-                InodeKind::Directory => 0o555,
-                InodeKind::Symlink => 0o777,
-            }
-        } else {
-            match entry.kind {
-                InodeKind::Symlink => 0o777,
-                _ => entry.mode,
-            }
+        // A file's own (stored) mode wins over `--file-mode`; read-only
+        // mounts still strip the write bits.
+        let perm = match (entry.kind, entry.stored_perm()) {
+            (InodeKind::Symlink, _) => 0o777,
+            (InodeKind::File, Some(perm)) if self.read_only => perm & !0o222,
+            (InodeKind::File, None) if self.read_only => 0o444,
+            (InodeKind::File, None) => self.file_mode,
+            (InodeKind::Directory, _) if self.read_only => 0o555,
+            _ => entry.mode,
         };
 
         VirtualFsAttr {
@@ -819,8 +818,17 @@ impl VirtualFs {
     /// Skips HEAD if the inode was validated within `metadata_ttl`.
     /// If the file's xet_hash changed, updates the inode and invalidates kernel cache.
     /// If the file was deleted (404), removes the inode.
+    /// If it turned into a symlink or back (stored mode type bits changed),
+    /// removes the inode and returns the HEAD info so the caller can insert
+    /// the path afresh with the right kind.
     /// On network errors, silently returns (graceful degradation).
-    async fn revalidate_file(&self, ino: u64, full_path: &str, current_hash: Option<&str>, current_etag: Option<&str>) {
+    async fn revalidate_file(
+        &self,
+        ino: u64,
+        full_path: &str,
+        current_hash: Option<&str>,
+        current_etag: Option<&str>,
+    ) -> Option<crate::hub_api::HeadFileInfo> {
         // When serve_lookup_from_cache is true, skip HEAD if recently validated.
         // When false (minimal mode), always HEAD on every lookup.
         if self.serve_lookup_from_cache {
@@ -829,7 +837,7 @@ impl VirtualFs {
                 && let Some(last) = entry.last_revalidated
                 && last.elapsed() < self.metadata_ttl
             {
-                return;
+                return None;
             }
         }
 
@@ -837,7 +845,7 @@ impl VirtualFs {
             Ok(r) => r,
             Err(e) => {
                 debug!("head_file({}) failed, using cached: {}", full_path, e);
-                return;
+                return None;
             }
         };
 
@@ -848,10 +856,29 @@ impl VirtualFs {
         // stall the whole VFS (and has been observed to deadlock production
         // pods). Apply the mutation, drop the lock, then notify.
         let mut to_invalidate: Vec<(u64, InvalKind)> = Vec::new();
+        // A file that became a symlink (or back) is replaced, not updated in
+        // place: the kernel never expects an inode to change type.
+        let (remote, replaced) = match remote {
+            Some(head) => {
+                let inodes = self.inode_table.read().expect("inodes poisoned");
+                if inodes
+                    .get(ino)
+                    .is_some_and(|e| e.kind != InodeKind::from_file_mode(head.mode))
+                {
+                    info!("Remote file type change detected via HEAD: {}", full_path);
+                    (None, Some(head))
+                } else {
+                    (Some(head), None)
+                }
+            }
+            None => (None, None),
+        };
         match remote {
             None => {
-                // File deleted remotely → remove from inode table
-                info!("Remote deletion detected via HEAD: {}", full_path);
+                // File deleted (or replaced) remotely → remove from inode table
+                if replaced.is_none() {
+                    info!("Remote deletion detected via HEAD: {}", full_path);
+                }
                 let mut inodes = self.inode_table.write().expect("inodes poisoned");
                 if let Some(entry) = inodes.get(ino) {
                     let parent = entry.parent;
@@ -882,7 +909,7 @@ impl VirtualFs {
                         Some(s) => s,
                         None => {
                             warn!("HEAD response missing size for {}, skipping update", full_path);
-                            return;
+                            return None;
                         }
                     };
                     let remote_mtime = head_info
@@ -897,6 +924,7 @@ impl VirtualFs {
                         remote_etag.map(|s| s.to_string()),
                         remote_size,
                         remote_mtime,
+                        head_info.mode,
                     );
                     let kind = if inodes.has_open_handles(ino) {
                         InvalKind::AttrOnly
@@ -904,13 +932,16 @@ impl VirtualFs {
                         InvalKind::Pages
                     };
                     to_invalidate.push((ino, kind));
-                } else {
+                } else if let Some(entry) = inodes.get_mut(ino) {
                     // Update stored etag even when content didn't change,
                     // so future revalidations have the latest value.
-                    if let Some(entry) = inodes.get_mut(ino)
-                        && remote_etag.is_some()
-                    {
+                    if remote_etag.is_some() {
                         entry.etag = remote_etag.map(|s| s.to_string());
+                    }
+                    // Metadata-only change (e.g. a remote chmod).
+                    if !entry.is_dirty() && entry.stored_perm() != inode::perm_bits(head_info.mode) {
+                        entry.set_stored_mode(head_info.mode);
+                        to_invalidate.push((ino, InvalKind::AttrOnly));
                     }
                 }
                 // Stamp revalidation time regardless of whether content changed
@@ -930,6 +961,7 @@ impl VirtualFs {
                 invalidate(ino, kind);
             }
         }
+        replaced
     }
 
     /// Ensure children of a directory inode are loaded from the Hub API.
@@ -1036,7 +1068,7 @@ impl VirtualFs {
                 let kind = if entry.entry_type == "directory" {
                     InodeKind::Directory
                 } else {
-                    InodeKind::File
+                    InodeKind::from_file_mode(entry.mode)
                 };
                 let size = entry.size.unwrap_or(0);
                 let mtime = entry
@@ -1049,6 +1081,19 @@ impl VirtualFs {
                 } else {
                     self.file_mode
                 };
+                // A cached file that became a symlink (or back) remotely is
+                // replaced, unless local writes or open handles still need it.
+                if let Some(stale) = inodes
+                    .lookup_child(parent_ino, &rel_path)
+                    .filter(|e| e.kind != kind && e.kind != InodeKind::Directory && kind != InodeKind::Directory)
+                    .map(|e| e.inode)
+                {
+                    if inodes.has_dirty_or_open_descendants(stale) {
+                        seen_names.insert(rel_path);
+                        continue;
+                    }
+                    inodes.remove(stale);
+                }
 
                 let ino = inodes.insert(
                     parent_ino,
@@ -1064,10 +1109,13 @@ impl VirtualFs {
                 );
                 let rel_name = rel_path.to_string();
                 seen_names.insert(rel_name);
-                if let Some(oid) = entry.oid
-                    && let Some(e) = inodes.get_mut(ino)
-                {
-                    e.etag = Some(oid);
+                if let Some(e) = inodes.get_mut(ino) {
+                    if let Some(oid) = entry.oid {
+                        e.etag = Some(oid);
+                    }
+                    if e.kind != InodeKind::Directory && !e.is_dirty() {
+                        e.set_stored_mode(entry.mode);
+                    }
                 }
             }
         }
@@ -1494,15 +1542,17 @@ impl VirtualFs {
             match inodes.lookup_child(parent, name) {
                 // Clean cached file: HEAD-revalidate (gated by `metadata_ttl`)
                 // so size/hash/mtime stay fresh between poll cycles.
-                Some(entry) if entry.kind == InodeKind::File && !entry.is_dirty() => FastResult::NeedsRevalidation {
-                    ino: entry.inode,
-                    full_path: entry.full_path.clone(),
-                    current_hash: entry.xet_hash.clone(),
-                    current_etag: entry.etag.clone(),
-                },
+                Some(entry) if entry.kind != InodeKind::Directory && !entry.is_dirty() => {
+                    FastResult::NeedsRevalidation {
+                        ino: entry.inode,
+                        full_path: entry.full_path.clone(),
+                        current_hash: entry.xet_hash.clone(),
+                        current_etag: entry.etag.clone(),
+                    }
+                }
                 // Either a dirty file (local writes win until flushed) or any
                 // entry under a freshly listed parent we can trust as-is.
-                Some(entry) if entry.kind == InodeKind::File || self.listing_is_fresh(parent_entry) => {
+                Some(entry) if entry.kind != InodeKind::Directory || self.listing_is_fresh(parent_entry) => {
                     FastResult::Hit(self.make_vfs_attr(entry))
                 }
                 // Cached non-file under an unloaded or stale parent: we can't
@@ -1541,8 +1591,12 @@ impl VirtualFs {
                 current_hash,
                 current_etag,
             } => {
-                self.revalidate_file(ino, &full_path, current_hash.as_deref(), current_etag.as_deref())
-                    .await;
+                if let Some(head) = self
+                    .revalidate_file(ino, &full_path, current_hash.as_deref(), current_etag.as_deref())
+                    .await
+                {
+                    return self.insert_file_from_head(parent, name, &full_path, head);
+                }
                 let inodes = self.inode_table.read().expect("inodes poisoned");
                 return match inodes.get(ino) {
                     Some(entry) => Ok(self.make_vfs_attr(entry)),
@@ -1722,17 +1776,18 @@ impl VirtualFs {
             Some(e) if e.kind != InodeKind::Directory => return Err(libc::ENOTDIR),
             Some(_) => {}
         }
+        let kind = InodeKind::from_file_mode(head.mode);
         if let Some(existing) = inodes.lookup_child(parent, name) {
             // A concurrent HEAD lookup may have just inserted the same file —
             // return its attr instead of redoing the work.
-            if existing.kind == InodeKind::File {
+            if existing.kind == kind {
                 return Ok(self.make_vfs_attr(existing));
             }
-            // The cached entry is a directory but HEAD just confirmed the
-            // remote path is a file: the dir was replaced. Evict the stale
-            // subtree, unless dirty/open descendants would be lost — in that
-            // case keep serving the stale dir (the next sweep / explicit
-            // close will eventually clear the way).
+            // The cached entry is a directory (or the other of file and
+            // symlink) but HEAD just confirmed the remote path's kind: it was
+            // replaced. Evict the stale subtree, unless dirty/open descendants
+            // would be lost — in that case keep serving the stale dir (the
+            // next sweep / explicit close will eventually clear the way).
             let stale_ino = existing.inode;
             if inodes.has_dirty_or_open_descendants(stale_ino) {
                 return Ok(self.make_vfs_attr(existing));
@@ -1743,7 +1798,7 @@ impl VirtualFs {
             parent,
             name.to_string(),
             full_path.to_string(),
-            InodeKind::File,
+            kind,
             size,
             mtime,
             head.xet_hash,
@@ -1751,10 +1806,9 @@ impl VirtualFs {
             self.uid,
             self.gid,
         );
-        if let Some(etag) = head.etag
-            && let Some(entry) = inodes.get_mut(ino)
-        {
-            entry.etag = Some(etag);
+        if let Some(entry) = inodes.get_mut(ino) {
+            entry.etag = head.etag;
+            entry.set_stored_mode(head.mode);
         }
         match inodes.get(ino) {
             Some(entry) => Ok(self.make_vfs_attr(entry)),
@@ -2149,6 +2203,7 @@ impl VirtualFs {
             if let Some(entry) = inodes.get_mut(ino) {
                 entry.set_dirty();
                 entry.size = 0;
+                entry.mtime = SystemTime::now();
                 entry.xet_hash = None;
                 channel
                     .dirty_generation_at_open
@@ -2383,6 +2438,7 @@ impl VirtualFs {
                             }
                             entry.size = new_end;
                         }
+                        entry.mtime = SystemTime::now();
                         entry.set_dirty();
                     }
                     inodes.touch(handle_ino);
@@ -2447,6 +2503,7 @@ impl VirtualFs {
                 let mut inodes = self.inode_table.write().expect("inodes poisoned");
                 if let Some(entry) = inodes.get_mut(handle_ino) {
                     entry.size = new_size;
+                    entry.mtime = SystemTime::now();
                 }
 
                 Ok(len as u32)
@@ -2780,23 +2837,23 @@ impl VirtualFs {
         };
 
         // Commit to Hub
-        let (full_path, pending_deletes) = {
+        let (full_path, pending_deletes, mtime, mode) = {
             let inodes = self.inode_table.read().expect("inodes poisoned");
             let entry = inodes.get(ino).ok_or(libc::ENOENT)?;
-            (entry.full_path.to_string(), entry.pending_deletes.clone())
+            (
+                entry.full_path.to_string(),
+                entry.pending_deletes.clone(),
+                entry.mtime,
+                entry.stored_mode(),
+            )
         };
 
-        let mtime_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-
-        let mut ops: Vec<BatchOp> = vec![BatchOp::AddFile {
-            path: full_path.clone(),
-            xet_hash: file_info.hash().to_string(),
-            mtime: mtime_ms,
-            content_type: None,
-        }];
+        let mut ops: Vec<BatchOp> = vec![BatchOp::add_file(
+            full_path.clone(),
+            file_info.hash().to_string(),
+            mtime,
+            mode,
+        )];
         for old_path in &pending_deletes {
             ops.push(BatchOp::DeleteFile { path: old_path.clone() });
         }
@@ -2881,6 +2938,8 @@ impl VirtualFs {
                 caller_gid,
             );
             let dirty_gen = if let Some(entry) = inodes.get_mut(ino) {
+                // The create mode is the file's own: persisted on upload.
+                entry.mode_stored = true;
                 entry.set_dirty();
                 entry.dirty_generation
             } else {
@@ -3056,6 +3115,7 @@ impl VirtualFs {
             xet_hash: hash,
             size: source.size,
             mode: source.mode,
+            stored_mode: source.stored_mode(),
             uid: source.uid,
             gid: source.gid,
         }))
@@ -3224,13 +3284,12 @@ impl VirtualFs {
 
         // Phase 2: commit the alias to the Hub.
         let now = SystemTime::now();
-        let mtime_ms = now.duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
-        let ops = [BatchOp::AddFile {
-            path: new_full_path.clone(),
-            xet_hash: source.xet_hash.clone(),
-            mtime: mtime_ms,
-            content_type: None,
-        }];
+        let ops = [BatchOp::add_file(
+            new_full_path.clone(),
+            source.xet_hash.clone(),
+            now,
+            source.stored_mode,
+        )];
         if let Err(e) = self.hub_client.batch_operations(&ops).await {
             error!(
                 "link: failed to commit {} as alias of {}: {}",
@@ -3273,6 +3332,9 @@ impl VirtualFs {
             source.uid,
             source.gid,
         );
+        if let Some(entry) = inodes.get_mut(new_ino) {
+            entry.set_stored_mode(source.stored_mode);
+        }
         inodes.touch_parent(newparent, now);
         inodes.touch(new_ino);
 
@@ -3457,18 +3519,33 @@ impl VirtualFs {
 
         self.ensure_children_loaded(parent).await?;
 
-        let now = SystemTime::now();
-        let (ino, full_path) = {
-            let mut inodes = self.inode_table.write().expect("inodes poisoned");
+        let validate = |inodes: &InodeTable| -> VirtualFsResult<String> {
             let parent_entry = match inodes.get(parent) {
                 Some(e) if e.kind == InodeKind::Directory => e,
                 Some(_) => return Err(libc::ENOTDIR),
                 None => return Err(libc::ENOENT),
             };
-            let full_path = inode::child_path(&parent_entry.full_path, name);
             if inodes.lookup_child(parent, name).is_some() {
                 return Err(libc::EEXIST);
             }
+            Ok(inode::child_path(&parent_entry.full_path, name))
+        };
+        let full_path = validate(&self.inode_table.read().expect("inodes poisoned"))?;
+
+        // Persist as a bucket file whose content is the target (overlay mode
+        // keeps it local, like every other write).
+        let now = SystemTime::now();
+        let xet_hash = if self.overlay() {
+            None
+        } else {
+            Some(self.upload_symlink(&full_path, target, now).await?)
+        };
+
+        let ino = {
+            let mut inodes = self.inode_table.write().expect("inodes poisoned");
+            // A concurrent create may have won the name while we uploaded
+            // (same accepted TOCTOU as link()).
+            validate(&inodes)?;
             let ino = inodes.insert(
                 parent,
                 name.to_string(),
@@ -3476,7 +3553,7 @@ impl VirtualFs {
                 InodeKind::Symlink,
                 target.len() as u64,
                 now,
-                None,
+                xet_hash,
                 mode,
                 caller_uid,
                 caller_gid,
@@ -3485,7 +3562,7 @@ impl VirtualFs {
                 entry.symlink_target = Some(target.to_string());
             }
             inodes.touch_parent(parent, now);
-            (ino, full_path)
+            ino
         };
 
         self.negative_cache_remove(&full_path);
@@ -3493,13 +3570,75 @@ impl VirtualFs {
         Ok(self.make_vfs_attr(inodes.get(ino).ok_or(libc::ENOENT)?))
     }
 
-    pub fn readlink(&self, ino: u64) -> VirtualFsResult<String> {
-        let inodes = self.inode_table.read().expect("inodes poisoned");
-        match inodes.get(ino) {
-            Some(entry) if entry.kind == InodeKind::Symlink => entry.symlink_target.clone().ok_or(libc::EINVAL),
-            Some(_) => Err(libc::EINVAL),
-            None => Err(libc::ENOENT),
+    /// Upload `target` as the content of a symlink file at `full_path` and
+    /// commit it with an `S_IFLNK` mode. Returns the content's xet hash.
+    async fn upload_symlink(&self, full_path: &str, target: &str, mtime: SystemTime) -> VirtualFsResult<String> {
+        let upload = async {
+            let mut writer = self.xet_sessions.create_streaming_writer().await?;
+            writer.write(target.as_bytes()).await?;
+            writer.finish_boxed().await
+        };
+        let info = upload.await.map_err(|e| {
+            error!("symlink: upload of {} failed: {}", full_path, e);
+            e.to_errno()
+        })?;
+        // `rm l && ln -s t l`: the queued delete of the old file must not
+        // remove the new symlink.
+        if let Some(fm) = &self.flush_manager {
+            fm.cancel_delete(full_path);
         }
+        let op = BatchOp::add_file(
+            full_path.to_string(),
+            info.hash().to_string(),
+            mtime,
+            Some(inode::S_IFLNK | 0o777),
+        );
+        if let Err(e) = self.hub_client.batch_operations(&[op]).await {
+            error!("symlink: commit of {} failed: {}", full_path, e);
+            return Err(e.to_errno());
+        }
+        Ok(info.hash().to_string())
+    }
+
+    /// Symlink target. Symlinks listed from the Hub fetch their content (the
+    /// target) on first readlink.
+    pub async fn readlink(&self, ino: u64) -> VirtualFsResult<String> {
+        let (xet_hash, size) = {
+            let inodes = self.inode_table.read().expect("inodes poisoned");
+            match inodes.get(ino) {
+                Some(entry) if entry.kind == InodeKind::Symlink => match (&entry.symlink_target, &entry.xet_hash) {
+                    (Some(target), _) => return Ok(target.clone()),
+                    (None, Some(hash)) => (hash.clone(), entry.size),
+                    (None, None) => return Err(libc::EIO),
+                },
+                Some(_) => return Err(libc::EINVAL),
+                None => return Err(libc::ENOENT),
+            }
+        };
+
+        let fetch = async {
+            let mut stream =
+                self.xet_sessions
+                    .download_stream_boxed(&XetFileInfo::new(xet_hash.clone(), size), 0, size, false)?;
+            let mut content = Vec::with_capacity(size as usize);
+            while let Some(chunk) = stream.next().await? {
+                content.extend_from_slice(&chunk);
+            }
+            Ok::<_, crate::error::Error>(content)
+        };
+        let content = fetch.await.map_err(|e| {
+            error!("readlink: fetching target of ino={} failed: {}", ino, e);
+            e.to_errno()
+        })?;
+        let target = String::from_utf8(content).map_err(|_| libc::EIO)?;
+
+        let mut inodes = self.inode_table.write().expect("inodes poisoned");
+        if let Some(entry) = inodes.get_mut(ino)
+            && entry.xet_hash.as_deref() == Some(xet_hash.as_str())
+        {
+            entry.symlink_target = Some(target.clone());
+        }
+        Ok(target)
     }
 
     pub async fn rmdir(&self, parent: u64, name: &str) -> VirtualFsResult<()> {
@@ -3607,7 +3746,7 @@ impl VirtualFs {
         }
 
         // Pre-load lazy directories before the sync validate phase:
-        // - Source subtree: so descendant_files is complete for remote rename ops
+        // - Source subtree: so remote_files is complete for remote rename ops
         // - Destination dir (if exists): so children.is_empty() check is accurate
         let (src_dir, dst_dir) = {
             let inodes = self.inode_table.read().expect("inodes poisoned");
@@ -3776,8 +3915,9 @@ impl VirtualFs {
             }
         }
 
-        // For directories, collect all descendant clean files for remote rename
-        let descendant_files = if src.kind == InodeKind::Directory {
+        // Clean committed files to re-add under the new path: the source
+        // itself, or for directories all its descendant files and symlinks.
+        let remote_files = if src.kind == InodeKind::Directory {
             let mut files = Vec::new();
             let mut stack = vec![src.inode];
             debug!(
@@ -3798,14 +3938,8 @@ impl VirtualFs {
                                 child.xet_hash.as_deref()
                             );
                             match child.kind {
-                                InodeKind::File if !child.is_dirty() && child.xet_hash.is_some() => {
-                                    files.push((
-                                        child.full_path.to_string(),
-                                        child.xet_hash.clone().expect("checked is_some above"),
-                                    ));
-                                }
                                 InodeKind::Directory => stack.push(child_ref.ino),
-                                _ => {}
+                                _ => files.extend(RemoteFile::of(child)),
                             }
                         }
                     }
@@ -3813,7 +3947,7 @@ impl VirtualFs {
             }
             files
         } else {
-            Vec::new()
+            RemoteFile::of(src).into_iter().collect()
         };
 
         let info = RenameInfo {
@@ -3823,7 +3957,7 @@ impl VirtualFs {
             xet_hash: src.xet_hash.clone(),
             is_dirty: src.is_dirty(),
             new_full_path,
-            descendant_files,
+            remote_files,
         };
         inodes.add_rename(info.old_path.clone(), info.new_full_path.clone());
         Ok(info)
@@ -3833,48 +3967,27 @@ impl VirtualFs {
     /// Returns true if remote operations were actually sent, false if skipped
     /// (e.g. dirty file with no remote presence).
     async fn rename_remote(&self, info: &RenameInfo) -> VirtualFsResult<bool> {
-        let mtime_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-
-        let ops: Vec<BatchOp> = if info.kind == InodeKind::File
-            && !info.is_dirty
-            && let Some(ref hash) = info.xet_hash
-        {
-            vec![
-                BatchOp::AddFile {
-                    path: info.new_full_path.clone(),
-                    xet_hash: hash.clone(),
-                    mtime: mtime_ms,
-                    content_type: None,
-                },
-                BatchOp::DeleteFile {
-                    path: info.old_path.clone(),
-                },
-            ]
-        } else if info.kind == InodeKind::Directory && !info.descendant_files.is_empty() {
-            // Hub batch API requires all adds before all deletes
-            let mut ops = Vec::with_capacity(info.descendant_files.len() * 2);
-            let mut deletes = Vec::with_capacity(info.descendant_files.len());
-            for (child_old_path, child_hash) in &info.descendant_files {
-                let suffix = child_old_path.strip_prefix(&info.old_path).unwrap_or(child_old_path);
-                let child_new_path = format!("{}{}", info.new_full_path, suffix);
-                ops.push(BatchOp::AddFile {
-                    path: child_new_path,
-                    xet_hash: child_hash.clone(),
-                    mtime: mtime_ms,
-                    content_type: None,
-                });
-                deletes.push(BatchOp::DeleteFile {
-                    path: child_old_path.clone(),
-                });
-            }
-            ops.append(&mut deletes);
-            ops
-        } else {
+        if info.remote_files.is_empty() {
             return Ok(false);
-        };
+        }
+        // Hub batch API requires all adds before all deletes. Re-adding keeps
+        // mtime and mode: addFile clears whatever it omits.
+        let mut ops = Vec::with_capacity(info.remote_files.len() * 2);
+        let mut deletes = Vec::with_capacity(info.remote_files.len());
+        for file in &info.remote_files {
+            let suffix = file.path.strip_prefix(&info.old_path).unwrap_or(&file.path);
+            let new_path = format!("{}{}", info.new_full_path, suffix);
+            ops.push(BatchOp::add_file(
+                new_path,
+                file.xet_hash.clone(),
+                file.mtime,
+                file.mode,
+            ));
+            deletes.push(BatchOp::DeleteFile {
+                path: file.path.clone(),
+            });
+        }
+        ops.append(&mut deletes);
 
         debug!(
             "rename_remote: {} -> {} ops={}",
@@ -4159,10 +4272,15 @@ impl VirtualFs {
                 }
             }
 
-            let mut inodes = self.inode_table.write().expect("inodes poisoned");
-            if let Some(entry) = inodes.get_mut(ino) {
+            let update = {
+                let mut inodes = self.inode_table.write().expect("inodes poisoned");
+                let entry = inodes.get_mut(ino).ok_or(libc::ENOENT)?;
+                let mode_changed = mode.is_some_and(|m| entry.stored_perm() != Some(m));
+                let mtime_changed = mtime.is_some_and(|m| entry.mtime != m);
+                let previous = (entry.mode, entry.mode_stored, entry.mtime);
                 if let Some(m) = mode {
                     entry.mode = m;
+                    entry.mode_stored = true;
                 }
                 if let Some(u) = uid {
                     entry.uid = u;
@@ -4177,6 +4295,21 @@ impl VirtualFs {
                     entry.mtime = m;
                 }
                 entry.ctime = SystemTime::now();
+                (self.persist_metadata(entry, mode_changed, mtime_changed), previous)
+            };
+            match update {
+                (Some(MetadataUpdate::Commit(op)), previous) => {
+                    if let Err(e) = self.hub_client.batch_operations(&[op]).await {
+                        error!("setattr: metadata update of ino={} failed: {}", ino, e);
+                        // Don't report a mode/mtime the Hub doesn't have.
+                        if let Some(entry) = self.inode_table.write().expect("inodes poisoned").get_mut(ino) {
+                            (entry.mode, entry.mode_stored, entry.mtime) = previous;
+                        }
+                        return Err(e.to_errno());
+                    }
+                }
+                (Some(MetadataUpdate::Flush), _) => self.schedule_flush(ino),
+                (None, _) => {}
             }
         }
 
@@ -4185,6 +4318,35 @@ impl VirtualFs {
             Some(entry) => Ok(self.make_vfs_attr(entry)),
             None => Err(libc::ENOENT),
         }
+    }
+
+    /// Decide how a local chmod / mtime change reaches the Hub (owner and
+    /// atime stay local: the Hub stores neither; directories have no stored
+    /// metadata). Called under the inode write lock, after the change.
+    fn persist_metadata(&self, entry: &mut InodeEntry, mode: bool, mtime: bool) -> Option<MetadataUpdate> {
+        if !(mode || mtime) || entry.kind == InodeKind::Directory || self.overlay() {
+            return None;
+        }
+        if entry.is_dirty() {
+            // The pending upload commits the new metadata. In advanced mode a
+            // flush may already be in flight with the old values: bump the
+            // generation so it doesn't clear dirty, and make the next flush
+            // commit even if the content is unchanged. (A streaming writer
+            // reads mode/mtime at commit time.)
+            if !self.advanced_writes {
+                return None;
+            }
+            entry.meta_dirty = true;
+            entry.set_dirty();
+            return Some(MetadataUpdate::Flush);
+        }
+        // Clean committed file: change only the metadata, no re-upload.
+        entry.xet_hash.as_ref()?;
+        Some(MetadataUpdate::Commit(BatchOp::update_metadata(
+            entry.full_path.to_string(),
+            mtime.then_some(entry.mtime),
+            if mode { entry.stored_mode() } else { None },
+        )))
     }
 
     /// Read a file inode's fields into a `FileEntry` snapshot.
@@ -4238,9 +4400,31 @@ struct RenameInfo {
     xet_hash: Option<String>,
     is_dirty: bool,
     new_full_path: String,
-    /// Descendant clean files to rename on the remote (dir renames only):
-    /// old path and xet hash.
-    descendant_files: Vec<(String, String)>,
+    /// Clean files to rename on the remote: the source itself, or its
+    /// descendants for a directory.
+    remote_files: Vec<RemoteFile>,
+}
+
+/// A clean, committed file or symlink as stored on the Hub.
+struct RemoteFile {
+    path: String,
+    xet_hash: String,
+    mtime: SystemTime,
+    mode: Option<u32>,
+}
+
+impl RemoteFile {
+    fn of(entry: &InodeEntry) -> Option<Self> {
+        if entry.kind == InodeKind::Directory || entry.is_dirty() {
+            return None;
+        }
+        Some(Self {
+            path: entry.full_path.to_string(),
+            xet_hash: entry.xet_hash.clone()?,
+            mtime: entry.mtime,
+            mode: entry.stored_mode(),
+        })
+    }
 }
 
 /// Unregisters the rename `rename_validate` registered (`InodeTable::renames`)
@@ -4331,12 +4515,21 @@ struct StreamingChannel {
     commit_hook: std::sync::Mutex<Option<CommitHookTx>>,
 }
 
+/// How `setattr` persists a mode/mtime change, see `persist_metadata`.
+enum MetadataUpdate {
+    /// Send this `updateMetadata` now.
+    Commit(BatchOp),
+    /// Re-flush the dirty file (advanced writes).
+    Flush,
+}
+
 /// Committed source attributes read under lock for `link()`.
 struct LinkSource {
     path: Arc<str>,
     xet_hash: String,
     size: u64,
     mode: u16,
+    stored_mode: Option<u32>,
     uid: u32,
     gid: u32,
 }

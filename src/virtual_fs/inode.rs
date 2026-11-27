@@ -18,11 +18,32 @@ pub fn child_path(parent_path: &str, name: &str) -> String {
     }
 }
 
+/// File-type bits of a POSIX `st_mode`, as stored by the Hub.
+pub const S_IFMT: u32 = 0o170000;
+pub const S_IFREG: u32 = 0o100000;
+pub const S_IFLNK: u32 = 0o120000;
+
+/// Permission bits of a stored `st_mode`.
+pub fn perm_bits(mode: Option<u32>) -> Option<u16> {
+    mode.map(|m| (m & 0o7777) as u16)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InodeKind {
     File,
     Directory,
     Symlink,
+}
+
+impl InodeKind {
+    /// Kind of a remote file entry from its stored `st_mode`: a symlink is a
+    /// file whose content is the target.
+    pub fn from_file_mode(mode: Option<u32>) -> Self {
+        match mode {
+            Some(m) if m & S_IFMT == S_IFLNK => Self::Symlink,
+            _ => Self::File,
+        }
+    }
 }
 
 /// A directory child entry: stores the name on the parent→child edge.
@@ -93,6 +114,19 @@ impl EvictionState {
     }
 }
 
+/// Point-in-time view of a file or symlink, see [`InodeTable::file_snapshot`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct FileSnapshot {
+    pub ino: u64,
+    pub path: Arc<str>,
+    pub kind: InodeKind,
+    pub xet_hash: Option<String>,
+    pub etag: Option<String>,
+    pub size: u64,
+    pub stored_perm: Option<u16>,
+    pub dirty: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct InodeEntry {
     pub inode: u64,
@@ -106,6 +140,13 @@ pub struct InodeEntry {
     pub size: u64,
     pub mtime: SystemTime,
     pub mode: u16,
+    /// Files only: `mode` is the file's own (stored on the Hub, or set locally
+    /// by create/chmod and sent with the next upload) instead of the
+    /// mount-wide `--file-mode`.
+    pub mode_stored: bool,
+    /// Mode or mtime changed while content was dirty (advanced writes): the
+    /// next flush must commit even if the content hash is unchanged.
+    pub meta_dirty: bool,
     pub uid: u32,
     pub gid: u32,
     pub atime: SystemTime,
@@ -213,6 +254,31 @@ impl InodeEntry {
         self.children_loaded_at.is_some()
     }
 
+    /// Apply a stored remote `st_mode` (`None`: the file has none and falls
+    /// back to `--file-mode`).
+    pub fn set_stored_mode(&mut self, mode: Option<u32>) {
+        self.mode_stored = mode.is_some();
+        if let Some(perm) = perm_bits(mode) {
+            self.mode = perm;
+        }
+    }
+
+    /// Permission bits stored for this entry, if any.
+    pub fn stored_perm(&self) -> Option<u16> {
+        self.mode_stored.then_some(self.mode)
+    }
+
+    /// Full `st_mode` to keep on the Hub, sent with every upload of this
+    /// entry (omitting it clears the stored mode): always set for symlinks,
+    /// for files only when they have their own mode.
+    pub fn stored_mode(&self) -> Option<u32> {
+        match self.kind {
+            InodeKind::Symlink => Some(S_IFLNK | self.stored_perm().unwrap_or(0o777) as u32),
+            InodeKind::File => self.stored_perm().map(|perm| S_IFREG | perm as u32),
+            InodeKind::Directory => None,
+        }
+    }
+
     /// Mark the inode as dirty, incrementing the generation counter.
     pub fn set_dirty(&mut self) {
         self.dirty_generation = self.dirty_generation.saturating_add(1);
@@ -272,10 +338,10 @@ impl InodeEntry {
             self.staging_is_current = true;
             self.size = size;
             self.pending_deletes.clear();
+            self.meta_dirty = false;
         }
-        let now = SystemTime::now();
-        self.mtime = now;
-        self.ctime = now;
+        // `mtime` was committed as-is (last write or explicit setattr).
+        self.ctime = SystemTime::now();
         // Mark as recently validated so subsequent lookups skip HEAD revalidation
         // for the duration of metadata_ttl (we just committed this exact hash).
         self.last_revalidated = Some(Instant::now());
@@ -335,6 +401,8 @@ impl InodeTable {
             size: 0,
             mtime: UNIX_EPOCH,
             mode: 0o755,
+            mode_stored: false,
+            meta_dirty: false,
             uid: 0,
             gid: 0,
             atime: UNIX_EPOCH,
@@ -676,6 +744,8 @@ impl InodeTable {
             size,
             mtime,
             mode,
+            mode_stored: false,
+            meta_dirty: false,
             uid,
             gid,
             atime: mtime,
@@ -737,26 +807,27 @@ impl InodeTable {
             .collect()
     }
 
-    /// Snapshot of all file entries: (ino, full_path, xet_hash, etag, size, is_dirty)
-    #[allow(clippy::type_complexity)]
-    pub fn file_snapshot(&self) -> Vec<(u64, Arc<str>, Option<String>, Option<String>, u64, bool)> {
+    /// Snapshot of all file and symlink entries (poll diff input).
+    pub fn file_snapshot(&self) -> Vec<FileSnapshot> {
         self.inodes
             .values()
-            .filter(|e| e.kind == InodeKind::File)
-            .map(|e| {
-                (
-                    e.inode,
-                    e.full_path.clone(),
-                    e.xet_hash.clone(),
-                    e.etag.clone(),
-                    e.size,
-                    e.is_dirty(),
-                )
+            .filter(|e| e.kind != InodeKind::Directory)
+            .map(|e| FileSnapshot {
+                ino: e.inode,
+                path: e.full_path.clone(),
+                kind: e.kind,
+                xet_hash: e.xet_hash.clone(),
+                etag: e.etag.clone(),
+                size: e.size,
+                stored_perm: e.stored_perm(),
+                dirty: e.is_dirty(),
             })
             .collect()
     }
 
     /// Update remote file metadata (only if not dirty). Returns true if updated.
+    /// `mode` is the remote stored `st_mode`; callers handle a kind change
+    /// (file ↔ symlink) by replacing the inode instead.
     pub fn update_remote_file(
         &mut self,
         ino: u64,
@@ -764,19 +835,24 @@ impl InodeTable {
         new_etag: Option<String>,
         new_size: u64,
         new_mtime: SystemTime,
+        mode: Option<u32>,
     ) -> bool {
         if !self.accepts_remote(ino, new_hash.as_deref()) {
             return false;
         }
         if let Some(entry) = self.inodes.get_mut(&ino) {
+            if (&entry.xet_hash, &entry.etag, entry.size) != (&new_hash, &new_etag, new_size) {
+                // Remote moved under us; the staging cache (if any) no longer
+                // matches xet_hash. An in-flight download observes this under
+                // its post-check and won't re-flag the cache.
+                entry.staging_is_current = false;
+                entry.symlink_target = None;
+            }
             entry.xet_hash = new_hash;
             entry.etag = new_etag;
             entry.size = new_size;
             entry.mtime = new_mtime;
-            // Remote moved under us; the staging cache (if any) no longer
-            // matches xet_hash. An in-flight download observes this under
-            // its post-check and won't re-flag the cache.
-            entry.staging_is_current = false;
+            entry.set_stored_mode(mode);
             true
         } else {
             false
@@ -913,7 +989,8 @@ impl InodeTable {
     }
 
     /// Merge a partial remote metadata update into a materialized file:
-    /// `None` fields keep their current value. Skips dirty files (local
+    /// `None` fields keep their current value (`mode: Some(None)` clears the
+    /// stored mode; callers handle a file ↔ symlink change). Skips dirty files (local
     /// writes win until flushed). Returns true if applied.
     pub fn merge_remote_file(
         &mut self,
@@ -921,6 +998,7 @@ impl InodeTable {
         hash: Option<String>,
         size: Option<u64>,
         mtime: Option<SystemTime>,
+        mode: Option<Option<u32>>,
     ) -> bool {
         if !self.accepts_remote(ino, hash.as_deref()) {
             return false;
@@ -929,7 +1007,13 @@ impl InodeTable {
             return false;
         };
         if let Some(hash) = hash {
+            if entry.xet_hash.as_deref() != Some(hash.as_str()) {
+                entry.symlink_target = None;
+            }
             entry.xet_hash = Some(hash);
+        }
+        if let Some(mode) = mode {
+            entry.set_stored_mode(mode);
         }
         if let Some(size) = size {
             entry.size = size;
@@ -1227,7 +1311,8 @@ mod tests {
         assert_eq!(entry.xet_hash.as_deref(), Some("new_hash"));
         assert_eq!(entry.size, 200);
         assert!(entry.pending_deletes.is_empty());
-        assert!(entry.mtime > UNIX_EPOCH);
+        assert_eq!(entry.mtime, UNIX_EPOCH, "the committed mtime is kept");
+        assert!(entry.ctime > UNIX_EPOCH);
     }
 
     /// A commit superseded by a newer write still reached the Hub, so its
@@ -1255,7 +1340,7 @@ mod tests {
         let second = entry.dirty_generation;
         entry.apply_commit("h2", 1, second);
         assert!(entry.is_earlier_own_commit("h1"));
-        assert!(!table.merge_remote_file(ino, Some("h1".to_string()), Some(1), None));
+        assert!(!table.merge_remote_file(ino, Some("h1".to_string()), Some(1), None, None));
         assert_eq!(table.get(ino).unwrap().xet_hash.as_deref(), Some("h2"));
     }
 
@@ -1282,8 +1367,8 @@ mod tests {
             let generation = entry.dirty_generation;
             entry.apply_commit(hash, 1, generation);
         }
-        assert!(table.merge_remote_file(ino, Some("other".to_string()), Some(5), None));
-        assert!(table.merge_remote_file(ino, Some("h1".to_string()), Some(1), None));
+        assert!(table.merge_remote_file(ino, Some("other".to_string()), Some(5), None, None));
+        assert!(table.merge_remote_file(ino, Some("h1".to_string()), Some(1), None, None));
         assert_eq!(table.get(ino).unwrap().xet_hash.as_deref(), Some("h1"));
     }
 
@@ -1635,16 +1720,17 @@ mod tests {
         let snapshot = table.file_snapshot();
         assert_eq!(snapshot.len(), 2, "only files, not directories");
 
-        let a = snapshot.iter().find(|(ino, ..)| *ino == ino1).unwrap();
-        assert_eq!(&*a.1, "a.txt");
-        assert_eq!(a.2, Some("hash_a".to_string()));
-        assert_eq!(a.3, None); // etag
-        assert_eq!(a.4, 100);
-        assert!(a.5, "a.txt should be dirty");
+        let a = snapshot.iter().find(|s| s.ino == ino1).unwrap();
+        assert_eq!(&*a.path, "a.txt");
+        assert_eq!(a.xet_hash, Some("hash_a".to_string()));
+        assert_eq!(a.etag, None);
+        assert_eq!(a.size, 100);
+        assert_eq!(a.stored_perm, None);
+        assert!(a.dirty, "a.txt should be dirty");
 
-        let b = snapshot.iter().find(|(ino, ..)| *ino == ino2).unwrap();
-        assert_eq!(&*b.1, "b.txt");
-        assert!(!b.5, "b.txt should not be dirty");
+        let b = snapshot.iter().find(|s| s.ino == ino2).unwrap();
+        assert_eq!(&*b.path, "b.txt");
+        assert!(!b.dirty, "b.txt should not be dirty");
     }
 
     #[test]
@@ -1667,19 +1753,26 @@ mod tests {
         let new_mtime = UNIX_EPOCH + std::time::Duration::from_secs(1000);
 
         // Update succeeds on non-dirty file
-        assert!(table.update_remote_file(ino, Some("new_hash".to_string()), None, 200, new_mtime));
+        assert!(table.update_remote_file(ino, Some("new_hash".to_string()), None, 200, new_mtime, Some(0o100750)));
         let entry = table.get(ino).unwrap();
         assert_eq!(entry.xet_hash, Some("new_hash".to_string()));
         assert_eq!(entry.size, 200);
         assert_eq!(entry.mtime, new_mtime);
+        assert_eq!(entry.stored_perm(), Some(0o750));
+        assert_eq!(entry.stored_mode(), Some(0o100750));
+
+        // A cleared remote mode falls back to the mount default.
+        assert!(table.update_remote_file(ino, Some("new_hash".to_string()), None, 200, new_mtime, None));
+        assert_eq!(table.get(ino).unwrap().stored_perm(), None);
+        assert_eq!(table.get(ino).unwrap().stored_mode(), None);
 
         // Mark dirty — update should fail
         table.get_mut(ino).unwrap().set_dirty();
-        assert!(!table.update_remote_file(ino, Some("ignored".to_string()), None, 999, UNIX_EPOCH));
+        assert!(!table.update_remote_file(ino, Some("ignored".to_string()), None, 999, UNIX_EPOCH, None));
         assert_eq!(table.get(ino).unwrap().size, 200, "dirty file should not be updated");
 
         // Non-existent inode
-        assert!(!table.update_remote_file(9999, None, None, 0, UNIX_EPOCH));
+        assert!(!table.update_remote_file(9999, None, None, 0, UNIX_EPOCH, None));
     }
 
     #[test]

@@ -9,7 +9,7 @@ use crate::error::Error;
 use crate::follow::{FollowChange, FollowEvent, FollowOp};
 use crate::hub_api::HubOps;
 
-use super::inode::{InodeKind, InodeTable, ROOT_INODE};
+use super::inode::{self, InodeKind, InodeTable, ROOT_INODE};
 use super::{InvalKind, Invalidator};
 
 /// Exponential backoff shared by the remote-change loops: `base * 2^exp`,
@@ -525,9 +525,9 @@ impl super::VirtualFs {
             for change in changes {
                 let materialized = inode_table
                     .get_by_path(&change.path)
-                    .filter(|e| e.kind == InodeKind::File)
-                    .map(|e| (e.inode, e.is_dirty()));
-                let Some((ino, is_dirty)) = materialized else {
+                    .filter(|e| e.kind != InodeKind::Directory)
+                    .map(|e| (e.inode, e.is_dirty(), e.kind, e.stored_mode()));
+                let Some((ino, is_dirty, local_kind, local_mode)) = materialized else {
                     // Not materialized: an entry appeared or vanished in the
                     // nearest existing ancestor directory (possibly behind an
                     // intermediate dir we never listed), so its cached listing
@@ -544,6 +544,19 @@ impl super::VirtualFs {
                 };
                 if is_dirty {
                     continue; // local writes take precedence until flushed
+                }
+                // A file that became a symlink (or back) is dropped and its
+                // parent listing invalidated, which re-creates it with the
+                // new kind. An absent `mode` means unchanged.
+                let new_mode = change.mode.unwrap_or(local_mode);
+                if change.op != FollowOp::Delete && InodeKind::from_file_mode(new_mode) != local_kind {
+                    if let Some(parent_ino) = remove_remote_file(&mut inode_table, ino, &mut inos_to_invalidate) {
+                        applied.push(("type change", &change.path));
+                        if inode_table.is_children_loaded(parent_ino) {
+                            dirs_to_invalidate.insert(parent_ino);
+                        }
+                    }
+                    continue;
                 }
                 match change.op {
                     FollowOp::Delete => {
@@ -562,7 +575,8 @@ impl super::VirtualFs {
                             .as_deref()
                             .or(change.uploaded_at.as_deref())
                             .map(crate::hub_api::mtime_from_str);
-                        if inode_table.merge_remote_file(ino, change.xet_hash.clone(), change.size, mtime) {
+                        if inode_table.merge_remote_file(ino, change.xet_hash.clone(), change.size, mtime, change.mode)
+                        {
                             queue_file_invalidation(&inode_table, ino, &mut inos_to_invalidate);
                             applied.push(("update", &change.path));
                         }
@@ -650,40 +664,54 @@ impl super::VirtualFs {
             etag: Option<String>,
             size: u64,
             mtime: SystemTime,
+            mode: Option<u32>,
+            /// False for a metadata-only change (e.g. a remote chmod): the
+            /// cached pages stay valid.
+            content_changed: bool,
         }
         let mut updates = Vec::new();
         let mut deletions = Vec::new();
 
-        for (ino, path, local_hash, local_etag, local_size, is_dirty) in &snapshot {
+        for local in &snapshot {
+            let path = &local.path;
             // Skip locally-modified files: local writes take precedence until flushed.
-            if *is_dirty {
+            if local.dirty {
                 continue;
             }
             match remote_map.get(path.as_ref()) {
+                // A file that became a symlink (or back): drop the inode, the
+                // parent listing invalidated below re-creates it.
+                Some(remote) if InodeKind::from_file_mode(remote.mode) != local.kind => {
+                    info!("Remote type change detected: {}", path);
+                    deletions.push((local.ino, path.clone()));
+                }
                 Some(remote) => {
                     let remote_hash = remote.xet_hash.as_deref();
                     let remote_oid = remote.oid.as_deref();
                     let remote_size = remote.size.unwrap_or(0);
                     // Detect changes via xet_hash (preferred) or oid (= etag).
-                    let changed = if local_hash.is_some() || remote_hash.is_some() {
-                        remote_hash != local_hash.as_deref()
+                    let changed = if local.xet_hash.is_some() || remote_hash.is_some() {
+                        remote_hash != local.xet_hash.as_deref()
                     } else {
-                        remote_oid != local_etag.as_deref()
+                        remote_oid != local.etag.as_deref()
                     };
+                    let content_changed = changed || remote_size != local.size;
 
-                    if changed || remote_size != *local_size {
+                    if content_changed || inode::perm_bits(remote.mode) != local.stored_perm {
                         let mtime = remote
                             .mtime
                             .as_deref()
                             .map(crate::hub_api::mtime_from_str)
                             .unwrap_or(SystemTime::now());
                         updates.push(Update {
-                            ino: *ino,
+                            ino: local.ino,
                             path: path.clone(),
                             hash: remote_hash.map(|s| s.to_string()),
                             etag: remote_oid.map(|s| s.to_string()),
                             size: remote_size,
                             mtime,
+                            mode: remote.mode,
+                            content_changed,
                         });
                         info!("Remote update detected: {}", path);
                     }
@@ -695,7 +723,7 @@ impl super::VirtualFs {
                     let parent_prefix = path.rsplit_once('/').map_or("", |(p, _)| p);
                     if polled_prefixes.contains(parent_prefix) {
                         info!("Remote deletion detected: {}", path);
-                        deletions.push((*ino, path.clone()));
+                        deletions.push((local.ino, path.clone()));
                     }
                 }
             }
@@ -715,8 +743,19 @@ impl super::VirtualFs {
                 if !at_path(&inode_table, update.ino, &update.path) {
                     continue;
                 }
-                inode_table.update_remote_file(update.ino, update.hash, update.etag, update.size, update.mtime);
-                queue_file_invalidation(&inode_table, update.ino, &mut inos_to_invalidate);
+                inode_table.update_remote_file(
+                    update.ino,
+                    update.hash,
+                    update.etag,
+                    update.size,
+                    update.mtime,
+                    update.mode,
+                );
+                if update.content_changed {
+                    queue_file_invalidation(&inode_table, update.ino, &mut inos_to_invalidate);
+                } else {
+                    inos_to_invalidate.push((update.ino, InvalKind::AttrOnly));
+                }
             }
 
             // Re-checked under the write lock by the helper: the inode may

@@ -894,6 +894,7 @@ fn lookup_ttl_skips_head_within_window() {
                 etag: None,
                 size: Some(200),
                 last_modified: None,
+                mode: None,
             }),
         );
 
@@ -1032,6 +1033,7 @@ fn lookup_miss_finds_remotely_added_file() {
                 etag: None,
                 size: Some(9),
                 last_modified: None,
+                mode: None,
             }),
         );
 
@@ -1252,6 +1254,7 @@ fn lookup_falls_back_to_list_when_head_has_no_size() {
             etag: None,
             size: None,
             last_modified: None,
+            mode: None,
         }),
     );
     let xet = MockXet::new();
@@ -1476,7 +1479,7 @@ fn poll_dirty_files_skipped() {
         }
 
         let mut inodes = vfs.inode_table.write().unwrap();
-        let updated = inodes.update_remote_file(ino, Some("new_hash".to_string()), None, 999, SystemTime::now());
+        let updated = inodes.update_remote_file(ino, Some("new_hash".to_string()), None, 999, SystemTime::now(), None);
         assert!(!updated);
         assert_eq!(inodes.get(ino).unwrap().xet_hash.as_deref(), Some("hash1"));
     });
@@ -2385,6 +2388,7 @@ fn open_readonly_empty_file() {
             etag: None,
             size: Some(0),
             last_modified: None,
+            mode: None,
         }),
     );
     let xet = MockXet::new();
@@ -2438,6 +2442,7 @@ fn open_readonly_http_download() {
             etag: Some("oid_abc".to_string()),
             size: Some(500),
             last_modified: None,
+            mode: None,
         }),
     );
     let xet = MockXet::new();
@@ -2465,6 +2470,7 @@ fn open_readonly_http_download_fail() {
             etag: Some("oid_abc".to_string()),
             size: Some(500),
             last_modified: None,
+            mode: None,
         }),
     );
     hub.fail_next_download();
@@ -2896,6 +2902,7 @@ fn unlink_cleans_staging() {
             etag: None,
             size: Some(0),
             last_modified: None,
+            mode: None,
         }),
     );
     let xet = MockXet::new();
@@ -3023,6 +3030,7 @@ fn follow_change(path: &str, op: FollowOp) -> FollowChange {
         xet_hash: None,
         uploaded_at: None,
         mtime: None,
+        mode: None,
     }
 }
 
@@ -3506,6 +3514,7 @@ fn revalidation_detects_hash_change() {
                 etag: None,
                 size: Some(200),
                 last_modified: None,
+                mode: None,
             }),
         );
 
@@ -3564,6 +3573,7 @@ fn revalidation_skips_dirty_files() {
                 etag: None,
                 size: Some(500),
                 last_modified: None,
+                mode: None,
             }),
         );
 
@@ -5031,6 +5041,7 @@ fn unlink_with_open_handle_cleans_open_files() {
             etag: None,
             size: Some(0),
             last_modified: None,
+            mode: None,
         }),
     );
     let xet = MockXet::new();
@@ -6143,6 +6154,8 @@ fn flush_pending_deletes_requeue_on_failure() {
 
 // ── Symlinks ────────────────────────────────────────────────────────
 
+/// symlink() commits a bucket file whose content is the target, with an
+/// S_IFLNK mode; renaming and unlinking it behave like regular files.
 #[test]
 fn symlink_create_and_readlink() {
     let hub = MockHub::new();
@@ -6155,14 +6168,401 @@ fn symlink_create_and_readlink() {
             .await
             .unwrap();
         let ino = attr.ino;
-
-        let looked_up = vfs.lookup(ROOT_INODE, "link").await.unwrap();
-        assert_eq!(looked_up.ino, ino);
-
-        let target = vfs.readlink(ino).unwrap();
-        assert_eq!(target, "target.txt");
         assert_eq!(attr.kind, super::inode::InodeKind::Symlink);
+        assert_eq!(attr.size, "target.txt".len() as u64);
+
+        let logs = hub.take_batch_log();
+        assert_eq!(logs.len(), 1);
+        let hash = match &logs[0][..] {
+            [
+                BatchOp::AddFile {
+                    path, xet_hash, mode, ..
+                },
+            ] => {
+                assert_eq!(path, "link");
+                assert_eq!(*mode, Some(0o120777));
+                xet_hash.clone()
+            }
+            other => panic!("expected one AddFile, got {other:?}"),
+        };
+        assert_eq!(
+            vfs.inode_table.read().unwrap().get(ino).unwrap().xet_hash.as_deref(),
+            Some(hash.as_str())
+        );
+        assert_eq!(vfs.readlink(ino).await.unwrap(), "target.txt");
+
+        // The Hub now serves it as a symlink file.
+        hub.add_file("link", 10, Some(&hash), None);
+        hub.set_mode("link", Some(0o120777));
+        assert_eq!(vfs.lookup(ROOT_INODE, "link").await.unwrap().ino, ino);
+
+        vfs.rename(ROOT_INODE, "link", ROOT_INODE, "moved", false)
+            .await
+            .unwrap();
+        let logs = hub.take_batch_log();
+        assert!(
+            matches!(&logs[..], [ops] if matches!(&ops[..], [
+                BatchOp::AddFile { path, mode: Some(0o120777), .. },
+                BatchOp::DeleteFile { path: old },
+            ] if path == "moved" && old == "link")),
+            "rename re-adds with the symlink mode: {logs:?}"
+        );
+
+        vfs.unlink(ROOT_INODE, "moved").await.unwrap();
+        let logs = hub.take_batch_log();
+        assert!(
+            matches!(&logs[..], [ops] if matches!(&ops[..], [BatchOp::DeleteFile { path }] if path == "moved")),
+            "{logs:?}"
+        );
     });
+}
+
+/// A symlink fails cleanly (no local entry) when its commit fails.
+#[test]
+fn symlink_commit_failure_leaves_no_entry() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        hub.fail_next_batch(1);
+        assert!(vfs.symlink(ROOT_INODE, "link", "t", 0o777, 0, 0).await.is_err());
+        assert_eq!(vfs.lookup(ROOT_INODE, "link").await.unwrap_err(), libc::ENOENT);
+    });
+}
+
+/// A Hub file with an S_IFLNK mode is a symlink; its target (the file
+/// content) is fetched on the first readlink and cached.
+#[test]
+fn remote_symlink_reads_target_lazily() {
+    let hub = MockHub::new();
+    hub.add_file("link", 10, Some("link_hash"), None);
+    hub.set_mode("link", Some(0o120777));
+    let xet = MockXet::new();
+    xet.add_file("link_hash", b"target.txt");
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let entries = vfs.readdir(ROOT_INODE).await.unwrap();
+        let entry = entries.iter().find(|e| e.name == "link").unwrap();
+        assert_eq!(entry.kind, super::inode::InodeKind::Symlink);
+
+        let attr = vfs.lookup(ROOT_INODE, "link").await.unwrap();
+        assert_eq!(attr.kind, super::inode::InodeKind::Symlink);
+        assert_eq!(attr.perm, 0o777);
+        assert_eq!(vfs.readlink(attr.ino).await.unwrap(), "target.txt");
+        assert_eq!(xet.stream_calls.lock().unwrap().len(), 1);
+        assert_eq!(vfs.readlink(attr.ino).await.unwrap(), "target.txt");
+        assert_eq!(xet.stream_calls.lock().unwrap().len(), 1, "target is cached");
+    });
+}
+
+// ── Stored file modes ───────────────────────────────────────────────
+
+/// A stored mode replaces `--file-mode` (listing and HEAD paths); read-only
+/// mounts still strip the write bits. Files without one keep today's modes.
+#[test]
+fn stored_mode_overrides_file_mode() {
+    let hub = MockHub::new();
+    hub.add_file("run.sh", 10, Some("h1"), None);
+    hub.set_mode("run.sh", Some(0o100755));
+    hub.add_file("plain.txt", 10, Some("h2"), None);
+    let xet = MockXet::new();
+
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+    rt.block_on(async {
+        vfs.readdir(ROOT_INODE).await.unwrap();
+        assert_eq!(vfs.lookup(ROOT_INODE, "run.sh").await.unwrap().perm, 0o755);
+        assert_eq!(vfs.lookup(ROOT_INODE, "plain.txt").await.unwrap().perm, 0o644);
+    });
+
+    let (rt, vfs) = vfs_readonly(&hub, &xet);
+    rt.block_on(async {
+        assert_eq!(vfs.lookup(ROOT_INODE, "run.sh").await.unwrap().perm, 0o555);
+        assert_eq!(vfs.lookup(ROOT_INODE, "plain.txt").await.unwrap().perm, 0o444);
+    });
+}
+
+/// A mode with other type bits (e.g. S_IFDIR) on a file entry is treated as
+/// a regular file with those permission bits.
+#[test]
+fn unknown_mode_type_bits_are_a_regular_file() {
+    let hub = MockHub::new();
+    hub.add_file("odd", 10, Some("h1"), None);
+    hub.set_mode("odd", Some(0o040750));
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let attr = vfs.lookup(ROOT_INODE, "odd").await.unwrap();
+        assert_eq!((attr.kind, attr.perm), (super::inode::InodeKind::File, 0o750));
+        vfs.readdir(ROOT_INODE).await.unwrap();
+        let attr = vfs.lookup(ROOT_INODE, "odd").await.unwrap();
+        assert_eq!((attr.kind, attr.perm), (super::inode::InodeKind::File, 0o750));
+    });
+}
+
+/// HEAD revalidation picks up a remote chmod, and replaces a file that
+/// became a symlink with a new inode.
+#[test]
+fn remote_mode_change_revalidated_via_head() {
+    let hub = MockHub::new();
+    hub.add_file("f", 10, Some("h1"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let attr = vfs.lookup(ROOT_INODE, "f").await.unwrap();
+        assert_eq!(attr.perm, 0o644);
+
+        hub.set_mode("f", Some(0o100700));
+        let updated = vfs.lookup(ROOT_INODE, "f").await.unwrap();
+        assert_eq!((updated.ino, updated.perm), (attr.ino, 0o700));
+
+        hub.set_mode("f", None);
+        assert_eq!(vfs.lookup(ROOT_INODE, "f").await.unwrap().perm, 0o644, "cleared mode");
+
+        hub.set_mode("f", Some(0o120777));
+        let link = vfs.lookup(ROOT_INODE, "f").await.unwrap();
+        assert_eq!(link.kind, super::inode::InodeKind::Symlink);
+        assert_ne!(link.ino, attr.ino);
+    });
+}
+
+/// The poll diff applies mode-only changes in place and drops a file that
+/// became a symlink (the invalidated listing re-creates it).
+#[test]
+fn poll_diff_applies_mode_and_type_changes() {
+    let hub = MockHub::new();
+    hub.add_file("a", 10, Some("ha"), None);
+    hub.add_file("b", 10, Some("hb"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        vfs.readdir(ROOT_INODE).await.unwrap();
+        let a = vfs.lookup(ROOT_INODE, "a").await.unwrap();
+
+        hub.set_mode("a", Some(0o100750));
+        hub.set_mode("b", Some(0o120777));
+        let remote = hub.list_tree("").await.unwrap();
+        let polled: std::collections::HashSet<String> = [String::new()].into();
+        VirtualFs::apply_poll_diff(remote, &polled, &vfs.inode_table, &vfs.negative_cache, &vfs.invalidator);
+
+        {
+            let inodes = vfs.inode_table.read().unwrap();
+            assert_eq!(inodes.get(a.ino).unwrap().stored_perm(), Some(0o750));
+            assert!(inodes.get_by_path("b").is_none(), "type change drops the inode");
+        }
+        assert_eq!(vfs.getattr(a.ino).unwrap().perm, 0o750);
+        let b = vfs.lookup(ROOT_INODE, "b").await.unwrap();
+        assert_eq!(b.kind, super::inode::InodeKind::Symlink);
+    });
+}
+
+/// Live-follow `mode`: absent keeps it, a number sets it, `null` clears it,
+/// and a symlink mode replaces the file.
+#[test]
+fn follow_applies_mode_changes() {
+    let hub = MockHub::new();
+    hub.add_file("f", 10, Some("h1"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let attr = vfs.lookup(ROOT_INODE, "f").await.unwrap();
+        let apply = |change: FollowChange| {
+            VirtualFs::apply_follow_changes(&[change], &vfs.inode_table, &vfs.negative_cache, &vfs.invalidator)
+        };
+
+        let mut change = follow_change("f", FollowOp::Update);
+        change.mode = Some(Some(0o100700));
+        apply(change);
+        assert_eq!(vfs.getattr(attr.ino).unwrap().perm, 0o700);
+
+        let mut change = follow_change("f", FollowOp::Update);
+        change.size = Some(20);
+        apply(change);
+        assert_eq!(vfs.getattr(attr.ino).unwrap().perm, 0o700, "absent mode is unchanged");
+
+        let mut change = follow_change("f", FollowOp::Update);
+        change.mode = Some(None);
+        apply(change);
+        assert_eq!(vfs.getattr(attr.ino).unwrap().perm, 0o644, "null mode is cleared");
+
+        let mut change = follow_change("f", FollowOp::Update);
+        change.mode = Some(Some(0o120777));
+        apply(change);
+        assert!(vfs.inode_table.read().unwrap().get_by_path("f").is_none());
+    });
+}
+
+fn single_op(logs: &[Vec<BatchOp>]) -> &BatchOp {
+    match logs {
+        [ops] if ops.len() == 1 => &ops[0],
+        other => panic!("expected a single op, got {other:?}"),
+    }
+}
+
+/// A created file commits its create mode and its last write time.
+#[test]
+fn create_commits_mode_and_mtime() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let (attr, fh) = vfs.create(ROOT_INODE, "run.sh", 0o755, 0, 0, None).await.unwrap();
+        write_blocking(&vfs, attr.ino, fh, 0, b"#!/bin/sh\n").await.unwrap();
+        let written_at = vfs.getattr(attr.ino).unwrap().mtime;
+        vfs.release(fh).await.unwrap();
+
+        let logs = hub.take_batch_log();
+        let BatchOp::AddFile {
+            mode,
+            mtime,
+            mtime_nanos,
+            ..
+        } = single_op(&logs)
+        else {
+            panic!("expected AddFile");
+        };
+        assert_eq!(*mode, Some(0o100755));
+        let sent = std::time::UNIX_EPOCH + Duration::from_millis(*mtime) + Duration::from_nanos(*mtime_nanos as u64);
+        assert_eq!(sent, written_at);
+        assert_eq!(vfs.getattr(attr.ino).unwrap().mtime, written_at, "commit keeps mtime");
+    });
+}
+
+/// Re-uploading a file keeps its stored mode (addFile clears it otherwise);
+/// a file without one stays without.
+#[test]
+fn reupload_keeps_stored_mode() {
+    let hub = MockHub::new();
+    hub.add_file("run.sh", 10, Some("h1"), None);
+    hub.set_mode("run.sh", Some(0o100755));
+    hub.add_file("plain.txt", 10, Some("h2"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        for (name, expected) in [("run.sh", Some(0o100755)), ("plain.txt", None)] {
+            let attr = vfs.lookup(ROOT_INODE, name).await.unwrap();
+            let fh = vfs.open(attr.ino, true, true, None).await.unwrap();
+            write_blocking(&vfs, attr.ino, fh, 0, b"new").await.unwrap();
+            vfs.release(fh).await.unwrap();
+            let logs = hub.take_batch_log();
+            assert!(
+                matches!(single_op(&logs), BatchOp::AddFile { mode, .. } if *mode == expected),
+                "{name}: {logs:?}"
+            );
+        }
+    });
+}
+
+/// chmod / utimens on an unmodified remote file send `updateMetadata` (no
+/// re-upload); owner changes and no-op chmods stay local.
+#[test]
+fn setattr_clean_file_sends_update_metadata() {
+    let hub = MockHub::new();
+    hub.add_file("f", 10, Some("h1"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let ino = vfs.lookup(ROOT_INODE, "f").await.unwrap().ino;
+
+        let attr = vfs.setattr(ino, None, Some(0o700), None, None, None, None).await.unwrap();
+        assert_eq!(attr.perm, 0o700);
+        let logs = hub.take_batch_log();
+        assert!(
+            matches!(single_op(&logs), BatchOp::UpdateMetadata { path, mode: Some(0o100700), mtime: None, .. } if path == "f"),
+            "{logs:?}"
+        );
+
+        let t = std::time::UNIX_EPOCH + Duration::new(1_700_000_000, 5_000_123);
+        vfs.setattr(ino, None, None, None, None, None, Some(t)).await.unwrap();
+        let logs = hub.take_batch_log();
+        assert!(
+            matches!(
+                single_op(&logs),
+                BatchOp::UpdateMetadata { mode: None, mtime: Some(1_700_000_000_005), mtime_nanos: Some(123), .. }
+            ),
+            "{logs:?}"
+        );
+
+        vfs.setattr(ino, None, Some(0o700), Some(42), Some(42), None, Some(t))
+            .await
+            .unwrap();
+        assert!(hub.take_batch_log().is_empty(), "nothing changed on the Hub side");
+
+        hub.fail_next_batch(1);
+        let err = vfs.setattr(ino, None, Some(0o600), None, None, None, None).await;
+        assert!(err.is_err(), "a failed update is reported");
+        assert_eq!(vfs.getattr(ino).unwrap().perm, 0o700, "and rolled back");
+    });
+}
+
+/// Advanced writes: a chmod on a dirty file rides along with its pending
+/// upload, and still commits when the content turns out unchanged.
+#[test]
+fn advanced_chmod_on_dirty_file_is_flushed() {
+    use std::sync::atomic::Ordering;
+
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_advanced(&hub, &xet);
+
+    rt.block_on(async {
+        let (attr, fh) = vfs.create(ROOT_INODE, "f", 0o644, 0, 0, None).await.unwrap();
+        let ino = attr.ino;
+        write_blocking(&vfs, ino, fh, 0, b"hello").await.unwrap();
+        vfs.release(fh).await.unwrap();
+        vfs.setattr(ino, None, Some(0o755), None, None, None, None)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        let logs = hub.take_batch_log();
+        assert!(
+            matches!(
+                single_op(&logs),
+                BatchOp::AddFile {
+                    mode: Some(0o100755),
+                    ..
+                }
+            ),
+            "{logs:?}"
+        );
+
+        // Re-dirty without a content change, then chmod: the flush sees the
+        // same hash but must still commit the new mode.
+        let hash = vfs
+            .inode_table
+            .read()
+            .unwrap()
+            .get(ino)
+            .unwrap()
+            .xet_hash
+            .clone()
+            .unwrap();
+        let counter: u64 = hash.strip_prefix("mock_hash_").unwrap().parse().unwrap();
+        xet.next_hash.store(counter, Ordering::SeqCst);
+        vfs.inode_table.write().unwrap().get_mut(ino).unwrap().set_dirty();
+        vfs.setattr(ino, None, Some(0o700), None, None, None, None)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        let logs = hub.take_batch_log();
+        assert!(
+            matches!(single_op(&logs), BatchOp::AddFile { xet_hash, mode: Some(0o100700), .. } if *xet_hash == hash),
+            "{logs:?}"
+        );
+        assert!(!vfs.inode_table.read().unwrap().get(ino).unwrap().is_dirty());
+    });
+
+    vfs.shutdown();
 }
 
 #[test]
@@ -6174,7 +6574,7 @@ fn readlink_regular_file_returns_error() {
 
     rt.block_on(async {
         let attr = vfs.lookup(ROOT_INODE, "regular.txt").await.unwrap();
-        let result = vfs.readlink(attr.ino);
+        let result = vfs.readlink(attr.ino).await;
         assert_eq!(result.unwrap_err(), libc::EINVAL);
     });
 }
@@ -7048,6 +7448,7 @@ fn transient_429_does_not_poison_negative_cache() {
                 etag: Some("etag-ready".to_string()),
                 size: Some(0),
                 last_modified: None,
+                mode: None,
             }),
         );
 

@@ -53,7 +53,9 @@ async fn bench_xorb_reconstruction_cache() {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis() as u64,
+            mtime_nanos: 0,
             content_type: None,
+            mode: None,
         }])
         .await
         .expect("batch add");

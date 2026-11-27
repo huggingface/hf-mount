@@ -40,7 +40,9 @@ async fn test_bench() {
                 path: filename.clone(),
                 xet_hash,
                 mtime: mtime_ms,
+                mtime_nanos: 0,
                 content_type: None,
+                mode: None,
             }])
             .await
             .expect("batch add failed");
